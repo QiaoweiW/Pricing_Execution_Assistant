@@ -1,0 +1,37 @@
+# Temporary files
+.*
+!.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Data files (exclude sensitive data)
+*.csv
+*.xlsx
+*.xls
+*.duckdb
+*.parquet
+!Pricing Quote Agent/current_pricing_data.duckdb
+!current_pricing_data.duckdb
+!pricing_data.parquet
+
+# Output files
+Output/
+*_vbcs.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db*.parquet

@@ -1,0 +1,83 @@
+Role: Act as a Senior Python Data Engineer with domain expertise in Supply Chain Planning.
+
+Objective: Write a robust Python script to manage a "Human-in-the-Loop" demand forecasting system. The goal is to ingest user adjustments from a CSV, update a persistent "Adjustment Ledger" (Parquet), and then merge these adjustments onto a base "Statistical Forecast" (Parquet) to create a final "Consensus Plan."
+
+Context: I am moving away from appending rows to a single file. Instead, I am adopting a Layered Architecture:
+
+Layer 1: The Statistical Base Forecast (ReadOnly).
+
+Layer 2: The User Adjustment Ledger (Read/Write - The "Source of Truth" for overrides).
+
+Layer 3: The Final View (Generated on the fly by joining Layer 1 & 2).
+
+Functional Requirements:
+
+1. Configuration & Setup
+
+Use pandas for data manipulation.
+
+Define file paths as variables at the top of the script for easy configuration.
+
+INPUT_TEMPLATE_PATH: Path to the user's upload (Adjustment_User_Template.csv).
+
+LEDGER_PATH: Path to the persistent storage (Adjustment_Ledger.parquet).
+
+STAT_FORECAST_PATH: Path to the base forecast (forecast_output.parquet).
+
+FINAL_OUTPUT_PATH: Path to save the result.
+
+2. Function: update_adjustment_ledger
+
+Read the INPUT_TEMPLATE_PATH.
+
+Add a Last_Modified_Timestamp column with the current execution time.
+
+Check if LEDGER_PATH exists.
+
+If no: The template becomes the new Ledger.
+
+If yes: Load the Ledger. Concatenate the new template data to the Ledger.
+
+Deduplication Logic (Crucial):
+
+Define the "Natural Key" columns (e.g., Date, Item, Type, Corporate Group, Customer Name, Format, Size, Brand, Item Description).
+
+Sort by Natural Key + Last_Modified_Timestamp (descending).
+
+Drop duplicates based on the Natural Key, keeping only the last entry (latest timestamp).
+
+Save the cleaned, deduplicated dataset back to LEDGER_PATH.
+
+3. Function: generate_consensus_plan
+
+Load the STAT_FORECAST_PATH.
+
+Load the LEDGER_PATH.
+
+Merge Logic:
+
+Perform a Left Join on the Statistical Forecast using the Natural Key.
+
+Column Logic:
+
+Create a column Final_Qty. Logic: If the Ledger has a value, use it. Otherwise, use the Statistical Forecast value. (Use coalesce logic).
+
+Create a column Adjustment_Type. Logic: If the value came from the Ledger, label it "User Override". If from Stat Forecast, label it "Statistical Forecast".
+
+Update the Generated Date column to the current date.
+
+Save the result to FINAL_OUTPUT_PATH (Parquet).
+
+4. Quality Standards
+
+Include standard Python logging (INFO/ERROR) to track progress.
+
+Include a try/except block to handle file-not-found errors gracefully.
+
+Ensure data types are consistent (e.g., enforce DateTime objects for date columns) to prevent merge errors.
+
+Data Dictionary for Matching (The Keys):
+
+Date, Item, Type, Corporate Group, Customer Name, Format, Size, Brand, Item Description.
+
+Output: Please provide the complete, commented Python code.

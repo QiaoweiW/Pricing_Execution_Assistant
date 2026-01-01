@@ -40,8 +40,6 @@ def render():
         st.markdown("""
         #### 📚 Resources
         - All CSV files should be in UTF-8 format
-        - Processing scripts are located in the `processing/` directory
-        - Output files are saved in the `data/` directory
         """)
     
     st.markdown("---")

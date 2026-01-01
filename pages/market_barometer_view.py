@@ -735,7 +735,7 @@ def render():
     **Features:**
     - 🔄Auto-refresh: Data will be automatically refreshed every 15 days.
     - 📊 **Interactive Dashboard**: View market indices organized by cost categories (Labor, Electricity, Natural Gas, Manufacturing, Packaging, Ingredient, Freight)
-    - 📈 **Forecasting**: Select future dates to see projected trends (orange dotted line) with confidence intervals (greenshaded area)
+    - 📈 **Forecasting** (Probabilistic and should NOT be used to set directions): Select future dates to see projected trends (orange dotted line) with confidence intervals (greenshaded area).
     - 🔍 **Filtering**: Customize which series to display in each category
     - 🔗 **Source Links**: Click on "Source" to view original, public data sources
     """)

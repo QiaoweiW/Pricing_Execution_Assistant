@@ -269,17 +269,13 @@ def process_uploaded_files(uploaded_files):
             final_result = final_result.drop('key', axis=1)
             
             # Apply business rule: Filter out invalid combinations where Custom-label volume > Sell-to Volume
+            # Vectorized comparison on the leading letter of each bracket label (e.g. "B. 500K..." -> "B").
+            # Alphabetically, A < B < C < D < E < F so custom_label >= sell_to means valid lower/equal tier.
             print("Applying volume tier constraint: Custom-label volume must be <= Sell-to Volume...")
             initial_count = len(final_result)
-            final_result = final_result[
-                final_result.apply(
-                    lambda row: compare_volume_tiers(
-                        row.get('Sell-to Volume Bracket'),
-                        row.get('Custom Label Bracket')
-                    ),
-                    axis=1
-                )
-            ]
+            sell_letter = final_result['Sell-to Volume Bracket'].astype(str).str.strip().str[0].str.upper()
+            custom_letter = final_result['Custom Label Bracket'].astype(str).str.strip().str[0].str.upper()
+            final_result = final_result[custom_letter >= sell_letter]
             filtered_count = len(final_result)
             print(f"[OK] Filtered out {initial_count - filtered_count:,} invalid combinations "
                   f"({filtered_count:,} valid combinations remaining)")

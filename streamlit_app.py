@@ -25,6 +25,7 @@ PAGES_DIR = Path(__file__).parent / "pages"
 # Mapping of view file names to display names
 VIEW_NAME_MAPPING = {
     "home_view": "Home",
+    "bid_asset_intelligence_view": "Bid Asset Intelligence",
     "new_price_quote_view": "New Price Quote",
     "market_barometer_view": "Market Barometer",
     "pricing_execution_automation_view": "Pricing Execution Automation",

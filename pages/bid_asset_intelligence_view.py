@@ -1,36 +1,181 @@
 """
 Bid Asset Intelligence page view.
 
-Features:
-- Upload Bid Asset CSV file
-- Multiselect filters: Format, Company, Bid Description, Month, Round (all mandatory)
-- Metrics row (single company + bid description + round only)
-- RFP Summary table (aggregated, grouped by key dimensions)
-- Detailed item-level table extract
-- Download buttons for both tables
+Sections
+--------
+1. Types & constants     (_FilterResult, _FINANCIAL_COLS, _GROUP_COLS,
+                          _STATUS_RULES, _DEFAULT_STATUS_COLOR, _COLOR_LEGEND,
+                          _CHART_FONT, _CHART_FILTER_DEFS, _SHAREPOINT_URL)
+2. Formatting helpers    (_fmt_currency, _fmt_volume, _fmt_pct, _to_csv_bytes,
+                          _apply_display_formats)
+3. Data helpers          (_month_sort_key, _coerce_month_to_label, _sel_hash,
+                          _excel_serial_to_date, _parse_currency_col,
+                          _filter_by_month_range)
+4. Chart helpers         (_round_num, _make_bid_label, _status_color,
+                          _prepare_chart_data, _build_overview_chart)
+5. Data loading          (_load_and_normalise)
+6. Page sections         (_render_bid_overview, _render_search_filters,
+                          _render_rfp_summary, _render_detail_table)
+7. Entry point           (render)
 """
+from __future__ import annotations
+
 import hashlib
-import streamlit as st
-import pandas as pd
 from datetime import datetime, timedelta
-from plotly.subplots import make_subplots
+from typing import NamedTuple, Optional
+
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
 from utils.ui_helpers import apply_custom_css
 
+# ── 1. Types & constants ──────────────────────────────────────────────────────
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+class _FilterResult(NamedTuple):
+    """Typed return value from _render_search_filters.
+
+    Bundles the filtered DataFrame together with the active cascading-filter
+    selections so callers receive an explicit contract instead of hidden state
+    stored on DataFrame.attrs.
+    """
+    df:          pd.DataFrame
+    sel_company: list[str]
+    sel_bid:     list[str]
+    sel_round:   list[str]
+
+
+# Used for both currency parsing on load AND aggregation/display in tables.
+# Single source of truth — no separate SUM_COLS / NUMERIC_COLS needed.
+_FINANCIAL_COLS = ["Volume (lbs)", "FOB Revenue $/Yr", "PCM $/Yr", "GP $/Yr"]
+
+# Column names used to group rows in the RFP Summary aggregation.
+_GROUP_COLS = [
+    "Format", "Company", "Bid Description", "Brand",
+    "Round", "Month", "Status", "Bid Rationale", "Feedback",
+]
+
+# Status keyword → (hex colour, legend label).
+# "award" maps to the same colour/label as "accept" intentionally.
+_STATUS_RULES: list[tuple[str, str, str]] = [
+    ("accept", "#4CAF50", "Accepted"),
+    ("award",  "#4CAF50", "Accepted"),
+    ("reject", "#9E9E9E", "Rejected"),
+]
+_DEFAULT_STATUS_COLOR = "#2196F3"   # "Other" / unknown
+
+# Ordered legend entries for the chart (de-duplicated view of _STATUS_RULES + default).
+_COLOR_LEGEND: list[tuple[str, str]] = [
+    ("#4CAF50", "Accepted"),
+    ("#9E9E9E", "Rejected"),
+    (_DEFAULT_STATUS_COLOR, "Other"),
+]
+
+_CHART_FONT = dict(family="Segoe UI, Tahoma, Geneva, Verdana, sans-serif", size=14)
+
+# Chart categorical filter definitions: (CSV column name, widget key suffix).
+_CHART_FILTER_DEFS: list[tuple[str, str]] = [
+    ("Format",                      "format"),
+    ("Size",                        "size"),
+    ("Referenced Item Description", "ref_item"),
+]
+
+_SHAREPOINT_URL = (
+    "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
+    "/Forms/AllItems.aspx?id=%2Fsites%2FBrandedPricing%2FShared%20Documents"
+    "%2FGeneral%2F02%20Resources%2FRFP%20Management"
+    "&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
+)
+
+# ── 2. Formatting helpers ─────────────────────────────────────────────────────
+
+def _fmt_currency(val) -> str:
+    if pd.isna(val):
+        return ""
+    return f"$({abs(val):,.0f})" if val < 0 else f"${val:,.0f}"
+
+
+def _fmt_volume(val) -> str:
+    return "" if pd.isna(val) else f"{val:,.0f}"
+
+
+def _fmt_pct(val) -> str:
+    """Format a ratio (already multiplied by 100) as a percentage string.
+
+    Uses a try/except instead of isinstance() so that numpy scalar types
+    (e.g. np.float64, which is not a subclass of float in NumPy ≥ 2.0)
+    are handled correctly without an explicit numpy dependency.
+    """
+    if pd.isna(val):
+        return "—"
+    try:
+        return f"{val:.1f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def _apply_display_formats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """Return a copy of *df* with financial columns formatted for display.
+
+    Volume (lbs) → comma-separated integer; everything else → $currency string.
+    Columns in *cols* that are not present in *df* are silently skipped.
+    """
+    out = df.copy()
+    for col in cols:
+        if col in out.columns:
+            out[col] = out[col].apply(
+                _fmt_volume if col == "Volume (lbs)" else _fmt_currency
+            )
+    return out
+
+
+# ── 3. Data helpers ───────────────────────────────────────────────────────────
 
 def _month_sort_key(m_str: str) -> datetime:
-    """Parse 'Mon YYYY' strings into datetime for chronological sorting."""
+    """Parse a canonical 'Mon YYYY' string to datetime for sorting/comparison.
+
+    Returns datetime.min on failure so unparseable values sort to the front
+    without raising.  After _load_and_normalise runs, every Month value is
+    guaranteed to be in this format, so failure should never occur in practice.
+    """
     try:
         return datetime.strptime(str(m_str).strip(), "%b %Y")
     except Exception:
         return datetime.min
 
 
+def _coerce_month_to_label(val) -> str:
+    """Normalise any common month representation to the canonical 'Mon YYYY' label.
+
+    Tries a series of explicit strptime formats first (fastest, most predictable),
+    then falls back to pandas' flexible parser.  This is the single place that
+    bridges the variety of month formats found in uploaded CSVs to the format
+    expected by _month_sort_key and the month-range slider.
+    """
+    s = str(val).strip()
+    for fmt in ("%b %Y", "%B %Y", "%Y-%m", "%m/%Y", "%m-%Y", "%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%b %Y")
+        except ValueError:
+            pass
+    try:
+        return pd.to_datetime(s).strftime("%b %Y")
+    except Exception:
+        return s  # return as-is; slider will display it but filtering may not work
+
+
 def _sel_hash(*selections) -> str:
-    """Short hash of upstream selections — used to key downstream widgets so
-    they reset (default = all) whenever a parent filter changes."""
+    """Return a short stable hash of one or more multiselect value lists.
+
+    Used as a widget key suffix so downstream cascading filters auto-reset
+    whenever any upstream selection changes.  Order within each selection list
+    is ignored; order across selection groups is preserved.
+    """
     combined = "|".join(
         str(x) for sel in selections for x in sorted(str(s) for s in sel)
     )
@@ -38,7 +183,7 @@ def _sel_hash(*selections) -> str:
 
 
 def _excel_serial_to_date(serial) -> str:
-    """Convert an Excel serial date integer to a human-readable 'Mon YYYY' string."""
+    """Convert an Excel date serial integer to a 'Mon YYYY' label."""
     try:
         dt = datetime(1899, 12, 30) + timedelta(days=int(float(serial)))
         return dt.strftime("%b %Y")
@@ -47,9 +192,10 @@ def _excel_serial_to_date(serial) -> str:
 
 
 def _parse_currency_col(series: pd.Series) -> pd.Series:
-    """
-    Convert currency strings like ' $424,236 ' or ' $(3,846)' to floats.
-    Leaves already-numeric series unchanged.
+    """Convert currency strings like '$424,236' or '$(3,846)' to floats.
+
+    Numeric series are returned unchanged.  Negative values expressed with
+    parentheses (accounting notation) are converted to negative floats.
     """
     if pd.api.types.is_numeric_dtype(series):
         return series
@@ -57,341 +203,405 @@ def _parse_currency_col(series: pd.Series) -> pd.Series:
         series.astype(str)
         .str.strip()
         .str.replace(r"\$", "", regex=True)
-        .str.replace(",", "", regex=False)
-        .str.replace(" ", "", regex=False)
+        .str.replace(",",   "", regex=False)
+        .str.replace(" ",   "", regex=False)
     )
     is_neg = cleaned.str.startswith("(")
     cleaned = cleaned.str.replace(r"[()]", "", regex=True)
-    result = pd.to_numeric(cleaned, errors="coerce")
-    result = result.where(~is_neg, -result)
-    return result
+    result  = pd.to_numeric(cleaned, errors="coerce")
+    return result.where(~is_neg, -result)
 
 
-def _fmt_currency(val) -> str:
-    if pd.isna(val):
-        return ""
-    if val < 0:
-        return f"$({abs(val):,.0f})"
-    return f"${val:,.0f}"
+def _filter_by_month_range(
+    df: pd.DataFrame,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> pd.DataFrame:
+    """Return rows whose Month falls within [start_dt, end_dt] (inclusive).
+
+    Vectorized via pd.to_datetime — avoids row-by-row Python apply overhead.
+    Relies on Month having been normalised to 'Mon YYYY' by _load_and_normalise;
+    unparseable values become NaT and are excluded from the result.
+    """
+    if "Month" not in df.columns or start_dt is None or end_dt is None:
+        return df
+    month_dts = pd.to_datetime(df["Month"], format="%b %Y", errors="coerce")
+    return df[(month_dts >= start_dt) & (month_dts <= end_dt)]
 
 
-def _fmt_volume(val) -> str:
-    if pd.isna(val):
-        return ""
-    return f"{val:,.0f}"
+# ── 4. Chart helpers ──────────────────────────────────────────────────────────
+
+def _round_num(r) -> int:
+    """Extract the numeric part of a round label (e.g. 'Round 2' → 2)."""
+    digits = "".join(c for c in str(r) if c.isdigit())
+    return int(digits) if digits else 0
 
 
-def _fmt_pct(val) -> str:
-    if pd.isna(val) or not isinstance(val, (int, float)):
-        return "—"
-    return f"{val:.1f}%"
-
-
-def _to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-
-# ── Main render ───────────────────────────────────────────────────────────────
-
-def render():
-    """Render the Bid Asset Intelligence page."""
-    apply_custom_css()
-
-    st.markdown(
-        '<h1 class="main-header">Bid Asset Intelligence</h1>',
-        unsafe_allow_html=True,
+def _make_bid_label(row: pd.Series) -> str:
+    """Build the multi-line x-axis tick label: Company / Bid Description / (Round)."""
+    return (
+        f"{row.get('Company', '')}<br>"
+        f"{row.get('Bid Description', '')}<br>"
+        f"({row.get('Round', '')})"
     )
 
-    # ── Welcome section ───────────────────────────────────────────────────────
-    st.markdown("""
-### Welcome
 
-Use this page to analyze historical trends since December 2025. These insights drive post-mortem analysis
-and sharpen future bid strategies. Key resources include:
+def _status_color(status: str) -> str:
+    """Map a status string to its chart colour via keyword substring matching."""
+    s = str(status).lower()
+    for keyword, color, _ in _STATUS_RULES:
+        if keyword in s:
+            return color
+    return _DEFAULT_STATUS_COLOR
 
-- **Visualizations:** Charts for bid comparisons.
-- **RFP Summary:** High-level tracking of program size, status and key financials.
-- **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
-""")
 
-    st.markdown("---")
+def _prepare_chart_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Reduce *df* (pre-filtered by chart controls) to one aggregated row per bid.
 
-    # ── Upload section ────────────────────────────────────────────────────────
-    st.markdown("### 📤 Upload Bid Asset CSV File")
-    st.markdown(
-        "Upload Bid Asset CSV export saved in the "
-        "[SharePoint Folder](https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents/Forms/AllItems.aspx"
-        "?id=%2Fsites%2FBrandedPricing%2FShared%20Documents%2FGeneral%2F02%20Resources%2FRFP%20Management"
-        "&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e)"
+    Steps
+    -----
+    1. Keep only the latest round per Company / Bid Description.
+    2. Sum Volume (lbs) and PCM $/Yr across all items in that round.
+    3. Derive PCM $/lb = PCM $/Yr / Volume (lbs), rounded to 2 dp.
+    4. Attach the modal Status, display colour, and x-axis label.
+
+    Returns an empty DataFrame when required columns are absent.
+    """
+    if df.empty or "Round" not in df.columns:
+        return pd.DataFrame()
+
+    group_keys = [c for c in ["Company", "Bid Description"] if c in df.columns]
+    if not group_keys:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["_round_num"] = work["Round"].apply(_round_num)
+
+    latest_per_bid = (
+        work.groupby(group_keys)["_round_num"]
+        .max()
+        .reset_index()
+        .rename(columns={"_round_num": "_max_round"})
     )
+    work = work.merge(latest_per_bid, on=group_keys)
+    work = work[work["_round_num"] == work["_max_round"]]
 
-    uploaded_file = st.file_uploader(
-        "Select Bid Asset CSV",
-        type=["csv"],
-        key="bid_asset_uploader",
-    )
+    agg_keys = group_keys + ["Round"]
+    sum_cols  = [c for c in ["Volume (lbs)", "PCM $/Yr"] if c in work.columns]
+    agg       = work.groupby(agg_keys, as_index=False)[sum_cols].sum()
 
-    if uploaded_file is None:
-        st.info("👆 Upload a CSV file above to unlock the search and analysis tables.")
-        return
-
-    # ── Load & normalise ──────────────────────────────────────────────────────
-    try:
-        raw_df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"Could not read the uploaded file: {exc}")
-        return
-
-    raw_df.columns = raw_df.columns.str.strip()
-
-    if "Rounds" in raw_df.columns:
-        raw_df = raw_df.rename(columns={"Rounds": "Round"})
-
-    if "Month" in raw_df.columns:
-        first_val = raw_df["Month"].dropna().iloc[0] if not raw_df["Month"].dropna().empty else None
-        if first_val is not None and pd.api.types.is_numeric_dtype(raw_df["Month"]):
-            raw_df["Month"] = raw_df["Month"].apply(_excel_serial_to_date)
-
-    NUMERIC_COLS = ["Volume (lbs)", "FOB Revenue $/Yr", "PCM $/Yr", "GP $/Yr"]
-    for col in NUMERIC_COLS:
-        if col in raw_df.columns:
-            raw_df[col] = _parse_currency_col(raw_df[col])
-
-    st.success(f"✅ File loaded — **{len(raw_df):,} rows**, **{len(raw_df.columns)} columns**")
-
-    st.markdown("---")
-
-    # ── Bid Overview (independent of search filters) ──────────────────────────
-    st.markdown("### 📈 Bid Overview")
-    st.caption(
-        "Bars show total Volume (lbs) from the **latest round** per bid. "
-        "Color: green = Accepted, gray = Rejected, blue = Other. "
-        "Dotted line shows Total PCM $/Yr (right axis). "
-        "This chart is independent of the search filters below."
-    )
-
-    # ── Chart controls row ────────────────────────────────────────────────────
-    ctrl_left, ctrl_right = st.columns([2, 3])
-
-    with ctrl_left:
-        chart_fmt_opts = (
-            sorted(raw_df["Format"].dropna().astype(str).unique().tolist())
-            if "Format" in raw_df.columns else []
+    if "Status" in work.columns:
+        status_mode = (
+            work.groupby(agg_keys)["Status"]
+            .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "Unknown")
+            .reset_index()
         )
-        selected_chart_fmts = st.multiselect(
-            "Format",
-            options=chart_fmt_opts,
-            default=chart_fmt_opts,
-            key="chart_format_filter",
-        )
+        agg = agg.merge(status_mode, on=agg_keys, how="left")
+    else:
+        agg["Status"] = "Unknown"
 
-    with ctrl_right:
-        if "Month" in raw_df.columns:
-            all_months_sorted = sorted(
-                raw_df["Month"].dropna().astype(str).unique().tolist(),
-                key=_month_sort_key,
-            )
-            if len(all_months_sorted) >= 2:
-                month_range = st.select_slider(
-                    "Month Range",
-                    options=all_months_sorted,
-                    value=(all_months_sorted[0], all_months_sorted[-1]),
-                    key="chart_month_range",
-                )
-                chart_start_month, chart_end_month = month_range
-            elif len(all_months_sorted) == 1:
-                chart_start_month = chart_end_month = all_months_sorted[0]
-            else:
-                chart_start_month = chart_end_month = None
-        else:
-            chart_start_month = chart_end_month = None
+    if {"Volume (lbs)", "PCM $/Yr"}.issubset(agg.columns):
+        safe_vol      = agg["Volume (lbs)"].replace(0, float("nan"))
+        agg["PCM $/lb"] = (agg["PCM $/Yr"] / safe_vol).round(2)
 
-    # Build base chart dataset
-    chart_base = raw_df.copy()
+    agg["_color"] = agg["Status"].apply(_status_color)
+    agg["_label"] = agg.apply(_make_bid_label, axis=1)
 
-    if selected_chart_fmts and "Format" in chart_base.columns:
-        chart_base = chart_base[chart_base["Format"].astype(str).isin(selected_chart_fmts)]
+    if "Volume (lbs)" in agg.columns:
+        agg = agg.sort_values("Volume (lbs)", ascending=False)
 
-    if chart_start_month and chart_end_month and "Month" in chart_base.columns:
-        start_dt = _month_sort_key(chart_start_month)
-        end_dt   = _month_sort_key(chart_end_month)
-        chart_base = chart_base[
-            chart_base["Month"].apply(lambda m: start_dt <= _month_sort_key(m) <= end_dt)
-        ]
+    return agg.reset_index(drop=True)
 
-    if not chart_base.empty and "Round" in chart_base.columns:
 
-        def _round_num(r):
-            digits = "".join(c for c in str(r) if c.isdigit())
-            return int(digits) if digits else 0
+def _build_overview_chart(
+    chart_agg: pd.DataFrame,
+    show_pcm_yr: bool = True,
+    show_pcm_lb: bool = True,
+) -> go.Figure:
+    """Build the Bid Overview combo chart.
 
-        chart_base = chart_base.copy()
-        chart_base["_round_num"] = chart_base["Round"].apply(_round_num)
+    Always rendered
+    ---------------
+    Volume (lbs): status-coloured bars → primary (left) y-axis.
+    One trace per status colour keeps the legend self-contained without
+    requiring dummy placeholder traces.
 
-        group_keys = [c for c in ["Company", "Bid Description"] if c in chart_base.columns]
+    Optional overlays
+    -----------------
+    Total PCM $/Yr: red dots, no lines  → secondary (right) y-axis.
+    PCM $/lb: black dots, no lines      → tertiary (far-right) y-axis.
 
-        if group_keys:
-            latest = (
-                chart_base.groupby(group_keys)["_round_num"]
-                .max()
-                .reset_index()
-                .rename(columns={"_round_num": "_max_round"})
-            )
-            chart_base = chart_base.merge(latest, on=group_keys)
-            chart_base = chart_base[chart_base["_round_num"] == chart_base["_max_round"]]
+    PCM $/lb requires its own axis: its $/lb scale (~$0–$5) would be
+    invisible against PCM $/Yr (~$100k–$5M) on a shared axis.
 
-        agg_keys = group_keys + ["Round"]
-        sum_cols  = [c for c in ["Volume (lbs)", "PCM $/Yr"] if c in chart_base.columns]
-        chart_agg = chart_base.groupby(agg_keys, as_index=False)[sum_cols].sum()
+    The x-axis domain contracts only as far as active right-side axes require,
+    so the bars always fill as much horizontal space as possible.
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-        if "Status" in chart_base.columns:
-            status_mode = (
-                chart_base.groupby(agg_keys)["Status"]
-                .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "Unknown")
-                .reset_index()
-            )
-            chart_agg = chart_agg.merge(status_mode, on=agg_keys, how="left")
-        else:
-            chart_agg["Status"] = "Unknown"
-
-        if "Volume (lbs)" in chart_agg.columns:
-            chart_agg = chart_agg.sort_values("Volume (lbs)", ascending=False).reset_index(drop=True)
-
-        def _make_label(row):
-            co  = str(row.get("Company", ""))
-            bid = str(row.get("Bid Description", ""))
-            rnd = str(row.get("Round", ""))
-            return f"{co}<br>{bid}<br>({rnd})"
-
-        chart_agg["_label"] = chart_agg.apply(_make_label, axis=1)
-
-        def _bar_color(status):
-            s = str(status).lower()
-            if "reject" in s:
-                return "#9E9E9E"
-            elif "accept" in s or "award" in s:
-                return "#4CAF50"
-            return "#2196F3"
-
-        chart_agg["_color"] = chart_agg["Status"].apply(_bar_color)
-
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-        color_groups = [
-            ("#4CAF50", "Accepted"),
-            ("#9E9E9E", "Rejected"),
-            ("#2196F3", "Other"),
-        ]
-        for color_hex, legend_name in color_groups:
-            mask = chart_agg["_color"] == color_hex
-            if mask.any():
-                subset = chart_agg[mask]
-                fig.add_trace(
-                    go.Bar(
-                        x=subset["_label"],
-                        y=subset["Volume (lbs)"] if "Volume (lbs)" in subset.columns else [],
-                        name=legend_name,
-                        marker_color=color_hex,
-                        opacity=0.85,
-                    ),
-                    secondary_y=False,
-                )
-
-        if "PCM $/Yr" in chart_agg.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_agg["_label"],
-                    y=chart_agg["PCM $/Yr"],
-                    name="Total PCM $/Yr",
-                    mode="markers",
-                    marker=dict(size=10, color="#d32f2f", symbol="circle"),
-                    hovertemplate="%{x}<br>PCM: $%{y:,.1f}<extra></extra>",
-                ),
-                secondary_y=True,
-            )
-
-        fig.update_layout(
-            barmode="overlay",
-            font=dict(family="Segoe UI, Tahoma, Geneva, Verdana, sans-serif", size=14),
-            xaxis=dict(
-                title=dict(text="Company / Bid Description (Round)", font=dict(size=15)),
-                tickangle=-20,
-                tickfont=dict(size=13),
+    for color_hex, legend_name in _COLOR_LEGEND:
+        mask = chart_agg["_color"] == color_hex
+        if not mask.any():
+            continue
+        subset = chart_agg[mask]
+        fig.add_trace(
+            go.Bar(
+                x=subset["_label"],
+                y=subset["Volume (lbs)"] if "Volume (lbs)" in subset.columns else [],
+                name=legend_name,
+                marker_color=color_hex,
+                opacity=0.85,
+                hovertemplate="%{x}<br>Volume: %{y:,.0f} lbs<extra></extra>",
             ),
-            legend=dict(
-                orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
-                font=dict(size=13),
-            ),
-            height=560,
-            margin=dict(l=80, r=80, t=60, b=180),
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-        )
-        fig.update_yaxes(
-            title_text="Volume (lbs)",
-            title_font=dict(size=15),
-            tickfont=dict(size=13),
             secondary_y=False,
-            gridcolor="#f0f0f0",
         )
-        fig.update_yaxes(
-            title_text="Total PCM $/Yr",
-            title_font=dict(size=15),
-            tickfont=dict(size=13),
+
+    if show_pcm_yr and "PCM $/Yr" in chart_agg.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=chart_agg["_label"],
+                y=chart_agg["PCM $/Yr"],
+                name="Total PCM $/Yr",
+                mode="markers",
+                marker=dict(size=10, color="#d32f2f", symbol="circle"),
+                hovertemplate="%{x}<br>PCM $/Yr: $%{y:,.0f}<extra></extra>",
+            ),
             secondary_y=True,
+        )
+
+    if show_pcm_lb and "PCM $/lb" in chart_agg.columns:
+        fig.add_trace(
+            go.Scatter(
+                x=chart_agg["_label"],
+                y=chart_agg["PCM $/lb"],
+                name="PCM $/lb",
+                mode="markers",
+                marker=dict(size=10, color="black", symbol="circle"),
+                hovertemplate="%{x}<br>PCM $/lb: $%{y:.2f}<extra></extra>",
+                yaxis="y3",
+            ),
+        )
+
+    if show_pcm_yr and show_pcm_lb:
+        x_right = 0.78      # room for two stacked right axes
+    elif show_pcm_yr or show_pcm_lb:
+        x_right = 0.88      # room for one right axis
+    else:
+        x_right = 1.0       # volume-only: bars fill full width
+
+    fig.update_layout(
+        barmode="overlay",
+        font=_CHART_FONT,
+        xaxis=dict(
+            domain=[0, x_right],
+            title=dict(text="Company / Bid Description (Round)", font=dict(size=15)),
+            tickangle=-20,
+            tickfont=dict(size=13),
+        ),
+        yaxis=dict(
+            title=dict(text="Volume (lbs)", font=dict(size=15)),
+            tickfont=dict(size=13),
+            gridcolor="#f0f0f0",
+        ),
+        yaxis2=dict(
+            title=dict(text="Total PCM $/Yr", font=dict(size=15)),
+            tickfont=dict(size=13),
             showgrid=False,
             tickformat="$.2s",
+            visible=show_pcm_yr,
+        ),
+        yaxis3=dict(
+            title=dict(text="PCM $/lb", font=dict(size=14)),
+            tickfont=dict(size=12),
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=0.93,
+            showgrid=False,
+            tickformat="$.2f",
+            visible=show_pcm_lb,
+        ),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1,
+            font=dict(size=13),
+        ),
+        height=560,
+        margin=dict(l=80, r=180, t=60, b=180),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+
+    return fig
+
+
+# ── 5. Data loading & normalisation ───────────────────────────────────────────
+
+def _load_and_normalise(uploaded_file) -> Optional[pd.DataFrame]:
+    """Read the uploaded CSV and normalise it in-place:
+
+    - Strip column-name whitespace.
+    - Rename 'Rounds' → 'Round' for schema consistency.
+    - Convert Month to canonical 'Mon YYYY' labels, handling numeric Excel
+      serials and any string format via _coerce_month_to_label.  This step
+      is critical: without it, _month_sort_key returns datetime.min for all
+      values, making the month-range slider a silent no-op.
+    - Parse financial columns to float via _parse_currency_col.
+
+    Returns None (with st.error displayed) on read failure.
+    """
+    try:
+        df = pd.read_csv(uploaded_file)
+    except Exception as exc:
+        st.error(f"Could not read the uploaded file: {exc}")
+        return None
+
+    df.columns = df.columns.str.strip()
+
+    if "Rounds" in df.columns:
+        df = df.rename(columns={"Rounds": "Round"})
+
+    if "Month" in df.columns:
+        if pd.api.types.is_numeric_dtype(df["Month"]):
+            df["Month"] = df["Month"].apply(_excel_serial_to_date)
+        else:
+            df["Month"] = df["Month"].apply(_coerce_month_to_label)
+
+    for col in _FINANCIAL_COLS:
+        if col in df.columns:
+            df[col] = _parse_currency_col(df[col])
+
+    return df
+
+
+# ── 6. Page sections ──────────────────────────────────────────────────────────
+
+def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> None:
+    """Render the Bid Overview section.
+
+    Controls (top to bottom)
+    ------------------------
+    1. Month-range slider  — filters which rows feed the chart.
+    2. Categorical filters — Format, Size, Referenced Item Description.
+    3. Overlay toggles     — show/hide PCM $/Yr (red) and PCM $/lb (black) dots.
+
+    All three layers apply to the same chart_base dataset before aggregation,
+    so every metric in the chart reflects the full filter state.
+    """
+    st.markdown("### 📈 Bid Overview")
+    st.caption(
+        "Volume (lbs) bars are always shown, colour-coded by bid outcome "
+        "(green = Accepted, gray = Rejected, blue = Other). "
+        "Use the overlay toggles to add financial rate metrics on separate axes. "
+        "All values update dynamically with every filter change."
+    )
+
+    # Row 1: month-range slicer (full width)
+    if len(all_months_sorted) >= 2:
+        chart_month_range = st.select_slider(
+            "Month Range",
+            options=all_months_sorted,
+            value=(all_months_sorted[0], all_months_sorted[-1]),
+            key="chart_month_range",
+        )
+        chart_start_dt = _month_sort_key(chart_month_range[0])
+        chart_end_dt   = _month_sort_key(chart_month_range[1])
+    elif all_months_sorted:
+        chart_start_dt = chart_end_dt = _month_sort_key(all_months_sorted[0])
+    else:
+        chart_start_dt = chart_end_dt = None
+
+    # Row 2: categorical filters
+    filter_cols = st.columns(len(_CHART_FILTER_DEFS))
+    chart_selections: dict[str, list[str]] = {}
+    for (col_name, key_sfx), col_ctx in zip(_CHART_FILTER_DEFS, filter_cols):
+        opts = (
+            sorted(raw_df[col_name].dropna().astype(str).unique().tolist())
+            if col_name in raw_df.columns else []
+        )
+        with col_ctx:
+            chart_selections[col_name] = st.multiselect(
+                col_name, options=opts, default=opts, key=f"chart_{key_sfx}"
+            )
+
+    # Row 3: metric overlay toggles
+    st.markdown("**Overlay metrics** — add financial rate indicators on top of the volume bars:")
+    ov1, ov2, _ = st.columns([2, 2, 3])
+    with ov1:
+        show_pcm_yr = st.checkbox(
+            "Total PCM $/Yr  🔴",
+            value=True,
+            key="chart_show_pcm_yr",
+            help=(
+                "Show Total PCM $/Yr as red dots on the right axis. "
+                "This is the absolute annual profit contribution of each bid."
+            ),
+        )
+    with ov2:
+        show_pcm_lb = st.checkbox(
+            "PCM $/lb  ⚫",
+            value=True,
+            key="chart_show_pcm_lb",
+            help=(
+                "Show PCM per pound as black dots on the far-right axis. "
+                "This rate metric normalises profitability by volume, making "
+                "bids of different sizes directly comparable."
+            ),
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+    # Build chart dataset — all filters applied sequentially
+    chart_base = _filter_by_month_range(raw_df, chart_start_dt, chart_end_dt)
+    for col_name, selection in chart_selections.items():
+        if selection and col_name in chart_base.columns:
+            chart_base = chart_base[chart_base[col_name].astype(str).isin(selection)]
+
+    chart_agg = _prepare_chart_data(chart_base)
+    if chart_agg.empty:
+        st.info("No data available for the selected chart filters.")
     else:
-        st.info("No data available for the selected format.")
+        st.plotly_chart(
+            _build_overview_chart(chart_agg, show_pcm_yr=show_pcm_yr, show_pcm_lb=show_pcm_lb),
+            use_container_width=True,
+        )
 
-    st.markdown("---")
 
-    # ── Search & Filter ────────────────────────────────────────────────────────
+def _render_search_filters(
+    raw_df: pd.DataFrame,
+    all_months_sorted: list[str],
+) -> Optional[_FilterResult]:
+    """Render the Search & Filter section and return a typed _FilterResult.
+
+    The month slider is independent of the cascading dropdowns — it pre-filters
+    the pool from which downstream options are drawn, but Company options always
+    come from the full dataset so known companies are never hidden.
+
+    Returns None if any cascading filter has no value selected, signalling the
+    caller to stop rendering further sections.
+    """
     st.markdown("### 🔍 Search & Filter")
     st.caption(
         "**Month** is an independent time-range slicer. "
         "**Company** anchors the remaining cascading filters."
     )
 
-    # ── 1. Month range slicer — independent of all other filters ──────────────
-    if "Month" in raw_df.columns:
-        all_filter_months = sorted(
-            raw_df["Month"].dropna().astype(str).unique().tolist(),
-            key=_month_sort_key,
-        )
-    else:
-        all_filter_months = []
-
-    if len(all_filter_months) >= 2:
+    if len(all_months_sorted) >= 2:
         filter_month_range = st.select_slider(
             "📅 Month Range",
-            options=all_filter_months,
-            value=(all_filter_months[0], all_filter_months[-1]),
+            options=all_months_sorted,
+            value=(all_months_sorted[0], all_months_sorted[-1]),
             key="filter_month_range",
         )
         filter_start_dt = _month_sort_key(filter_month_range[0])
         filter_end_dt   = _month_sort_key(filter_month_range[1])
-    elif len(all_filter_months) == 1:
-        filter_start_dt = filter_end_dt = _month_sort_key(all_filter_months[0])
+    elif all_months_sorted:
+        filter_start_dt = filter_end_dt = _month_sort_key(all_months_sorted[0])
     else:
         filter_start_dt = filter_end_dt = None
 
-    # Apply month range to base dataset for the cascading filters
-    if filter_start_dt and filter_end_dt and "Month" in raw_df.columns:
-        df_month = raw_df[
-            raw_df["Month"].apply(lambda m: filter_start_dt <= _month_sort_key(m) <= filter_end_dt)
-        ]
-    else:
-        df_month = raw_df.copy()
+    df_month = _filter_by_month_range(raw_df, filter_start_dt, filter_end_dt)
 
-    # ── 2–5. Cascading filters: Company → Bid Description → Round → Format ────
+    # Cascading dropdowns: Company → Bid Description → Round → Format
     f1, f2, f3, f4 = st.columns(4)
 
-    # Company — draws from full dataset (independent of month for option list,
-    # but final data intersects with month-filtered rows)
     with f1:
         company_opts = (
             sorted(raw_df["Company"].dropna().astype(str).unique().tolist())
@@ -407,7 +617,6 @@ and sharpen future bid strategies. Key resources include:
         else df_month.iloc[0:0]
     )
 
-    # Bid Description — cascades from Company (within month-filtered slice)
     with f2:
         bid_opts = (
             sorted(df1["Bid Description"].dropna().astype(str).unique().tolist())
@@ -424,7 +633,6 @@ and sharpen future bid strategies. Key resources include:
         else df1.iloc[0:0]
     )
 
-    # Round — cascades from Company + Bid Description
     with f3:
         round_opts = (
             sorted(df2["Round"].dropna().astype(str).unique().tolist())
@@ -441,7 +649,6 @@ and sharpen future bid strategies. Key resources include:
         else df2.iloc[0:0]
     )
 
-    # Format — cascades from Company + Bid Description + Round
     with f4:
         format_opts = (
             sorted(df3["Format"].dropna().astype(str).unique().tolist())
@@ -458,140 +665,113 @@ and sharpen future bid strategies. Key resources include:
         else df3.iloc[0:0]
     )
 
-    # selections dict (used by metrics conditions)
-    selections = {
-        "Company":         sel_company,
-        "Bid Description": sel_bid,
-        "Round":           sel_round,
-        "Format":          sel_format,
-    }
-
-    # Guard: warn if any cascading filter is empty
-    empty_filters = [k for k, v in selections.items() if not v]
-    if empty_filters:
-        st.warning(
-            f"⚠️ Please select at least one value for: **{', '.join(empty_filters)}**"
-        )
-        return
+    empty = [
+        name for name, vals in [
+            ("Company", sel_company), ("Bid Description", sel_bid),
+            ("Round",   sel_round),   ("Format",          sel_format),
+        ]
+        if not vals
+    ]
+    if empty:
+        st.warning(f"⚠️ Please select at least one value for: **{', '.join(empty)}**")
+        return None
 
     st.markdown(f"**{len(filtered_df):,} records** match the current filter criteria.")
 
-    st.markdown("---")
+    return _FilterResult(
+        df=filtered_df,
+        sel_company=sel_company,
+        sel_bid=sel_bid,
+        sel_round=sel_round,
+    )
 
-    # ── RFP Summary ───────────────────────────────────────────────────────────
+
+def _render_rfp_summary(result: _FilterResult) -> None:
+    """Render the RFP Summary section: optional KPI metrics row + aggregated table."""
     st.markdown("### 📊 RFP Summary")
     st.markdown(
         "Item-level PCM, GP, and detailed price builds can be extracted from the "
-        "**\"Detailed Item-level Data\"** section below. "
+        "**\"Detailed Item-Level Data\"** section below. "
         "Note the % here is a comparison against FOB Revenue."
     )
 
-    GROUP_COLS = [
-        "Format", "Company", "Bid Description", "Brand",
-        "Round", "Month", "Status", "Bid Rationale", "Feedback",
-    ]
-    SUM_COLS = ["Volume (lbs)", "FOB Revenue $/Yr", "PCM $/Yr", "GP $/Yr"]
+    filtered_df = result.df
+    available_group = [c for c in _GROUP_COLS      if c in filtered_df.columns]
+    available_sum   = [c for c in _FINANCIAL_COLS  if c in filtered_df.columns]
 
-    available_group = [c for c in GROUP_COLS if c in filtered_df.columns]
-    available_sum   = [c for c in SUM_COLS   if c in filtered_df.columns]
+    # KPI row — only meaningful when a single bid/round is in focus
+    if (
+        len(result.sel_company) == 1
+        and len(result.sel_bid)  == 1
+        and len(result.sel_round) == 1
+        and available_sum
+    ):
+        total_lbs = filtered_df["Volume (lbs)"].sum()     if "Volume (lbs)"     in filtered_df.columns else None
+        total_fob = filtered_df["FOB Revenue $/Yr"].sum() if "FOB Revenue $/Yr" in filtered_df.columns else None
+        total_pcm = filtered_df["PCM $/Yr"].sum()         if "PCM $/Yr"         in filtered_df.columns else None
+        total_gp  = filtered_df["GP $/Yr"].sum()          if "GP $/Yr"          in filtered_df.columns else None
 
-    # ── Conditional metrics ───────────────────────────────────────────────────
-    one_company  = len(selections.get("Company",         [])) == 1
-    one_bid_desc = len(selections.get("Bid Description", [])) == 1
-    one_round    = len(selections.get("Round",           [])) == 1
+        pcm_pct = (total_pcm / total_fob * 100) if total_fob else None
+        gp_pct  = (total_gp  / total_fob * 100) if total_fob else None
 
-    if one_company and one_bid_desc and one_round and available_sum:
-        total_lbs = filtered_df["Volume (lbs)"].sum()       if "Volume (lbs)"     in filtered_df.columns else None
-        total_fob = filtered_df["FOB Revenue $/Yr"].sum()   if "FOB Revenue $/Yr" in filtered_df.columns else None
-        total_pcm = filtered_df["PCM $/Yr"].sum()           if "PCM $/Yr"         in filtered_df.columns else None
-        total_gp  = filtered_df["GP $/Yr"].sum()            if "GP $/Yr"          in filtered_df.columns else None
-
-        pcm_pct = (total_pcm / total_fob * 100) if (total_fob and total_fob != 0) else None
-        gp_pct  = (total_gp  / total_fob * 100) if (total_fob and total_fob != 0) else None
-
-        # Status: show unique value(s) for the current selection
         if "Status" in filtered_df.columns:
             unique_statuses = filtered_df["Status"].dropna().astype(str).unique().tolist()
-            status_display = " / ".join(sorted(unique_statuses)) if unique_statuses else "—"
+            status_display  = " / ".join(sorted(unique_statuses)) if unique_statuses else "—"
         else:
             status_display = "—"
 
         m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-        with m1:
-            st.metric("Total Pounds", _fmt_volume(total_lbs))
-        with m2:
-            st.metric("Total FOB Revenue $/Yr", _fmt_currency(total_fob))
-        with m3:
-            st.metric("Total PCM $/Yr", _fmt_currency(total_pcm))
-        with m4:
-            st.metric("Total GP $/Yr", _fmt_currency(total_gp))
-        with m5:
-            st.metric("PCM %", _fmt_pct(pcm_pct))
-        with m6:
-            st.metric("GP %", _fmt_pct(gp_pct))
-        with m7:
-            st.metric("Status", status_display)
+        with m1: st.metric("Total Pounds",           _fmt_volume(total_lbs))
+        with m2: st.metric("Total FOB Revenue $/Yr", _fmt_currency(total_fob))
+        with m3: st.metric("Total PCM $/Yr",         _fmt_currency(total_pcm))
+        with m4: st.metric("Total GP $/Yr",          _fmt_currency(total_gp))
+        with m5: st.metric("PCM %",                  _fmt_pct(pcm_pct))
+        with m6: st.metric("GP %",                   _fmt_pct(gp_pct))
+        with m7: st.metric("Status",                 status_display)
+        st.markdown("")
 
-        st.markdown("")  # spacer
-
-    # ── Summary table ─────────────────────────────────────────────────────────
-    if available_group and available_sum:
-        summary_df = (
-            filtered_df
-            .groupby(available_group, as_index=False, dropna=False)[available_sum]
-            .sum()
-        )
-
-        summary_display = summary_df.copy()
-        for col in available_sum:
-            if col == "Volume (lbs)":
-                summary_display[col] = summary_df[col].apply(_fmt_volume)
-            else:
-                summary_display[col] = summary_df[col].apply(_fmt_currency)
-
-        # Add "Price Implement Time" from source data if available, else blank
-        if "Price Implement Time" in filtered_df.columns:
-            pit = filtered_df.groupby(available_group, as_index=False)["Price Implement Time"].first()
-            summary_display = summary_display.merge(pit, on=available_group, how="left")
-        else:
-            summary_display["Price Implement Time"] = ""
-
-        st.dataframe(summary_display, use_container_width=True, hide_index=True)
-
-        st.download_button(
-            label="⬇️ Download RFP Summary (CSV)",
-            data=_to_csv_bytes(summary_df),
-            file_name=f"rfp_summary_{datetime.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-            key="download_summary",
-        )
-    else:
+    if not (available_group and available_sum):
         st.warning("Not enough columns available to build the RFP Summary table.")
+        return
 
-    st.markdown("---")
+    summary_df = (
+        filtered_df
+        .groupby(available_group, as_index=False, dropna=False)[available_sum]
+        .sum()
+    )
+    summary_display = _apply_display_formats(summary_df, available_sum)
 
-    # ── Detailed item-level table ──────────────────────────────────────────────
+    if "Price Implement Time" in filtered_df.columns:
+        pit = filtered_df.groupby(available_group, as_index=False)["Price Implement Time"].first()
+        summary_display = summary_display.merge(pit, on=available_group, how="left")
+    else:
+        summary_display["Price Implement Time"] = ""
+
+    st.dataframe(summary_display, use_container_width=True, hide_index=True)
+    st.download_button(
+        label="⬇️ Download RFP Summary (CSV)",
+        data=_to_csv_bytes(summary_df),
+        file_name=f"rfp_summary_{datetime.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+        key="download_summary",
+    )
+
+
+def _render_detail_table(filtered_df: pd.DataFrame) -> None:
+    """Render the Detailed Item-Level Data section."""
     st.markdown("### 📋 Detailed Item-Level Data")
     st.caption("Full extract of the CSV filtered by the search criteria above.")
 
-    # Identify $/EA columns and round to 4 decimal places
-    EA_COLS = [c for c in filtered_df.columns if "$/EA" in c or "$/ea" in c.lower()]
+    available_sum = [c for c in _FINANCIAL_COLS if c in filtered_df.columns]
 
     detail_download = filtered_df.copy()
-    for col in EA_COLS:
-        if pd.api.types.is_numeric_dtype(detail_download[col]):
+    for col in filtered_df.columns:
+        if "$/ea" in col.lower() and pd.api.types.is_numeric_dtype(detail_download[col]):
             detail_download[col] = detail_download[col].round(4)
 
-    detail_display = detail_download.copy()
-    for col in available_sum:
-        if col in detail_display.columns:
-            if col == "Volume (lbs)":
-                detail_display[col] = detail_download[col].apply(_fmt_volume)
-            else:
-                detail_display[col] = detail_download[col].apply(_fmt_currency)
+    detail_display = _apply_display_formats(detail_download, available_sum)
 
     st.dataframe(detail_display, use_container_width=True, hide_index=True)
-
     st.download_button(
         label="⬇️ Download Detailed Table (CSV)",
         data=_to_csv_bytes(detail_download),
@@ -599,3 +779,67 @@ and sharpen future bid strategies. Key resources include:
         mime="text/csv",
         key="download_detail",
     )
+
+
+# ── 7. Entry point ────────────────────────────────────────────────────────────
+
+def render() -> None:
+    """Render the Bid Asset Intelligence page.
+
+    Orchestrates the four page sections in order.  Each section is self-contained:
+    it reads Streamlit widget state, computes its own data slice, and renders its
+    own UI.  render() itself carries no business logic.
+    """
+    apply_custom_css()
+
+    st.markdown(
+        '<h1 class="main-header">Bid Asset Intelligence</h1>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("""
+### Welcome
+
+Use this page to analyze historical trends since December 2025. These insights drive post-mortem analysis
+and sharpen future bid strategies. Key resources include:
+
+- **Visualizations:** Charts for bid comparisons.
+- **RFP Summary:** High-level tracking of program size, status and key financials.
+- **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
+""")
+    st.markdown("---")
+
+    st.markdown("### 📤 Upload Bid Asset CSV File")
+    st.markdown(f"Upload Bid Asset CSV export saved in the [SharePoint Folder]({_SHAREPOINT_URL})")
+
+    uploaded_file = st.file_uploader(
+        "Select Bid Asset CSV", type=["csv"], key="bid_asset_uploader"
+    )
+    if uploaded_file is None:
+        st.info("👆 Upload a CSV file above to unlock the search and analysis tables.")
+        return
+
+    raw_df = _load_and_normalise(uploaded_file)
+    if raw_df is None:
+        return
+
+    st.success(f"✅ File loaded — **{len(raw_df):,} rows**, **{len(raw_df.columns)} columns**")
+    st.markdown("---")
+
+    # Sorted month list computed once and shared by both sliders.
+    all_months_sorted: list[str] = (
+        sorted(raw_df["Month"].dropna().astype(str).unique().tolist(), key=_month_sort_key)
+        if "Month" in raw_df.columns else []
+    )
+
+    _render_bid_overview(raw_df, all_months_sorted)
+    st.markdown("---")
+
+    result = _render_search_filters(raw_df, all_months_sorted)
+    if result is None:
+        return
+
+    st.markdown("---")
+    _render_rfp_summary(result)
+    st.markdown("---")
+    _render_detail_table(result.df)

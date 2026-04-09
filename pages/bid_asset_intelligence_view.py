@@ -574,19 +574,27 @@ and sharpen future bid strategies. Key resources include:
     st.markdown("### 📋 Detailed Item-Level Data")
     st.caption("Full extract of the CSV filtered by the search criteria above.")
 
-    detail_display = filtered_df.copy()
+    # Identify $/EA columns and round to 4 decimal places
+    EA_COLS = [c for c in filtered_df.columns if "$/EA" in c or "$/ea" in c.lower()]
+
+    detail_download = filtered_df.copy()
+    for col in EA_COLS:
+        if pd.api.types.is_numeric_dtype(detail_download[col]):
+            detail_download[col] = detail_download[col].round(4)
+
+    detail_display = detail_download.copy()
     for col in available_sum:
         if col in detail_display.columns:
             if col == "Volume (lbs)":
-                detail_display[col] = filtered_df[col].apply(_fmt_volume)
+                detail_display[col] = detail_download[col].apply(_fmt_volume)
             else:
-                detail_display[col] = filtered_df[col].apply(_fmt_currency)
+                detail_display[col] = detail_download[col].apply(_fmt_currency)
 
     st.dataframe(detail_display, use_container_width=True, hide_index=True)
 
     st.download_button(
         label="⬇️ Download Detailed Table (CSV)",
-        data=_to_csv_bytes(filtered_df),
+        data=_to_csv_bytes(detail_download),
         file_name=f"bid_asset_detail_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
         key="download_detail",

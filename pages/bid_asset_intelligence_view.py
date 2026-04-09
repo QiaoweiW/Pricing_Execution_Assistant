@@ -5,7 +5,7 @@ Sections
 --------
 1. Types & constants     (_FilterResult, _FINANCIAL_COLS, _GROUP_COLS,
                           _STATUS_RULES, _DEFAULT_STATUS_COLOR, _COLOR_LEGEND,
-                          _CHART_FONT, _CHART_FILTER_DEFS, _SHAREPOINT_URL)
+                          _CHART_FONT, _SHAREPOINT_URL)
 2. Formatting helpers    (_fmt_currency, _fmt_volume, _fmt_pct, _to_csv_bytes,
                           _apply_display_formats)
 3. Data helpers          (_month_sort_key, _coerce_month_to_label, _sel_hash,
@@ -73,13 +73,6 @@ _COLOR_LEGEND: list[tuple[str, str]] = [
 ]
 
 _CHART_FONT = dict(family="Segoe UI, Tahoma, Geneva, Verdana, sans-serif", size=14)
-
-# Chart categorical filter definitions: (CSV column name, widget key suffix).
-_CHART_FILTER_DEFS: list[tuple[str, str]] = [
-    ("Format",                      "format"),
-    ("Size",                        "size"),
-    ("Referenced Item Description", "ref_item"),
-]
 
 _SHAREPOINT_URL = (
     "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
@@ -480,12 +473,15 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
 
     Controls (top to bottom)
     ------------------------
-    1. Month-range slider  — filters which rows feed the chart.
-    2. Categorical filters — Format, Size, Referenced Item Description.
+    1. Month-range slider  — first filter; narrows the data pool for all below.
+    2. Categorical filters — cascading: Format → Size → Referenced Item Description.
+       Each filter's options are derived from the rows that survive all filters
+       above it, so selecting a Format instantly restricts which Sizes appear,
+       and selecting a Size restricts which Referenced Item Descriptions appear.
     3. Overlay toggles     — show/hide PCM $/Yr (red) and PCM $/lb (black) dots.
 
-    All three layers apply to the same chart_base dataset before aggregation,
-    so every metric in the chart reflects the full filter state.
+    All layers feed the same chart_base dataset before aggregation, so every
+    metric in the chart reflects the full filter state at all times.
     """
     st.markdown("### 📈 Bid Overview")
     st.caption(
@@ -510,18 +506,69 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
     else:
         chart_start_dt = chart_end_dt = None
 
-    # Row 2: categorical filters
-    filter_cols = st.columns(len(_CHART_FILTER_DEFS))
-    chart_selections: dict[str, list[str]] = {}
-    for (col_name, key_sfx), col_ctx in zip(_CHART_FILTER_DEFS, filter_cols):
-        opts = (
-            sorted(raw_df[col_name].dropna().astype(str).unique().tolist())
-            if col_name in raw_df.columns else []
+    # Month-filtered pool — basis for all categorical cascades below.
+    # Computed here (between the slider and the column widgets) so that Format
+    # options already reflect the selected date range on every rerun.
+    df_chart_month = _filter_by_month_range(raw_df, chart_start_dt, chart_end_dt)
+
+    # Row 2: cascading categorical filters — Format → Size → Referenced Item Description
+    # Each filter's option list is drawn from the rows that survive all upstream
+    # filters, so the available choices narrow automatically as you drill down.
+    # _sel_hash-keyed widgets reset to "all" whenever a parent selection changes.
+    cf1, cf2, cf3 = st.columns(3)
+
+    # Format — root of the cascade; options from the month-filtered pool
+    with cf1:
+        fmt_opts = (
+            sorted(df_chart_month["Format"].dropna().astype(str).unique().tolist())
+            if "Format" in df_chart_month.columns else []
         )
-        with col_ctx:
-            chart_selections[col_name] = st.multiselect(
-                col_name, options=opts, default=opts, key=f"chart_{key_sfx}"
-            )
+        sel_chart_fmt = st.multiselect(
+            "Format", options=fmt_opts, default=fmt_opts, key="chart_format"
+        )
+
+    df_after_fmt = (
+        df_chart_month[df_chart_month["Format"].astype(str).isin(sel_chart_fmt)]
+        if sel_chart_fmt and "Format" in df_chart_month.columns
+        else df_chart_month if not fmt_opts          # column absent — pass through
+        else df_chart_month.iloc[0:0]                # user cleared selection
+    )
+
+    # Size — cascades from Format; resets when Format selection changes
+    with cf2:
+        size_opts = (
+            sorted(df_after_fmt["Size"].dropna().astype(str).unique().tolist())
+            if "Size" in df_after_fmt.columns else []
+        )
+        sel_chart_size = st.multiselect(
+            "Size", options=size_opts, default=size_opts,
+            key=f"chart_size_{_sel_hash(sel_chart_fmt)}",
+        )
+
+    df_after_size = (
+        df_after_fmt[df_after_fmt["Size"].astype(str).isin(sel_chart_size)]
+        if sel_chart_size and "Size" in df_after_fmt.columns
+        else df_after_fmt if not size_opts           # column absent — pass through
+        else df_after_fmt.iloc[0:0]                  # user cleared selection
+    )
+
+    # Referenced Item Description — cascades from Size; resets when Format or Size changes
+    with cf3:
+        ref_opts = (
+            sorted(df_after_size["Referenced Item Description"].dropna().astype(str).unique().tolist())
+            if "Referenced Item Description" in df_after_size.columns else []
+        )
+        sel_chart_ref = st.multiselect(
+            "Referenced Item Description", options=ref_opts, default=ref_opts,
+            key=f"chart_ref_item_{_sel_hash(sel_chart_fmt, sel_chart_size)}",
+        )
+
+    chart_base = (
+        df_after_size[df_after_size["Referenced Item Description"].astype(str).isin(sel_chart_ref)]
+        if sel_chart_ref and "Referenced Item Description" in df_after_size.columns
+        else df_after_size if not ref_opts           # column absent — pass through
+        else df_after_size.iloc[0:0]                 # user cleared selection
+    )
 
     # Row 3: metric overlay toggles
     st.markdown("**Overlay metrics** — add financial rate indicators on top of the volume bars:")
@@ -547,12 +594,6 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
                 "bids of different sizes directly comparable."
             ),
         )
-
-    # Build chart dataset — all filters applied sequentially
-    chart_base = _filter_by_month_range(raw_df, chart_start_dt, chart_end_dt)
-    for col_name, selection in chart_selections.items():
-        if selection and col_name in chart_base.columns:
-            chart_base = chart_base[chart_base[col_name].astype(str).isin(selection)]
 
     chart_agg = _prepare_chart_data(chart_base)
     if chart_agg.empty:

@@ -303,9 +303,8 @@ and sharpen future bid strategies. Key resources include:
                     x=chart_agg["_label"],
                     y=chart_agg["PCM $/Yr"],
                     name="Total PCM $/Yr",
-                    mode="lines+markers",
-                    line=dict(dash="dot", color="#d32f2f", width=2),
-                    marker=dict(size=7, color="#d32f2f"),
+                    mode="markers",
+                    marker=dict(size=10, color="#d32f2f", symbol="circle"),
                     hovertemplate="%{x}<br>PCM: $%{y:,.1f}<extra></extra>",
                 ),
                 secondary_y=True,
@@ -549,6 +548,13 @@ and sharpen future bid strategies. Key resources include:
                 summary_display[col] = summary_df[col].apply(_fmt_volume)
             else:
                 summary_display[col] = summary_df[col].apply(_fmt_currency)
+
+        # Add "Price Implement Time" from source data if available, else blank
+        if "Price Implement Time" in filtered_df.columns:
+            pit = filtered_df.groupby(available_group, as_index=False)["Price Implement Time"].first()
+            summary_display = summary_display.merge(pit, on=available_group, how="left")
+        else:
+            summary_display["Price Implement Time"] = ""
 
         st.dataframe(summary_display, use_container_width=True, hide_index=True)
 

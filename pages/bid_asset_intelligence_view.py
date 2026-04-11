@@ -5,7 +5,7 @@ Sections
 --------
 1. Types & constants     (_FilterResult, _FINANCIAL_COLS, _GROUP_COLS,
                           _STATUS_RULES, _DEFAULT_STATUS_COLOR, _COLOR_LEGEND,
-                          _CHART_FONT, _SHAREPOINT_URL)
+                          _CHART_FONT, _SHAREPOINT_URL, _OVERVIEW_TABLE_COLS)
 2. Formatting helpers    (_fmt_currency, _fmt_volume, _fmt_pct, _to_csv_bytes,
                           _apply_display_formats)
 3. Data helpers          (_month_sort_key, _coerce_month_to_label, _sel_hash,
@@ -14,7 +14,8 @@ Sections
 4. Chart helpers         (_round_num, _make_bid_label, _status_color,
                           _prepare_chart_data, _build_overview_chart)
 5. Data loading          (_load_and_normalise)
-6. Page sections         (_render_bid_overview, _render_search_filters,
+6. Page sections         (_multiselect_filter, _render_overview_table,
+                          _render_bid_overview, _render_search_filters,
                           _render_rfp_summary, _render_detail_table)
 7. Entry point           (render)
 """
@@ -73,6 +74,20 @@ _COLOR_LEGEND: list[tuple[str, str]] = [
 ]
 
 _CHART_FONT = dict(family="Segoe UI, Tahoma, Geneva, Verdana, sans-serif", size=14)
+
+# Ordered (source_col, display_label) pairs for the Bid Overview summary table.
+# Only columns present in the aggregated DataFrame are rendered; missing ones are
+# silently skipped, so the table stays valid regardless of uploaded CSV schema.
+_OVERVIEW_TABLE_COLS: list[tuple[str, str]] = [
+    ("Company",         "Company"),
+    ("Bid Description", "Bid Description"),
+    ("Format",          "Format"),
+    ("Size",            "Size"),
+    ("Volume (lbs)",    "Total Pounds"),
+    ("Round",           "Round"),
+    ("PCM $/lb",        "PCM $/lbs"),
+    ("Status",          "Status"),
+]
 
 _SHAREPOINT_URL = (
     "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
@@ -256,7 +271,11 @@ def _prepare_chart_data(df: pd.DataFrame) -> pd.DataFrame:
     1. Keep only the latest round per Company / Bid Description.
     2. Sum Volume (lbs) and PCM $/Yr across all items in that round.
     3. Derive PCM $/lb = PCM $/Yr / Volume (lbs), rounded to 2 dp.
-    4. Attach the modal Status, display colour, and x-axis label.
+    4. Attach the modal Status, Format, and Size (most common value in the round).
+    5. Attach the display colour and x-axis label.
+
+    Format and Size are captured here so the Bid Overview summary table can
+    share exactly this DataFrame without any separate aggregation pass.
 
     Returns an empty DataFrame when required columns are absent.
     """
@@ -270,6 +289,7 @@ def _prepare_chart_data(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     work["_round_num"] = work["Round"].apply(_round_num)
 
+    # Identify the maximum round number per bid, then keep only those rows.
     latest_per_bid = (
         work.groupby(group_keys)["_round_num"]
         .max()
@@ -283,18 +303,22 @@ def _prepare_chart_data(df: pd.DataFrame) -> pd.DataFrame:
     sum_cols  = [c for c in ["Volume (lbs)", "PCM $/Yr"] if c in work.columns]
     agg       = work.groupby(agg_keys, as_index=False)[sum_cols].sum()
 
-    if "Status" in work.columns:
-        status_mode = (
-            work.groupby(agg_keys)["Status"]
+    # Attach modal (most-common) value for every categorical column of interest.
+    # Status drives chart colouring; Format and Size populate the summary table.
+    modal_cols = [c for c in ["Status", "Format", "Size"] if c in work.columns]
+    if modal_cols:
+        modal_agg = (
+            work.groupby(agg_keys)[modal_cols]
             .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "Unknown")
             .reset_index()
         )
-        agg = agg.merge(status_mode, on=agg_keys, how="left")
-    else:
+        agg = agg.merge(modal_agg, on=agg_keys, how="left")
+
+    if "Status" not in agg.columns:
         agg["Status"] = "Unknown"
 
     if {"Volume (lbs)", "PCM $/Yr"}.issubset(agg.columns):
-        safe_vol      = agg["Volume (lbs)"].replace(0, float("nan"))
+        safe_vol        = agg["Volume (lbs)"].replace(0, float("nan"))
         agg["PCM $/lb"] = (agg["PCM $/Yr"] / safe_vol).round(2)
 
     agg["_color"] = agg["Status"].apply(_status_color)
@@ -468,6 +492,92 @@ def _load_and_normalise(uploaded_file) -> Optional[pd.DataFrame]:
 
 # ── 6. Page sections ──────────────────────────────────────────────────────────
 
+def _multiselect_filter(
+    label: str,
+    col: str,
+    pool_df: pd.DataFrame,
+    *,
+    key: str,
+    options_df: Optional[pd.DataFrame] = None,
+) -> tuple[list[str], pd.DataFrame]:
+    """Render a multiselect widget and return *(selection, filtered_df)*.
+
+    This helper eliminates the repetitive options-derive → render → apply-filter
+    pattern that would otherwise appear once per cascading filter widget.
+
+    Parameters
+    ----------
+    label      : Widget label shown to the user.
+    col        : Column to filter on.
+    pool_df    : DataFrame to filter; also the options source unless *options_df*
+                 is provided.
+    key        : Unique Streamlit widget key (callers embed _sel_hash for
+                 cascading reset behaviour).
+    options_df : When supplied, options come from this DataFrame instead of
+                 *pool_df*.  Used when a root filter should always list all known
+                 values (e.g. Company drawn from the full dataset) while the
+                 actual row filtering operates on a month-scoped subset.
+
+    Return contract
+    ---------------
+    - Column absent in *pool_df*: selection=[], filtered_df=pool_df (pass-through).
+    - User cleared all selections: selection=[], filtered_df=empty DataFrame.
+    - Normal: selection=chosen values, filtered_df=rows matching selection.
+    """
+    src  = options_df if options_df is not None else pool_df
+    opts = (
+        sorted(src[col].dropna().astype(str).unique().tolist())
+        if col in src.columns else []
+    )
+    sel = st.multiselect(label, options=opts, default=opts, key=key)
+
+    if not opts:
+        # Column is absent — nothing to filter on; pass pool through unchanged.
+        return sel, pool_df
+    if not sel:
+        # User explicitly cleared the widget; return an empty frame so downstream
+        # sections know there is no valid selection rather than showing all rows.
+        return sel, pool_df.iloc[0:0]
+
+    filtered = (
+        pool_df[pool_df[col].astype(str).isin(sel)]
+        if col in pool_df.columns else pool_df
+    )
+    return sel, filtered
+
+
+def _render_overview_table(chart_agg: pd.DataFrame) -> None:
+    """Render the Bid Overview summary table above the chart.
+
+    Each row corresponds to exactly one bar on the chart — same data, same
+    aggregation (final round only, volumes summed, PCM $/lb derived).  The
+    table updates automatically whenever *chart_agg* changes because it is
+    derived directly from _prepare_chart_data output.
+
+    Columns: Company, Bid Description, Format, Size, Total Pounds, Round,
+             PCM $/lbs, Status  (columns absent from *chart_agg* are omitted).
+    """
+    # Build the display DataFrame from the ordered column map.
+    src_cols   = [src for src, _   in _OVERVIEW_TABLE_COLS if src in chart_agg.columns]
+    disp_names = [lbl for src, lbl in _OVERVIEW_TABLE_COLS if src in chart_agg.columns]
+
+    if not src_cols:
+        return  # nothing to show if aggregation produced no relevant columns
+
+    display = chart_agg[src_cols].copy()
+    display.columns = disp_names
+
+    if "Total Pounds" in display.columns:
+        display["Total Pounds"] = display["Total Pounds"].apply(_fmt_volume)
+
+    if "PCM $/lbs" in display.columns:
+        display["PCM $/lbs"] = display["PCM $/lbs"].apply(
+            lambda v: f"${v:.2f}" if pd.notna(v) else "—"
+        )
+
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
 def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> None:
     """Render the Bid Overview section.
 
@@ -478,12 +588,15 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
        Each filter's options are derived from the rows that survive all filters
        above it, so selecting a Format instantly restricts which Sizes appear,
        and selecting a Size restricts which Referenced Item Descriptions appear.
-    3. Overlay toggles     — show/hide PCM $/Yr (red) and PCM $/lb (black) dots.
+    3. Summary table       — one row per bid (final round only), mirroring every
+       bar in the chart below.  Updates in sync with every filter change.
+    4. Overlay toggles     — show/hide PCM $/Yr (red) and PCM $/lb (black) dots.
+    5. Chart              — Plotly combo chart driven by the same aggregated data.
 
-    All layers feed the same chart_base dataset before aggregation, so every
-    metric in the chart reflects the full filter state at all times.
+    All filter layers feed the same chart_base dataset before aggregation, so
+    every metric in both the table and the chart reflects the full filter state.
     """
-    st.markdown("### 📈 Bid Overview")
+    st.markdown("### 📈 Bid Volume & PCM Overview")
     st.caption(
         "Volume (lbs) bars are always shown, colour-coded by bid outcome "
         "(green = Accepted, gray = Rejected, blue = Other). "
@@ -491,7 +604,7 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
         "All values update dynamically with every filter change."
     )
 
-    # Row 1: month-range slicer (full width)
+    # ── Month-range slicer (full width) ──────────────────────────────────────
     if len(all_months_sorted) >= 2:
         chart_month_range = st.select_slider(
             "Month Range",
@@ -506,71 +619,44 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
     else:
         chart_start_dt = chart_end_dt = None
 
-    # Month-filtered pool — basis for all categorical cascades below.
-    # Computed here (between the slider and the column widgets) so that Format
-    # options already reflect the selected date range on every rerun.
+    # Month-filtered pool — basis for all categorical cascades.  Computed here
+    # (between the slider and the column widgets) so Format options already
+    # reflect the selected date range on every rerun.
     df_chart_month = _filter_by_month_range(raw_df, chart_start_dt, chart_end_dt)
 
-    # Row 2: cascading categorical filters — Format → Size → Referenced Item Description
-    # Each filter's option list is drawn from the rows that survive all upstream
-    # filters, so the available choices narrow automatically as you drill down.
-    # _sel_hash-keyed widgets reset to "all" whenever a parent selection changes.
+    # ── Cascading categorical filters — Format → Size → Referenced Item ───────
+    # _multiselect_filter renders the widget and applies the filter in one call.
+    # _sel_hash-keyed widgets auto-reset to "all" whenever a parent changes.
     cf1, cf2, cf3 = st.columns(3)
-
-    # Format — root of the cascade; options from the month-filtered pool
     with cf1:
-        fmt_opts = (
-            sorted(df_chart_month["Format"].dropna().astype(str).unique().tolist())
-            if "Format" in df_chart_month.columns else []
+        sel_chart_fmt, df_after_fmt = _multiselect_filter(
+            "Format", "Format", df_chart_month, key="chart_format"
         )
-        sel_chart_fmt = st.multiselect(
-            "Format", options=fmt_opts, default=fmt_opts, key="chart_format"
-        )
-
-    df_after_fmt = (
-        df_chart_month[df_chart_month["Format"].astype(str).isin(sel_chart_fmt)]
-        if sel_chart_fmt and "Format" in df_chart_month.columns
-        else df_chart_month if not fmt_opts          # column absent — pass through
-        else df_chart_month.iloc[0:0]                # user cleared selection
-    )
-
-    # Size — cascades from Format; resets when Format selection changes
     with cf2:
-        size_opts = (
-            sorted(df_after_fmt["Size"].dropna().astype(str).unique().tolist())
-            if "Size" in df_after_fmt.columns else []
-        )
-        sel_chart_size = st.multiselect(
-            "Size", options=size_opts, default=size_opts,
+        sel_chart_size, df_after_size = _multiselect_filter(
+            "Size", "Size", df_after_fmt,
             key=f"chart_size_{_sel_hash(sel_chart_fmt)}",
         )
-
-    df_after_size = (
-        df_after_fmt[df_after_fmt["Size"].astype(str).isin(sel_chart_size)]
-        if sel_chart_size and "Size" in df_after_fmt.columns
-        else df_after_fmt if not size_opts           # column absent — pass through
-        else df_after_fmt.iloc[0:0]                  # user cleared selection
-    )
-
-    # Referenced Item Description — cascades from Size; resets when Format or Size changes
     with cf3:
-        ref_opts = (
-            sorted(df_after_size["Referenced Item Description"].dropna().astype(str).unique().tolist())
-            if "Referenced Item Description" in df_after_size.columns else []
-        )
-        sel_chart_ref = st.multiselect(
-            "Referenced Item Description", options=ref_opts, default=ref_opts,
+        _, chart_base = _multiselect_filter(
+            "Referenced Item Description", "Referenced Item Description", df_after_size,
             key=f"chart_ref_item_{_sel_hash(sel_chart_fmt, sel_chart_size)}",
         )
 
-    chart_base = (
-        df_after_size[df_after_size["Referenced Item Description"].astype(str).isin(sel_chart_ref)]
-        if sel_chart_ref and "Referenced Item Description" in df_after_size.columns
-        else df_after_size if not ref_opts           # column absent — pass through
-        else df_after_size.iloc[0:0]                 # user cleared selection
-    )
+    # ── Aggregate once; table and chart share the same result ─────────────────
+    chart_agg = _prepare_chart_data(chart_base)
 
-    # Row 3: metric overlay toggles
+    # ── Summary table — appears between filters and chart ─────────────────────
+    if chart_agg.empty:
+        st.info("No data available for the selected chart filters.")
+        return
+
+    st.markdown(
+        "**Bid Summary** — one row per bid at its final round, matching each bar in the chart below:"
+    )
+    _render_overview_table(chart_agg)
+
+    # ── Overlay metric toggles ─────────────────────────────────────────────────
     st.markdown("**Overlay metrics** — add financial rate indicators on top of the volume bars:")
     ov1, ov2, _ = st.columns([2, 2, 3])
     with ov1:
@@ -595,14 +681,11 @@ def _render_bid_overview(raw_df: pd.DataFrame, all_months_sorted: list[str]) -> 
             ),
         )
 
-    chart_agg = _prepare_chart_data(chart_base)
-    if chart_agg.empty:
-        st.info("No data available for the selected chart filters.")
-    else:
-        st.plotly_chart(
-            _build_overview_chart(chart_agg, show_pcm_yr=show_pcm_yr, show_pcm_lb=show_pcm_lb),
-            use_container_width=True,
-        )
+    # ── Chart ─────────────────────────────────────────────────────────────────
+    st.plotly_chart(
+        _build_overview_chart(chart_agg, show_pcm_yr=show_pcm_yr, show_pcm_lb=show_pcm_lb),
+        use_container_width=True,
+    )
 
 
 def _render_search_filters(
@@ -618,7 +701,7 @@ def _render_search_filters(
     Returns None if any cascading filter has no value selected, signalling the
     caller to stop rendering further sections.
     """
-    st.markdown("### 🔍 Search & Filter")
+    st.markdown("### 🔍 RFP Program-level Details")
     st.caption(
         "**Month** is an independent time-range slicer. "
         "**Company** anchors the remaining cascading filters."
@@ -640,71 +723,31 @@ def _render_search_filters(
 
     df_month = _filter_by_month_range(raw_df, filter_start_dt, filter_end_dt)
 
-    # Cascading dropdowns: Company → Bid Description → Round → Format
+    # ── Cascading dropdowns: Company → Bid Description → Round → Format ────────
+    # Company options always come from the full dataset (raw_df) so known
+    # companies are never hidden by the month filter, while actual row filtering
+    # still operates on the month-scoped pool (df_month).
     f1, f2, f3, f4 = st.columns(4)
-
     with f1:
-        company_opts = (
-            sorted(raw_df["Company"].dropna().astype(str).unique().tolist())
-            if "Company" in raw_df.columns else []
+        sel_company, df1 = _multiselect_filter(
+            "Company", "Company", df_month,
+            options_df=raw_df, key="ms_company",
         )
-        sel_company = st.multiselect(
-            "Company", options=company_opts, default=company_opts, key="ms_company"
-        )
-
-    df1 = (
-        df_month[df_month["Company"].astype(str).isin(sel_company)]
-        if sel_company and "Company" in df_month.columns
-        else df_month.iloc[0:0]
-    )
-
     with f2:
-        bid_opts = (
-            sorted(df1["Bid Description"].dropna().astype(str).unique().tolist())
-            if "Bid Description" in df1.columns else []
-        )
-        sel_bid = st.multiselect(
-            "Bid Description", options=bid_opts, default=bid_opts,
+        sel_bid, df2 = _multiselect_filter(
+            "Bid Description", "Bid Description", df1,
             key=f"ms_bid_{_sel_hash(sel_company)}",
         )
-
-    df2 = (
-        df1[df1["Bid Description"].astype(str).isin(sel_bid)]
-        if sel_bid and "Bid Description" in df1.columns
-        else df1.iloc[0:0]
-    )
-
     with f3:
-        round_opts = (
-            sorted(df2["Round"].dropna().astype(str).unique().tolist())
-            if "Round" in df2.columns else []
-        )
-        sel_round = st.multiselect(
-            "Round", options=round_opts, default=round_opts,
+        sel_round, df3 = _multiselect_filter(
+            "Round", "Round", df2,
             key=f"ms_round_{_sel_hash(sel_company, sel_bid)}",
         )
-
-    df3 = (
-        df2[df2["Round"].astype(str).isin(sel_round)]
-        if sel_round and "Round" in df2.columns
-        else df2.iloc[0:0]
-    )
-
     with f4:
-        format_opts = (
-            sorted(df3["Format"].dropna().astype(str).unique().tolist())
-            if "Format" in df3.columns else []
-        )
-        sel_format = st.multiselect(
-            "Format", options=format_opts, default=format_opts,
+        sel_format, filtered_df = _multiselect_filter(
+            "Format", "Format", df3,
             key=f"ms_format_{_sel_hash(sel_company, sel_bid, sel_round)}",
         )
-
-    filtered_df = (
-        df3[df3["Format"].astype(str).isin(sel_format)]
-        if sel_format and "Format" in df3.columns
-        else df3.iloc[0:0]
-    )
 
     empty = [
         name for name, vals in [
@@ -729,10 +772,10 @@ def _render_search_filters(
 
 def _render_rfp_summary(result: _FilterResult) -> None:
     """Render the RFP Summary section: optional KPI metrics row + aggregated table."""
-    st.markdown("### 📊 RFP Summary")
+    st.markdown("### 📊 RFP Program-level Table")
     st.markdown(
         "Item-level PCM, GP, and detailed price builds can be extracted from the "
-        "**\"Detailed Item-Level Data\"** section below. "
+        "**\"Item-level Details\"** section below. "
         "Note the % here is a comparison against FOB Revenue."
     )
 
@@ -800,7 +843,7 @@ def _render_rfp_summary(result: _FilterResult) -> None:
 
 def _render_detail_table(filtered_df: pd.DataFrame) -> None:
     """Render the Detailed Item-Level Data section."""
-    st.markdown("### 📋 Detailed Item-Level Data")
+    st.markdown("### 📋 Item-level Details")
     st.caption("Full extract of the CSV filtered by the search criteria above.")
 
     available_sum = [c for c in _FINANCIAL_COLS if c in filtered_df.columns]
@@ -845,7 +888,7 @@ Use this page to analyze historical trends since December 2025. These insights d
 and sharpen future bid strategies. Key resources include:
 
 - **Visualizations:** Charts for bid comparisons.
-- **RFP Summary:** High-level tracking of program size, status and key financials.
+- **RFP Program-level Table:** High-level tracking of program size, status and key financials.
 - **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
 """)
     st.markdown("---")

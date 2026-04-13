@@ -16,9 +16,15 @@ def render():
     
     Welcome to the Darigold Pricing Intelligence platform. This application provides tools for:
     
-    - **New Price Quote**: Generate rapid, on-demand price quotes for HTST products
-    - **Market Barometer**: Monitor market trends and pricing indicators
-    - **Pricing Execution Automation**: Generate VBCS files for Oracle upload
+    - **Bid Asset Intelligence**: Analyze customer bid opportunities — evaluate volume,
+      pricing method, delivery charges, pallet economics, and custom-label fees to
+      support competitive and profitable bid decisions.
+    - **HTST Shipment Monitor**: Upload actual HTST shipment data to refresh
+      site-level activity metrics, delivery charges, pallet status, and volume
+      bracket classifications across your customer-site portfolio.
+    - **New Price Quote**: Generate rapid, on-demand price quotes for HTST products.
+    - **Market Barometer**: Monitor market trends and pricing indicators.
+    - **Pricing Execution Automation**: Generate VBCS files for Oracle upload.
     
     Select a page from the sidebar to get started.
     """)
@@ -31,7 +37,9 @@ def render():
     with col1:
         st.markdown("""
         #### 🚀 Quick Start
-        - New to the platform? Start with **New Price Quote**
+        - Evaluating a customer bid? Go to **Bid Asset Intelligence**
+        - Refreshing shipment activity & charges? Use **HTST Shipment Monitor**
+        - Need a quick price quote? Go to **New Price Quote**
         - Need to generate VBCS files? Use **Pricing Execution Automation**
         - Want to analyze market trends? Check **Market Barometer**
         """)

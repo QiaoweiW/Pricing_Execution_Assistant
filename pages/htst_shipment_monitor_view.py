@@ -8,7 +8,9 @@ Sections
 2. I/O helpers         (_detect_files, _to_csv_bytes, _widget_key)
 3. DataFrame utilities (_insert_col_after, _drop_blank_columns)
 4. Processing pipeline (_process_shipment_data)
-5. Analytics           (_compute_duration, _build_customer_site_summary)
+5. Analytics           (_compute_duration, _bracket_sellto_volume,
+                        _bracket_custom_label_volume, _bracket_mileage,
+                        _bracket_drop_size, _build_customer_site_summary)
 6. UI rendering        (_render_upload_section, _render_filters,
                         _render_customer_site_details, _render_output_section)
 7. Entry point         (render)
@@ -26,9 +28,15 @@ Design notes
 * Pallet classification uses two thresholds defined in section 1:
     _PALLET_FULL_ROW_MIN : per-row — Pallet% >= threshold → "Full".
     _PALLET_FULL_AGG_MIN : summary — Full Pallet% > threshold → "Full".
-* All lookup joins in _build_customer_site_summary receive pre-loaded DataFrames
-  passed from render().  No function below section 4 reads from disk or from
-  local file paths.
+* Volume and delivery bracket thresholds are all hardcoded in section 1.  Fee
+  values for the volume brackets are dynamic (read from uploaded CSVs) with
+  hardcoded fallbacks.  Delivery charges (_DELIVERY_FEES) are fully hardcoded as
+  a 2-D dict keyed by (Mileage Fee Tier, Drop Fee Tier) — the 12×5 table is small
+  and stable; dynamic parsing of the dollar-prefixed strings would add fragility.
+* All optional-lookup DataFrames (pallet_fee_df, sell_to_df, custom_label_df) are
+  loaded in render() and passed as arguments.  No function in section 5 or below
+  reads from disk.  _process_shipment_data (section 4) is the sole location that
+  performs file I/O on the uploaded file objects.
 * Exactly two CSV outputs are produced: the filtered enriched report and the
   Customer-Site Summary.
 """
@@ -107,6 +115,131 @@ _SELLTO_FEES_FALLBACK: dict[str, float] = {
     "D. 100K - 250K": 0.03,
     "E. 10K - 100K":  0.10,
     "F. <= 10K":      0.35,
+}
+
+    # Custom-label volume bracket classification — same design rationale as sell-to.
+# "Not Applicable" is assigned when the site-level custom-label volume is zero,
+# meaning every product at that site is DG-branded and nothing contributes to
+# custom-label volume.  pd.cut handles all non-zero volumes.
+_CUSTOM_LABEL_BINS: list[float] = [
+    float("-inf"), 250_000, 500_000, 1_000_000, 5_000_000, float("inf")
+]
+_CUSTOM_LABEL_LABELS: list[str] = [
+    "E. < 250K",
+    "D. 250K - 500K",
+    "C. 500K - 1MM",
+    "B. 1MM - 5MM",
+    "A. >= 5MM",
+]
+_CUSTOM_LABEL_FEES_FALLBACK: dict[str, float] = {
+    "A. >= 5MM":      0.00,
+    "B. 1MM - 5MM":   0.01,
+    "C. 500K - 1MM":  0.02,
+    "D. 250K - 500K": 0.03,
+    "E. < 250K":      0.05,
+    "Not Applicable": 0.00,
+}
+
+# Delivery charge — 2-D lookup keyed by (Mileage Fee Tier, Drop Fee Tier).
+#
+# Both tier dimensions are hardcoded from Delivery_Miles Tier_Drop Size Tier_Fee.csv
+# using the same rationale as the sell-to and custom-label brackets: the tier
+# labels are free-text strings with K/MM multipliers that would be fragile to
+# parse programmatically, and the table is small and rarely changes.
+#
+# Missing (mileage_tier, drop_tier) combos — e.g. when Mileage is "n/a" — default
+# to 0.0 via dict.get().  Pricing Method == 0 (FOB) forces Delivery Charge to 0
+# regardless of tier, applied as a post-lookup override.
+_MILEAGE_BINS: list[float] = [
+    float("-inf"), 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1_000, float("inf")
+]
+_MILEAGE_LABELS: list[str] = [
+    "L. <50 mi",
+    "K. 100 - 50 mi",
+    "J. 200 - 100 mi",
+    "I. 300 - 200 mi",
+    "H. 400 - 300 mi",
+    "G. 500 - 400 mi",
+    "F. 600 - 500 mi",
+    "E. 700 - 600 mi",
+    "D. 800 - 700 mi",
+    "C. 900 - 800 mi",
+    "B. 1000 - 900 mi",
+    "A. >= 1000 mi",
+]
+
+_DROP_BINS: list[float] = [
+    float("-inf"), 4_000, 10_000, 20_000, 30_000, float("inf")
+]
+_DROP_LABELS: list[str] = [
+    "E. < 4k lbs",
+    "D. 4k - 10k lbs",
+    "C. 10k - 20k lbs",
+    "B. 20k - 30k lbs",
+    "A. >= 30k lbs",
+]
+
+_DELIVERY_FEES: dict[tuple[str, str], float] = {
+    ("A. >= 1000 mi",    "A. >= 30k lbs"):    0.82,
+    ("A. >= 1000 mi",    "B. 20k - 30k lbs"): 1.32,
+    ("A. >= 1000 mi",    "C. 10k - 20k lbs"): 2.13,
+    ("A. >= 1000 mi",    "D. 4k - 10k lbs"):  4.90,
+    ("A. >= 1000 mi",    "E. < 4k lbs"):      10.67,
+    ("B. 1000 - 900 mi", "A. >= 30k lbs"):    0.77,
+    ("B. 1000 - 900 mi", "B. 20k - 30k lbs"): 1.23,
+    ("B. 1000 - 900 mi", "C. 10k - 20k lbs"): 1.98,
+    ("B. 1000 - 900 mi", "D. 4k - 10k lbs"):  4.57,
+    ("B. 1000 - 900 mi", "E. < 4k lbs"):      9.94,
+    ("C. 900 - 800 mi",  "A. >= 30k lbs"):    0.69,
+    ("C. 900 - 800 mi",  "B. 20k - 30k lbs"): 1.11,
+    ("C. 900 - 800 mi",  "C. 10k - 20k lbs"): 1.79,
+    ("C. 900 - 800 mi",  "D. 4k - 10k lbs"):  4.12,
+    ("C. 900 - 800 mi",  "E. < 4k lbs"):      8.97,
+    ("D. 800 - 700 mi",  "A. >= 30k lbs"):    0.65,
+    ("D. 800 - 700 mi",  "B. 20k - 30k lbs"): 1.04,
+    ("D. 800 - 700 mi",  "C. 10k - 20k lbs"): 1.68,
+    ("D. 800 - 700 mi",  "D. 4k - 10k lbs"):  3.86,
+    ("D. 800 - 700 mi",  "E. < 4k lbs"):      8.41,
+    ("E. 700 - 600 mi",  "A. >= 30k lbs"):    0.64,
+    ("E. 700 - 600 mi",  "B. 20k - 30k lbs"): 1.03,
+    ("E. 700 - 600 mi",  "C. 10k - 20k lbs"): 1.66,
+    ("E. 700 - 600 mi",  "D. 4k - 10k lbs"):  3.83,
+    ("E. 700 - 600 mi",  "E. < 4k lbs"):      8.33,
+    ("F. 600 - 500 mi",  "A. >= 30k lbs"):    0.55,
+    ("F. 600 - 500 mi",  "B. 20k - 30k lbs"): 0.88,
+    ("F. 600 - 500 mi",  "C. 10k - 20k lbs"): 1.42,
+    ("F. 600 - 500 mi",  "D. 4k - 10k lbs"):  3.28,
+    ("F. 600 - 500 mi",  "E. < 4k lbs"):      7.13,
+    ("G. 500 - 400 mi",  "A. >= 30k lbs"):    0.45,
+    ("G. 500 - 400 mi",  "B. 20k - 30k lbs"): 0.72,
+    ("G. 500 - 400 mi",  "C. 10k - 20k lbs"): 1.17,
+    ("G. 500 - 400 mi",  "D. 4k - 10k lbs"):  2.68,
+    ("G. 500 - 400 mi",  "E. < 4k lbs"):      5.84,
+    ("H. 400 - 300 mi",  "A. >= 30k lbs"):    0.39,
+    ("H. 400 - 300 mi",  "B. 20k - 30k lbs"): 0.63,
+    ("H. 400 - 300 mi",  "C. 10k - 20k lbs"): 1.02,
+    ("H. 400 - 300 mi",  "D. 4k - 10k lbs"):  2.35,
+    ("H. 400 - 300 mi",  "E. < 4k lbs"):      5.11,
+    ("I. 300 - 200 mi",  "A. >= 30k lbs"):    0.28,
+    ("I. 300 - 200 mi",  "B. 20k - 30k lbs"): 0.46,
+    ("I. 300 - 200 mi",  "C. 10k - 20k lbs"): 0.74,
+    ("I. 300 - 200 mi",  "D. 4k - 10k lbs"):  1.69,
+    ("I. 300 - 200 mi",  "E. < 4k lbs"):      3.68,
+    ("J. 200 - 100 mi",  "A. >= 30k lbs"):    0.20,
+    ("J. 200 - 100 mi",  "B. 20k - 30k lbs"): 0.32,
+    ("J. 200 - 100 mi",  "C. 10k - 20k lbs"): 0.52,
+    ("J. 200 - 100 mi",  "D. 4k - 10k lbs"):  1.20,
+    ("J. 200 - 100 mi",  "E. < 4k lbs"):      2.61,
+    ("K. 100 - 50 mi",   "A. >= 30k lbs"):    0.11,
+    ("K. 100 - 50 mi",   "B. 20k - 30k lbs"): 0.18,
+    ("K. 100 - 50 mi",   "C. 10k - 20k lbs"): 0.29,
+    ("K. 100 - 50 mi",   "D. 4k - 10k lbs"):  0.66,
+    ("K. 100 - 50 mi",   "E. < 4k lbs"):      1.44,
+    ("L. <50 mi",        "A. >= 30k lbs"):    0.04,
+    ("L. <50 mi",        "B. 20k - 30k lbs"): 0.06,
+    ("L. <50 mi",        "C. 10k - 20k lbs"): 0.10,
+    ("L. <50 mi",        "D. 4k - 10k lbs"):  0.22,
+    ("L. <50 mi",        "E. < 4k lbs"):      0.48,
 }
 
 
@@ -282,11 +415,11 @@ def _process_shipment_data(
     # ── Step 3b: Row-level pallet metrics ────────────────────────────────────
     # Pallet% measures the fraction of one full pallet's total weight ordered.
     # Rows with missing denominator (no Demantra match) get NaN → "Mixed".
+    # Vectorised boolean avoids row-by-row Python overhead on 400K+ rows.
     full_pallet_lbs = df["Total Each Per Pallet"] * df["Unit Net Weight"]
     df["Pallet%"] = (df["Ordered LBS"] / full_pallet_lbs).round(4)
-    df["Pallet Status"] = df["Pallet%"].apply(
-        lambda v: "Full" if pd.notna(v) and v >= _PALLET_FULL_ROW_MIN else "Mixed"
-    )
+    is_full = df["Pallet%"].notna() & (df["Pallet%"] >= _PALLET_FULL_ROW_MIN)
+    df["Pallet Status"] = is_full.map({True: "Full", False: "Mixed"})
     df = _insert_col_after(df, "Unit Net Weight", "Pallet%")
     df = _insert_col_after(df, "Pallet%", "Pallet Status")
 
@@ -342,6 +475,66 @@ def _bracket_sellto_volume(vol: pd.Series) -> pd.Series:
     ).astype(str)
 
 
+def _bracket_custom_label_volume(vol: pd.Series) -> pd.Series:
+    """Classify a custom-label volume series (gallons) into the standard bracket labels.
+
+    Uses pd.cut with right=False so every non-zero interval is [left, right):
+        (0, 250 000)       → E. < 250K
+        [250 000, 500 000) → D. 250K - 500K
+        [500 000, 1 000 000) → C. 500K - 1MM
+        [1 000 000, 5 000 000) → B. 1MM - 5MM
+        [5 000 000, inf)   → A. >= 5MM
+        0 (sites where every product is DG-branded) → Not Applicable
+
+    The "Not Applicable" assignment is a post-cut override applied via
+    Series.where() — the same vectorised pattern used in _bracket_sellto_volume.
+    Returns object dtype (str) so downstream joins work without category quirks.
+    """
+    result = pd.cut(
+        vol,
+        bins=_CUSTOM_LABEL_BINS,
+        labels=_CUSTOM_LABEL_LABELS,
+        right=False,
+    ).astype(str)
+    # Rows with zero custom-label volume are not in any numeric bracket.
+    return result.where(vol > 0, "Not Applicable")
+
+
+def _bracket_mileage(mileage: pd.Series) -> pd.Series:
+    """Classify a mileage series into the standard delivery tier labels.
+
+    Mileage is stored as a mixed-type column: numeric values for matched routes
+    and the string "n/a" for unmatched ones.  pd.to_numeric coerces "n/a" to NaN
+    so pd.cut can operate on the numeric subset; NaN rows are then overridden to
+    "Not Applicable" via Series.where(), matching the pattern in the other bracket
+    functions.
+
+    Returns object dtype (str) so the downstream tuple-key fee lookup works cleanly.
+    """
+    numeric = pd.to_numeric(mileage, errors="coerce")
+    result = pd.cut(
+        numeric,
+        bins=_MILEAGE_BINS,
+        labels=_MILEAGE_LABELS,
+        right=False,
+    ).astype(str)
+    return result.where(numeric.notna(), "Not Applicable")
+
+
+def _bracket_drop_size(drop_size: pd.Series) -> pd.Series:
+    """Classify a drop size series (lbs per drop) into the standard delivery tier labels.
+
+    Drop Size is always numeric (site LBS / count of orders), so no "n/a"
+    handling is needed.  Returns object dtype (str) for consistent downstream joins.
+    """
+    return pd.cut(
+        drop_size,
+        bins=_DROP_BINS,
+        labels=_DROP_LABELS,
+        right=False,
+    ).astype(str)
+
+
 def _compute_duration(df: pd.DataFrame, date_col: str = "Order Date") -> int:
     """Return the span in calendar days between the earliest and latest order date.
 
@@ -361,6 +554,7 @@ def _build_customer_site_summary(
     duration_days: int,
     pallet_fee_df: Optional[pd.DataFrame] = None,
     sell_to_df: Optional[pd.DataFrame] = None,
+    custom_label_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Aggregate the filtered enriched DataFrame into the Customer-Site Details table.
 
@@ -370,27 +564,34 @@ def _build_customer_site_summary(
     ---------------------------
     Customer, SHIPTONAME, PRODUCTDESC, Product Group,
     Ordered Secondary QTY, Ordered LBS,
-    Count of Unique Orders         — unique Order Numbers per Customer+SHIPTONAME,
-    Duration                       — global days span (filter-invariant, passed in),
-    Annualized Gallons             — Ordered Secondary QTY / Duration × 350,
-    Site-level Sell-to Volume      — sum of Annualized Gallons per Customer+SHIPTONAME,
-    Site-level Custom-label Volume — same sum but only non-"DG" products; 0 for DG rows,
-    Drop Size                      — sum(Ordered LBS at site) / Count of Unique Orders,
+    Count of Unique Orders           — unique Order Numbers per Customer+SHIPTONAME,
+    Duration                         — global days span (filter-invariant, passed in),
+    Annualized Gallons               — Ordered Secondary QTY / Duration × 350,
+    Site-level Sell-to Volume        — sum of Annualized Gallons per Customer+SHIPTONAME,
+    Site-level Custom-label Volume   — sum of non-"DG" Annualized Gallons at site;
+                                       uniform across all product rows at that site
+                                       (0 only when the entire site is DG-branded),
+    Drop Size (lbs per drop)         — sum(Ordered LBS at site) / Count of Unique Orders,
     Pricing Method, Mileage,
-    Full Pallet%                   — fraction of rows with row-level Pallet Status "Full",
-    Pallet Status                  — "Full" if Full Pallet% > _PALLET_FULL_AGG_MIN,
-    Mixed Pallet Fee               — joined from pallet_fee_df on Pallet Status,
-    Sell-to Volume Bracket         — volume bracket label from _bracket_sellto_volume(),
-    Sell-to Volume Fee ($/Gal)     — fee from sell_to_df if uploaded, else fallback dict.
+    Mileage Fee Tier (Mi)            — delivery distance tier from _bracket_mileage(),
+    Drop Fee Tier (lbs/Drop Size)    — delivery drop-size tier from _bracket_drop_size(),
+    Delivery Charge ($/Gal)          — fee from _DELIVERY_FEES[(mileage_tier, drop_tier)];
+                                       forced to 0 when Pricing Method == 0 (FOB),
+    Full Pallet%                     — fraction of rows with row-level Pallet Status "Full",
+    Pallet Status                    — "Full" if Full Pallet% > _PALLET_FULL_AGG_MIN,
+    Mixed Pallet Fee                 — joined from pallet_fee_df on Pallet Status,
+    Sell-to Volume Bracket           — bracket from _bracket_sellto_volume(),
+    Sell-to Volume Fee ($/Gal)       — fee from sell_to_df if uploaded, else fallback,
+    Custom Label Bracket (Gal/Yr)    — bracket from _bracket_custom_label_volume(),
+    Custom Label Fee ($/Gal)         — fee from custom_label_df if uploaded, else fallback.
 
     Design decisions
     ----------------
-    * Full Pallet% consumes the row-level Pallet Status set by _process_shipment_data.
-      No threshold is re-evaluated here.
-    * Sell-to bracket thresholds are hardcoded (_SELLTO_BINS / _SELLTO_LABELS).
-      Fee values are dynamic when sell_to_df is provided, static otherwise.
-    * No file I/O occurs in this function; all lookup DataFrames are pre-loaded
-      by render() and passed as arguments.
+    * Full Pallet% consumes the row-level Pallet Status set by _process_shipment_data;
+      no threshold is re-evaluated here.
+    * Volume bracket thresholds are hardcoded; fee values are dynamic from the uploaded
+      CSVs when available, falling back to hardcoded dicts otherwise.
+    * No file I/O occurs here; all lookup DataFrames are pre-loaded by render().
     """
     if filtered_df.empty:
         return pd.DataFrame()
@@ -437,7 +638,10 @@ def _build_customer_site_summary(
     agg = agg.merge(site_vol, on=site_keys, how="left")
 
     # ── Site-level Custom-label Volume (Gallons) ──────────────────────────────
-    # Only non-"DG" products contribute.  For DG product rows the value is 0.
+    # Only non-"DG" products contribute to the site total.  Every row at a site
+    # (including DG rows) receives the same site-level value so the column is
+    # uniform across all product lines for a given Customer × SHIPTONAME.
+    # Sites where every product is DG-branded get 0 (left-join produces NaN → 0).
     non_dg_mask = ~agg["PRODUCTDESC"].str.startswith("DG", na=True)
     if non_dg_mask.any():
         custom_vol = (
@@ -451,10 +655,7 @@ def _build_customer_site_summary(
     else:
         agg["_custom_vol"] = 0
 
-    # Vectorised assignment: keep the site total for non-DG rows, 0 for DG rows.
-    is_dg = agg["PRODUCTDESC"].str.startswith("DG", na=True)
-    agg["Site-level Custom-label Volume (Gallons)"] = agg["_custom_vol"].where(~is_dg, 0)
-    agg = agg.drop(columns=["_custom_vol"])
+    agg = agg.rename(columns={"_custom_vol": "Site-level Custom-label Volume (Gallons)"})
 
     # ── Drop Size (lbs per order, at site level) ──────────────────────────────
     # Total Ordered LBS at the site divided by Count of Unique Orders.
@@ -466,8 +667,26 @@ def _build_customer_site_summary(
         .rename(columns={"Ordered LBS": "_site_lbs"})
     )
     agg = agg.merge(site_lbs, on=site_keys, how="left")
-    agg["Drop Size"] = (agg["_site_lbs"] / agg["Count of Unique Orders"]).round(1)
+    agg["Drop Size (lbs per drop)"] = (agg["_site_lbs"] / agg["Count of Unique Orders"]).round(1)
     agg = agg.drop(columns=["_site_lbs"])
+
+    # ── Delivery tiers and charge ─────────────────────────────────────────────
+    # Mileage Fee Tier: derived from the "Mileage" column (may contain "n/a").
+    # Drop Fee Tier:    derived from "Drop Size (lbs per drop)" (always numeric).
+    # Delivery Charge:  looked up from the hardcoded _DELIVERY_FEES 2-D dict.
+    #   • Unrecognised (tier, tier) combos (e.g. "Not Applicable" × a valid drop
+    #     tier) default to 0.0 via dict.get().
+    #   • Pricing Method == 0 indicates FOB delivery — the customer is not billed
+    #     for delivery, so the charge is forced to 0 regardless of tiers.
+    agg["Mileage Fee Tier (Mi)"] = _bracket_mileage(agg["Mileage"])
+    agg["Drop Fee Tier (lbs/Drop Size)"] = _bracket_drop_size(agg["Drop Size (lbs per drop)"])
+
+    fee_keys = list(zip(agg["Mileage Fee Tier (Mi)"], agg["Drop Fee Tier (lbs/Drop Size)"]))
+    agg["Delivery Charge ($/Gal)"] = [_DELIVERY_FEES.get(k, 0.0) for k in fee_keys]
+
+    # FOB override: Pricing Method 0 means the seller, not the buyer, covers freight.
+    is_fob = agg["Pricing Method"].astype(str).eq("0")
+    agg.loc[is_fob, "Delivery Charge ($/Gal)"] = 0.0
 
     # ── Full Pallet% and Pallet Status ────────────────────────────────────────
     # Consolidate total-row and full-row counts in a single groupby to avoid
@@ -525,6 +744,24 @@ def _build_customer_site_summary(
             agg["Sell-to Volume Bracket"].map(_SELLTO_FEES_FALLBACK)
         )
 
+    # ── Custom Label Bracket and Fee ─────────────────────────────────────────
+    # Same pattern as sell-to: hardcoded thresholds, dynamic fees when uploaded.
+    # Zero-volume rows (DG products) are assigned "Not Applicable" by the
+    # bracketing function before the fee lookup is applied.
+    agg["Custom Label Bracket (Gal/Yr)"] = _bracket_custom_label_volume(
+        agg["Site-level Custom-label Volume (Gallons)"]
+    )
+    if custom_label_df is not None:
+        cl_fee_lookup = (
+            custom_label_df[["Custom Label Bracket (Gal/Yr)", "Custom Label Fee ($/Gal)"]]
+            .drop_duplicates(subset=["Custom Label Bracket (Gal/Yr)"])
+        )
+        agg = agg.merge(cl_fee_lookup, on="Custom Label Bracket (Gal/Yr)", how="left")
+    else:
+        agg["Custom Label Fee ($/Gal)"] = (
+            agg["Custom Label Bracket (Gal/Yr)"].map(_CUSTOM_LABEL_FEES_FALLBACK)
+        )
+
     # ── Rename and enforce column order ──────────────────────────────────────
     agg = agg.rename(columns={"PRODUCTGROUP": "Product Group"})
 
@@ -534,10 +771,12 @@ def _build_customer_site_summary(
         "Count of Unique Orders", "Duration", "Annualized Gallons",
         "Site-level Sell-to Volume (Gallons)",
         "Site-level Custom-label Volume (Gallons)",
-        "Drop Size",
-        "Pricing Method", "Mileage",
+        "Drop Size (lbs per drop)", "Drop Fee Tier (lbs/Drop Size)",
+        "Pricing Method", "Mileage", "Mileage Fee Tier (Mi)",
+        "Delivery Charge ($/Gal)",
         "Full Pallet%", "Pallet Status", "Mixed Pallet Fee",
         "Sell-to Volume Bracket", "Sell-to Volume Fee ($/Gal)",
+        "Custom Label Bracket (Gal/Yr)", "Custom Label Fee ($/Gal)",
     ]
     present = [c for c in ordered_cols if c in agg.columns]
     return (
@@ -555,10 +794,17 @@ def _render_upload_section() -> dict[str, object]:
     The user drops all CSVs from the HTST Shipment Monitor folder in one action;
     each file is identified automatically by filename keywords.
     """
+    _SHAREPOINT_URL = (
+        "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
+        "/Forms/AllItems.aspx?id=%2Fsites%2FBrandedPricing%2FShared%20Documents"
+        "%2FGeneral%2F02%20Resources%2FHTST%20Activity%20Model%20Monitor"
+        "&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
+    )
     st.markdown("### 📤 Upload Data Files")
     st.caption(
         "Select or drag-and-drop all CSVs from your HTST Shipment Monitor folder. "
-        "Files are identified automatically by their filename."
+        "Files are identified automatically by their filename. "
+        f"[📁 Upload files in this folder]({_SHAREPOINT_URL})"
     )
     uploaded_files = st.file_uploader(
         "Select all HTST Shipment Monitor CSV files",
@@ -570,29 +816,30 @@ def _render_upload_section() -> dict[str, object]:
 
 
 def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
-    """Render a Customer selectbox and a cascading SHIPTONAME multiselect.
+    """Render a Customer multiselect and a cascading SHIPTONAME multiselect.
 
     Returns the subset of *df* that matches the current widget selections.
-    Customer is single-select so the downstream views stay focused.
-    SHIPTONAME options narrow automatically when the customer changes; the
-    widget key embeds a hash of the selected customer so Streamlit resets it
-    (back to all Ship-To options) on every customer switch.
+    Both filters default to all available options on first load.
+    SHIPTONAME options narrow to only the Ship-Tos belonging to the selected
+    customers; the widget key embeds a hash of the selected customer list so
+    Streamlit resets it automatically whenever the customer selection changes.
     """
     st.markdown("### 🔍 Filter")
     f1, f2 = st.columns(2)
 
     with f1:
         all_customers = sorted(df["Customer"].dropna().astype(str).unique().tolist())
-        sel_customer = st.selectbox(
+        sel_customers = st.multiselect(
             "Customer",
             options=all_customers,
+            default=all_customers,
             key="htst_filter_customer",
-            help="Select a customer. Ship-To options narrow automatically.",
+            help="Select one or more customers. Ship-To options narrow automatically.",
         )
 
     df_by_customer = (
-        df[df["Customer"].astype(str) == sel_customer]
-        if sel_customer else df.iloc[0:0]
+        df[df["Customer"].astype(str).isin(sel_customers)]
+        if sel_customers else df.iloc[0:0]
     )
 
     with f2:
@@ -603,7 +850,9 @@ def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
             "Ship-To Name",
             options=shiptoname_opts,
             default=shiptoname_opts,
-            key=f"htst_filter_shiptoname_{_widget_key(sel_customer or '')}",
+            # Hash the sorted customer list so the widget auto-resets when
+            # the customer selection changes, without manual session_state wiring.
+            key=f"htst_filter_shiptoname_{_widget_key(str(sorted(sel_customers)))}",
             help="Options narrow automatically based on the Customer selection above.",
         )
 
@@ -620,17 +869,19 @@ def _render_customer_site_details(
     duration_days: int,
     pallet_fee_df: Optional[pd.DataFrame],
     sell_to_df: Optional[pd.DataFrame],
+    custom_label_df: Optional[pd.DataFrame],
 ) -> None:
     """Render the Customer-Site Details aggregated summary table.
 
-    *pallet_fee_df* and *sell_to_df* are pre-loaded by render() from the
-    respective uploaded files (None when not uploaded).  Passing them as
-    DataFrames keeps this function free of file I/O.
+    All optional lookup DataFrames (*pallet_fee_df*, *sell_to_df*,
+    *custom_label_df*) are pre-loaded by render() from the respective
+    uploaded files (None when not uploaded).  Passing them as DataFrames
+    keeps this function — and _build_customer_site_summary — free of file I/O.
     """
     st.markdown("### 📊 Customer-Site Details")
 
     summary = _build_customer_site_summary(
-        filtered_df, duration_days, pallet_fee_df, sell_to_df
+        filtered_df, duration_days, pallet_fee_df, sell_to_df, custom_label_df
     )
 
     if summary.empty:
@@ -702,8 +953,9 @@ def render() -> None:
 
     Business logic is fully delegated to section-specific functions.
     Duration is computed before filtering so it is filter-invariant.
-    Optional lookup DataFrames (pallet_fee_df) are loaded here from uploaded
-    file objects and passed as arguments — no function downstream opens a file.
+    Optional lookup DataFrames (pallet_fee_df, sell_to_df, custom_label_df)
+    are loaded here from uploaded file objects and passed as arguments — no
+    function downstream opens a file directly.
     """
     apply_custom_css()
 
@@ -712,9 +964,12 @@ def render() -> None:
         unsafe_allow_html=True,
     )
 
-    # ── Welcome (TBD) ─────────────────────────────────────────────────────────
+    # ── Welcome ───────────────────────────────────────────────────────────────
     st.markdown("### Welcome")
-    st.info("TBD — overview and guidance for this page will be added here.")
+    st.info(
+        "Use this page to upload ACTUAL shipment report and REFRESH activity "
+        "levels and associated charges."
+    )
     st.markdown("---")
 
     # ── Upload & auto-detect ──────────────────────────────────────────────────
@@ -766,6 +1021,14 @@ def render() -> None:
         except Exception as exc:
             st.warning(f"Sell-To Volume Bracket file could not be read — fallback fees will be used: {exc}")
 
+    custom_label_df: Optional[pd.DataFrame] = None
+    if detected.get("custom_label") is not None:
+        try:
+            custom_label_df = pd.read_csv(detected["custom_label"])
+            custom_label_df.columns = custom_label_df.columns.str.strip()
+        except Exception as exc:
+            st.warning(f"Custom Label Volume Bracket file could not be read — fallback fees will be used: {exc}")
+
     st.success(
         f"✅ Processing complete — **{len(enriched_df):,} rows**, "
         f"**{len(enriched_df.columns)} columns**"
@@ -777,7 +1040,9 @@ def render() -> None:
     st.markdown("---")
 
     # ── Customer-Site Details ─────────────────────────────────────────────────
-    _render_customer_site_details(filtered_df, duration_days, pallet_fee_df, sell_to_df)
+    _render_customer_site_details(
+        filtered_df, duration_days, pallet_fee_df, sell_to_df, custom_label_df
+    )
     st.markdown("---")
 
     # ── Enriched Shipment Report (filtered, downloadable) ─────────────────────

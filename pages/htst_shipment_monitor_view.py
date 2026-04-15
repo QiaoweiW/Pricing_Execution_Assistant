@@ -991,7 +991,7 @@ def render() -> None:
         if p.required and detected.get(p.key) is None
     ]
     if required_missing:
-        st.info("👆 Still waiting for: **" + "**, **".join(required_missing) + "**")
+        st.info("📤 File uploading and calculation in progress.")
         return
 
     # ── Process main enrichment pipeline (session-state cached) ───────────────

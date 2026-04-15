@@ -8,9 +8,9 @@ Sections
 2. I/O helpers         (_detect_files, _to_csv_bytes, _widget_key)
 3. DataFrame utilities (_insert_col_after, _drop_blank_columns)
 4. Processing pipeline (_process_shipment_data)
-5. Analytics           (_compute_duration, _bracket_sellto_volume,
-                        _bracket_custom_label_volume, _bracket_mileage,
-                        _bracket_drop_size, _build_customer_site_summary)
+5. Analytics           (_bracket_sellto_volume, _bracket_custom_label_volume,
+                        _bracket_mileage, _bracket_drop_size,
+                        _build_customer_site_summary)
 6. UI rendering        (_render_upload_section, _render_filters,
                         _render_customer_site_details, _render_output_section)
 7. Entry point         (render)
@@ -23,10 +23,12 @@ Design notes
 * The full enriched DataFrame is NEVER pushed to the browser as a table.  Only
   _PREVIEW_ROWS rows go through st.dataframe().  Download buttons stream via
   HTTP (not the WebSocket), so they work for any dataset size on Streamlit Cloud.
-* Duration is computed once from the unfiltered enriched dataset so it remains
-  stable regardless of filter state.  Both the enriched DataFrame and duration
-  are cached in st.session_state (keyed by a file-set signature) so the
-  expensive enrichment pipeline does not re-run on every widget interaction.
+* Duration equals (sel_end − sel_start).days from the Order Date range slicer,
+  clamped to ≥ 1 to prevent division-by-zero.  It drives the Annualized Gallons
+  denominator in Customer-Site Details and updates automatically when the slicer
+  changes.  The enriched DataFrame is cached in st.session_state (keyed by a
+  file-set signature) so the expensive enrichment pipeline does not re-run on
+  every widget interaction.
 * Pallet classification uses two thresholds defined in section 1:
     _PALLET_FULL_ROW_MIN : per-row — Pallet% >= threshold → "Full".
     _PALLET_FULL_AGG_MIN : summary — Full Pallet% > threshold → "Full".
@@ -45,7 +47,7 @@ Design notes
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import date, datetime
 from typing import NamedTuple, Optional
 
 import pandas as pd
@@ -537,25 +539,6 @@ def _bracket_drop_size(drop_size: pd.Series) -> pd.Series:
     ).astype(str)
 
 
-def _compute_duration(df: pd.DataFrame, date_col: str = "Order Date") -> int:
-    """Return the span in calendar days between the earliest and latest order date.
-
-    Uses the full (unfiltered) enriched DataFrame so Duration is filter-invariant.
-    Falls back to 1 on parse failure to prevent division-by-zero downstream.
-
-    No explicit format is specified so pandas' inference engine handles the full
-    range of date representations that appear in HTST Shipment Reports
-    (e.g. "15-Apr-2025", "04/15/2025", "2025-04-15").  The previous
-    format="%d-%b" matched only day+month with no year, causing every
-    year-qualified value to coerce to NaT → all-empty Series → return 1.
-    """
-    if date_col not in df.columns:
-        return 1
-    dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
-    if dates.empty or dates.max() == dates.min():
-        return 1
-    return int((dates.max() - dates.min()).days)
-
 
 def _build_customer_site_summary(
     filtered_df: pd.DataFrame,
@@ -573,7 +556,8 @@ def _build_customer_site_summary(
     Customer, SHIPTONAME, PRODUCTDESC, Product Group,
     Ordered Secondary QTY, Ordered LBS,
     Count of Unique Orders           — unique Order Numbers per Customer+SHIPTONAME,
-    Duration                         — global days span (filter-invariant, passed in),
+    Duration                         — calendar-day span of the selected Order Date range
+                                       (passed in from _render_filters),
     Annualized Gallons               — Ordered Secondary QTY / Duration × 350,
     Site-level Sell-to Volume        — sum of Annualized Gallons per Customer+SHIPTONAME,
     Site-level Custom-label Volume   — sum of non-"DG" Annualized Gallons at site;
@@ -632,7 +616,8 @@ def _build_customer_site_summary(
     agg = agg.merge(order_counts, on=site_keys, how="left")
 
     # ── Duration and Annualized Gallons ───────────────────────────────────────
-    # Duration is passed from render() so it is invariant to filter state.
+    # Duration comes from the Order Date range slicer, so Annualized Gallons
+    # automatically reflect the chosen period.
     agg["Duration"] = duration_days
     agg["Annualized Gallons"] = (agg["Ordered Secondary QTY"] / duration_days * 350).round(1)
 
@@ -823,31 +808,100 @@ def _render_upload_section() -> dict[str, object]:
     return _detect_files(uploaded_files or [])
 
 
-def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
-    """Render a Customer multiselect and a cascading SHIPTONAME multiselect.
+def _render_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Render date range slicer, Customer multiselect, and SHIPTONAME multiselect.
 
-    Returns the subset of *df* that matches the current widget selections.
-    Both filters default to all available options on first load.
-    SHIPTONAME options narrow to only the Ship-Tos belonging to the selected
-    customers; the widget key embeds a hash of the selected customer list so
-    Streamlit resets it automatically whenever the customer selection changes.
+    Returns (filtered_df, duration_days) where:
+    - filtered_df   — subset of *df* matching all current widget selections.
+    - duration_days — calendar-day span of the selected Order Date range (≥ 1),
+                      used as the annualisation denominator in Customer-Site Details
+                      so that all volume metrics reflect the chosen period.
+
+    Filter application order (each stage feeds the next):
+      1. Order Date range  → date_df       (bounds Customer/Ship-To options)
+      2. Customer          → customer_df
+      3. Ship-To Name      → filtered_df   (returned)
+
+    Widget auto-reset strategy
+    --------------------------
+    All three widget keys embed hashes of upstream selections so that Streamlit
+    treats them as brand-new whenever an upstream filter changes, resetting them
+    to their full defaults without manual session_state manipulation:
+    - Customer key   embeds the date range hash.
+    - Ship-To key    embeds both date range and customer selection hashes.
     """
     st.markdown("### 🔍 Filter")
+
+    # ── 1. Order Date range ───────────────────────────────────────────────────
+    # Parse "Order Date" once; reuse the Series for both slider bounds AND the
+    # row mask to avoid a second O(n) parse pass.
+    date_col = "Order Date"
+    if date_col in df.columns:
+        # errors="coerce" silently converts unparseable values to NaT.
+        date_series: Optional[pd.Series] = pd.to_datetime(df[date_col], errors="coerce")
+        valid_dates = date_series.dropna()
+        min_dt: Optional[date] = valid_dates.min().date() if not valid_dates.empty else None
+        max_dt: Optional[date] = valid_dates.max().date() if not valid_dates.empty else None
+    else:
+        date_series = None
+        min_dt = max_dt = None
+
+    if min_dt is not None and min_dt != max_dt:
+        date_range = st.date_input(
+            "Order Date Range",
+            value=(min_dt, max_dt),
+            min_value=min_dt,
+            max_value=max_dt,
+            key="htst_filter_date_range",
+            help=(
+                "Select the order date window.  All downstream metrics — "
+                "Annualized Gallons, volume brackets, and fees — "
+                "recalculate automatically based on this period."
+            ),
+        )
+        # Guard: during user interaction st.date_input may return a 1-element
+        # tuple (start only, end not yet clicked).  Fall back to the full range.
+        if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+            sel_start, sel_end = date_range[0], date_range[1]
+        else:
+            sel_start, sel_end = min_dt, max_dt
+
+        # Normalise to midnight before comparison so rows whose Order Date
+        # parsed with a time component are not unintentionally excluded.
+        norm  = date_series.dt.normalize()
+        mask  = (norm >= pd.Timestamp(sel_start)) & (norm <= pd.Timestamp(sel_end))
+        date_df      = df[mask.fillna(False)]
+        duration_days = max((sel_end - sel_start).days, 1)
+    else:
+        # No parseable dates — skip the date filter entirely.
+        if min_dt is None:
+            st.caption("ℹ️ 'Order Date' column could not be parsed — date filter unavailable.")
+        sel_start = sel_end = None
+        date_df       = df
+        duration_days = 1
+
+    # Fragment embedded in Customer and Ship-To keys; changes when the date
+    # range changes, causing both downstream widgets to auto-reset.
+    date_key = f"{sel_start}:{sel_end}" if sel_start is not None else "nodate"
+
+    # ── 2. Customer & Ship-To filters ─────────────────────────────────────────
     f1, f2 = st.columns(2)
 
     with f1:
-        all_customers = sorted(df["Customer"].dropna().astype(str).unique().tolist())
+        all_customers = sorted(date_df["Customer"].dropna().astype(str).unique().tolist())
         sel_customers = st.multiselect(
             "Customer",
             options=all_customers,
             default=all_customers,
-            key="htst_filter_customer",
-            help="Select one or more customers. Ship-To options narrow automatically.",
+            # Key changes with the date range so the widget resets when the
+            # date window changes (customers in range may differ).
+            key=f"htst_filter_customer_{_widget_key(date_key)}",
+            help="Select one or more customers.  Ship-To options narrow automatically.",
         )
 
     df_by_customer = (
-        df[df["Customer"].astype(str).isin(sel_customers)]
-        if sel_customers else df.iloc[0:0]
+        date_df[date_df["Customer"].astype(str).isin(sel_customers)]
+        if sel_customers else date_df.iloc[0:0]
     )
 
     with f2:
@@ -858,9 +912,9 @@ def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
             "Ship-To Name",
             options=shiptoname_opts,
             default=shiptoname_opts,
-            # Hash the sorted customer list so the widget auto-resets when
-            # the customer selection changes, without manual session_state wiring.
-            key=f"htst_filter_shiptoname_{_widget_key(str(sorted(sel_customers)))}",
+            # Key embeds both date and customer so this widget resets whenever
+            # either upstream selection changes.
+            key=f"htst_filter_shiptoname_{_widget_key(date_key + str(sorted(sel_customers)))}",
             help="Options narrow automatically based on the Customer selection above.",
         )
 
@@ -869,7 +923,7 @@ def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
         if sel_shiptonames else df_by_customer.iloc[0:0]
     )
     st.caption(f"**{len(filtered):,}** rows match the current filter criteria.")
-    return filtered
+    return filtered, duration_days
 
 
 def _render_customer_site_details(
@@ -898,8 +952,8 @@ def _render_customer_site_details(
 
     st.caption(
         f"Aggregated by Customer × Ship-To × Product. "
-        f"Duration ({duration_days:,} days) is computed from the full dataset "
-        f"and is filter-invariant."
+        f"Duration: **{duration_days:,} days** (selected date range). "
+        f"Annualized Gallons reflect the activity rate for this period."
     )
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
@@ -957,14 +1011,17 @@ def render() -> None:
     """Render the HTST Shipment Monitor page.
 
     Flow: upload → validate → process (cached) → load optional lookups →
-          filter → Customer-Site Details → Enriched Report.
+          filter (date + customer + ship-to) → Customer-Site Details →
+          Enriched Report.
 
     Business logic is fully delegated to section-specific functions.
-    The enrichment pipeline and duration are cached in st.session_state so
-    they only re-run when the uploaded file set changes, not on every widget
-    interaction.  Optional lookup DataFrames (pallet_fee_df, sell_to_df,
-    custom_label_df) are loaded here from uploaded file objects and passed as
-    arguments — no function downstream opens a file directly.
+    The enrichment pipeline is cached in st.session_state so it only re-runs
+    when the uploaded file set changes, not on every widget interaction.
+    duration_days is derived from the Order Date range slicer inside
+    _render_filters and is NOT cached — it updates instantly with the slicer.
+    Optional lookup DataFrames (pallet_fee_df, sell_to_df, custom_label_df) are
+    loaded here from uploaded file objects and passed as arguments — no function
+    downstream opens a file directly.
     """
     apply_custom_css()
 
@@ -1027,14 +1084,13 @@ def render() -> None:
             )
         if enriched_df is None:
             return  # st.error already raised inside _process_shipment_data
-        # Cache both the DataFrame and the filter-invariant duration together
-        # so neither needs recomputing on subsequent filter interactions.
-        st.session_state["_htst_enriched_df"]   = enriched_df
-        st.session_state["_htst_duration_days"] = _compute_duration(enriched_df)
-        st.session_state["_htst_file_sig"]      = file_sig
+        # Cache the enriched DataFrame keyed by the file-set signature.
+        # duration_days is NOT cached here; it comes from the Order Date range
+        # slicer in _render_filters and updates on every widget interaction.
+        st.session_state["_htst_enriched_df"] = enriched_df
+        st.session_state["_htst_file_sig"]    = file_sig
 
-    enriched_df   = st.session_state.get("_htst_enriched_df")
-    duration_days = st.session_state.get("_htst_duration_days", 1)
+    enriched_df = st.session_state.get("_htst_enriched_df")
 
     if enriched_df is None:
         # Defensive guard: cache entry missing (e.g. session was reset).
@@ -1076,7 +1132,9 @@ def render() -> None:
     st.markdown("---")
 
     # ── Filters (drive both downstream sections) ──────────────────────────────
-    filtered_df = _render_filters(enriched_df)
+    # _render_filters returns the date-filtered + customer/ship-to filtered df
+    # together with duration_days derived from the selected date range.
+    filtered_df, duration_days = _render_filters(enriched_df)
     st.markdown("---")
 
     # ── Customer-Site Details ─────────────────────────────────────────────────

@@ -24,7 +24,9 @@ Design notes
   _PREVIEW_ROWS rows go through st.dataframe().  Download buttons stream via
   HTTP (not the WebSocket), so they work for any dataset size on Streamlit Cloud.
 * Duration is computed once from the unfiltered enriched dataset so it remains
-  stable regardless of filter state.
+  stable regardless of filter state.  Both the enriched DataFrame and duration
+  are cached in st.session_state (keyed by a file-set signature) so the
+  expensive enrichment pipeline does not re-run on every widget interaction.
 * Pallet classification uses two thresholds defined in section 1:
     _PALLET_FULL_ROW_MIN : per-row — Pallet% >= threshold → "Full".
     _PALLET_FULL_AGG_MIN : summary — Full Pallet% > threshold → "Full".
@@ -540,10 +542,16 @@ def _compute_duration(df: pd.DataFrame, date_col: str = "Order Date") -> int:
 
     Uses the full (unfiltered) enriched DataFrame so Duration is filter-invariant.
     Falls back to 1 on parse failure to prevent division-by-zero downstream.
+
+    No explicit format is specified so pandas' inference engine handles the full
+    range of date representations that appear in HTST Shipment Reports
+    (e.g. "15-Apr-2025", "04/15/2025", "2025-04-15").  The previous
+    format="%d-%b" matched only day+month with no year, causing every
+    year-qualified value to coerce to NaT → all-empty Series → return 1.
     """
     if date_col not in df.columns:
         return 1
-    dates = pd.to_datetime(df[date_col], format="%d-%b", errors="coerce").dropna()
+    dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
     if dates.empty or dates.max() == dates.min():
         return 1
     return int((dates.max() - dates.min()).days)
@@ -948,14 +956,15 @@ def _render_output_section(filtered_df: pd.DataFrame) -> None:
 def render() -> None:
     """Render the HTST Shipment Monitor page.
 
-    Flow: upload → validate → process → load optional lookups →
+    Flow: upload → validate → process (cached) → load optional lookups →
           filter → Customer-Site Details → Enriched Report.
 
     Business logic is fully delegated to section-specific functions.
-    Duration is computed before filtering so it is filter-invariant.
-    Optional lookup DataFrames (pallet_fee_df, sell_to_df, custom_label_df)
-    are loaded here from uploaded file objects and passed as arguments — no
-    function downstream opens a file directly.
+    The enrichment pipeline and duration are cached in st.session_state so
+    they only re-run when the uploaded file set changes, not on every widget
+    interaction.  Optional lookup DataFrames (pallet_fee_df, sell_to_df,
+    custom_label_df) are loaded here from uploaded file objects and passed as
+    arguments — no function downstream opens a file directly.
     """
     apply_custom_css()
 
@@ -985,21 +994,52 @@ def render() -> None:
         st.info("👆 Still waiting for: **" + "**, **".join(required_missing) + "**")
         return
 
-    # ── Process main enrichment pipeline ──────────────────────────────────────
-    with st.spinner("Processing — enriching shipment data…"):
-        enriched_df = _process_shipment_data(
-            shipment_file=detected["shipment"],
-            plant_tracker_file=detected["plant_tracker"],
-            mileage_tracker_file=detected["mileage_tracker"],
-            demantra_file=detected["demantra"],
-            pricing_tracker_file=detected["pricing_tracker"],
-        )
+    # ── Process main enrichment pipeline (session-state cached) ───────────────
+    # _process_shipment_data reads and joins all required CSVs — an expensive
+    # operation on a 400 K-row, 200 MB+ file.  Streamlit re-executes render()
+    # on every widget interaction (including filter changes), so without caching
+    # this pipeline would re-run on every click, causing timeouts / memory
+    # pressure on Streamlit Cloud and exhausting UploadedFile cursors.
+    #
+    # Strategy: compute a lightweight MD5 signature from each required file's
+    # name and byte-size.  If the signature matches what is stored in
+    # session_state the enriched DataFrame and duration are read from cache;
+    # otherwise the pipeline runs and the results are stored.  hashlib is
+    # already imported (used by _widget_key).
+    _REQUIRED_KEYS = [
+        "shipment", "plant_tracker", "mileage_tracker", "demantra", "pricing_tracker"
+    ]
+    file_sig = hashlib.md5(
+        "".join(
+            f"{detected[k].name}:{detected[k].size}" for k in _REQUIRED_KEYS
+        ).encode()
+    ).hexdigest()
+
+    if st.session_state.get("_htst_file_sig") != file_sig:
+        # File set changed — re-run the enrichment pipeline.
+        with st.spinner("Processing — enriching shipment data…"):
+            enriched_df = _process_shipment_data(
+                shipment_file=detected["shipment"],
+                plant_tracker_file=detected["plant_tracker"],
+                mileage_tracker_file=detected["mileage_tracker"],
+                demantra_file=detected["demantra"],
+                pricing_tracker_file=detected["pricing_tracker"],
+            )
+        if enriched_df is None:
+            return  # st.error already raised inside _process_shipment_data
+        # Cache both the DataFrame and the filter-invariant duration together
+        # so neither needs recomputing on subsequent filter interactions.
+        st.session_state["_htst_enriched_df"]   = enriched_df
+        st.session_state["_htst_duration_days"] = _compute_duration(enriched_df)
+        st.session_state["_htst_file_sig"]      = file_sig
+
+    enriched_df   = st.session_state.get("_htst_enriched_df")
+    duration_days = st.session_state.get("_htst_duration_days", 1)
 
     if enriched_df is None:
-        return  # st.error already raised inside _process_shipment_data
-
-    # Duration computed before any filtering so it is filter-invariant.
-    duration_days = _compute_duration(enriched_df)
+        # Defensive guard: cache entry missing (e.g. session was reset).
+        st.error("Processed data unavailable — please re-upload your files.")
+        return
 
     # ── Load optional lookup tables from uploaded files ───────────────────────
     # Both tables are loaded here so _build_customer_site_summary stays a pure

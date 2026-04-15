@@ -1,5 +1,5 @@
 """
-HTST Shipment Monitor page view.
+HTST Activity Monitor page view.
 
 Sections
 --------
@@ -1008,7 +1008,7 @@ def _render_output_section(filtered_df: pd.DataFrame) -> None:
 # ── 7. Entry point ────────────────────────────────────────────────────────────
 
 def render() -> None:
-    """Render the HTST Shipment Monitor page.
+    """Render the HTST Activity Monitor page.
 
     Flow: upload → validate → process (cached) → load optional lookups →
           filter (date + customer + ship-to) → Customer-Site Details →
@@ -1026,7 +1026,7 @@ def render() -> None:
     apply_custom_css()
 
     st.markdown(
-        '<h1 class="main-header">HTST Shipment Monitor</h1>',
+        '<h1 class="main-header">HTST Activity Monitor</h1>',
         unsafe_allow_html=True,
     )
 

@@ -19,9 +19,11 @@ def render():
     - **Bid Asset Intelligence**: Analyze customer bid opportunities — evaluate volume,
       pricing method, delivery charges, pallet economics, and custom-label fees to
       support competitive and profitable bid decisions.
-    - **HTST Shipment Monitor**: Upload actual HTST shipment data to refresh
+    - **HTST Activity Monitor**: Upload actual HTST shipment data to refresh
       site-level activity metrics, delivery charges, pallet status, and volume
       bracket classifications across your customer-site portfolio.
+    - **Customer Data Barometer**: Upload consolidated Walmart HTST monthly files to
+      review how Walmart tracks fuel and resin costs for the fresh business.
     - **New Price Quote**: Generate rapid, on-demand price quotes for HTST products.
     - **Market Barometer**: Monitor market trends and pricing indicators.
     - **Pricing Execution Automation**: Generate VBCS files for Oracle upload.
@@ -38,7 +40,8 @@ def render():
         st.markdown("""
         #### 🚀 Quick Start
         - Evaluating a customer bid? Go to **Bid Asset Intelligence**
-        - Refreshing shipment activity & charges? Use **HTST Shipment Monitor**
+        - Refreshing shipment activity & charges? Use **HTST Activity Monitor**
+        - Reviewing Walmart fuel & resin cost tracking? Use **Customer Data Barometer**
         - Need a quick price quote? Go to **New Price Quote**
         - Need to generate VBCS files? Use **Pricing Execution Automation**
         - Want to analyze market trends? Check **Market Barometer**

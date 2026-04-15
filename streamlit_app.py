@@ -26,7 +26,8 @@ PAGES_DIR = Path(__file__).parent / "pages"
 VIEW_NAME_MAPPING = {
     "home_view": "Home",
     "bid_asset_intelligence_view": "Bid Asset Intelligence",
-    "htst_shipment_monitor_view": "HTST Shipment Monitor",
+    "htst_activity_monitor_view": "HTST Activity Monitor",
+    "customer_data_barometer_view": "Customer Data Barometer",
     "new_price_quote_view": "New Price Quote",
     "market_barometer_view": "Market Barometer",
     "pricing_execution_automation_view": "Pricing Execution Automation",

@@ -832,12 +832,6 @@ def _render_chart_section(
             "Fuel Change from Base: Month-over-Month ($/Gal)",
             "Fuel Change ($/Gal)",
         )
-        if fuel_gal is not None:
-            st.metric(
-                "Fuel Change $/Gal (Last vs First)",
-                f"{fuel_gal:+.5f}",
-                help="Absolute change in Fuel Change from Base $/Gal from first to last month.",
-            )
         # Summary table: all scenarios, same time range as the filtered view.
         fuel_tbl = _build_scenario_change_table(enriched_df, filtered_df, _COL_FUEL_GAL)
         if not fuel_tbl.empty:
@@ -852,12 +846,6 @@ def _render_chart_section(
             "Resin Change from Base: Month-over-Month ($/Gal)",
             "Resin Change ($/Gal)",
         )
-        if resin_gal is not None:
-            st.metric(
-                "Resin Change $/Gal (Last vs First)",
-                f"{resin_gal:+.5f}",
-                help="Absolute change in Resin Change from Base $/Gal from first to last month.",
-            )
         # Summary table: all scenarios, same time range as the filtered view.
         resin_tbl = _build_scenario_change_table(enriched_df, filtered_df, _COL_RESIN_GAL)
         if not resin_tbl.empty:

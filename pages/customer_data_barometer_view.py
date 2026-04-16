@@ -833,9 +833,9 @@ def _render_chart_section(
             "Fuel Change ($/Gal)",
         )
         # Summary table: all scenarios, same time range as the filtered view.
-        fuel_tbl = _build_scenario_change_table(enriched_df, filtered_df, _COL_FUEL_GAL)
+        fuel_tbl = _build_scenario_change_table(filtered_df, filtered_df, _COL_FUEL_GAL)
         if not fuel_tbl.empty:
-            st.caption("All-scenario summary — Fuel Change $/Gal:")
+            st.caption("Fuel Change $/Gal — filtered by selected scenarios & time range:")
             st.dataframe(fuel_tbl, use_container_width=True, hide_index=True)
         st.plotly_chart(fig_fuel_wf, use_container_width=True)
 
@@ -847,9 +847,9 @@ def _render_chart_section(
             "Resin Change ($/Gal)",
         )
         # Summary table: all scenarios, same time range as the filtered view.
-        resin_tbl = _build_scenario_change_table(enriched_df, filtered_df, _COL_RESIN_GAL)
+        resin_tbl = _build_scenario_change_table(filtered_df, filtered_df, _COL_RESIN_GAL)
         if not resin_tbl.empty:
-            st.caption("All-scenario summary — Resin Change $/Gal:")
+            st.caption("Resin Change $/Gal — filtered by selected scenarios & time range:")
             st.dataframe(resin_tbl, use_container_width=True, hide_index=True)
         st.plotly_chart(fig_resin_wf, use_container_width=True)
 

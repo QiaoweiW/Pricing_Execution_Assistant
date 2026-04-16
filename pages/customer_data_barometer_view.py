@@ -711,6 +711,9 @@ def _render_controls(enriched_df: pd.DataFrame) -> pd.DataFrame:
                 "The per-scenario summary tables always show all scenarios."
             ),
         )
+        st.markdown(
+            "**Select a single scenario to view the waterfall charts.**"
+        )
 
     if not sel_scenarios:
         return enriched_df.iloc[0:0]
@@ -822,7 +825,18 @@ def _render_chart_section(
                 )
         st.plotly_chart(fig_resin, use_container_width=True)
 
-    # ── Row 2: waterfall charts ───────────────────────────────────────────────
+    # ── Row 2: waterfall charts (single-scenario only) ───────────────────────
+    single_scenario = (
+        "Scenario" in filtered_df.columns
+        and filtered_df["Scenario"].nunique() == 1
+    )
+    if not single_scenario:
+        st.info(
+            "💡 **Select exactly one scenario** from the filter above to display "
+            "the waterfall charts."
+        )
+        return
+
     col3, col4 = st.columns(2)
 
     with col3:

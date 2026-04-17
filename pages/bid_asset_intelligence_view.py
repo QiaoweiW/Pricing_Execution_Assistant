@@ -865,7 +865,58 @@ def _render_detail_table(filtered_df: pd.DataFrame) -> None:
     )
 
 
-# ── 7. Entry point ────────────────────────────────────────────────────────────
+# ── 7. Pricing Implementation Tracker ─────────────────────────────────────────
+
+_TRACKER_SOURCE_COLS = [
+    "Bid Description",
+    "Referenced Item",
+    "Referenced Item Description",
+    "Month",
+    "Variable vs Fixed Pricing",
+    "Brand",
+    "Price Implement Time",
+]
+
+_TRACKER_DISPLAY_COLS = {
+    "Bid Description": "Bid Description",
+    "Referenced Item": "Referenced Item",
+    "Referenced Item Description": "Referenced Item Description",
+    "Month": "Month",
+    "Variable vs Fixed Pricing": "Variable vs Fixed Pricing",
+    "Brand": "Brand",
+    "Price Implement Time": "Price Implementation Time",
+}
+
+
+def _render_pricing_tracker(raw_df: pd.DataFrame) -> None:
+    """Render the Pricing Implementation Tracker summary table."""
+    st.markdown("### 🗂️ Pricing Implementation Tracker")
+    st.caption("Accepted bids only — sourced from the full uploaded CSV (not filtered by search criteria above).")
+
+    present_cols = [c for c in _TRACKER_SOURCE_COLS if c in raw_df.columns]
+    missing_cols = [c for c in _TRACKER_SOURCE_COLS if c not in raw_df.columns]
+
+    if missing_cols:
+        st.warning(
+            f"The following expected columns were not found in the CSV and will be omitted: "
+            f"{', '.join(missing_cols)}"
+        )
+
+    if "Status" not in raw_df.columns:
+        st.info("No **Status** column found — cannot filter for accepted rows.")
+        return
+
+    tracker_df = raw_df[raw_df["Status"].astype(str).str.strip().str.lower() == "accept"][present_cols].copy()
+
+    if tracker_df.empty:
+        st.info("No rows with Status = \"Accept\" found in the uploaded CSV.")
+        return
+
+    tracker_df = tracker_df.rename(columns=_TRACKER_DISPLAY_COLS)
+    st.dataframe(tracker_df, use_container_width=True, hide_index=True)
+
+
+# ── 8. Entry point ────────────────────────────────────────────────────────────
 
 def render() -> None:
     """Render the Bid Asset Intelligence page.
@@ -927,3 +978,5 @@ and sharpen future bid strategies. Key resources include:
     _render_rfp_summary(result)
     st.markdown("---")
     _render_detail_table(result.df)
+    st.markdown("---")
+    _render_pricing_tracker(raw_df)

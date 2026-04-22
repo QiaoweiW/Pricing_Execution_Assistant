@@ -4,6 +4,7 @@ HTST Activity Monitor page view.
 Sections
 --------
 1. Types & constants   (_FilePattern, _FILE_PATTERNS, _DROP_COLS, _PREVIEW_ROWS,
+                        _HTST_SHIPMENT_MONITOR_SHAREPOINT_URL,
                         _PALLET_FULL_ROW_MIN, _PALLET_FULL_AGG_MIN)
 2. I/O helpers         (_detect_files, _to_csv_bytes, _widget_key)
 3. DataFrame utilities (_insert_col_after, _drop_blank_columns)
@@ -84,6 +85,15 @@ _DROP_COLS = ["Reason Code", "Include for Fill Rate Calculations", "Past Due by 
 
 # Maximum rows shown in the browser preview to avoid WebSocket message-size errors.
 _PREVIEW_ROWS = 500
+
+# SharePoint library where HTST Shipment Monitor CSVs are maintained (linked from
+# the upload caption — no local path assumptions in the UI).
+_HTST_SHIPMENT_MONITOR_SHAREPOINT_URL: str = (
+    "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
+    "/Forms/AllItems.aspx?id=%2Fsites%2FBrandedPricing%2FShared%20Documents"
+    "%2FGeneral%2F02%20Resources%2FStreamlit%20Folders%20%28DO%20NOT%20DELETE%29"
+    "%2FHTST%20Activity%20Model%20Monitor&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
+)
 
 # Pallet classification thresholds — single source of truth for both views.
 # _PALLET_FULL_ROW_MIN : per-row  — Pallet% >= threshold → row "Full".
@@ -787,17 +797,11 @@ def _render_upload_section() -> dict[str, object]:
     The user drops all CSVs from the HTST Shipment Monitor folder in one action;
     each file is identified automatically by filename keywords.
     """
-    _SHAREPOINT_URL = (
-        "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
-        "/Forms/AllItems.aspx?id=%2Fsites%2FBrandedPricing%2FShared%20Documents"
-        "%2FGeneral%2F02%20Resources%2FHTST%20Activity%20Model%20Monitor"
-        "&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
-    )
     st.markdown("### 📤 Upload Data Files")
     st.caption(
         "Select or drag-and-drop all CSVs from your HTST Shipment Monitor folder. "
         "Files are identified automatically by their filename. "
-        f"[📁 Upload files in this folder]({_SHAREPOINT_URL})"
+        f"[📁 Upload files in this folder]({_HTST_SHIPMENT_MONITOR_SHAREPOINT_URL})"
     )
     uploaded_files = st.file_uploader(
         "Select all HTST Shipment Monitor CSV files",

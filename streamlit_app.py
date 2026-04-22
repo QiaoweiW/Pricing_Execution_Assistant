@@ -22,19 +22,24 @@ from utils.ui_helpers import apply_custom_css, render_footer
 # Dynamic view discovery - only load views that exist in pages directory
 PAGES_DIR = Path(__file__).parent / "pages"
 
-# Mapping of view file names to display names
+# Mapping of view file names to display names.
+# Only views listed here are eligible for sidebar navigation.
 VIEW_NAME_MAPPING = {
-    "home_view": "Home",
-    "bid_asset_intelligence_view": "Bid Asset Intelligence",
-    "htst_activity_monitor_view": "HTST Activity Monitor",
-    "customer_data_barometer_view": "Customer Data Barometer",
-    "new_price_quote_view": "New Price Quote",
-    "market_barometer_view": "Market Barometer",
-    "pricing_execution_automation_view": "Pricing Execution Automation",
-    "pricing_granularity_view": "Pricing Granularity",
-    "unit_economics_view": "Unit Economics",
-    "demand_view": "Demand Insight"
+    "home_view":                          "Home",
+    "bid_asset_intelligence_view":        "Bid Asset Intelligence",
+    "htst_activity_monitor_view":         "HTST Activity Monitor",
+    "new_price_quote_view":               "New Price Quote",
+    "market_barometer_view":              "Market Barometer",
+    "pricing_execution_automation_view":  "Pricing Execution Automation",
+    "pricing_granularity_view":           "Pricing Granularity",
+    "unit_economics_view":                "Unit Economics",
+    "demand_view":                        "Demand Insight",
 }
+
+# Views temporarily hidden from the sidebar without being deleted.
+# Add a view's file-stem here to suppress its navigation button while keeping
+# the module available for import by other pages.
+HIDDEN_VIEWS: set = set()
 
 # Discover available views dynamically
 AVAILABLE_VIEWS = {}
@@ -42,8 +47,8 @@ PAGE_ROUTER = {}
 
 for view_file in PAGES_DIR.glob("*_view.py"):
     view_name = view_file.stem  # e.g., "home_view"
-    
-    if view_name in VIEW_NAME_MAPPING:
+
+    if view_name in VIEW_NAME_MAPPING and view_name not in HIDDEN_VIEWS:
         try:
             # Dynamically import the view module
             module = importlib.import_module(f"pages.{view_name}")

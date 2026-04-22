@@ -92,8 +92,10 @@ _OVERVIEW_TABLE_COLS: list[tuple[str, str]] = [
 _SHAREPOINT_URL = (
     "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
     "/Forms/AllItems.aspx?id=%2Fsites%2FBrandedPricing%2FShared%20Documents"
-    "%2FGeneral%2F02%20Resources%2FRFP%20Management"
-    "&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
+    "%2FGeneral%2F02%20Resources%2FStreamlit%20Folders%20%28DO%20NOT%20DELETE%29"
+    "%2FRFP%20Management%2FUpload&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
+    "&newTargetListUrl=%2Fsites%2FBrandedPricing%2FShared%20Documents"
+    "&viewpath=%2Fsites%2FBrandedPricing%2FShared%20Documents%2FForms%2FAllItems%2Easpx"
 )
 
 # ── 2. Formatting helpers ─────────────────────────────────────────────────────

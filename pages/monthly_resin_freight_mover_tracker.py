@@ -18,10 +18,10 @@ Sections
                         _enrich_resin_mover_fg_with_htst,
                         _build_example_prices_impact_table,
                         _compute_all_outputs)
-7. UI fragments        (_render_upload_panel, _render_chart,
-                        _render_freight_outlook, _render_table_and_refresh,
-                        _render_results, _clear_upload_state,
-                        _clear_freight_state)
+7. UI fragments        (_render_monthly_sop_and_upload_intro, _render_upload_panel,
+                        _render_chart, _render_freight_outlook,
+                        _render_table_and_refresh, _render_results,
+                        _clear_upload_state, _clear_freight_state)
 8. Public API          (render_monthly_resin_freight_mover_tracker)
 
 Design notes
@@ -37,6 +37,11 @@ Robustness
     NOT need to be known in advance, so the user can drop any vintage of
     these files (e.g. "..._20260422.csv" today, "..._20260521.csv" next
     month) and the pipeline keeps working.
+  * **Streamlit Cloud / fragment reruns:** ``st.rerun(scope="fragment")`` can
+    raise ``StreamlitAPIException`` when no fragment id is active (e.g. this
+    widget tree lives inside a parent ``st.expander``). This module avoids
+    fragment-scoped reruns; it uses same-run fall-through or full
+    ``st.rerun()`` where a hard reset is required.
   * "Current month" is derived from ``date.today()`` at render time, so the
     same code automatically advances month-over-month without edits.
   * HTST annualized gallons CSV is matched by filename keyword and left-joined
@@ -978,8 +983,8 @@ def _compute_all_outputs(
 
 # ── 7. UI fragments ───────────────────────────────────────────────────────────
 
-def _render_upload_panel() -> list:
-    """Render SharePoint guidance, monthly SOP, and the multi-file uploader."""
+def _render_monthly_sop_and_upload_intro() -> None:
+    """SharePoint guidance + Monthly SOP — always visible for this fragment."""
     st.markdown(
         "Upload all files in this SharePoint Folder "
         f"([LINK]({_MONTHLY_MOVERS_SHAREPOINT_URL}))."
@@ -988,18 +993,22 @@ def _render_upload_panel() -> list:
         """
 **Monthly SOP**
 
-1. Maintain and refresh source files (**DO NOT change file names**):
-   - `Pkg_Index` (Procurement)
-   - `example_prices` (RGM)
-   - `Movers_Tracker` (RGM)
-   - `Scrape_Tracker` (RGM, as needed)
-   - `htst_annualized_gallons` (RGM, annually)
-2. Use the **Mover Tracker** to align movers with commercial leaders; click **Refresh** to see impact.
-3. Download **`resin_mover_fg`** in the **Impact** section for Pricing Execution.
+- Maintain and refresh source files (**DO NOT change file names**):
+  - `Pkg_Index` (Procurement)
+  - `example_prices` (RGM)
+  - `Movers_Tracker` (RGM), `Resin_Cost_Tracker` (RGM, make sure last month data is appended)
+  - `Scrape_Tracker` (RGM, as needed)
+  - `htst_annualized_gallons` (RGM, annually)
+- Use the Mover Tracker to align movers with commercial leaders; click **Refresh** to see impact.
+- Download `resin_mover_fg` in the **Impact** section for Pricing Execution.
 
 _Files are still matched automatically by filename keyword after upload._
         """.strip()
     )
+
+
+def _render_upload_panel() -> list:
+    """Render the multi-file uploader (intro + SOP: `_render_monthly_sop_and_upload_intro`)."""
     return st.file_uploader(
         "Select Monthly Movers CSV files",
         type=["csv"],
@@ -1128,8 +1137,8 @@ def _render_freight_outlook() -> None:
     State contract
     --------------
     * **No file cached** → section header + single ``st.file_uploader``.
-      Once the user picks a file, bytes are cached in session_state and the
-      fragment reruns so the uploader chrome disappears.
+      Once the user picks a file, bytes are cached in session_state; the
+      preview renders in the same run (no fragment-scoped rerun).
     * **File cached** → section header + rendered preview (image via
       ``st.image``, PDF via a base64 iframe) + a subtle "Replace file" button
       so the user can swap the outlook without reloading the page.
@@ -1165,10 +1174,15 @@ def _render_freight_outlook() -> None:
         st.session_state[_SS_FREIGHT_MIME]     = getattr(uploaded, "type", None) \
                                                   or _guess_mime(uploaded.name)
         st.session_state[_SS_FREIGHT_FILENAME] = uploaded.name
-        # Rerun so the uploader disappears and the preview takes its place.
-        st.rerun(scope="fragment")
+        # No fragment-scoped rerun here (see module note on Streamlit Cloud).
+        # Re-read bytes — the local ``cached_bytes`` from the top of the function
+        # is still stale in the branch where we just wrote session_state.
+        cached_bytes = st.session_state.get(_SS_FREIGHT_BYTES)
 
     # ── Preview state ────────────────────────────────────────────────────────
+    if not cached_bytes:
+        return
+
     mime     = st.session_state.get(_SS_FREIGHT_MIME, "application/octet-stream")
     filename = st.session_state.get(_SS_FREIGHT_FILENAME, "uploaded-file")
 
@@ -1183,7 +1197,9 @@ def _render_freight_outlook() -> None:
             help="Remove the current file and show the upload panel again.",
         ):
             _clear_freight_state()
-            st.rerun(scope="fragment")
+            # Full rerun: reliable on all hosts; fragment-scoped rerun is brittle
+            # when the fragment stack is unavailable (see freight upload path).
+            st.rerun()
 
     if mime == "application/pdf":
         # Browsers can render PDFs directly from a base64 data URL inside an
@@ -1381,15 +1397,17 @@ def render_monthly_resin_freight_mover_tracker() -> None:
     -------------
     * **Upload state** (no cached uploads)
         → Render the file uploader. On successful upload, cache the parsed
-          files in session_state and rerun the fragment.
+          files in session_state and continue in the same run (no
+          ``st.rerun(scope="fragment")`` — see Robustness note in module doc).
     * **Processed state** (uploads cached)
-        → Uploader and the detected-files summary are hidden. Only a compact
-          "Change files" button is shown so the user can reset if needed.
-          The chart, editable table, Refresh button, and results render below.
+        → Uploader is hidden. A "Change files" button clears state and calls
+          full ``st.rerun()``. Chart, Mover Tracker, Refresh, and Impact follow.
     """
     # Always recompute "current month" at render time so the section advances
     # automatically month-over-month without code changes.
     current_month = pd.Timestamp(date.today().replace(day=1))
+
+    _render_monthly_sop_and_upload_intro()
 
     uploads: dict[str, _Uploaded] | None = st.session_state.get(f"{_SS_PREFIX}_uploads")
 
@@ -1404,9 +1422,9 @@ def render_monthly_resin_freight_mover_tracker() -> None:
         st.session_state[f"{_SS_PREFIX}_sig"] = sig
         # Drop any stale outputs (defensive — the key should already be absent).
         st.session_state.pop(f"{_SS_PREFIX}_outputs", None)
-        # Rerun so the uploader and its "Browse files" chrome disappear on the
-        # next paint, replaced by the compact processed-state header below.
-        st.rerun(scope="fragment")
+        # Same-run continuation: ``st.rerun(scope="fragment")`` raises on
+        # Streamlit Cloud when the runtime has no active fragment id (common
+        # when this fragment is nested under ``st.expander`` in the parent page).
 
     # ── Processed state ───────────────────────────────────────────────────────
     # Uploader and detected-files summary are intentionally NOT rendered here
@@ -1418,7 +1436,7 @@ def render_monthly_resin_freight_mover_tracker() -> None:
         help="Clear the currently-loaded files and return to the upload panel.",
     ):
         _clear_upload_state()
-        st.rerun(scope="fragment")
+        st.rerun()
 
     st.markdown("---")
     # Packaging Index Outlook and Freight Index Outlook are laid out in two

@@ -12,7 +12,10 @@ Sections
                         _file_sig, REQUIRED_ROLES)
 4. Chart builder       (_build_packaging_index_chart)
 5. Editable table      (_visible_movers_window, _render_editable_movers)
-6. Calculations        (_build_resincalculate,
+6. Calculations        (HTST helpers: _filter_htst_included,
+                        _resolve_htst_column, _build_htst_gallons_lookup,
+                        _build_freight_impact_detail;
+                        Pipeline: _build_resincalculate,
                         _build_updated_resin_cost_tracker,
                         _build_resin_mover_fg,
                         _enrich_resin_mover_fg_with_htst,
@@ -46,6 +49,8 @@ Robustness
     same code automatically advances month-over-month without edits.
   * HTST annualized gallons CSV is matched by filename keyword and left-joined
     onto ``resin_mover_fg`` for Impact volume columns and freight totals.
+    The HTST merge is filtered to rows where ``Include/N == "Y"`` so excluded
+    customers (Costco, Walmart, USF) never contribute to either impact metric.
   * Dollar and percent text cells (e.g. "$0.915 ", "1%") are parsed with
     dedicated helpers that strip whitespace / symbols before casting.
 
@@ -548,45 +553,94 @@ def _freight_mover_next_month(
     return _parse_money(val)
 
 
+# Sentinel value meaning "row is in scope for the monthly impact calculations"
+# in the HTST ``Include/N`` flag column. Comparisons are case-insensitive and
+# whitespace-trimmed — see ``_filter_htst_included``.
+_INCLUDE_FLAG_YES: str = "Y"
+
+
+def _norm_header(name: str) -> str:
+    """Return a lower-case, alphanumeric-only version of a column header.
+
+    Used by ``_resolve_htst_column`` so small header variations ("SHIPTONAME"
+    vs "Ship-To Name", "PRODUCTDESC" vs "Product Desc") all resolve to the
+    same logical column without maintaining an exhaustive alias list.
+    """
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _resolve_htst_column(df: pd.DataFrame, *needles: str) -> Optional[str]:
+    """Return the first column whose normalised header contains *all* ``needles``.
+
+    The needles are themselves normalised, so callers can pass natural-language
+    hints like ``"product"``, ``"group"`` without worrying about spacing or case.
+    Returns ``None`` when no column matches — callers decide whether that is a
+    hard error or a soft fallback.
+    """
+    target = [_norm_header(n) for n in needles]
+    for c in df.columns:
+        cn = _norm_header(c)
+        if all(n in cn for n in target):
+            return c
+    return None
+
+
+def _resolve_include_flag_column(df: pd.DataFrame) -> Optional[str]:
+    """Locate the HTST Include/N flag column.
+
+    Tries the canonical "Include/N" header first (exact, whitespace-insensitive)
+    and falls back to any column starting with "include" so mild header drift
+    (``"Include"`` or ``"Include (Y/N)"``) still works.
+    """
+    for c in df.columns:
+        if str(c).strip().lower().replace(" ", "") in {"include/n", "includen"}:
+            return c
+    for c in df.columns:
+        if str(c).strip().lower().startswith("include"):
+            return c
+    return None
+
+
+def _filter_htst_included(htst_df: pd.DataFrame) -> pd.DataFrame:
+    """Return HTST rows where the Include/N flag equals ``"Y"``.
+
+    Column whitespace is stripped first so downstream column resolution always
+    sees clean headers. When the flag column cannot be located the unfiltered
+    (but stripped) DataFrame is returned — this keeps legacy files without the
+    Include/N column working while newer files gain the Costco/Walmart/USF
+    exclusion automatically.
+    """
+    htst = _strip_df_columns(htst_df)
+    flag_col = _resolve_include_flag_column(htst)
+    if flag_col is None:
+        return htst
+    mask = (
+        htst[flag_col].astype(str).str.strip().str.upper()
+        == _INCLUDE_FLAG_YES
+    )
+    return htst.loc[mask].copy()
+
+
 def _resolve_htst_columns(htst_df: pd.DataFrame) -> tuple[Optional[str], Optional[str], Optional[str]]:
     """Resolve PRODUCTDESC, Monthly Gallons, and Pricing Method column names.
 
-    Headers in the wild may carry inconsistent spacing / casing; we match
-    case-insensitively on normalised names.
+    Thin convenience wrapper around ``_resolve_htst_column`` that returns the
+    three columns most HTST consumers need in a single call.
     """
-    cols = list(htst_df.columns)
-    prod_c = next(
-        (c for c in cols if c.lower().replace(" ", "") == "productdesc"),
-        None,
+    return (
+        _resolve_htst_column(htst_df, "productdesc"),
+        _resolve_htst_column(htst_df, "monthly", "gallon"),
+        _resolve_htst_column(htst_df, "pricing", "method"),
     )
-    mg_c = next(
-        (c for c in cols if "monthly" in c.lower() and "gallon" in c.lower()),
-        None,
-    )
-    pm_c = next(
-        (c for c in cols if "pricing" in c.lower() and "method" in c.lower()),
-        None,
-    )
-    return prod_c, mg_c, pm_c
-
-
-def _htst_total_monthly_gallons_pricing_one(htst_df: pd.DataFrame) -> Optional[float]:
-    """Sum Monthly Gallons across rows where Pricing Method == 1."""
-    htst = _strip_df_columns(htst_df)
-    _, mg_c, pm_c = _resolve_htst_columns(htst)
-    if mg_c is None or pm_c is None:
-        return None
-    pm = pd.to_numeric(htst[pm_c], errors="coerce")
-    mg = htst[mg_c].map(_parse_gallons_cell)
-    total = mg.loc[pm == 1].sum(skipna=True)
-    if pd.isna(total):
-        return 0.0
-    return float(total)
 
 
 def _build_htst_gallons_lookup(htst_df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """One row per normalised product description with summed monthly gallons."""
-    htst = _strip_df_columns(htst_df)
+    """One row per normalised product description with summed monthly gallons.
+
+    Applies the Include/N == Y filter before aggregating so excluded customers
+    (Costco / Walmart / USF) never contribute volume to ``resin_mover_fg``.
+    """
+    htst = _filter_htst_included(htst_df)
     prod_c, mg_c, _pm = _resolve_htst_columns(htst)
     if prod_c is None or mg_c is None:
         return None
@@ -599,6 +653,97 @@ def _build_htst_gallons_lookup(htst_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     )
     grouped["_match_key"] = grouped[prod_c].map(_normalize_desc)
     return grouped[["_match_key", "Est. Monthly Gallons"]]
+
+
+# Canonical output column names for the freight-impact detail table. Kept as
+# module-level constants so the UI and the builder stay in lockstep — reorder
+# or rename in one place.
+FREIGHT_IMPACT_DETAIL_COLUMNS: tuple[str, ...] = (
+    "Customer",
+    "SHIPTONAME",
+    "PRODUCTDESC",
+    "Product Group",
+    "Annualized Gallons",
+    "Monthly Gallons",
+    "Pricing Method",
+    "Monthly Freight Mover",
+)
+
+
+def _build_freight_impact_detail(
+    htst_df: pd.DataFrame,
+    freight_per_lb: Optional[float],
+) -> tuple[pd.DataFrame, Optional[str]]:
+    """Build the per-row table that backs the Est. Monthly Freight Impact metric.
+
+    Columns (see ``FREIGHT_IMPACT_DETAIL_COLUMNS``):
+      Customer | SHIPTONAME | PRODUCTDESC | Product Group |
+      Annualized Gallons | Monthly Gallons | Pricing Method |
+      Monthly Freight Mover
+
+    The first seven columns are sourced verbatim from the HTST annualized
+    gallons file, restricted to rows where ``Include/N == "Y"``. The final
+    column is computed as::
+
+        Monthly Freight Mover
+            = Monthly Gallons × Pricing Method × 8.6 × freight_per_lb
+
+    Returns ``(detail_df, warning_message)``. When the HTST file is missing
+    any required source column, ``detail_df`` is returned empty with the
+    shape intact and ``warning_message`` explains which columns were absent,
+    so the UI can surface a friendly warning without crashing the page.
+    """
+    empty = pd.DataFrame(columns=list(FREIGHT_IMPACT_DETAIL_COLUMNS))
+    htst = _filter_htst_included(htst_df)
+    if htst.empty:
+        return empty, None
+
+    # Resolve every source column up-front; report missing ones collectively so
+    # the user fixes the headers once rather than in a whack-a-mole loop.
+    resolved = {
+        "Customer":           _resolve_htst_column(htst, "customer"),
+        "SHIPTONAME":         _resolve_htst_column(htst, "shipto", "name"),
+        "PRODUCTDESC":        _resolve_htst_column(htst, "productdesc"),
+        "Product Group":      _resolve_htst_column(htst, "product", "group"),
+        "Annualized Gallons": _resolve_htst_column(htst, "annualized", "gallon"),
+        "Monthly Gallons":    _resolve_htst_column(htst, "monthly", "gallon"),
+        "Pricing Method":     _resolve_htst_column(htst, "pricing", "method"),
+    }
+    missing = [label for label, src in resolved.items() if src is None]
+    if missing:
+        return empty, (
+            "Could not resolve HTST column(s): " + ", ".join(missing) +
+            ". The Est. Monthly Freight Impact detail table will be empty."
+        )
+
+    # Numeric coercion for the three columns feeding the multiplication.
+    monthly_gal   = htst[resolved["Monthly Gallons"]].map(_parse_gallons_cell)
+    annual_gal    = htst[resolved["Annualized Gallons"]].map(_parse_gallons_cell)
+    pricing_meth  = pd.to_numeric(htst[resolved["Pricing Method"]], errors="coerce")
+
+    fm = float(freight_per_lb) if freight_per_lb is not None and not pd.isna(freight_per_lb) else None
+    if fm is None:
+        monthly_freight_mover = pd.Series([float("nan")] * len(htst), index=htst.index)
+    else:
+        monthly_freight_mover = (
+            monthly_gal.fillna(0.0)
+            * pricing_meth.fillna(0.0)
+            * 8.6
+            * fm
+        )
+
+    detail = pd.DataFrame({
+        "Customer":           htst[resolved["Customer"]].values,
+        "SHIPTONAME":         htst[resolved["SHIPTONAME"]].values,
+        "PRODUCTDESC":        htst[resolved["PRODUCTDESC"]].values,
+        "Product Group":      htst[resolved["Product Group"]].values,
+        "Annualized Gallons": annual_gal.round(2).values,
+        "Monthly Gallons":    monthly_gal.round(2).values,
+        "Pricing Method":     pricing_meth.values,
+        "Monthly Freight Mover": monthly_freight_mover.round(2).values,
+    })
+    # Preserve declared column order defensively even if pandas reorders.
+    return detail[list(FREIGHT_IMPACT_DETAIL_COLUMNS)], None
 
 
 def _enrich_resin_mover_fg_with_htst(
@@ -953,15 +1098,21 @@ def _compute_all_outputs(
     if ex_warn:
         st.warning(f"⚠️ {ex_warn}")
 
-    total_gal_pm1 = _htst_total_monthly_gallons_pricing_one(htst_df)
-    if total_gal_pm1 is None:
-        st.warning(
-            "⚠️ Could not compute total Monthly Gallons (Pricing Method = 1) — "
-            "check HTST column names."
-        )
+    # Freight-impact detail table (Include/N == Y) — drives both the download
+    # and the Est. Monthly Freight Impact metric (metric = Σ Monthly Freight
+    # Mover). Deriving the metric from the same table we expose to the user
+    # guarantees the number on screen always reconciles with the download.
+    freight_detail, fd_warn = _build_freight_impact_detail(htst_df, freight_per_lb)
+    if fd_warn:
+        st.warning(f"⚠️ {fd_warn}")
+
     est_monthly_freight_impact: Optional[float] = None
-    if freight_per_lb is not None and total_gal_pm1 is not None:
-        est_monthly_freight_impact = freight_per_lb * total_gal_pm1 / 8.6
+    if freight_per_lb is not None and not freight_detail.empty:
+        est_monthly_freight_impact = float(
+            pd.to_numeric(
+                freight_detail["Monthly Freight Mover"], errors="coerce",
+            ).sum(skipna=True)
+        )
 
     return {
         "resincalculate":  resincalculate,
@@ -970,13 +1121,14 @@ def _compute_all_outputs(
         "example_prices_impact": example_impact,
         "monthly_resin_impact_total": monthly_resin_impact_total,
         "est_monthly_freight_impact": est_monthly_freight_impact,
+        "freight_impact_detail": freight_detail,
         "_meta": pd.DataFrame([{
             "scrape_fraction":      scrape_fraction,
             "resin_cost_per_lb":    resin_lbs,
             "current_month":        current_month.strftime("%Y-%m-%d"),
             "next_month_of_editor": (current_month + pd.DateOffset(months=1)).strftime("%Y-%m-%d"),
             "freight_mover_next_mo_$lb": freight_per_lb,
-            "htst_monthly_gal_pm1_total": total_gal_pm1,
+            "freight_impact_row_count":  int(len(freight_detail)),
         }]),
     }
 
@@ -1276,15 +1428,23 @@ def _render_results() -> None:
     if not outputs:
         return
 
-    resin_mover_fg = outputs["resin_mover_fg"]
+    resin_mover_fg    = outputs["resin_mover_fg"]
     monthly_resin_total = outputs.get("monthly_resin_impact_total", 0.0)
     freight_impact    = outputs.get("est_monthly_freight_impact")
+    freight_detail: pd.DataFrame = outputs.get(
+        "freight_impact_detail", pd.DataFrame(columns=list(FREIGHT_IMPACT_DETAIL_COLUMNS)),
+    )
 
     st.markdown("---")
-    st.markdown("### Impact")
+    # Heading now flags the HTST Include/N filter so users immediately know
+    # the Costco/Walmart/USF volumes have been excluded from both metrics and
+    # the resin_mover_fg join.
+    st.markdown("### Impact (EXCLUDE COSTCO, WALMART, USF)")
     st.caption(
-        "Download the full per-product table (with HTST volumes and resin "
-        "impact columns). Summary metrics and example-price scenarios below."
+        "Rows with HTST `Include/N` = **N** (Costco, Walmart, USF) are "
+        "excluded. Download the per-product table (with HTST volumes and "
+        "resin impact columns); summary metrics and example-price scenarios "
+        "follow below."
     )
 
     if resin_mover_fg.empty:
@@ -1294,14 +1454,39 @@ def _render_results() -> None:
         )
         return
 
+    # Downloads are grouped side-by-side so the two artifacts that back the
+    # metrics below — resin_mover_fg (backs Monthly Resin Impact) and
+    # freight_mover_breakdown (backs Est. Monthly Freight Impact) — are
+    # equally prominent and visually paired.
     today = datetime.now().strftime("%Y%m%d")
-    st.download_button(
-        label="⬇️ Download resin_mover_fg (CSV)",
-        data=_to_csv_bytes(resin_mover_fg),
-        file_name=f"resin_mover_fg_{today}.csv",
-        mime="text/csv",
-        key=f"{_SS_PREFIX}_download_resin_mover_fg",
-    )
+    dl_resin, dl_freight = st.columns(2, gap="medium")
+    with dl_resin:
+        st.download_button(
+            label="⬇️ Download resin_mover_fg (CSV)",
+            data=_to_csv_bytes(resin_mover_fg),
+            file_name=f"resin_mover_fg_{today}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"{_SS_PREFIX}_download_resin_mover_fg",
+        )
+    with dl_freight:
+        # Disable when the detail is empty (e.g. HTST column resolution failed
+        # upstream and surfaced a warning) so we never hand users an empty CSV.
+        st.download_button(
+            label="⬇️ Download freight_mover_breakdown (CSV)",
+            data=_to_csv_bytes(freight_detail),
+            file_name=f"freight_mover_breakdown_{today}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=freight_detail.empty,
+            help=(
+                "Per-row backing for Est. Monthly Freight Impact. "
+                "Monthly Freight Mover = Monthly Gallons × Pricing Method × "
+                "8.6 × Freight Mover ($/lbs) from the last row of the "
+                "Mover Tracker."
+            ),
+            key=f"{_SS_PREFIX}_download_freight_mover_breakdown",
+        )
 
     m1, m2 = st.columns(2, gap="medium")
     with m1:
@@ -1309,7 +1494,8 @@ def _render_results() -> None:
             label="Monthly Resin Impact",
             value=f"${monthly_resin_total:,.2f}",
             help="Sum of Est. Monthly Resin Impact (resin mover $/gal × "
-                 "Est. Monthly Gallons per FG row, after HTST left join).",
+                 "Est. Monthly Gallons per FG row, after HTST left join "
+                 "filtered to Include/N = Y).",
         )
     with m2:
         st.metric(
@@ -1319,8 +1505,12 @@ def _render_results() -> None:
                 if freight_impact is not None
                 else "N/A"
             ),
-            help="Freight Mover ($/lbs) from the editable Movers row × total "
-                 "Monthly Gallons (HTST rows where Pricing Method = 1) ÷ 8.6.",
+            help=(
+                "Σ over HTST rows (Include/N = Y) of "
+                "Monthly Gallons × Pricing Method × 8.6 × Freight Mover "
+                "($/lbs). Use **Download freight_mover_breakdown** above "
+                "for the per-row backing."
+            ),
         )
 
     example_impact = outputs.get("example_prices_impact")
@@ -1356,16 +1546,6 @@ def _render_results() -> None:
             "Values in **Price Increase%** are percentage points "
             "(e.g. `12.34` means 12.34%)."
         )
-
-    with st.expander("🔍 Inspect intermediate outputs (resincalculate, updated tracker)", expanded=False):
-        meta_df = outputs.get("_meta", pd.DataFrame())
-        if not meta_df.empty:
-            st.caption("Calculation inputs:")
-            st.dataframe(meta_df, hide_index=True, use_container_width=True)
-        st.caption("`resincalculate` — Resin_Calculator + derived Resin Cost ($/Gal):")
-        st.dataframe(outputs["resincalculate"], hide_index=True, use_container_width=True)
-        st.caption("Updated Resin_Cost_Tracker (original rows + appended current-month rows):")
-        st.dataframe(outputs["updated_tracker"], hide_index=True, use_container_width=True)
 
 
 # ── 8. Public API ─────────────────────────────────────────────────────────────

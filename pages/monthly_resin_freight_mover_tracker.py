@@ -355,7 +355,8 @@ def _build_packaging_index_chart(pkg_df: pd.DataFrame) -> go.Figure:
     layout_kwargs = dict(
         xaxis=dict(title="", showgrid=False, showline=True, linecolor="#e0e0e0"),
         yaxis=dict(title="Resin ($/lb)", showgrid=True, gridcolor="#f0f0f0",
-                   showline=True, linecolor="#e0e0e0"),
+                   showline=True, linecolor="#e0e0e0",
+                   rangemode="tozero"),
         plot_bgcolor="white",
         paper_bgcolor="white",
         margin=dict(l=50, r=50, t=30, b=80),
@@ -376,6 +377,7 @@ def _build_packaging_index_chart(pkg_df: pd.DataFrame) -> go.Figure:
         layout_kwargs["yaxis2"] = dict(
             title="Linerboard ($/ton)", overlaying="y", side="right",
             showgrid=False, showline=True, linecolor="#e0e0e0",
+            rangemode="tozero",
         )
     fig.update_layout(**layout_kwargs)
     return fig

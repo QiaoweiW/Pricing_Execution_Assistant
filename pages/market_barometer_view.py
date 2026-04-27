@@ -4,8 +4,7 @@ Market Barometer page view.
 Sections
 --------
 1. Paths & processing module          (BASE_DIR, DATA_DIR, CSV_FILE, …, mbp)
-2. Configuration                      (FRED_SERIES_URLS, EIA URLs, SERIES_GROUPS,
-                                       quarterly surcharge link defaults)
+2. Configuration                      (FRED_SERIES_URLS, EIA URLs, SERIES_GROUPS)
 3. Data loading & caching             (_load_csv_cached, _load_csv,
                                        generate_forecast_data_cached,
                                        _build_summary_table)
@@ -14,12 +13,9 @@ Sections
 5. API key & data management          (check_api_keys, _render_api_key_upload,
                                        _handle_auto_refresh,
                                        _load_or_generate_forecast)
-6. Quarterly surcharge link storage   (_load_surcharge_links, _save_surcharge_link)
-7. Page section renderers             (_render_instructions,
-                                       _render_sharepoint_link_card,
-                                       _render_quarterly_tracker_section,
+6. Page section renderers             (_render_instructions,
                                        _render_market_indices_section)
-8. Entry point                        (render)
+7. Entry point                        (render)
 
 Design notes
 ------------
@@ -38,17 +34,9 @@ Series groups
   membership of each cost-category section. Changing order or adding a new group
   requires only a single edit here; all rendering code iterates SERIES_GROUPS
   automatically.
-
-Quarterly surcharge links
-  The Fuel and Resin subsections each expose a SharePoint link the user can
-  override at runtime via an "⚙️ Edit link" control. Overrides are persisted to
-  QUARTERLY_SURCHARGE_LINKS_FILE (JSON) so changes survive page reruns and are
-  shared across all viewers of this Streamlit instance. If the file is absent
-  or unreadable the defaults in _SURCHARGE_LINK_DEFAULTS are used.
 """
 import importlib
 import importlib.util
-import json
 import traceback
 from datetime import date, timedelta
 from pathlib import Path
@@ -80,9 +68,6 @@ DATA_DIR       = BASE_DIR / "data" / "Market Barometer"
 CSV_FILE       = DATA_DIR / "inflation_data.csv"       # historical market data
 FUTURE_CSV_FILE = DATA_DIR / "future_data.csv"         # generated 24-month forecast
 API_KEYS_FILE  = DATA_DIR / "API_Keys.txt"
-# User-customisable SharePoint links for the Quarterly Resin & Fuel Surcharge
-# Tracker. Persisted as JSON so edits made via the UI survive page reruns.
-QUARTERLY_SURCHARGE_LINKS_FILE = DATA_DIR / "quarterly_surcharge_links.json"
 
 
 # ── 2. Configuration ──────────────────────────────────────────────────────────
@@ -113,34 +98,6 @@ EIA_ELECTRICITY_URL: str = (
     "&rtype=s&maptype=0&rse=0&pin=&endsec=vg"
 )
 EIA_CRUDE_OIL_URL: str = "https://www.eia.gov/dnav/pet/pet_pri_spt_s1_d.htm"
-
-# SharePoint workbooks backing the Quarterly Resin & Fuel Surcharge Tracker.
-# These are the shipped defaults; users can override them at runtime via the
-# "⚙️ Edit link" control and overrides are persisted to
-# QUARTERLY_SURCHARGE_LINKS_FILE. Editing the DEFAULT_* constants here merely
-# changes what a fresh deployment (or a "Restore defaults" action) starts with.
-DEFAULT_FUEL_SURCHARGE_SHAREPOINT_URL: str = (
-    "https://darigold1com-my.sharepoint.com/:x:/g/personal/"
-    "sanaffz_internal_darigold_com/"
-    "IQAAbWdD24T7QrTucovscBKbAe8Rm0Fy-AbA0X6t2HxzOAc"
-    "?CID=6de76f9a-6212-b7cc-9c5d-d5677b6cb4b0"
-)
-DEFAULT_RESIN_SURCHARGE_SHAREPOINT_URL: str = (
-    "https://darigold1com.sharepoint.com/sites/BrandedPricing/"
-    "Shared%20Documents/B2C%20Brands/4.%20Projects/Cross%20Category/"
-    "2026-04%20-%20Packaging%20and%20Ingredients%20Inflation%20Model/"
-    "Forecast%20Model%20P&I%20Cost%20and%20Revenue.xlsx?web=1"
-)
-
-# Stable keys used both in the JSON config file and as session-state / widget
-# namespaces — change with care, existing deployments rely on them.
-_FUEL_SURCHARGE_LINK_KEY:  str = "fuel_surcharge_url"
-_RESIN_SURCHARGE_LINK_KEY: str = "resin_surcharge_url"
-
-_SURCHARGE_LINK_DEFAULTS: Dict[str, str] = {
-    _FUEL_SURCHARGE_LINK_KEY:  DEFAULT_FUEL_SURCHARGE_SHAREPOINT_URL,
-    _RESIN_SURCHARGE_LINK_KEY: DEFAULT_RESIN_SURCHARGE_SHAREPOINT_URL,
-}
 
 # Ordered dict — insertion order determines the section render order on the page.
 # Freight and Packaging are listed first for prominence.
@@ -443,7 +400,14 @@ def _create_line_chart(
     fig.update_layout(
         title=dict(text=series_name, font=dict(size=12)),
         xaxis=dict(title="", showgrid=False, showline=True, linecolor="#e0e0e0"),
-        yaxis=dict(title="", showgrid=False, showline=True, linecolor="#e0e0e0"),
+        yaxis=dict(
+            title="", showgrid=False, showline=True, linecolor="#e0e0e0",
+            # Anchor every cost-series axis at zero so cross-chart visual scale
+            # comparisons stay honest — small relative moves on a high-base
+            # series should not look as dramatic as the same delta on a low-base
+            # series.
+            rangemode="tozero",
+        ),
         plot_bgcolor="white",
         paper_bgcolor="white",
         margin=dict(l=40, r=40, t=40, b=40),
@@ -741,187 +705,17 @@ def _load_or_generate_forecast(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             return None
 
 
-# ── 6. Quarterly surcharge link storage ──────────────────────────────────────
-
-def _load_surcharge_links() -> Dict[str, str]:
-    """Return the current quarterly-surcharge URLs, falling back to defaults.
-
-    Reads QUARTERLY_SURCHARGE_LINKS_FILE (JSON) and layers any stored values on
-    top of _SURCHARGE_LINK_DEFAULTS. Missing keys, missing file, corrupt JSON,
-    and I/O errors all degrade gracefully to defaults so the UI never fails
-    to render — a worst-case outcome is that the user sees the shipped link
-    and simply re-saves their override.
-    """
-    links = dict(_SURCHARGE_LINK_DEFAULTS)
-    if not QUARTERLY_SURCHARGE_LINKS_FILE.exists():
-        return links
-
-    try:
-        raw = json.loads(QUARTERLY_SURCHARGE_LINKS_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return links
-
-    if isinstance(raw, dict):
-        for key in _SURCHARGE_LINK_DEFAULTS:
-            value = raw.get(key)
-            if isinstance(value, str) and value.strip():
-                links[key] = value.strip()
-    return links
-
-
-def _save_surcharge_link(key: str, url: str) -> None:
-    """Persist a single surcharge-link override to disk, preserving other keys.
-
-    Performs a read-modify-write so edits to one key never clobber the other.
-    Callers are expected to have validated ``url`` (non-empty, http/https).
-    """
-    if key not in _SURCHARGE_LINK_DEFAULTS:
-        raise ValueError(f"Unknown surcharge link key: {key!r}")
-
-    QUARTERLY_SURCHARGE_LINKS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    current = _load_surcharge_links()
-    current[key] = url.strip()
-    QUARTERLY_SURCHARGE_LINKS_FILE.write_text(
-        json.dumps(current, indent=2), encoding="utf-8"
-    )
-
-
-# ── 7. Page section renderers ─────────────────────────────────────────────────
+# ── 6. Page section renderers ─────────────────────────────────────────────────
 
 def _render_instructions() -> None:
     """Render the static instructions block at the top of the page."""
     st.markdown("""
 ### 📋 Instructions
 
-This page tracks **a)** quarterly resin & fuel surcharges, **b)** monthly resin
-and freight fluctuations, **c)** Walmart Fresh movers, and **d)** real-time
-market indices from FRED and EIA (a 24-month statistical forecast is enabled
-for all key indices).
+This page tracks **a)** monthly resin and freight fluctuations, **b)** Walmart
+Fresh movers, and **c)** real-time market indices from FRED and EIA (a 24-month
+statistical forecast is enabled for all key indices).
 """)
-
-
-def _render_sharepoint_link_card(
-    *,
-    heading: str,
-    heading_icon: str,
-    config_key: str,
-    current_url: str,
-    help_text: str,
-    widget_key_prefix: str,
-) -> None:
-    """Render one SharePoint-link card: heading, caption, button, and edit control.
-
-    The card has a consistent visual footprint so Fuel and Resin subsections stay
-    visually symmetrical:
-
-      1. ``### {icon} {heading}``              — section header.
-      2. Caption describing what the link does.
-      3. Primary blue "Open & Edit in SharePoint" button linking to ``current_url``
-         (opens in a new tab; target=_blank + rel=noopener for security).
-      4. Collapsed "⚙️ Edit link" expander containing a text input + Save button.
-         Saving validates the URL, persists it under ``config_key`` via
-         _save_surcharge_link, and triggers a rerun so the updated button is
-         reflected immediately.
-
-    Parameters are keyword-only to prevent accidental positional mis-ordering at
-    call sites — the helper has many string arguments that are easy to swap.
-
-    ``widget_key_prefix`` namespaces the Streamlit widget keys so multiple cards
-    can coexist on the same page without colliding.
-    """
-    st.markdown(f"### {heading_icon} {heading}")
-    st.caption(help_text)
-
-    st.markdown(
-        f"""
-        <a href="{current_url}" target="_blank" rel="noopener noreferrer"
-           style="display:inline-block; padding:8px 18px; margin:4px 0 8px 0;
-                  background-color:#1f77b4; color:#ffffff; border-radius:4px;
-                  text-decoration:none; font-weight:600;
-                  font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
-            🔗 Open &amp; Edit in SharePoint
-        </a>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("⚙️ Edit link", expanded=False):
-        new_url = st.text_input(
-            "SharePoint URL",
-            value=current_url,
-            key=f"{widget_key_prefix}_url_input",
-            help=(
-                "Paste a new SharePoint URL and click Save to update the button "
-                "above. The change is persisted and visible to all users of this "
-                "app."
-            ),
-        )
-        save_col, _spacer = st.columns([1, 3])
-        with save_col:
-            if st.button(
-                "💾 Save",
-                key=f"{widget_key_prefix}_save_btn",
-                type="primary",
-                use_container_width=True,
-            ):
-                candidate = (new_url or "").strip()
-                if not candidate:
-                    st.error("URL cannot be empty.")
-                elif not candidate.lower().startswith(("http://", "https://")):
-                    st.error("URL must start with http:// or https://.")
-                else:
-                    try:
-                        _save_surcharge_link(config_key, candidate)
-                    except OSError as exc:
-                        st.error(f"❌ Failed to save link: {exc}")
-                    else:
-                        st.success("✅ Link updated.")
-                        st.rerun()
-
-
-def _render_quarterly_tracker_section() -> None:
-    """Render the Quarterly Resin & Fuel Surcharge Tracker expander.
-
-    Contains two clearly divided subsections, each rendered via
-    ``_render_sharepoint_link_card`` so they share identical UI and behaviour:
-
-      1. ⛽ Fuel Surcharge  — link to the FSC forecast workbook in SharePoint.
-      2. 🧪 Resin Surcharge — link to the P&I Forecast Model workbook.
-
-    Both URLs are user-editable via the per-card "⚙️ Edit link" control and
-    overrides are persisted to ``QUARTERLY_SURCHARGE_LINKS_FILE``.
-    """
-    links = _load_surcharge_links()
-
-    with st.expander("💠 Quarterly Resin & Fuel Surcharge Tracker", expanded=False):
-        _render_sharepoint_link_card(
-            heading="Fuel Surcharge",
-            heading_icon="⛽",
-            config_key=_FUEL_SURCHARGE_LINK_KEY,
-            current_url=links[_FUEL_SURCHARGE_LINK_KEY],
-            help_text=(
-                "Open the SharePoint-hosted workbook in Excel Online to view or "
-                "edit values — changes save directly to the source file for all "
-                "viewers."
-            ),
-            widget_key_prefix="quarterly_fuel_surcharge",
-        )
-
-        # ── Divider between subsections ───────────────────────────────────
-        st.markdown("---")
-
-        _render_sharepoint_link_card(
-            heading="Resin Surcharge",
-            heading_icon="🧪",
-            config_key=_RESIN_SURCHARGE_LINK_KEY,
-            current_url=links[_RESIN_SURCHARGE_LINK_KEY],
-            help_text=(
-                "Open the SharePoint-hosted workbook in Excel Online to view or "
-                "edit values — changes save directly to the source file for all "
-                "viewers."
-            ),
-            widget_key_prefix="quarterly_resin_surcharge",
-        )
 
 
 def _render_market_indices_section(df: pd.DataFrame) -> None:
@@ -995,7 +789,7 @@ def _render_market_indices_section(df: pd.DataFrame) -> None:
         )
 
 
-# ── 8. Entry point ────────────────────────────────────────────────────────────
+# ── 7. Entry point ────────────────────────────────────────────────────────────
 
 def render() -> None:
     """Render the Market Barometer page.
@@ -1003,12 +797,11 @@ def render() -> None:
     Flow
     ----
     1. Instructions
-    2. Quarterly Resin & Fuel Surcharge Tracker (collapsible, collapsed by default)
-    3. Monthly Resin & Freight Mover Tracker (collapsible, collapsed by default)
-    4. API key check → upload widget (if invalid) or auto-refresh (if valid)
-    5. Load inflation data — gate on non-empty before proceeding
-    6. Walmart Fresh Tracker (collapsible, collapsed by default)
-    7. Market Indices dashboard (collapsible, expanded by default)
+    2. Monthly Resin & Freight Mover Tracker (collapsible, collapsed by default)
+    3. API key check → upload widget (if invalid) or auto-refresh (if valid)
+    4. Load inflation data — gate on non-empty before proceeding
+    5. Walmart Fresh Tracker (collapsible, collapsed by default)
+    6. Market Indices dashboard (collapsible, expanded by default)
     """
     apply_custom_css()
     st.markdown('<h1 class="main-header">Market Barometer</h1>', unsafe_allow_html=True)
@@ -1018,18 +811,9 @@ def render() -> None:
     # Divider separates the instructions from the collapsible trackers below.
     st.markdown("---")
 
-    # Quarterly Resin & Fuel Surcharge Tracker sits above the monthly mover
-    # tracker. Its contents are backed by SharePoint so no local data/state
-    # is shared with other sections on this page.
-    _render_quarterly_tracker_section()
-
-    # Divider separates the quarterly tracker from the monthly tracker below.
-    st.markdown("---")
-
-    # Monthly Resin & Freight Mover Tracker lives immediately below the
-    # quarterly tracker and above the Walmart Fresh Tracker. It is a fully
-    # self-contained @st.fragment — no data or state is shared with the rest
-    # of this view, so uploads / edits here do not trigger reruns elsewhere.
+    # Monthly Resin & Freight Mover Tracker is a fully self-contained
+    # @st.fragment — no data or state is shared with the rest of this view,
+    # so uploads / edits here do not trigger reruns elsewhere.
     with st.expander("📦 Monthly Resin & Freight Mover Tracker", expanded=False):
         render_monthly_resin_freight_mover_tracker()
 

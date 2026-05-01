@@ -3,12 +3,13 @@ HTST Activity Monitor page view.
 
 Sections
 --------
-1. Types & constants   (_FilePattern, _FILE_PATTERNS, _PRODUCT_GROUP_FILTER,
-                        _DROP_COLS, _PREVIEW_ROWS, _PALLET_FULL_ROW_MIN,
-                        _PALLET_FULL_AGG_MIN, bracket bins/labels/fees,
-                        _DELIVERY_FEES)
+1. Types & constants   (_FilePattern, _FILE_PATTERNS, _SHIPMENT_PATTERN,
+                        _PRODUCT_GROUP_FILTER, _DROP_COLS, _PREVIEW_ROWS,
+                        _PALLET_FULL_ROW_MIN, _PALLET_FULL_AGG_MIN,
+                        bracket bins/labels/fees, _DELIVERY_FEES)
 2. I/O helpers         (_detect_files, _to_csv_bytes, _load_optional_lookup,
-                        _widget_key)
+                        _widget_key, _filter_to_htst,
+                        _htst_filtered_csv_bytes)
 3. DataFrame utilities (_insert_col_after, _drop_blank_columns)
 4. Processing pipeline (_process_shipment_data)
 5. Analytics           (_bracket_sellto_volume, _bracket_custom_label_volume,
@@ -21,12 +22,19 @@ Sections
 
 Data flow
 ---------
-    Fabric Lakehouse Delta table   ──┐
-        (HTST_Shipment via dataflow) │
-                                     ▼
-          _render_shipment_source ──> shipment_df (HTST + non-HTST rows)
+                  ┌─ DEFAULT (web-friendly) ─────────────────────────────┐
+                  │   User uploads HTST Shipment Report + lookup CSVs    │
+                  │   in one multi-file uploader → _detect_files         │
+                  │                                                       │
+                  ├─ OPT-IN (local desktop only) ────────────────────────┤
+                  │   _render_shipment_source pulls Shipments from the   │
+                  │   Fabric Lakehouse Delta table; user uploads only    │
+                  │   the lookup CSVs. A "Download HTST-Only Shipment    │
+                  │   Data (CSV)" button is rendered here so users can   │
+                  │   capture a local snapshot of the HTST-filtered raw  │
+                  │   dataflow data, pre-merge.                          │
+                  └──────────────────────────────────────────────────────┘
                                      │
-          User uploads 4 lookup CSVs ┼──> _detect_files
                                      ▼
           _process_shipment_data ──> enriched_df  (HTST-only, joined)
                                      │  cached in st.session_state
@@ -41,18 +49,33 @@ Data flow
 
 Design notes
 ------------
-* Two ingest sources, each with its own UI block:
-    - Shipment data: Microsoft Fabric Lakehouse (Delta) via the connector in
-      data_sources/htst_shipment.py — auto-fetched, with a manual-upload
-      fallback for outage scenarios.
-    - Lookup tables: a single multi-file uploader, with files matched to
-      their roles by case-insensitive keyword search on the filename.
+* Two ingest modes, gated by a single checkbox at the top of the page:
+    - DEFAULT (checkbox unchecked) — manual upload.  One multi-file
+      uploader accepts the HTST Shipment Report alongside all lookup
+      CSVs.  Required for Streamlit Cloud (web) users because the
+      dataflow path needs an interactive Azure browser sign-in that a
+      headless cloud server cannot complete.
+    - OPT-IN (checkbox checked, marked "DO NOT CLICK IF YOU ARE A WEB
+      USER") — fetches Shipments from Microsoft Fabric Lakehouse via
+      data_sources/htst_shipment.py.  Lookup CSVs are still uploaded.
+      A download button beside the dataflow caption emits the HTST-
+      filtered raw shipment table (no merges) as a CSV, so the user can
+      keep an offline snapshot or feed the manual-upload path in a later
+      session.
+* The "shipment" pattern is defined separately as _SHIPMENT_PATTERN so it
+  is appended to the active pattern list only in default mode.  Pattern
+  matching in _detect_files is first-match-wins, with the lookup
+  patterns ordered before _SHIPMENT_PATTERN so generic substrings like
+  "shipment" in lookup filenames (e.g. "Shipment_Plant_Tracker.csv") are
+  claimed by their specific lookup pattern before the broader shipment
+  one is consulted.
 * Filter to PRODUCTGROUP == _PRODUCT_GROUP_FILTER ("HTST") happens at the
   TOP of _process_shipment_data, before any merge or aggregation, so the
   full Shipments table is reduced to the HTST subset before consuming
   memory or CPU on row-by-row work.  This is also semantically required —
   site-level aggregates like "Site-level Sell-to Volume" must not be
-  contaminated by non-HTST product rows.
+  contaminated by non-HTST product rows.  The same filter logic is
+  re-used by _filter_to_htst() to power the dataflow download button.
 * The full enriched DataFrame is NEVER pushed to the browser as a table.
   Only _PREVIEW_ROWS rows go through st.dataframe().  Download buttons
   stream via HTTP (not the WebSocket), so they work for any dataset size
@@ -108,13 +131,10 @@ class _FilePattern(NamedTuple):
                          # the filename causes this pattern to match
 
 
-# Order matters: the first matching pattern claims each uploaded file.
-#
-# NOTE: "shipment" is intentionally absent — the HTST Shipment Report is now
-# sourced from the Microsoft Fabric Dataflow Gen2 → Lakehouse Delta table via
-# data_sources.htst_shipment.fetch_htst_shipment_df().  Users no longer upload
-# it.  A manual-upload fallback is exposed in _render_shipment_source() for
-# the case when the dataflow is unreachable.
+# Lookup-file patterns.  Order matters: the first matching pattern claims each
+# uploaded file.  The HTST Shipment Report itself is handled by the separate
+# _SHIPMENT_PATTERN below — it is appended to this list only in the default
+# (manual-upload) mode, so dataflow-mode users do not have to re-upload it.
 _FILE_PATTERNS: list[_FilePattern] = [
     _FilePattern("plant_tracker",   True,  "Shipment Plant Tracker",          ["plant_tracker", "plant tracker", "shipment_plant"]),
     _FilePattern("mileage_tracker", True,  "Ship Route Mileage Tracker",      ["mileage_tracker", "mileage tracker", "route_mileage", "route mileage"]),
@@ -124,6 +144,19 @@ _FILE_PATTERNS: list[_FilePattern] = [
     _FilePattern("pallet_fee",      False, "Pallet Fee",                      ["pallet_fee", "pallet fee"]),
     _FilePattern("sell_to",         False, "Sell-To Volume Bracket Fee",      ["sell-to", "sell_to"]),
 ]
+
+# Shipment-Report pattern, kept separate from _FILE_PATTERNS so it can be
+# included or excluded depending on the source mode (manual upload vs Fabric
+# dataflow).  Keywords are deliberately specific ("htst_shipment",
+# "shipment_report", …) to avoid claiming lookup files such as
+# "Shipment_Plant_Tracker.csv" — those are claimed by their dedicated lookup
+# pattern, which sits earlier in the matching order.
+_SHIPMENT_PATTERN: _FilePattern = _FilePattern(
+    key="shipment",
+    required=True,
+    label="HTST Shipment Report",
+    keywords=["htst_shipment", "htst shipment", "shipment_report", "shipment report"],
+)
 
 # Product-group filter applied in _process_shipment_data BEFORE any merge or
 # aggregation runs.  The Fabric Shipments table contains every product group
@@ -314,19 +347,24 @@ _DELIVERY_FEES: dict[tuple[str, str], float] = {
 
 # ── 2. I/O helpers ────────────────────────────────────────────────────────────
 
-def _detect_files(uploaded_files: list) -> dict[str, object]:
+def _detect_files(
+    uploaded_files: list,
+    patterns: Optional[list[_FilePattern]] = None,
+) -> dict[str, object]:
     """Map each uploaded file to its logical role via filename keyword matching.
 
-    Iterates _FILE_PATTERNS in order.  The first pattern whose keywords appear
-    (substring, case-insensitive) in the filename claims that role.  Each role
-    is claimed at most once; unrecognised files are silently skipped.
+    Iterates *patterns* (defaults to _FILE_PATTERNS) in order.  The first
+    pattern whose keywords appear (substring, case-insensitive) in the
+    filename claims that role.  Each role is claimed at most once;
+    unrecognised files are silently skipped.
 
     Returns a dict keyed by _FilePattern.key; unmatched roles map to None.
     """
-    result: dict[str, object] = {p.key: None for p in _FILE_PATTERNS}
+    pats = patterns if patterns is not None else _FILE_PATTERNS
+    result: dict[str, object] = {p.key: None for p in pats}
     for f in uploaded_files:
         name_lower = f.name.lower()
-        for pattern in _FILE_PATTERNS:
+        for pattern in pats:
             if result[pattern.key] is not None:
                 continue  # role already filled by an earlier file
             if any(kw in name_lower for kw in pattern.keywords):
@@ -371,6 +409,41 @@ def _widget_key(value: str) -> str:
     manual session_state manipulation.
     """
     return hashlib.md5(str(value).encode()).hexdigest()[:8]
+
+
+def _filter_to_htst(df: pd.DataFrame) -> pd.DataFrame:
+    """Return the HTST product-group subset with normalised column names.
+
+    Columns are stripped of leading/trailing whitespace; rows are kept where
+    PRODUCTGROUP equals _PRODUCT_GROUP_FILTER under case- and whitespace-
+    insensitive comparison.  This is the single source of truth for the HTST
+    filter and is reused by both _process_shipment_data (pre-merge) and
+    _htst_filtered_csv_bytes (the dataflow download button).
+
+    Raises KeyError("PRODUCTGROUP") if the column is missing — callers decide
+    whether to surface a Streamlit error or skip the optional download.
+    """
+    df = df.rename(columns=str.strip)
+    if "PRODUCTGROUP" not in df.columns:
+        raise KeyError("PRODUCTGROUP")
+    mask = (
+        df["PRODUCTGROUP"].astype(str).str.strip().str.upper().eq(_PRODUCT_GROUP_FILTER)
+    )
+    return df[mask]
+
+
+@st.cache_data(show_spinner=False)
+def _htst_filtered_csv_bytes(_df: pd.DataFrame, snapshot_sig: str) -> bytes:
+    """Serialize the HTST-filtered subset of *_df* to UTF-8 CSV bytes (cached).
+
+    The leading underscore on *_df* tells Streamlit not to hash the DataFrame
+    (which would be wasteful on a 400 K-row table); cache identity is keyed on
+    *snapshot_sig*, which already encodes the dataflow Delta version + last-
+    modified timestamp.  As a result the filter + CSV-encode pass runs at
+    most once per dataflow snapshot, even though Streamlit reruns the page on
+    every widget interaction.
+    """
+    return _filter_to_htst(_df).to_csv(index=False).encode("utf-8")
 
 
 # ── 3. DataFrame utilities ────────────────────────────────────────────────────
@@ -448,20 +521,19 @@ def _process_shipment_data(
 
     Returns None on any read/join failure (st.error is called internally).
     """
-    # ── Step 0a: Normalise column names ──────────────────────────────────────
-    # .rename returns a new DataFrame whose column index is fresh but whose
-    # underlying data is still shared with shipment_df (no row-data copy yet).
-    df = shipment_df.rename(columns=str.strip)
-
-    # ── Step 0b: Filter to HTST product group ────────────────────────────────
-    if "PRODUCTGROUP" not in df.columns:
+    # ── Steps 0a + 0b: Normalise headers and filter to HTST product group ───
+    # _filter_to_htst centralises both the column-strip and the case-insensitive
+    # PRODUCTGROUP filter so the logic stays in lockstep with the dataflow
+    # download button (_htst_filtered_csv_bytes).  KeyError signals a missing
+    # PRODUCTGROUP column — surfaced as a Streamlit error and aborted.
+    try:
+        df = _filter_to_htst(shipment_df)
+    except KeyError:
         st.error(
             "Shipment data is missing the 'PRODUCTGROUP' column — cannot "
             "filter to HTST.  Verify the Fabric dataflow output schema."
         )
         return None
-    htst_mask = df["PRODUCTGROUP"].astype(str).str.strip().str.upper().eq(_PRODUCT_GROUP_FILTER)
-    df = df[htst_mask]
     if df.empty:
         st.error(
             f"No rows found with PRODUCTGROUP == '{_PRODUCT_GROUP_FILTER}' in "
@@ -899,64 +971,32 @@ def _build_customer_site_summary(
 # ── 6. UI rendering ───────────────────────────────────────────────────────────
 
 def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[SnapshotMeta], Optional[str]]:
-    """Render the HTST Shipment Report source section and return its DataFrame.
+    """Render the Microsoft Fabric Dataflow shipment-source section.
 
-    Two modes, controlled by a single checkbox:
-      1. Dataflow (default) — fetches from the Fabric Lakehouse Delta table via
-         data_sources.htst_shipment.fetch_htst_shipment_df().  A "Refresh"
-         button bypasses the 15-minute Streamlit cache.
-      2. Manual upload (fallback) — re-enables a file_uploader for the
-         shipment CSV, used when the dataflow is unavailable or for ad-hoc
-         what-if analysis on a non-canonical file.
+    Called only when the user has opted in to the dataflow path via the
+    "Use Microsoft Fabric Dataflow" checkbox in render().  Pulls the full
+    Shipments table from the Fabric Lakehouse Delta table via
+    data_sources.htst_shipment.fetch_htst_shipment_df(), shows a refresh
+    button that bypasses the 15-minute cache, and (when the fetch
+    succeeded) renders an HTST-only CSV download button so users can keep
+    a local snapshot of the raw HTST-filtered shipment data — pre-merge —
+    for offline analysis or to feed into the manual-upload path later.
 
     Returns
     -------
     (shipment_df, meta, signature)
-        shipment_df : The materialised DataFrame, or None if not yet ready.
-        meta        : SnapshotMeta when sourced from the dataflow, else None.
-        signature   : A stable string used by render()'s session-state cache
-                      key.  Combines the dataflow snapshot identity OR the
-                      uploaded file's name+size, so the enrichment pipeline
-                      is rerun if-and-only-if the underlying shipment changes.
+        shipment_df : Full Shipments DataFrame from the dataflow, or None
+                      when the fetch failed (errors are surfaced inline).
+        meta        : SnapshotMeta describing the Delta version + last-
+                      modified timestamp + row count, or None on failure.
+        signature   : meta.cache_key on success, None on failure.  Used by
+                      render() as part of the enrichment-cache key so the
+                      pipeline reruns if-and-only-if the dataflow snapshot
+                      changes.
     """
-    st.markdown("### 🛰️ HTST Shipment Source")
+    st.markdown("### 🛰️ HTST Shipment Source — Microsoft Fabric Dataflow")
 
-    use_fallback = st.checkbox(
-        "Use manual file upload (fallback)",
-        value=False,
-        key="htst_shipment_use_fallback",
-        help=(
-            "Leave unchecked to pull the shipment report from the Microsoft "
-            "Fabric dataflow.  Check only if the dataflow is unavailable or "
-            "you need to run analytics on a non-canonical CSV."
-        ),
-    )
-
-    # ── Mode 1: Manual upload fallback ────────────────────────────────────────
-    if use_fallback:
-        uploaded = st.file_uploader(
-            "HTST Shipment Report (CSV)",
-            type=["csv"],
-            accept_multiple_files=False,
-            key="htst_shipment_fallback_upload",
-        )
-        if uploaded is None:
-            st.info("📤 Upload the HTST Shipment Report CSV to continue.")
-            return None, None, None
-        try:
-            df = pd.read_csv(uploaded, low_memory=False)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Could not read uploaded shipment CSV: {exc}")
-            return None, None, None
-        sig = f"upload:{uploaded.name}:{uploaded.size}"
-        st.caption(
-            f"📄 Using uploaded file **{uploaded.name}** "
-            f"({len(df):,} rows, {uploaded.size / 1_048_576:.1f} MB)."
-        )
-        return df, None, sig
-
-    # ── Mode 2: Dataflow (default) ────────────────────────────────────────────
-    # The Refresh button must be wired BEFORE fetch_htst_shipment_df() runs so
+    # The refresh button must be wired BEFORE fetch_htst_shipment_df() runs so
     # that clicking it clears the cache on this same render pass.
     refresh_clicked = st.button(
         "🔄 Refresh from Dataflow",
@@ -969,8 +1009,8 @@ def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[Snapshot
     except HTSTShipmentSourceError as exc:
         st.error(f"❌ Could not load shipment data from the Fabric dataflow.\n\n{exc}")
         st.info(
-            "Tick **Use manual file upload (fallback)** above to keep working "
-            "while the dataflow is being fixed."
+            "Untick **Use Microsoft Fabric Dataflow** at the top of the page "
+            "to switch to manual upload."
         )
         return None, None, None
 
@@ -980,30 +1020,89 @@ def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[Snapshot
         f"· Delta version **v{meta.version}** "
         f"· **{meta.row_count:,}** rows"
     )
+
+    # ── HTST-only raw download button ─────────────────────────────────────────
+    # Available in both local and Streamlit Cloud sessions because
+    # st.download_button streams over HTTP, not the WebSocket — there is no
+    # client-side limit on the payload size.  CSV bytes are produced lazily
+    # and cached by snapshot signature inside _htst_filtered_csv_bytes, so
+    # the filter + CSV-encode pass runs at most once per dataflow refresh.
+    try:
+        csv_bytes = _htst_filtered_csv_bytes(df, meta.cache_key)
+    except KeyError:
+        st.warning(
+            "HTST-only download unavailable: the dataflow output is missing "
+            "the 'PRODUCTGROUP' column."
+        )
+    else:
+        if csv_bytes:
+            today = datetime.now().strftime("%Y%m%d")
+            st.download_button(
+                label="⬇️ Download HTST-Only Shipment Data (CSV)",
+                data=csv_bytes,
+                file_name=f"HTST_Shipment_{today}.csv",
+                mime="text/csv",
+                key="htst_dataflow_raw_download",
+                help=(
+                    "HTST-filtered raw shipment table from the dataflow, "
+                    "before any lookup merges or enrichment."
+                ),
+            )
+
     return df, meta, meta.cache_key
 
 
-def _render_upload_section() -> dict[str, object]:
-    """Render a single multi-file uploader and return the auto-detected file map.
+def _render_upload_section(*, include_shipment: bool) -> dict[str, object]:
+    """Render the multi-file uploader and return the auto-detected file map.
 
-    The user drops all CSVs from the HTST Shipment Monitor folder in one action;
-    each file is identified automatically by filename keywords.
+    Two layouts share the same uploader widget (and Streamlit key) so files
+    persist when the user toggles the dataflow checkbox in either direction:
+
+    * include_shipment=True  (default mode) — the user is expected to upload
+      the HTST Shipment Report alongside the four lookup CSVs in a single
+      action.  _SHIPMENT_PATTERN is appended to the active pattern list and
+      the returned dict carries an additional "shipment" key.
+    * include_shipment=False (dataflow mode) — the shipment is sourced from
+      _render_shipment_source(); only the lookup CSVs are needed here.
+
+    The SharePoint folder link stays visible in both layouts so users always
+    know where to find the canonical files.
     """
-    st.markdown("### 📤 Upload Lookup Files")
-    st.caption(
-        "Upload the lookup CSVs (Plant Tracker, Mileage Tracker, Demantra, "
-        "Pricing Tracker, and any optional fee files). "
-        "The HTST Shipment Report itself is now pulled automatically from the "
-        "Fabric dataflow above. Files are identified by filename keywords. "
-        f"[📁 Upload files in this folder]({_HTST_SHIPMENT_MONITOR_SHAREPOINT_URL})"
-    )
+    if include_shipment:
+        # _SHIPMENT_PATTERN is appended LAST so its broad keywords ("shipment_
+        # report", etc.) cannot accidentally claim a lookup file whose name
+        # happens to contain "shipment" (e.g. "Shipment_Plant_Tracker.csv").
+        patterns = [*_FILE_PATTERNS, _SHIPMENT_PATTERN]
+        header = "### 📤 Upload Required Reports"
+        body = (
+            "Upload the HTST Shipment Report and all lookup CSVs together "
+            "(Plant Tracker, Mileage Tracker, Demantra, Pricing Tracker, "
+            "plus any optional fee files).  Files are identified automatically "
+            "by filename keywords. "
+            f"[📁 Find these reports in this SharePoint folder]({_HTST_SHIPMENT_MONITOR_SHAREPOINT_URL})"
+        )
+        prompt = "Select all the HTST CSV files (Shipment Report + Lookups)"
+    else:
+        patterns = list(_FILE_PATTERNS)
+        header = "### 📤 Upload Lookup Files"
+        body = (
+            "Upload the lookup CSVs (Plant Tracker, Mileage Tracker, Demantra, "
+            "Pricing Tracker, plus any optional fee files).  The HTST Shipment "
+            "Report is being pulled from the Fabric dataflow above. "
+            f"[📁 Find these reports in this SharePoint folder]({_HTST_SHIPMENT_MONITOR_SHAREPOINT_URL})"
+        )
+        prompt = "Select the HTST lookup CSV files"
+
+    st.markdown(header)
+    st.caption(body)
+
     uploaded_files = st.file_uploader(
-        "Select the HTST lookup CSV files",
+        prompt,
         type=["csv"],
         accept_multiple_files=True,
         key="htst_all_files",
     )
-    return _detect_files(uploaded_files or [])
+    return _detect_files(uploaded_files or [], patterns=patterns)
 
 
 def _render_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -1208,7 +1307,8 @@ def _render_output_section(filtered_df: pd.DataFrame) -> None:
 def render() -> None:
     """Render the HTST Activity Monitor page.
 
-    Flow: dataflow fetch (or fallback upload) → validate lookup uploads →
+    Flow: source-mode toggle → shipment input (upload OR dataflow) →
+          lookup uploads (and shipment in default mode) → validate →
           process (cached) → load optional lookups → filter →
           Customer-Site Details → Enriched Report.
 
@@ -1230,31 +1330,72 @@ def render() -> None:
 
     # ── Welcome ───────────────────────────────────────────────────────────────
     st.markdown("### Welcome")
-    st.info(
-        "The HTST Shipment Report is loaded automatically from the Microsoft "
-        "Fabric dataflow.  Upload the lookup CSVs below to refresh activity "
-        "levels and associated charges."
+    st.info("Upload the required reports to get the refreshed HTST activity level report.")
+    st.markdown("---")
+
+    # ── Source-mode toggle ────────────────────────────────────────────────────
+    # The dataflow path requires interactive Azure sign-in (browser popup) to
+    # acquire a OneLake storage token.  Streamlit Cloud is headless — the
+    # popup cannot open — so the dataflow option is gated behind an opt-in
+    # checkbox with a loud warning to keep web users on the upload path.
+    use_dataflow = st.checkbox(
+        "Use Microsoft Fabric Dataflow as the shipment source — "
+        "**DO NOT CLICK IF YOU ARE A WEB USER**",
+        value=False,
+        key="htst_use_dataflow",
+        help=(
+            "Default (unchecked): upload the HTST Shipment Report alongside "
+            "the lookup CSVs in the uploader below.  This is the right "
+            "choice for Streamlit Cloud (web) users.\n\n"
+            "Checked: fetch the shipment data directly from the Microsoft "
+            "Fabric Lakehouse Delta table.  Requires interactive Azure "
+            "sign-in or a service principal — only works in a local "
+            "desktop session, not on a headless Streamlit Cloud server."
+        ),
     )
     st.markdown("---")
 
-    # ── Shipment source: Fabric dataflow (or manual fallback) ────────────────
-    # _shipment_meta is unused here — _render_shipment_source already surfaces
-    # version + as-of timestamp in its own caption — but it's exposed for any
-    # future audit-logging or telemetry the page might add.
-    shipment_df, _shipment_meta, shipment_sig = _render_shipment_source()
-    st.markdown("---")
-    if shipment_df is None:
-        # _render_shipment_source already surfaced the error / waiting state.
-        return
+    # ── Shipment input ────────────────────────────────────────────────────────
+    # Default mode: shipment file is part of the multi-file uploader (handled
+    # below) and read into a DataFrame after the lookup-detection step.
+    # Dataflow mode: _render_shipment_source fetches it from Fabric and
+    # surfaces the HTST-only download button alongside.
+    if use_dataflow:
+        shipment_df, _shipment_meta, shipment_sig = _render_shipment_source()
+        st.markdown("---")
+        if shipment_df is None:
+            # _render_shipment_source already surfaced the error state.
+            return
+    else:
+        shipment_df = None
+        shipment_sig = None  # populated after the shipment file is read below.
 
-    # ── Lookup uploads (Plant / Mileage / Demantra / Pricing + optional fees)
-    detected = _render_upload_section()
+    # ── Lookup uploads (and the shipment file in default mode) ───────────────
+    detected = _render_upload_section(include_shipment=not use_dataflow)
     st.markdown("---")
 
+    # In default mode, materialise the uploaded shipment CSV before the
+    # required-missing gate so its presence/absence is reflected in the
+    # waiting message alongside the lookup files.
+    if not use_dataflow:
+        shipment_file = detected.get("shipment")
+        if shipment_file is not None:
+            try:
+                shipment_df = pd.read_csv(shipment_file, low_memory=False)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read uploaded HTST Shipment Report: {exc}")
+                return
+            shipment_sig = f"upload:{shipment_file.name}:{shipment_file.size}"
+
+    # Required-files gate.  In default mode we additionally check the
+    # shipment file via shipment_df, since _SHIPMENT_PATTERN is not part of
+    # _FILE_PATTERNS.
     required_missing = [
         p.label for p in _FILE_PATTERNS
         if p.required and detected.get(p.key) is None
     ]
+    if not use_dataflow and shipment_df is None:
+        required_missing.append(_SHIPMENT_PATTERN.label)
     if required_missing:
         st.info("📤 File uploading and calculation in progress.")
         return

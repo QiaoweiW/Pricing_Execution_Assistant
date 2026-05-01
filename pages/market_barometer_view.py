@@ -865,7 +865,7 @@ def render() -> None:
     Flow
     ----
     1. Instructions
-    2. Monthly Resin & Freight Mover Tracker (collapsible, collapsed by default)
+    2. Monthly Milk, Resin & Freight Movers (collapsible, collapsed by default)
     3. API key check → upload widget (if invalid) or auto-refresh (if valid)
     4. Load inflation data — gate on non-empty before proceeding
     5. Walmart Fresh Tracker (collapsible, collapsed by default)
@@ -879,10 +879,10 @@ def render() -> None:
     # Divider separates the instructions from the collapsible trackers below.
     st.markdown("---")
 
-    # Monthly Resin & Freight Mover Tracker is a fully self-contained
+    # Monthly Milk, Resin & Freight Movers is a fully self-contained
     # @st.fragment — no data or state is shared with the rest of this view,
     # so uploads / edits here do not trigger reruns elsewhere.
-    with st.expander("📦 Monthly Resin & Freight Mover Tracker", expanded=False):
+    with st.expander("📦 Monthly Milk, Resin & Freight Movers", expanded=False):
         render_monthly_resin_freight_mover_tracker()
 
     # API key management: show upload widget if keys are missing/invalid,

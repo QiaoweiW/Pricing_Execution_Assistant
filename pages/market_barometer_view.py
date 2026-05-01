@@ -37,6 +37,7 @@ Series groups
 """
 import importlib
 import importlib.util
+import re
 import traceback
 from datetime import date, timedelta
 from pathlib import Path
@@ -97,13 +98,21 @@ EIA_ELECTRICITY_URL: str = (
     "&map=ELEC.SALES.US-ALL.M&freq=M&start=200101&end=201510&ctype=linechart&ltype=pin"
     "&rtype=s&maptype=0&rse=0&pin=&endsec=vg"
 )
-EIA_CRUDE_OIL_URL: str = "https://www.eia.gov/dnav/pet/pet_pri_spt_s1_d.htm"
+# EIA series → clickable source URLs. Mirrors FRED_SERIES_URLS so adding a new
+# EIA series is a single dict entry. The Electricity Cost group shares one
+# dashboard URL across all four state series, handled as a group-level fallback
+# in _build_summary_table rather than duplicated four times here.
+EIA_SERIES_URLS: Dict[str, str] = {
+    "WTI Crude Oil":                                "https://www.eia.gov/dnav/pet/pet_pri_spt_s1_d.htm",
+    "West Coast Diesel Price (Except California)": "https://www.eia.gov/dnav/pet/PET_PRI_GND_DCUS_R5XCA_W.htm",
+}
 
 # Ordered dict — insertion order determines the section render order on the page.
 # Freight and Packaging are listed first for prominence.
 SERIES_GROUPS: Dict[str, List[str]] = {
     "Freight Cost": [
         "West Coast Diesel Price",
+        "West Coast Diesel Price (Except California)",
         "US Diesel Sales Price",
         "WTI Crude Oil",
         "Wood Pallets Price",
@@ -265,10 +274,10 @@ def _build_summary_table(
         if source == "FRED" and series in FRED_SERIES_URLS:
             source_url = FRED_SERIES_URLS[series]
         elif source == "EIA":
-            if series in SERIES_GROUPS.get("Electricity Cost", []):
+            if series in EIA_SERIES_URLS:
+                source_url = EIA_SERIES_URLS[series]
+            elif series in SERIES_GROUPS.get("Electricity Cost", []):
                 source_url = EIA_ELECTRICITY_URL
-            elif series == "WTI Crude Oil":
-                source_url = EIA_CRUDE_OIL_URL
 
         row: dict = {
             "Series":     series,
@@ -417,6 +426,40 @@ def _create_line_chart(
     return fig
 
 
+def _slugify(name: str) -> str:
+    """Convert a series name to a filename-safe slug.
+
+    Collapses any run of non-alphanumeric characters to a single hyphen so
+    downloaded files like ``west-coast-diesel-price-except-california_…csv``
+    are portable across operating systems.
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower() or "series"
+
+
+def _series_csv_bytes(
+    df: pd.DataFrame,
+    series_name: str,
+    start_date: date,
+    end_date: date,
+) -> bytes:
+    """Return UTF-8 CSV bytes for one series, sliced to a date range.
+
+    Historical data only — by design, forecast values are never included so
+    speculative numbers can't leak out of the app via the download button.
+    Generation is a single pandas slice + ``to_csv`` call (sub-millisecond
+    per series), so it's done inline on each render rather than cached;
+    cache lookup overhead would exceed the work for these tiny payloads.
+    """
+    series_df = df[
+        (df["Series"] == series_name)
+        & (df["Date"] >= pd.Timestamp(start_date))
+        & (df["Date"] <= pd.Timestamp(end_date))
+    ].sort_values("Date")
+    out = series_df[["Date", "Series", "Value", "Source"]].copy()
+    out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
+    return out.to_csv(index=False).encode("utf-8")
+
+
 def _render_series_group(
     group_name: str,
     series_list: List[str],
@@ -503,6 +546,12 @@ def _render_series_group(
         html += "</tbody></table>"
         st.markdown(html, unsafe_allow_html=True)
 
+    # Cap CSV downloads at the last historical date so users never get
+    # speculative forecast values in the exported file.
+    hist_end = (
+        min(end_date, max_historical_date) if max_historical_date else end_date
+    )
+
     with col_right:
         cols_per_row = 2
         for row_idx in range((len(selected_series) + cols_per_row - 1) // cols_per_row):
@@ -522,6 +571,25 @@ def _render_series_group(
                     st.plotly_chart(
                         fig, use_container_width=True,
                         key=f"{key_prefix}_chart_{group_name}_{series_idx}",
+                    )
+
+                    csv_bytes = _series_csv_bytes(
+                        df=group_data,
+                        series_name=s_name,
+                        start_date=start_date,
+                        end_date=hist_end,
+                    )
+                    st.download_button(
+                        label="📥 CSV",
+                        data=csv_bytes,
+                        file_name=(
+                            f"{_slugify(s_name)}_"
+                            f"{start_date.isoformat()}_{hist_end.isoformat()}.csv"
+                        ),
+                        mime="text/csv",
+                        key=f"{key_prefix}_dl_{group_name}_{series_idx}",
+                        type="tertiary",
+                        help="Download the historical data behind this chart (forecast excluded).",
                     )
 
 

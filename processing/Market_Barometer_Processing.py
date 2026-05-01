@@ -62,6 +62,14 @@ EIA_SERIES: Final[Dict[str, Dict]] = {
             "facets[series][]": "RWTC"
         }
     },
+    "West Coast Diesel Price (Except California)": {
+        "route": "petroleum/pri/gnd",
+        "params": {
+            "frequency": "weekly",
+            "data[0]": "value",
+            "facets[series][]": "EMD_EPD2D_PTE_R5XCA_DPG"
+        }
+    },
     "Electricity Price Industrial - WA": {
         "route": "electricity/retail-sales",
         "params": {

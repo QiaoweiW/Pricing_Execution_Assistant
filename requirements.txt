@@ -15,3 +15,8 @@ statsmodels>=0.14.0
 patsy>=0.5.0
 openpyxl>=3.0.0
 pywin32>=306; sys_platform == "win32"
+
+# Microsoft Fabric / OneLake Delta-table reader (HTST Shipment dataflow source).
+deltalake>=0.17.0
+azure-identity>=1.15.0
+

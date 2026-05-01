@@ -4,6 +4,9 @@
 !.streamlit/
 !.streamlit/**
 
+# NEVER commit real Streamlit secrets — only the template is checked in.
+.streamlit/secrets.toml
+
 # Python
 __pycache__/
 *.pyc

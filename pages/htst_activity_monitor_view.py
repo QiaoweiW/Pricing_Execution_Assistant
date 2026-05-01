@@ -3,47 +3,83 @@ HTST Activity Monitor page view.
 
 Sections
 --------
-1. Types & constants   (_FilePattern, _FILE_PATTERNS, _DROP_COLS, _PREVIEW_ROWS,
-                        _HTST_SHIPMENT_MONITOR_SHAREPOINT_URL,
-                        _PALLET_FULL_ROW_MIN, _PALLET_FULL_AGG_MIN)
-2. I/O helpers         (_detect_files, _to_csv_bytes, _widget_key)
+1. Types & constants   (_FilePattern, _FILE_PATTERNS, _PRODUCT_GROUP_FILTER,
+                        _DROP_COLS, _PREVIEW_ROWS, _PALLET_FULL_ROW_MIN,
+                        _PALLET_FULL_AGG_MIN, bracket bins/labels/fees,
+                        _DELIVERY_FEES)
+2. I/O helpers         (_detect_files, _to_csv_bytes, _load_optional_lookup,
+                        _widget_key)
 3. DataFrame utilities (_insert_col_after, _drop_blank_columns)
 4. Processing pipeline (_process_shipment_data)
 5. Analytics           (_bracket_sellto_volume, _bracket_custom_label_volume,
                         _bracket_mileage, _bracket_drop_size,
                         _build_customer_site_summary)
-6. UI rendering        (_render_upload_section, _render_filters,
-                        _render_customer_site_details, _render_output_section)
+6. UI rendering        (_render_shipment_source, _render_upload_section,
+                        _render_filters, _render_customer_site_details,
+                        _render_output_section)
 7. Entry point         (render)
+
+Data flow
+---------
+    Fabric Lakehouse Delta table   ──┐
+        (HTST_Shipment via dataflow) │
+                                     ▼
+          _render_shipment_source ──> shipment_df (HTST + non-HTST rows)
+                                     │
+          User uploads 4 lookup CSVs ┼──> _detect_files
+                                     ▼
+          _process_shipment_data ──> enriched_df  (HTST-only, joined)
+                                     │  cached in st.session_state
+                                     ▼
+              _render_filters    ──> filtered_df + duration_days
+                                     │
+                                     ├──> _render_customer_site_details
+                                     │       (uses optional lookup CSVs for
+                                     │        Pallet/SellTo/CustomLabel fees)
+                                     │
+                                     └──> _render_output_section
 
 Design notes
 ------------
-* A single multi-file uploader accepts all CSVs at once.  Files are matched to
-  their roles by case-insensitive keyword search on the filename, so exact
-  naming is not required.
-* The full enriched DataFrame is NEVER pushed to the browser as a table.  Only
-  _PREVIEW_ROWS rows go through st.dataframe().  Download buttons stream via
-  HTTP (not the WebSocket), so they work for any dataset size on Streamlit Cloud.
-* Duration equals (sel_end − sel_start).days from the Order Date range slicer,
-  clamped to ≥ 1 to prevent division-by-zero.  It drives the Annualized Gallons
-  denominator in Customer-Site Details and updates automatically when the slicer
-  changes.  The enriched DataFrame is cached in st.session_state (keyed by a
-  file-set signature) so the expensive enrichment pipeline does not re-run on
-  every widget interaction.
+* Two ingest sources, each with its own UI block:
+    - Shipment data: Microsoft Fabric Lakehouse (Delta) via the connector in
+      data_sources/htst_shipment.py — auto-fetched, with a manual-upload
+      fallback for outage scenarios.
+    - Lookup tables: a single multi-file uploader, with files matched to
+      their roles by case-insensitive keyword search on the filename.
+* Filter to PRODUCTGROUP == _PRODUCT_GROUP_FILTER ("HTST") happens at the
+  TOP of _process_shipment_data, before any merge or aggregation, so the
+  full Shipments table is reduced to the HTST subset before consuming
+  memory or CPU on row-by-row work.  This is also semantically required —
+  site-level aggregates like "Site-level Sell-to Volume" must not be
+  contaminated by non-HTST product rows.
+* The full enriched DataFrame is NEVER pushed to the browser as a table.
+  Only _PREVIEW_ROWS rows go through st.dataframe().  Download buttons
+  stream via HTTP (not the WebSocket), so they work for any dataset size
+  on Streamlit Cloud.
+* Duration equals (sel_end − sel_start).days from the Order Date range
+  slicer, clamped to ≥ 1 to prevent division-by-zero.  It drives the
+  Annualized Gallons denominator in Customer-Site Details and updates
+  automatically when the slicer changes.  The enriched DataFrame is cached
+  in st.session_state (keyed by a composite signature of the shipment
+  snapshot identity AND the lookup files' name+size) so the expensive
+  enrichment pipeline does not re-run on every widget interaction.
 * Pallet classification uses two thresholds defined in section 1:
     _PALLET_FULL_ROW_MIN : per-row — Pallet% >= threshold → "Full".
     _PALLET_FULL_AGG_MIN : summary — Full Pallet% > threshold → "Full".
-* Volume and delivery bracket thresholds are all hardcoded in section 1.  Fee
-  values for the volume brackets are dynamic (read from uploaded CSVs) with
-  hardcoded fallbacks.  Delivery charges (_DELIVERY_FEES) are fully hardcoded as
-  a 2-D dict keyed by (Mileage Fee Tier, Drop Fee Tier) — the 12×5 table is small
-  and stable; dynamic parsing of the dollar-prefixed strings would add fragility.
-* All optional-lookup DataFrames (pallet_fee_df, sell_to_df, custom_label_df) are
-  loaded in render() and passed as arguments.  No function in section 5 or below
-  reads from disk.  _process_shipment_data (section 4) is the sole location that
-  performs file I/O on the uploaded file objects.
-* Exactly two CSV outputs are produced: the filtered enriched report and the
-  Customer-Site Summary.
+* Volume and delivery bracket thresholds are all hardcoded in section 1.
+  Fee values for the volume brackets are dynamic (read from uploaded CSVs)
+  with hardcoded fallbacks.  Delivery charges (_DELIVERY_FEES) are fully
+  hardcoded as a 2-D dict keyed by (Mileage Fee Tier, Drop Fee Tier) —
+  the 12×5 table is small and stable; dynamic parsing of the
+  dollar-prefixed strings would add fragility.
+* All optional-lookup DataFrames (pallet_fee_df, sell_to_df,
+  custom_label_df) are loaded in render() via _load_optional_lookup and
+  passed as arguments.  No function in section 5 reads from disk.
+  _process_shipment_data (section 4) is the sole location that performs
+  file I/O on the uploaded lookup file objects.
+* Exactly two CSV outputs are produced: the filtered enriched report and
+  the Customer-Site Summary.
 """
 from __future__ import annotations
 
@@ -54,6 +90,11 @@ from typing import NamedTuple, Optional
 import pandas as pd
 import streamlit as st
 
+from data_sources.htst_shipment import (
+    HTSTShipmentSourceError,
+    SnapshotMeta,
+    fetch_htst_shipment_df,
+)
 from utils.ui_helpers import apply_custom_css
 
 
@@ -68,17 +109,31 @@ class _FilePattern(NamedTuple):
 
 
 # Order matters: the first matching pattern claims each uploaded file.
+#
+# NOTE: "shipment" is intentionally absent — the HTST Shipment Report is now
+# sourced from the Microsoft Fabric Dataflow Gen2 → Lakehouse Delta table via
+# data_sources.htst_shipment.fetch_htst_shipment_df().  Users no longer upload
+# it.  A manual-upload fallback is exposed in _render_shipment_source() for
+# the case when the dataflow is unreachable.
 _FILE_PATTERNS: list[_FilePattern] = [
-    _FilePattern("shipment",        True,  "HTST Shipment Report",           ["htst shipment", "htst_shipment", "shipment report"]),
     _FilePattern("plant_tracker",   True,  "Shipment Plant Tracker",          ["plant_tracker", "plant tracker", "shipment_plant"]),
     _FilePattern("mileage_tracker", True,  "Ship Route Mileage Tracker",      ["mileage_tracker", "mileage tracker", "route_mileage", "route mileage"]),
     _FilePattern("demantra",        True,  "Demantra Item Master",            ["demantra"]),
     _FilePattern("pricing_tracker", True,  "Delivered vs FOB Pricing Tracker",["delivered vs fob", "delivered_vs_fob", "fob_tracker", "fob tracker"]),
     _FilePattern("custom_label",    False, "Custom Label Volume Bracket Fee", ["custom label", "custom_label"]),
-    _FilePattern("delivery_miles",  False, "Delivery Miles Tier Fee",         ["delivery", "miles tier", "drop size"]),
     _FilePattern("pallet_fee",      False, "Pallet Fee",                      ["pallet_fee", "pallet fee"]),
     _FilePattern("sell_to",         False, "Sell-To Volume Bracket Fee",      ["sell-to", "sell_to"]),
 ]
+
+# Product-group filter applied in _process_shipment_data BEFORE any merge or
+# aggregation runs.  The Fabric Shipments table contains every product group
+# Darigold ships (HTST, Cheese, Powder, etc.); only HTST rows belong on this
+# page.  Filtering early shrinks the working set ~7× (matters for memory and
+# for every downstream operation), and is more correct than filtering at the
+# UI layer because incorrect rows would otherwise contaminate site-level
+# aggregates (e.g. Site-level Sell-to Volume sums).  Comparison is uppercase
+# + stripped to absorb minor formatting drift in the source data.
+_PRODUCT_GROUP_FILTER: str = "HTST"
 
 # Columns to remove from the enriched output — not needed downstream.
 _DROP_COLS = ["Reason Code", "Include for Fill Rate Calculations", "Past Due by Request Date"]
@@ -289,6 +344,25 @@ def _to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
+def _load_optional_lookup(file_obj, label: str) -> Optional[pd.DataFrame]:
+    """Read an optional lookup CSV, normalising headers; return None on failure.
+
+    Centralises the read/strip/warn pattern that the three optional fee files
+    (Pallet Fee, Sell-To Volume, Custom Label Volume) all share.  Returning
+    None — instead of raising — lets the page degrade to hardcoded fallback
+    fees while still warning the user about the specific file that failed.
+    """
+    if file_obj is None:
+        return None
+    try:
+        df = pd.read_csv(file_obj)
+        df.columns = df.columns.str.strip()
+        return df
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"{label} could not be read — fallback values will be used: {exc}")
+        return None
+
+
 def _widget_key(value: str) -> str:
     """Return an 8-character hex hash of *value* for use as a widget key suffix.
 
@@ -335,17 +409,28 @@ def _drop_blank_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ── 4. Processing pipeline ────────────────────────────────────────────────────
 
 def _process_shipment_data(
-    shipment_file,
+    shipment_df: pd.DataFrame,
     plant_tracker_file,
     mileage_tracker_file,
     demantra_file,
     pricing_tracker_file,
 ) -> Optional[pd.DataFrame]:
-    """Load and enrich the HTST Shipment Report in a sequential pipeline.
+    """Enrich the HTST Shipment Report in a sequential pipeline.
+
+    The shipment DataFrame is supplied directly by the caller — sourced from
+    either the Fabric dataflow connector (preferred) or the manual-upload
+    fallback (CSV → DataFrame conversion happens in _render_shipment_source).
+    The four lookup tables remain CSVs uploaded by the user.
 
     Enrichment steps
     ----------------
-    0.  Drop noise columns (_DROP_COLS).
+    0a. Normalise column names (strip whitespace).
+    0b. Filter to PRODUCTGROUP == _PRODUCT_GROUP_FILTER ("HTST").  Done first
+        so all downstream merges and aggregations operate on the ~1/7 row
+        subset rather than the full Shipments table.
+    0c. Defensive copy + drop noise columns (_DROP_COLS).
+    0d. Pre-parse 'Order Date' once into datetime64.  _render_filters then
+        skips its own O(n) parse on every widget interaction.
     1.  Left-join Plant Tracker on 'Shipping Warehouse'
         → 'Sourcing Plant' inserted after 'Shipping Warehouse'.
     2.  Left-join Mileage Tracker on ('Sourcing Plant', 'SHIPTONAME')
@@ -362,18 +447,40 @@ def _process_shipment_data(
     5.  Drop all-blank columns.
 
     Returns None on any read/join failure (st.error is called internally).
-    All files are read from the uploaded file objects; no local paths are used.
     """
-    # ── Load main report ──────────────────────────────────────────────────────
-    try:
-        df = pd.read_csv(shipment_file, low_memory=False)
-        df.columns = df.columns.str.strip()
-    except Exception as exc:
-        st.error(f"Could not read HTST Shipment Report: {exc}")
+    # ── Step 0a: Normalise column names ──────────────────────────────────────
+    # .rename returns a new DataFrame whose column index is fresh but whose
+    # underlying data is still shared with shipment_df (no row-data copy yet).
+    df = shipment_df.rename(columns=str.strip)
+
+    # ── Step 0b: Filter to HTST product group ────────────────────────────────
+    if "PRODUCTGROUP" not in df.columns:
+        st.error(
+            "Shipment data is missing the 'PRODUCTGROUP' column — cannot "
+            "filter to HTST.  Verify the Fabric dataflow output schema."
+        )
+        return None
+    htst_mask = df["PRODUCTGROUP"].astype(str).str.strip().str.upper().eq(_PRODUCT_GROUP_FILTER)
+    df = df[htst_mask]
+    if df.empty:
+        st.error(
+            f"No rows found with PRODUCTGROUP == '{_PRODUCT_GROUP_FILTER}' in "
+            "the shipment data.  Verify the dataflow refresh produced HTST rows."
+        )
         return None
 
-    # Step 0: drop columns not needed in the output
+    # ── Step 0c: Defensive copy + drop noise columns ─────────────────────────
+    # Copy AFTER the HTST filter — same correctness, much smaller allocation.
+    # Without the copy we'd mutate the connector's cached frame.
+    df = df.copy()
     df = df.drop(columns=[c for c in _DROP_COLS if c in df.columns])
+
+    # ── Step 0d: Pre-parse Order Date once ───────────────────────────────────
+    # The page's _render_filters needs datetime semantics for the slider AND
+    # row mask.  Parsing once here (run once per shipment-snapshot change)
+    # eliminates a per-rerun O(n) parse pass on every filter-widget interaction.
+    if "Order Date" in df.columns:
+        df["Order Date"] = pd.to_datetime(df["Order Date"], errors="coerce")
 
     # ── Step 1: Sourcing Plant ────────────────────────────────────────────────
     try:
@@ -791,20 +898,107 @@ def _build_customer_site_summary(
 
 # ── 6. UI rendering ───────────────────────────────────────────────────────────
 
+def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[SnapshotMeta], Optional[str]]:
+    """Render the HTST Shipment Report source section and return its DataFrame.
+
+    Two modes, controlled by a single checkbox:
+      1. Dataflow (default) — fetches from the Fabric Lakehouse Delta table via
+         data_sources.htst_shipment.fetch_htst_shipment_df().  A "Refresh"
+         button bypasses the 15-minute Streamlit cache.
+      2. Manual upload (fallback) — re-enables a file_uploader for the
+         shipment CSV, used when the dataflow is unavailable or for ad-hoc
+         what-if analysis on a non-canonical file.
+
+    Returns
+    -------
+    (shipment_df, meta, signature)
+        shipment_df : The materialised DataFrame, or None if not yet ready.
+        meta        : SnapshotMeta when sourced from the dataflow, else None.
+        signature   : A stable string used by render()'s session-state cache
+                      key.  Combines the dataflow snapshot identity OR the
+                      uploaded file's name+size, so the enrichment pipeline
+                      is rerun if-and-only-if the underlying shipment changes.
+    """
+    st.markdown("### 🛰️ HTST Shipment Source")
+
+    use_fallback = st.checkbox(
+        "Use manual file upload (fallback)",
+        value=False,
+        key="htst_shipment_use_fallback",
+        help=(
+            "Leave unchecked to pull the shipment report from the Microsoft "
+            "Fabric dataflow.  Check only if the dataflow is unavailable or "
+            "you need to run analytics on a non-canonical CSV."
+        ),
+    )
+
+    # ── Mode 1: Manual upload fallback ────────────────────────────────────────
+    if use_fallback:
+        uploaded = st.file_uploader(
+            "HTST Shipment Report (CSV)",
+            type=["csv"],
+            accept_multiple_files=False,
+            key="htst_shipment_fallback_upload",
+        )
+        if uploaded is None:
+            st.info("📤 Upload the HTST Shipment Report CSV to continue.")
+            return None, None, None
+        try:
+            df = pd.read_csv(uploaded, low_memory=False)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not read uploaded shipment CSV: {exc}")
+            return None, None, None
+        sig = f"upload:{uploaded.name}:{uploaded.size}"
+        st.caption(
+            f"📄 Using uploaded file **{uploaded.name}** "
+            f"({len(df):,} rows, {uploaded.size / 1_048_576:.1f} MB)."
+        )
+        return df, None, sig
+
+    # ── Mode 2: Dataflow (default) ────────────────────────────────────────────
+    # The Refresh button must be wired BEFORE fetch_htst_shipment_df() runs so
+    # that clicking it clears the cache on this same render pass.
+    refresh_clicked = st.button(
+        "🔄 Refresh from Dataflow",
+        key="htst_shipment_refresh",
+        help="Bypass the 15-minute cache and re-read the latest dataflow snapshot.",
+    )
+    try:
+        with st.spinner("Reading HTST Shipment Report from Microsoft Fabric…"):
+            df, meta = fetch_htst_shipment_df(force_refresh=refresh_clicked)
+    except HTSTShipmentSourceError as exc:
+        st.error(f"❌ Could not load shipment data from the Fabric dataflow.\n\n{exc}")
+        st.info(
+            "Tick **Use manual file upload (fallback)** above to keep working "
+            "while the dataflow is being fixed."
+        )
+        return None, None, None
+
+    last_mod = meta.last_modified.strftime("%Y-%m-%d %H:%M UTC") if meta.last_modified else "unknown"
+    st.caption(
+        f"🛰️ Shipment data **as of {last_mod}** "
+        f"· Delta version **v{meta.version}** "
+        f"· **{meta.row_count:,}** rows"
+    )
+    return df, meta, meta.cache_key
+
+
 def _render_upload_section() -> dict[str, object]:
     """Render a single multi-file uploader and return the auto-detected file map.
 
     The user drops all CSVs from the HTST Shipment Monitor folder in one action;
     each file is identified automatically by filename keywords.
     """
-    st.markdown("### 📤 Upload Data Files")
+    st.markdown("### 📤 Upload Lookup Files")
     st.caption(
-        "Select or drag-and-drop all CSVs from your HTST Shipment Monitor folder. "
-        "Files are identified automatically by their filename. "
+        "Upload the lookup CSVs (Plant Tracker, Mileage Tracker, Demantra, "
+        "Pricing Tracker, and any optional fee files). "
+        "The HTST Shipment Report itself is now pulled automatically from the "
+        "Fabric dataflow above. Files are identified by filename keywords. "
         f"[📁 Upload files in this folder]({_HTST_SHIPMENT_MONITOR_SHAREPOINT_URL})"
     )
     uploaded_files = st.file_uploader(
-        "Select all HTST Shipment Monitor CSV files",
+        "Select the HTST lookup CSV files",
         type=["csv"],
         accept_multiple_files=True,
         key="htst_all_files",
@@ -837,11 +1031,11 @@ def _render_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     st.markdown("### 🔍 Filter")
 
     # ── 1. Order Date range ───────────────────────────────────────────────────
-    # Parse "Order Date" once; reuse the Series for both slider bounds AND the
-    # row mask to avoid a second O(n) parse pass.
+    # 'Order Date' is pre-parsed to datetime64 by _process_shipment_data, so
+    # this is just an idempotent dtype check (microseconds).  Strings still
+    # work because pd.to_datetime is a no-op on already-datetime Series.
     date_col = "Order Date"
     if date_col in df.columns:
-        # errors="coerce" silently converts unparseable values to NaT.
         date_series: Optional[pd.Series] = pd.to_datetime(df[date_col], errors="coerce")
         valid_dates = date_series.dropna()
         min_dt: Optional[date] = valid_dates.min().date() if not valid_dates.empty else None
@@ -1014,18 +1208,18 @@ def _render_output_section(filtered_df: pd.DataFrame) -> None:
 def render() -> None:
     """Render the HTST Activity Monitor page.
 
-    Flow: upload → validate → process (cached) → load optional lookups →
-          filter (date + customer + ship-to) → Customer-Site Details →
-          Enriched Report.
+    Flow: dataflow fetch (or fallback upload) → validate lookup uploads →
+          process (cached) → load optional lookups → filter →
+          Customer-Site Details → Enriched Report.
 
     Business logic is fully delegated to section-specific functions.
     The enrichment pipeline is cached in st.session_state so it only re-runs
-    when the uploaded file set changes, not on every widget interaction.
-    duration_days is derived from the Order Date range slicer inside
-    _render_filters and is NOT cached — it updates instantly with the slicer.
-    Optional lookup DataFrames (pallet_fee_df, sell_to_df, custom_label_df) are
-    loaded here from uploaded file objects and passed as arguments — no function
-    downstream opens a file directly.
+    when the shipment snapshot OR the lookup file set changes — not on every
+    widget interaction.  duration_days is derived from the Order Date range
+    slicer inside _render_filters and is NOT cached — it updates instantly
+    with the slicer.  Optional lookup DataFrames (pallet_fee_df, sell_to_df,
+    custom_label_df) are loaded here from uploaded file objects and passed as
+    arguments — no function downstream opens a file directly.
     """
     apply_custom_css()
 
@@ -1037,16 +1231,26 @@ def render() -> None:
     # ── Welcome ───────────────────────────────────────────────────────────────
     st.markdown("### Welcome")
     st.info(
-        "Use this page to upload ACTUAL shipment report and REFRESH activity "
+        "The HTST Shipment Report is loaded automatically from the Microsoft "
+        "Fabric dataflow.  Upload the lookup CSVs below to refresh activity "
         "levels and associated charges."
     )
     st.markdown("---")
 
-    # ── Upload & auto-detect ──────────────────────────────────────────────────
+    # ── Shipment source: Fabric dataflow (or manual fallback) ────────────────
+    # _shipment_meta is unused here — _render_shipment_source already surfaces
+    # version + as-of timestamp in its own caption — but it's exposed for any
+    # future audit-logging or telemetry the page might add.
+    shipment_df, _shipment_meta, shipment_sig = _render_shipment_source()
+    st.markdown("---")
+    if shipment_df is None:
+        # _render_shipment_source already surfaced the error / waiting state.
+        return
+
+    # ── Lookup uploads (Plant / Mileage / Demantra / Pricing + optional fees)
     detected = _render_upload_section()
     st.markdown("---")
 
-    # Gate on required files — surface exactly which are still missing.
     required_missing = [
         p.label for p in _FILE_PATTERNS
         if p.required and detected.get(p.key) is None
@@ -1056,31 +1260,29 @@ def render() -> None:
         return
 
     # ── Process main enrichment pipeline (session-state cached) ───────────────
-    # _process_shipment_data reads and joins all required CSVs — an expensive
-    # operation on a 400 K-row, 200 MB+ file.  Streamlit re-executes render()
-    # on every widget interaction (including filter changes), so without caching
-    # this pipeline would re-run on every click, causing timeouts / memory
-    # pressure on Streamlit Cloud and exhausting UploadedFile cursors.
+    # _process_shipment_data joins the in-memory shipment DataFrame against
+    # four uploaded lookup CSVs — an expensive operation on a 400 K-row table.
+    # Streamlit re-executes render() on every widget interaction, so without
+    # caching this pipeline would re-run on every click.
     #
-    # Strategy: compute a lightweight MD5 signature from each required file's
-    # name and byte-size.  If the signature matches what is stored in
-    # session_state the enriched DataFrame and duration are read from cache;
-    # otherwise the pipeline runs and the results are stored.  hashlib is
-    # already imported (used by _widget_key).
-    _REQUIRED_KEYS = [
-        "shipment", "plant_tracker", "mileage_tracker", "demantra", "pricing_tracker"
+    # Strategy: build a composite signature from the shipment snapshot identity
+    # AND the four lookup files' name+size.  If the signature matches what is
+    # stored in session_state, the enriched DataFrame is read from cache;
+    # otherwise the pipeline runs and the results are stored.
+    _REQUIRED_LOOKUP_KEYS = [
+        "plant_tracker", "mileage_tracker", "demantra", "pricing_tracker"
     ]
+    lookup_sig_input = "".join(
+        f"{detected[k].name}:{detected[k].size}" for k in _REQUIRED_LOOKUP_KEYS
+    )
     file_sig = hashlib.md5(
-        "".join(
-            f"{detected[k].name}:{detected[k].size}" for k in _REQUIRED_KEYS
-        ).encode()
+        f"{shipment_sig}||{lookup_sig_input}".encode()
     ).hexdigest()
 
     if st.session_state.get("_htst_file_sig") != file_sig:
-        # File set changed — re-run the enrichment pipeline.
         with st.spinner("Processing — enriching shipment data…"):
             enriched_df = _process_shipment_data(
-                shipment_file=detected["shipment"],
+                shipment_df=shipment_df,
                 plant_tracker_file=detected["plant_tracker"],
                 mileage_tracker_file=detected["mileage_tracker"],
                 demantra_file=detected["demantra"],
@@ -1088,9 +1290,6 @@ def render() -> None:
             )
         if enriched_df is None:
             return  # st.error already raised inside _process_shipment_data
-        # Cache the enriched DataFrame keyed by the file-set signature.
-        # duration_days is NOT cached here; it comes from the Order Date range
-        # slicer in _render_filters and updates on every widget interaction.
         st.session_state["_htst_enriched_df"] = enriched_df
         st.session_state["_htst_file_sig"]    = file_sig
 
@@ -1098,36 +1297,16 @@ def render() -> None:
 
     if enriched_df is None:
         # Defensive guard: cache entry missing (e.g. session was reset).
-        st.error("Processed data unavailable — please re-upload your files.")
+        st.error("Processed data unavailable — please refresh the dataflow and re-upload the lookup files.")
         return
 
     # ── Load optional lookup tables from uploaded files ───────────────────────
-    # Both tables are loaded here so _build_customer_site_summary stays a pure
-    # analytics function with no file I/O.  None is passed when not uploaded.
-
-    pallet_fee_df: Optional[pd.DataFrame] = None
-    if detected.get("pallet_fee") is not None:
-        try:
-            pallet_fee_df = pd.read_csv(detected["pallet_fee"])
-            pallet_fee_df.columns = pallet_fee_df.columns.str.strip()
-        except Exception as exc:
-            st.warning(f"Pallet Fee file could not be read — Mixed Pallet Fee column skipped: {exc}")
-
-    sell_to_df: Optional[pd.DataFrame] = None
-    if detected.get("sell_to") is not None:
-        try:
-            sell_to_df = pd.read_csv(detected["sell_to"])
-            sell_to_df.columns = sell_to_df.columns.str.strip()
-        except Exception as exc:
-            st.warning(f"Sell-To Volume Bracket file could not be read — fallback fees will be used: {exc}")
-
-    custom_label_df: Optional[pd.DataFrame] = None
-    if detected.get("custom_label") is not None:
-        try:
-            custom_label_df = pd.read_csv(detected["custom_label"])
-            custom_label_df.columns = custom_label_df.columns.str.strip()
-        except Exception as exc:
-            st.warning(f"Custom Label Volume Bracket file could not be read — fallback fees will be used: {exc}")
+    # All three are loaded here so _build_customer_site_summary stays a pure
+    # analytics function with no file I/O.  None is passed when not uploaded;
+    # _build_customer_site_summary then substitutes hardcoded fallback fees.
+    pallet_fee_df   = _load_optional_lookup(detected.get("pallet_fee"),   "Pallet Fee file")
+    sell_to_df      = _load_optional_lookup(detected.get("sell_to"),      "Sell-To Volume Bracket file")
+    custom_label_df = _load_optional_lookup(detected.get("custom_label"), "Custom Label Volume Bracket file")
 
     st.success(
         f"✅ Processing complete — **{len(enriched_df):,} rows**, "

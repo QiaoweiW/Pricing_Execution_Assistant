@@ -475,6 +475,7 @@ def _build_milk_commodity_chart(
     milk_df: pd.DataFrame,
     start_month: Optional[pd.Timestamp] = None,
     end_month: Optional[pd.Timestamp] = None,
+    category_filter: Optional[str] = None,
 ) -> go.Figure:
     """Multi-series time-series chart of milk Skim & Butterfat rates.
 
@@ -487,6 +488,14 @@ def _build_milk_commodity_chart(
     The optional ``start_month`` / ``end_month`` arguments restrict the
     plotted x-range so the chart reacts to the time slicer rendered above it.
     Both bounds are inclusive; ``None`` means "no bound on that side".
+
+    ``category_filter`` is a chart-only knob that restricts which Category
+    families are drawn — accepts ``"HTST"`` / ``"ESL"`` (case-insensitive) to
+    isolate one family, or ``None`` / ``"All"`` to draw every series. It does
+    NOT influence any downstream calculation (metrics, backing table,
+    milk_mover downloads, example-prices enrichment) — those continue to
+    consume every (Category, Class) row from ``Milk_Mover_Tracker`` exactly
+    as before.
     """
     df = _strip_df_columns(milk_df).copy()
     if "Month" not in df.columns or "Category" not in df.columns or "Class" not in df.columns:
@@ -511,8 +520,17 @@ def _build_milk_commodity_chart(
     if skim_col is None and bf_col is None:
         return go.Figure()
 
+    # Normalise the chart-only category filter once. Anything outside the
+    # known {"HTST", "ESL"} set falls back to "show everything" so unexpected
+    # values can never silently blank out the chart.
+    cat_filter = (category_filter or "").strip().upper()
+    if cat_filter not in {"HTST", "ESL"}:
+        cat_filter = ""
+
     fig = go.Figure()
     for (cat, cls), color in _MILK_COLOR_MAP.items():
+        if cat_filter and cat != cat_filter:
+            continue
         sub = df[
             (df["Category"].astype(str).str.upper() == cat)
             & (df["Class"].astype(str).str.upper() == cls)
@@ -583,6 +601,20 @@ _SS_NMT_DF = f"{_SS_PREFIX}_movers_non_milk_df"
 # table without requiring another Refresh click.
 _SS_MILK_START = f"{_SS_PREFIX}_milk_start_month"
 _SS_MILK_END   = f"{_SS_PREFIX}_milk_end_month"
+
+# Session-state key for the chart-only "HTST vs ESL" category filter. Lives
+# beside the time slicer keys but is intentionally NOT consumed by the milk
+# pipeline — it only restricts which (Category, Class) lines are rendered on
+# the Milk Commodity Cost chart, so metrics, backing table, milk_mover
+# downloads and example-prices enrichment are unaffected.
+_SS_MILK_CATEGORY = f"{_SS_PREFIX}_milk_category_filter"
+
+# Filter options for the chart-only category selector. ``"All"`` is the
+# default and preserves the legacy four-line view; ``"HTST"`` / ``"ESL"``
+# isolate the two pasteurisation methods so users can compare classes within
+# a single family without legend clutter.
+_MILK_CATEGORY_ALL: str = "All"
+_MILK_CATEGORY_OPTIONS: tuple[str, ...] = (_MILK_CATEGORY_ALL, "HTST", "ESL")
 
 
 def _seed_movers_non_milk_df() -> pd.DataFrame:
@@ -1604,7 +1636,7 @@ def _render_milk_slicer(
     available_months: list[pd.Timestamp],
     current_month: pd.Timestamp,
 ) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp]]:
-    """Render compact Start/End month selectboxes above the milk chart.
+    """Render compact Start/End month selectboxes + chart-only category filter.
 
     Behaviour
     ---------
@@ -1614,6 +1646,10 @@ def _render_milk_slicer(
     * Selections persist in ``session_state`` under ``_SS_MILK_START`` /
       ``_SS_MILK_END``; if a previously-stored value is no longer in the
       newly-uploaded data it falls back to the default.
+    * The third column renders a chart-only "HTST vs ESL" filter under
+      ``_SS_MILK_CATEGORY``. It is intentionally NOT returned from this
+      function — the chart reads it directly from ``session_state`` so the
+      milk-impact pipeline contract (Start/End months only) stays unchanged.
     * Returns the live ``(start, end)`` Timestamps so the chart and the
       milk-impact pipeline both see the same selection in the same render.
     """
@@ -1634,10 +1670,12 @@ def _render_milk_slicer(
         st.session_state[_SS_MILK_START] = default_start
     if st.session_state.get(_SS_MILK_END) not in available_months:
         st.session_state[_SS_MILK_END] = default_end
+    if st.session_state.get(_SS_MILK_CATEGORY) not in _MILK_CATEGORY_OPTIONS:
+        st.session_state[_SS_MILK_CATEGORY] = _MILK_CATEGORY_ALL
 
     label_map = {m: m.strftime("%b %Y") for m in available_months}
 
-    col_s, col_e = st.columns(2)
+    col_s, col_e, col_cat = st.columns(3)
     with col_s:
         st.selectbox(
             "Start Month",
@@ -1653,6 +1691,19 @@ def _render_milk_slicer(
             format_func=lambda m: label_map[m],
             key=_SS_MILK_END,
             help="Drives the 'End Month' Skim/Butterfat rates in the milk-impact pipeline.",
+        )
+    with col_cat:
+        st.selectbox(
+            "HTST vs ESL",
+            options=_MILK_CATEGORY_OPTIONS,
+            key=_SS_MILK_CATEGORY,
+            help=(
+                "Chart-only filter. Limits the Skim/Butterfat lines drawn "
+                "below to one pasteurisation family. Does not affect the "
+                "Monthly Milk Impact metric, the backing table, or the "
+                "milk_mover download — those always consume every "
+                "(Category, Class) row from Milk_Mover_Tracker."
+            ),
         )
 
     return (
@@ -1684,8 +1735,20 @@ def _render_milk_commodity(
     available_months = _available_milk_months(milk.df)
     start_month, end_month = _render_milk_slicer(available_months, current_month)
 
+    # The "HTST vs ESL" filter is a chart-only knob — read it straight from
+    # session_state so the slicer's ``(start, end)`` return stays minimal and
+    # the milk-impact pipeline contract is unchanged. ``"All"`` (the default)
+    # is normalised to ``None`` so the chart builder draws every series.
+    category_choice = st.session_state.get(_SS_MILK_CATEGORY, _MILK_CATEGORY_ALL)
+    category_filter = (
+        None if category_choice == _MILK_CATEGORY_ALL else category_choice
+    )
+
     fig = _build_milk_commodity_chart(
-        milk.df, start_month=start_month, end_month=end_month,
+        milk.df,
+        start_month=start_month,
+        end_month=end_month,
+        category_filter=category_filter,
     )
     st.plotly_chart(fig, use_container_width=True, key=f"{_SS_PREFIX}_milk_chart")
 
@@ -2116,6 +2179,7 @@ def _clear_upload_state() -> None:
         _SS_NMT_DF,
         _SS_MILK_START,
         _SS_MILK_END,
+        _SS_MILK_CATEGORY,
     ):
         st.session_state.pop(key, None)
 

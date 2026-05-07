@@ -150,12 +150,41 @@ def promote_sp_secrets_to_env(cfg: dict[str, str]) -> None:
 
 # ── Credential & token ───────────────────────────────────────────────────────
 
+def _is_headless_runtime() -> bool:
+    """Detect a headless Streamlit runtime (Streamlit Community Cloud,
+    ``--server.headless=true`` flag, container deployments).
+
+    The credential chain MUST NOT include
+    :class:`InteractiveBrowserCredential` in such environments — there
+    is no browser to receive the OAuth redirect, and the credential
+    blocks waiting for a callback that never arrives (~5 minute hang
+    before it finally errors). Detecting headless mode lets us drop
+    the interactive credential so any auth failure (missing SP creds,
+    expired secret, etc.) surfaces immediately as a clean error
+    instead of freezing the page.
+    """
+    return (
+        os.environ.get("STREAMLIT_SHARING_MODE") is not None
+        or os.environ.get("STREAMLIT_SERVER_HEADLESS", "").lower() == "true"
+        or os.environ.get("STREAMLIT_RUNTIME_ENV", "").lower() == "cloud"
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def _build_credential_cached(cache_name: str):
     """Build a credential chain with disk-persistent MSAL token cache.
 
     Cached by ``cache_name`` so two callers using the same name share one
     in-memory credential object (and the same MSAL cache file on disk).
+
+    Chain composition:
+      * ``EnvironmentCredential`` — picks up ``AZURE_TENANT_ID`` /
+        ``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET`` (set by
+        ``promote_sp_secrets_to_env``). Always first so a configured
+        service principal short-circuits the rest.
+      * ``InteractiveBrowserCredential`` — only added when running
+        with an attached browser (i.e. NOT on Streamlit Cloud or any
+        ``--server.headless`` deployment). See ``_is_headless_runtime``.
     """
     try:
         from azure.identity import (
@@ -170,21 +199,25 @@ def _build_credential_cached(cache_name: str):
             "Run: pip install -r requirements.txt"
         ) from exc
 
-    # allow_unencrypted_storage=True is required on Windows workstations
-    # that lack a managed keyring (i.e. virtually all corporate-locked-down
-    # PCs). The cache file lives at %LOCALAPPDATA%\.IdentityService\<name>
-    # — a user-profile location that needs no admin rights.
-    persistence = TokenCachePersistenceOptions(
-        name=cache_name,
-        allow_unencrypted_storage=True,
-    )
+    credentials = [EnvironmentCredential()]
 
-    return ChainedTokenCredential(
-        EnvironmentCredential(),
-        InteractiveBrowserCredential(
-            cache_persistence_options=persistence,
-        ),
-    )
+    if not _is_headless_runtime():
+        # allow_unencrypted_storage=True is required on Windows
+        # workstations that lack a managed keyring (i.e. virtually all
+        # corporate-locked-down PCs). The cache file lives at
+        # %LOCALAPPDATA%\.IdentityService\<name> — a user-profile
+        # location that needs no admin rights.
+        persistence = TokenCachePersistenceOptions(
+            name=cache_name,
+            allow_unencrypted_storage=True,
+        )
+        credentials.append(
+            InteractiveBrowserCredential(
+                cache_persistence_options=persistence,
+            )
+        )
+
+    return ChainedTokenCredential(*credentials)
 
 
 def get_credential(cache_name: str):
@@ -195,8 +228,13 @@ def get_credential(cache_name: str):
 def acquire_storage_token(cache_name: str) -> str:
     """Acquire a bearer token for the OneLake Storage scope.
 
-    First call typically opens a browser window for sign-in; subsequent
-    calls within the cache TTL are silent (cached refresh token).
+    On a workstation: first call typically opens a browser window for
+    sign-in; subsequent calls within the cache TTL are silent.
+
+    On a headless runtime (Streamlit Cloud / containers): only the
+    service-principal env vars (``AZURE_TENANT_ID`` / ``AZURE_CLIENT_ID``
+    / ``AZURE_CLIENT_SECRET``) can satisfy this call. The error message
+    below adapts to surface that requirement clearly.
 
     Raises
     ------
@@ -207,6 +245,22 @@ def acquire_storage_token(cache_name: str) -> str:
     try:
         return credential.get_token(STORAGE_SCOPE).token
     except Exception as exc:  # noqa: BLE001
+        if _is_headless_runtime():
+            raise FabricAuthError(
+                "Could not acquire an Azure Storage token for OneLake on "
+                "this headless deployment.\n\n"
+                "A service principal is required to read Microsoft Fabric "
+                "from Streamlit Cloud (or any --server.headless runtime). "
+                "Add the following keys to your secrets in 'Manage app → "
+                "Settings → Secrets':\n"
+                "    tenant_id     = \"<Azure AD tenant GUID>\"\n"
+                "    client_id     = \"<App registration client GUID>\"\n"
+                "    client_secret = \"<Client secret value>\"\n"
+                "Place them inside the [fabric_htst] block (or any "
+                "[fabric_*] override block) — they are picked up by "
+                "EnvironmentCredential automatically.\n\n"
+                f"Underlying error: {exc}"
+            ) from exc
         raise FabricAuthError(
             "Could not acquire an Azure Storage token for OneLake. "
             "If a sign-in window opened, complete it and reload this page. "

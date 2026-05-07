@@ -20,10 +20,10 @@ Sections
                               _previous_month_extract, _build_resin_mover_fg,
                               _build_two_resin_mover_fgs;
                               Tag → tracker-column resolution helpers;
-                              Combined backing: _build_combined_backing_no_milk;
+                              mover_details_table: _build_mover_details_table_no_milk;
                               Milk pipeline: _milk_rate_lookup_for_month,
                               _build_milk_usage_with_movers,
-                              _layer_milk_on_backing;
+                              _layer_milk_on_mover_details_table;
                               Example-prices enrichment;
                               Top-level: _compute_all_outputs)
 7. UI fragments              (intro, upload, milk-commodity chart + slicer,
@@ -68,9 +68,9 @@ Calculation contract (matches the May-2026 product spec)
      tracker, e.g. April when editing May), and "New" is the freshly-computed
      cost using the tracker's last-row $/lbs driver. Each FG is exposed as a
      CSV download. No monthly-gallons / monthly-impact columns live here —
-     those live on the combined backing table.
+     those live on the mover_details_table.
 
-  2. Combined backing table = ONE copy of ``site_item_volume`` with the
+  2. mover_details_table = ONE copy of ``site_item_volume`` with the
      following columns appended (in this order):
 
          Monthly Freight Mover  = Monthly Gallons × Pricing Method × Freight Mover $/Gal
@@ -100,7 +100,7 @@ Calculation contract (matches the May-2026 product spec)
      Skim/Butterfat rates per (Category, Class) come from
      ``Milk_Mover_Tracker`` for the slicer-selected months. Milk Scrape%
      is the last-row ``Milk`` cell of ``Scrape_Tracker``. The result is
-     joined onto the backing by Item Description ↔ PRODUCTDESC match and
+     joined onto the mover_details_table by Item Description ↔ PRODUCTDESC match and
      drives Monthly Milk Mover.
 
   4. Example prices (optional file) is enriched with Resin Mover $/EA
@@ -119,6 +119,17 @@ from typing import Optional
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# OneLake-backed store + USDA-PDF auto-update workflow for Milk_Mover_Tracker.
+# These two modules replace the legacy ``Milk_Mover_Tracker.csv`` upload —
+# the milk DataFrame is now read from a Microsoft Fabric Lakehouse blob at
+# render time, and a separate orchestrator keeps it in sync with the USDA
+# advanced-prices PDF. None of the downstream calculation code has been
+# touched: only how the milk DataFrame enters this view changed.
+from data_sources import milk_mover_autoupdate as _milk_autoupdate
+from data_sources import milk_mover_store as _milk_store
+from data_sources import milk_usage_stable_store as _milk_usage_store
+from data_sources import base_milk_cost_tracker_store as _base_milk_cost_tracker
 
 
 # ── 1. Constants ──────────────────────────────────────────────────────────────
@@ -145,12 +156,15 @@ _BREAKTHROUGH_FUEL_URL: str = (
 )
 
 # Role → filename keyword mapping (case-insensitive, evaluated in order so
-# more specific keys win — e.g. "milk_mover_tracker" must be tested before any
-# shorter key that could absorb it).
+# more specific keys win — e.g. "site_item_volume" must be tested before any
+# shorter key that could absorb it). The legacy ``milk_mover_tracker`` and
+# ``milk_usage_stable`` roles are intentionally absent: both DataFrames now
+# come from Microsoft Fabric Lakehouse blobs (see
+# ``data_sources/milk_mover_store.py`` and ``data_sources/milk_usage_stable_store.py``)
+# and are injected into the uploads dict in
+# ``render_monthly_resin_freight_mover_tracker``.
 _ROLE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("site_item_volume",   ("site_item_volume",)),
-    ("milk_mover_tracker", ("milk_mover_tracker",)),
-    ("milk_usage_stable",  ("milk_usage_stable",)),
     ("resin_calculator",   ("resin_calculator",)),
     ("resin_cost_tracker", ("resin_cost_tracker",)),
     # Legacy filename ``Scrap_Tracker`` still classifies for backwards-compat.
@@ -161,8 +175,9 @@ _ROLE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 # Roles that MUST be uploaded before the Refresh step can run. Optional roles
-# (milk_mover_tracker, milk_usage_stable, packaging_index/pkg_index,
-# example_prices) are accepted but skipped silently when absent.
+# (packaging_index/pkg_index, example_prices) are accepted but skipped
+# silently when absent. milk_usage_stable and milk_mover_tracker are sourced
+# from Fabric and are not part of the upload contract.
 REQUIRED_ROLES: tuple[str, ...] = (
     "site_item_volume",
     "resin_calculator",
@@ -388,6 +403,130 @@ def _load_uploaded_files(files: list) -> dict[str, _Uploaded]:
     return result
 
 
+# ── 3a. Milk Mover OneLake source ────────────────────────────────────────────
+#
+# The Milk Mover Tracker has been migrated from "user uploads a CSV" to
+# "system reads a Microsoft Fabric Lakehouse blob, kept in sync with the USDA
+# advanced-prices PDF." These helpers are the only seam between the new
+# storage layer and the unchanged downstream pipeline — every other consumer
+# of ``uploads["milk_mover_tracker"]`` keeps working byte-for-byte because
+# ``read_milk_mover_df`` returns the exact same DataFrame shape the legacy
+# CSV produced (Category, Month, Class, Skim Rate, Butterfat Rate).
+
+# Session-state key under which we cache the latest auto-update result, so
+# the status caption rendered under the milk slicer can show what happened
+# without re-running the orchestrator on every rerun.
+_SS_MILK_AUTOUPDATE_RESULT = "monthly_movers_milk_autoupdate_result"
+
+
+def _load_milk_mover_uploaded_from_store() -> Optional[_Uploaded]:
+    """Return an ``_Uploaded`` populated from the OneLake milk-mover store.
+
+    Returns ``None`` when the store is empty AND the seed CSV is missing —
+    at that point we have no rows to render and the milk chart degrades to
+    a friendly empty-state message.
+    """
+    try:
+        df = _milk_store.read_milk_mover_df()
+    except _milk_store.MilkMoverStoreError as exc:
+        # Surface a clean, single-line caption; the empty-state branch in
+        # ``_render_milk_commodity`` will then render the connectivity
+        # message rather than the chart.
+        st.session_state[_SS_MILK_AUTOUPDATE_RESULT] = (
+            _milk_autoupdate.AutoUpdateResult(
+                checked_at=datetime.now(),
+                errors=[f"OneLake read failed: {exc}"],
+            )
+        )
+        return None
+    if df is None or df.empty:
+        return None
+    return _Uploaded(
+        role="milk_mover_tracker",
+        filename=_milk_store.get_store_label(),
+        df=df,
+    )
+
+
+def _run_milk_mover_autoupdate(*, force: bool = False) -> None:
+    """Run the USDA-PDF auto-update once and cache the result.
+
+    The orchestrator is itself TTL-guarded (default 1 h), so calling this on
+    every rerun is cheap once we've checked recently. The cached result is
+    rendered as a small status caption beneath the milk slicer.
+    """
+    try:
+        result = _milk_autoupdate.maybe_update_from_pdfs(force=force)
+    except Exception as exc:  # pragma: no cover — defensive only
+        # Never let the auto-update path break the page render. The DB still
+        # holds the last known good data; we just won't show new rows.
+        result = _milk_autoupdate.AutoUpdateResult(
+            checked_at=datetime.now(),
+            errors=[f"unexpected error: {exc}"],
+        )
+    st.session_state[_SS_MILK_AUTOUPDATE_RESULT] = result
+
+
+def _inject_milk_mover_from_store(uploads: dict[str, _Uploaded]) -> None:
+    """Populate ``uploads['milk_mover_tracker']`` from the OneLake store.
+
+    Done in-place so callers don't need to thread a new dict through the
+    rest of the section. If the store is empty (or unreachable) the key
+    is left absent — ``_render_milk_commodity`` then renders the
+    empty-state branch instead of the chart.
+    """
+    sourced = _load_milk_mover_uploaded_from_store()
+    if sourced is None:
+        uploads.pop("milk_mover_tracker", None)
+        return
+    uploads["milk_mover_tracker"] = sourced
+
+
+def _load_milk_usage_stable_uploaded_from_store() -> Optional[_Uploaded]:
+    """Return an ``_Uploaded`` populated from the OneLake Milk_Usage_Stable store.
+
+    Returns ``None`` when the blob is empty AND the seed CSV is missing.
+    Errors raised by the store are swallowed and surfaced through the
+    auto-update result session-state slot, mirroring the milk-mover path
+    so the page always renders a coherent caption.
+    """
+    try:
+        # Cheap idempotent bootstrap — only writes on the first ever render
+        # against an empty lakehouse; a no-op afterwards.
+        _milk_usage_store.seed_from_csv_if_empty()
+        df = _milk_usage_store.read_milk_usage_stable_df()
+    except _milk_usage_store.MilkUsageStableStoreError as exc:
+        st.session_state[_SS_MILK_AUTOUPDATE_RESULT] = (
+            _milk_autoupdate.AutoUpdateResult(
+                checked_at=datetime.now(),
+                errors=[f"Milk_Usage_Stable OneLake read failed: {exc}"],
+            )
+        )
+        return None
+    if df is None or df.empty:
+        return None
+    return _Uploaded(
+        role="milk_usage_stable",
+        filename=_milk_usage_store.get_store_label(),
+        df=df,
+    )
+
+
+def _inject_milk_usage_stable_from_store(uploads: dict[str, _Uploaded]) -> None:
+    """Populate ``uploads['milk_usage_stable']`` from the OneLake store.
+
+    Same shape as :func:`_inject_milk_mover_from_store` so the two
+    Fabric-sourced inputs are wired the same way. The role key matches
+    the value the legacy upload-classifier used so every downstream
+    consumer (``_compute_milk_usage_for_render`` etc.) keeps working.
+    """
+    sourced = _load_milk_usage_stable_uploaded_from_store()
+    if sourced is None:
+        uploads.pop("milk_usage_stable", None)
+        return
+    uploads["milk_usage_stable"] = sourced
+
+
 # ── 4. Chart builder ──────────────────────────────────────────────────────────
 
 def _build_packaging_index_chart(pkg_df: pd.DataFrame) -> go.Figure:
@@ -500,8 +639,8 @@ def _build_milk_commodity_chart(
     (``category_filter="HTST"`` + ``class_filter="I"`` shows HTST Class I
     only).
 
-    Neither filter influences any downstream calculation (metrics, backing
-    table, milk_mover downloads, example-prices enrichment) — those continue
+    Neither filter influences any downstream calculation (metrics,
+    mover_details_table, milk_mover downloads, example-prices enrichment) — those continue
     to consume every (Category, Class) row from ``Milk_Mover_Tracker``
     exactly as before.
     """
@@ -613,7 +752,7 @@ def _build_milk_commodity_chart(
 _SS_NMT_DF = f"{_SS_PREFIX}_movers_non_milk_df"
 
 # Session-state keys for the Milk Commodity Cost time slicer. Persisted here
-# so changing the slicer reactively re-layers the milk columns on the backing
+# so changing the slicer reactively re-layers the milk columns on the mover_details_table
 # table without requiring another Refresh click.
 _SS_MILK_START = f"{_SS_PREFIX}_milk_start_month"
 _SS_MILK_END   = f"{_SS_PREFIX}_milk_end_month"
@@ -622,7 +761,7 @@ _SS_MILK_END   = f"{_SS_PREFIX}_milk_end_month"
 # ("I vs II") filters. Both live beside the time slicer keys but are
 # intentionally NOT consumed by the milk pipeline — they only restrict which
 # (Category, Class) lines are rendered on the Milk Commodity Cost chart, so
-# metrics, backing table, milk_mover downloads and example-prices enrichment
+# metrics, mover_details_table, milk_mover downloads and example-prices enrichment
 # are unaffected.
 _SS_MILK_CATEGORY = f"{_SS_PREFIX}_milk_category_filter"
 _SS_MILK_CLASS    = f"{_SS_PREFIX}_milk_class_filter"
@@ -721,7 +860,7 @@ def _render_movers_non_milk_editor() -> pd.DataFrame:
 # ── 6. Calculations ───────────────────────────────────────────────────────────
 
 # 6a. Resin FG generation — unchanged contract from the legacy module so the
-# downstream consumers (resin_mover_fg downloads, resin-backing fallback) keep
+# downstream consumers (resin_mover_fg downloads, resin-mover_details_table fallback) keep
 # matching the spec the team is already familiar with.
 
 def _latest_scrape_fraction(scrape_tracker_df: pd.DataFrame) -> float:
@@ -768,7 +907,7 @@ def _build_resincalculate(
 
 
 # Output column names for the resin-mover FG. Defined once at module scope so
-# the builder, downstream consumers (resin-backing fallback, example-prices
+# the builder, downstream consumers (resin-mover_details_table fallback, example-prices
 # enrichment) and tests can reference a single source of truth.
 _FG_COL_OLD       = "Old Resin Cost ($/Gal)"
 _FG_COL_NEW       = "New Resin Cost ($/Gal)"
@@ -1008,14 +1147,14 @@ def _last_row_value(
         return None
 
 
-# 6c. Backing tables ──────────────────────────────────────────────────────────
+# 6c. mover_details_tables ──────────────────────────────────────────────────────────
 #
-# The Monthly Pricing pack uses a single combined backing table — one copy of
+# The Monthly Pricing pack uses a single mover_details_table — one copy of
 # site_item_volume with Freight, Resin, and Milk movers ($/Gal) plus their
 # Monthly equivalents appended. The $/Gal columns sit grouped at the END per
 # the May-2026 product spec.
 #
-# The Milk Mover columns are LAYERED on top of the base backing at render
+# The Milk Mover columns are LAYERED on top of the base mover_details_table at render
 # time so they react to the time slicer above the Milk Commodity Cost chart
 # without requiring another Refresh click.
 
@@ -1042,9 +1181,9 @@ def _fg_resin_lookup_by_desc(fg_df: pd.DataFrame) -> dict[str, float]:
     return dict(zip(grouped["_match_key"], grouped[_FG_COL_MOVER]))
 
 
-# ── Combined backing builder (no-milk base) ──────────────────────────────────
+# ── mover_details_table builder (no-milk base) ──────────────────────────────────
 #
-# Canonical column names for the combined backing. Defined once so the builder,
+# Canonical column names for the mover_details_table. Defined once so the builder,
 # the milk layer, and consumers all reference a single source of truth.
 _BK_COL_FREIGHT_GAL  = "Freight Mover $/Gal"
 _BK_COL_RESIN_GAL    = "Resin Mover $/Gal"
@@ -1053,7 +1192,7 @@ _BK_COL_MONTHLY_FRT  = "Monthly Freight Mover"
 _BK_COL_MONTHLY_RES  = "Monthly Resin Mover"
 _BK_COL_MONTHLY_MILK = "Monthly Milk Mover"
 
-# $/Gal columns are grouped together at the END of the final backing per the
+# $/Gal columns are grouped together at the END of the final mover_details_table per the
 # May-2026 spec. The Monthly columns sit just before them so the source-of-
 # truth ($/Gal drivers) and their derived per-row totals stay visually paired.
 _BK_GAL_COLUMNS:     tuple[str, ...] = (
@@ -1064,16 +1203,16 @@ _BK_MONTHLY_COLUMNS: tuple[str, ...] = (
 )
 
 
-def _build_combined_backing_no_milk(
+def _build_mover_details_table_no_milk(
     site_item_volume_df: pd.DataFrame,
     movers_non_milk_df: pd.DataFrame,
     rest_htst_resin_mover_fg: pd.DataFrame,
     topco_resin_mover_fg: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Single backing table with Freight + Resin movers ($/Gal) and monthly totals.
+    """Single mover_details_table with Freight + Resin movers ($/Gal) and monthly totals.
 
     The milk columns are *not* added here — they are layered separately by
-    :func:`_layer_milk_on_backing` so they react to the time-slicer without a
+    :func:`_layer_milk_on_mover_details_table` so they react to the time-slicer without a
     Refresh.
 
     Per-row contract::
@@ -1314,29 +1453,29 @@ def _milk_lookup_by_desc(milk_usage_with_movers_df: pd.DataFrame) -> dict[str, f
     return dict(zip(grouped["_match_key"], grouped[_MUM_COL_MILK_COST_GAL]))
 
 
-def _layer_milk_on_backing(
-    backing_base: pd.DataFrame,
+def _layer_milk_on_mover_details_table(
+    mover_details_table_base: pd.DataFrame,
     milk_usage_with_movers_df: Optional[pd.DataFrame],
 ) -> tuple[pd.DataFrame, float]:
-    """Add ``Milk Mover $/Gal`` and ``Monthly Milk Mover`` to the base backing.
+    """Add ``Milk Mover $/Gal`` and ``Monthly Milk Mover`` to the base mover_details_table.
 
     Steps
     -----
     1. Pull ``Milk Cost Mover $/Gal`` from ``milk_usage_with_movers_df`` keyed
-       on item description (matched against ``PRODUCTDESC`` in the backing,
+       on item description (matched against ``PRODUCTDESC`` in the mover_details_table,
        case-insensitive).
     2. Compute ``Monthly Milk Mover = Monthly Gallons × Milk Mover $/Gal``,
        coercing both inputs to numeric float64 first so a stray ``None`` from
        gallon-cell parsing can never poison the multiplication dtype.
     3. Reorder columns so the three Monthly Movers sit together followed by
        the three $/Gal drivers grouped at the END (per the May-2026 spec).
-    4. Compute the headline metric as the sum of the **final backing**'s
+    4. Compute the headline metric as the sum of the **final mover_details_table**'s
        ``Monthly Milk Mover`` column — this guarantees the metric and the
        downloadable CSV column always agree to the cent.
 
-    Returns ``(final_backing, monthly_milk_impact_total)``.
+    Returns ``(final_mover_details_table, monthly_milk_impact_total)``.
     """
-    out = backing_base.copy()
+    out = mover_details_table_base.copy()
     milk_lookup = _milk_lookup_by_desc(milk_usage_with_movers_df)
 
     if not milk_lookup or "PRODUCTDESC" not in out.columns:
@@ -1371,13 +1510,13 @@ def _layer_milk_on_backing(
     other_cols   = [c for c in out.columns if c not in grouped]
     monthly_pres = [c for c in _BK_MONTHLY_COLUMNS if c in out.columns]
     gal_pres     = [c for c in _BK_GAL_COLUMNS     if c in out.columns]
-    final_backing = out[other_cols + monthly_pres + gal_pres]
+    final_mover_details_table = out[other_cols + monthly_pres + gal_pres]
 
     monthly_milk_total = float(
-        pd.to_numeric(final_backing[_BK_COL_MONTHLY_MILK], errors="coerce")
+        pd.to_numeric(final_mover_details_table[_BK_COL_MONTHLY_MILK], errors="coerce")
         .sum(skipna=True)
     )
-    return final_backing, monthly_milk_total
+    return final_mover_details_table, monthly_milk_total
 
 
 # 6d. Example prices enrichment ───────────────────────────────────────────────
@@ -1478,7 +1617,7 @@ def _compute_all_outputs(
     Outputs (keys in the returned dict):
       * ``rest_htst_resin_mover_fg`` — DataFrame for download.
       * ``topco_resin_mover_fg`` — DataFrame for download.
-      * ``combined_backing_base`` — DataFrame (siv + Freight + Resin movers).
+      * ``mover_details_table_base`` — DataFrame (siv + Freight + Resin movers).
         Milk columns are NOT included here — they are layered at render time
         so they react to the time slicer above the Milk Commodity chart
         without requiring another Refresh click.
@@ -1535,10 +1674,10 @@ def _compute_all_outputs(
         editing_month,
     )
 
-    # 2. Combined backing (Freight + Resin only — milk is layered at render
+    # 2. mover_details_table (Freight + Resin only — milk is layered at render
     #    time). Freight + Resin totals don't depend on the milk slicer, so
     #    they can be computed (and cached) here once per Refresh.
-    combined_base = _build_combined_backing_no_milk(
+    combined_base = _build_mover_details_table_no_milk(
         uploads["site_item_volume"].df,
         movers_non_milk_df,
         rest_fg,
@@ -1566,7 +1705,7 @@ def _compute_all_outputs(
     return {
         "rest_htst_resin_mover_fg":     rest_fg,
         "topco_resin_mover_fg":         topco_fg,
-        "combined_backing_base":        combined_base,
+        "mover_details_table_base":        combined_base,
         "monthly_freight_impact_total": monthly_freight_total,
         "monthly_resin_impact_total":   monthly_resin_total,
         "rest_htst_freight_per_gal":    rest_freight_gal,
@@ -1605,7 +1744,7 @@ def _render_monthly_sop_and_upload_intro() -> None:
   commercial leaders; click **Refresh** to recompute the impact metrics and
   downloads.
 - Download and use the **"Mover Downloads"** for pricing updates. Save the
-  backing table in the Monthly Pricing folder for tracking.
+  mover_details_table in the Monthly Pricing folder for tracking.
 
 _Files are matched automatically by filename keyword after upload._
         """.strip()
@@ -1734,7 +1873,7 @@ def _render_milk_slicer(
             help=(
                 "Chart-only filter. Limits the Skim/Butterfat lines drawn "
                 "below to one pasteurisation family. Does not affect the "
-                "Monthly Milk Impact metric, the backing table, or the "
+                "Monthly Milk Impact metric, the mover_details_table, or the "
                 "milk_mover download — those always consume every "
                 "(Category, Class) row from Milk_Mover_Tracker."
             ),
@@ -1747,7 +1886,7 @@ def _render_milk_slicer(
             help=(
                 "Chart-only filter. Limits the Skim/Butterfat lines drawn "
                 "below to one milk class. Does not affect the Monthly Milk "
-                "Impact metric, the backing table, or the milk_mover "
+                "Impact metric, the mover_details_table, or the milk_mover "
                 "download — those always consume every (Category, Class) "
                 "row from Milk_Mover_Tracker."
             ),
@@ -1757,6 +1896,41 @@ def _render_milk_slicer(
         st.session_state.get(_SS_MILK_START),
         st.session_state.get(_SS_MILK_END),
     )
+
+
+def _render_milk_autoupdate_status() -> None:
+    """Render the auto-update status caption + 'Force refresh' button.
+
+    Reads the cached :class:`AutoUpdateResult` produced earlier in the same
+    render by ``_run_milk_mover_autoupdate``. The button forces a check that
+    bypasses the TTL guard — useful when the user knows USDA just published.
+    """
+    result = st.session_state.get(_SS_MILK_AUTOUPDATE_RESULT)
+
+    col_status, col_btn = st.columns([4, 1])
+    with col_status:
+        if result is not None:
+            st.caption(result.as_caption())
+        else:
+            st.caption(
+                "🥛 Milk Mover data sourced from the Fabric Lakehouse "
+                "(`Files/milk_mover_tracker.json`), kept in sync with USDA's "
+                "[Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf)."
+            )
+    with col_btn:
+        if st.button(
+            "🔄 USDA refresh",
+            key=f"{_SS_PREFIX}_milk_force_refresh",
+            help=(
+                "Bypass the 1-hour cooldown and check the USDA "
+                "advanced-prices PDF right now. Inserts a new row when a "
+                "change is detected."
+            ),
+            use_container_width=True,
+        ):
+            with st.spinner("Checking USDA…"):
+                _run_milk_mover_autoupdate(force=True)
+            st.rerun()
 
 
 def _render_milk_commodity(
@@ -1773,14 +1947,23 @@ def _render_milk_commodity(
     st.markdown("#### 🥛 Milk Commodity Cost")
     milk = uploads.get("milk_mover_tracker")
     if milk is None:
+        # The OneLake store is the only source of truth — an empty result
+        # means either the seed CSV is missing or OneLake is unreachable.
+        # Both cases surface in the auto-update status caption below.
         st.info(
-            "🥛 Upload `Milk_Mover_Tracker.csv` to see Skim & Butterfat rate "
-            "trends by Category and Class."
+            "🥛 Milk Mover store is empty or unreachable. Verify the "
+            "`[fabric_htst]` (or `[fabric_milk_mover]`) section of "
+            "`.streamlit/secrets.toml`, ensure your account has access "
+            "to the lakehouse, and reload the page. If this is a fresh "
+            "deployment, confirm `Milk_Mover_Tracker.csv` exists in "
+            "`data/Market Barometer/Montly Movers/` so it can seed the store."
         )
+        _render_milk_autoupdate_status()
         return
 
     available_months = _available_milk_months(milk.df)
     start_month, end_month = _render_milk_slicer(available_months, current_month)
+    _render_milk_autoupdate_status()
 
     # The Category ("HTST vs ESL") and Class ("I vs II") filters are
     # chart-only knobs — read them straight from session_state so the
@@ -1973,6 +2156,83 @@ def _render_table_and_refresh(
             st.success("✅ Calculations complete. Results below.")
 
 
+# Session-state slot used to dedupe Base Milk Cost tracker append attempts —
+# once we've appended (or confirmed an end_month is already present in the
+# tracker) for a given (end_month) value, we don't hit Fabric again for that
+# month in this session.
+_SS_BASE_MILK_TRACKER_LAST_END = "monthly_movers_base_milk_tracker_last_end"
+
+
+def _maybe_append_to_base_milk_cost_tracker(
+    milk_usage_with_movers: pd.DataFrame,
+    end_month: Optional[pd.Timestamp],
+) -> None:
+    """Append [Item, Item Description, End Month Milk Cost, End Month] to Fabric.
+
+    Honours the contract from the migration plan:
+
+        "whenever both a new milk_mover CSV is generated AND a new end
+         month is selected that doesn't exist in this file yet, append
+         the new rows to the Base Milk Cost Monthly Tracker."
+
+    "New milk_mover CSV is generated" = ``milk_usage_with_movers`` is a
+    non-empty frame (i.e. the milk pipeline successfully ran for the
+    current slicer selection). "New end month" = the End Month selected
+    by the slicer is not already present in the OneLake tracker.
+
+    Idempotent: the underlying ``append_rows_for_end_month`` no-ops when
+    the month is already there, so re-calling on a slicer toggle is safe.
+    A session-state cache short-circuits the Fabric round-trip when we
+    just confirmed the same End Month milliseconds ago.
+
+    Failures are swallowed (logged + a non-fatal info badge); never
+    breaks the page render.
+    """
+    if (milk_usage_with_movers is None
+            or milk_usage_with_movers.empty
+            or end_month is None):
+        return
+
+    em = pd.Timestamp(end_month).normalize().replace(day=1)
+    if st.session_state.get(_SS_BASE_MILK_TRACKER_LAST_END) == em:
+        return  # already handled this end_month in this session
+
+    needed = (
+        _MUM_COL_END_COST,        # "End Month Milk Cost"
+        "Item",
+        "Item Description",
+    )
+    if not all(c in milk_usage_with_movers.columns for c in needed):
+        return  # graceful-degrade: required columns missing
+
+    payload = milk_usage_with_movers[list(needed)].rename(
+        columns={
+            "Item": _base_milk_cost_tracker.COL_ITEM,
+            "Item Description": _base_milk_cost_tracker.COL_ITEM_DESC,
+            _MUM_COL_END_COST: _base_milk_cost_tracker.COL_END_COST,
+        }
+    )
+
+    try:
+        rows_appended, was_new = (
+            _base_milk_cost_tracker.append_rows_for_end_month(payload, em)
+        )
+    except _base_milk_cost_tracker.BaseMilkCostTrackerError as exc:
+        # Render a small caption so the operator knows the tracker isn't
+        # up to date, but DON'T raise — milk-impact rendering still works.
+        st.caption(
+            f"⚠️ Could not update base_milk_cost_monthly_tracker: {exc}"
+        )
+        return
+
+    st.session_state[_SS_BASE_MILK_TRACKER_LAST_END] = em
+    if was_new and rows_appended:
+        st.caption(
+            f"✅ Appended {rows_appended} row(s) for {em:%Y-%m} to "
+            f"{_base_milk_cost_tracker.get_store_label()}."
+        )
+
+
 def _compute_milk_usage_for_render(
     uploads: dict[str, _Uploaded],
 ) -> Optional[pd.DataFrame]:
@@ -1983,7 +2243,12 @@ def _compute_milk_usage_for_render(
     the milk columns blank, which is the intended graceful-degrade behaviour.
 
     Reads the slicer values from ``session_state`` so the entire downstream
-    backing reacts to slicer changes without requiring another Refresh.
+    mover_details_table reacts to slicer changes without requiring another Refresh.
+
+    Side effect: when a fresh DataFrame comes back AND the selected End
+    Month isn't already in ``base_milk_cost_monthly_tracker.csv``, we
+    append the per-item ``End Month Milk Cost`` rows for that month.
+    See :func:`_maybe_append_to_base_milk_cost_tracker` for details.
     """
     milk = uploads.get("milk_mover_tracker")
     usage = uploads.get("milk_usage_stable")
@@ -1997,13 +2262,17 @@ def _compute_milk_usage_for_render(
     )
     milk_scrape_fraction = _latest_milk_scrape_fraction(scrape_tracker_df)
 
-    return _build_milk_usage_with_movers(
+    milk_usage_with_movers = _build_milk_usage_with_movers(
         milk_usage_stable_df=usage.df,
         milk_mover_tracker_df=milk.df,
         milk_scrape_fraction=milk_scrape_fraction,
         start_month=start_month,
         end_month=end_month,
     )
+
+    _maybe_append_to_base_milk_cost_tracker(milk_usage_with_movers, end_month)
+
+    return milk_usage_with_movers
 
 
 def _render_mover_downloads(
@@ -2019,7 +2288,7 @@ def _render_mover_downloads(
         | Rest HTST resin_mover_fg | TOPCO resin_mover_fg | milk_mover (usage) |
 
     Each download exposes the *driver* table that produced one of the per-row
-    mover columns in the combined backing — useful for audit, spot-checking,
+    mover columns in the mover_details_table — useful for audit, spot-checking,
     and external reuse. The Milk Mover download is the slicer-driven
     ``milk_usage_with_movers_df`` (everything from ``Milk_Usage_Stable`` plus
     the Start/End-month rates, costs, and ``Milk Cost Mover $/Gal``); when the
@@ -2076,7 +2345,7 @@ def _render_mover_downloads(
 
 
 def _render_results() -> None:
-    """Render Impact metrics + Mover Downloads + Backing table + Example prices.
+    """Render Impact metrics + Mover Downloads + mover_details_table + Example prices.
 
     Surfaced only after a successful Refresh — otherwise this is a no-op.
     Section order (per the May-2026 product spec):
@@ -2084,7 +2353,7 @@ def _render_results() -> None:
         1. Three headline Impact metrics (Resin / Freight / Milk).
         2. **Mover Downloads** — Rest HTST FG, TOPCO FG, and the slicer-driven
            ``milk_mover`` (milk_usage_table + Milk Cost Mover $/Gal).
-        3. **Backing table download** — single combined CSV used for the
+        3. **mover_details_table download** — single combined CSV used for the
            monthly pricing update.
         4. Example prices (when uploaded).
 
@@ -2099,7 +2368,7 @@ def _render_results() -> None:
 
     rest_fg: pd.DataFrame        = outputs["rest_htst_resin_mover_fg"]
     topco_fg: pd.DataFrame       = outputs["topco_resin_mover_fg"]
-    backing_base: pd.DataFrame   = outputs["combined_backing_base"]
+    mover_details_table_base: pd.DataFrame   = outputs["mover_details_table_base"]
     monthly_resin_total: float   = outputs.get("monthly_resin_impact_total",   0.0)
     monthly_freight_total: float = outputs.get("monthly_freight_impact_total", 0.0)
 
@@ -2107,14 +2376,14 @@ def _render_results() -> None:
     # description-keyed map + one element-wise multiply) so we run it on every
     # render — that's how the slicer stays reactive without a Refresh click.
     milk_usage_with_movers = _compute_milk_usage_for_render(uploads)
-    combined_backing, monthly_milk_total = _layer_milk_on_backing(
-        backing_base, milk_usage_with_movers,
+    mover_details_table, monthly_milk_total = _layer_milk_on_mover_details_table(
+        mover_details_table_base, milk_usage_with_movers,
     )
 
     st.markdown("---")
     st.markdown("### Impact")
     st.caption(
-        "Metrics are summed from the combined backing table; download it "
+        "Metrics are summed from the mover_details_table; download it "
         "below for the full per-SKU breakdown. Milk Impact reacts to the "
         "Start/End Month slicer above the Milk Commodity Cost chart."
     )
@@ -2149,7 +2418,7 @@ def _render_results() -> None:
             ),
             value=f"${monthly_milk_total:,.2f}",
             help=(
-                "Σ(Monthly Milk Mover) over the backing table — Milk Mover "
+                "Σ(Monthly Milk Mover) over the mover_details_table — Milk Mover "
                 "$/Gal = End Month Milk Cost − Start Month Milk Cost from the "
                 "time slicer above the Milk Commodity Cost chart. Monthly "
                 "Milk Mover = Monthly Gallons × Milk Mover $/Gal."
@@ -2158,24 +2427,24 @@ def _render_results() -> None:
 
     today = datetime.now().strftime("%Y%m%d")
 
-    # ── 2. Mover Downloads (above the backing) ──────────────────────────────
+    # ── 2. Mover Downloads (above the mover_details_table) ──────────────────────────────
     _render_mover_downloads(rest_fg, topco_fg, milk_usage_with_movers, today)
 
-    # ── 3. Single combined backing-table download ───────────────────────────
-    st.markdown("#### Backing table download")
+    # ── 3. Single mover_details_table-table download ───────────────────────────
+    st.markdown("#### mover_details_table download")
     st.download_button(
-        label="⬇️ Download backing_table (CSV)",
-        data=_to_csv_bytes(combined_backing),
-        file_name=f"backing_table_{today}.csv",
+        label="⬇️ Download mover_details_table (CSV)",
+        data=_to_csv_bytes(mover_details_table),
+        file_name=f"mover_details_table_{today}.csv",
         mime="text/csv",
         use_container_width=True,
-        disabled=combined_backing.empty,
+        disabled=mover_details_table.empty,
         help=(
             "site_item_volume + Monthly Freight/Resin/Milk Mover totals + "
             "Freight/Resin/Milk Mover ($/Gal) drivers grouped at the end. "
             "Use this file for the monthly pricing update."
         ),
-        key=f"{_SS_PREFIX}_dl_backing",
+        key=f"{_SS_PREFIX}_dl_mover_details_table",
     )
 
     # ── 4. Example prices (optional) ────────────────────────────────────────
@@ -2257,6 +2526,11 @@ def render_monthly_resin_freight_mover_tracker() -> None:
     """
     current_month = pd.Timestamp(date.today().replace(day=1))
 
+    # Run the USDA auto-update once per render (TTL-guarded internally so
+    # this is a no-op on most reruns). The cached result is rendered as a
+    # status caption beneath the milk slicer.
+    _run_milk_mover_autoupdate(force=False)
+
     _render_monthly_sop_and_upload_intro()
 
     uploads: dict[str, _Uploaded] | None = st.session_state.get(f"{_SS_PREFIX}_uploads")
@@ -2271,6 +2545,13 @@ def render_monthly_resin_freight_mover_tracker() -> None:
         st.session_state[f"{_SS_PREFIX}_uploads"] = uploads
         st.session_state[f"{_SS_PREFIX}_sig"] = sig
         st.session_state.pop(f"{_SS_PREFIX}_outputs", None)
+
+    # Source the milk_mover_tracker AND milk_usage_stable DataFrames from
+    # the OneLake store. Neither file is a recognised upload role (see
+    # ``_ROLE_KEYWORDS``) so these two injections are the only place the
+    # milk DataFrames enter the section.
+    _inject_milk_mover_from_store(uploads)
+    _inject_milk_usage_stable_from_store(uploads)
 
     # ── Processed state ───────────────────────────────────────────────────────
     if st.button(

@@ -60,7 +60,6 @@ azure-identity>=1.15 (credential chain + token acquisition)
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -68,16 +67,14 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
-
-# RFC-4122 GUID pattern (case-insensitive).  Used by _build_table_uri to
-# decide whether the workspace/lakehouse identifier is a GUID (canonical,
-# stable) or a display name (friendly but rename-fragile).  When a GUID is
-# detected we omit the ".Lakehouse" suffix because OneLake's GUID-form URLs
-# do not use it, whereas the display-name form requires it.
-_GUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
+from data_sources.fabric_auth import (
+    GUID_RE,
+    FabricAuthError,
+    acquire_storage_token,
+    promote_sp_secrets_to_env,
+    read_section,
 )
+
 
 # deltalake is imported lazily inside _read_delta_table() so that this module
 # can still be imported (and the page can render its error UI) even if the
@@ -120,79 +117,25 @@ class HTSTShipmentSourceError(RuntimeError):
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-_REQUIRED_SECRETS = ("workspace", "lakehouse")  # SP keys are optional — see _read_config
 _DEFAULT_TABLE = "htst_shipment"
 _CACHE_TTL_SECONDS = 15 * 60  # 15 minutes — balances freshness vs Fabric API load
-_STORAGE_SCOPE = "https://storage.azure.com/.default"  # honored by OneLake
 
 
 def _read_config() -> dict[str, str]:
-    """Pull and validate the Fabric secrets block from st.secrets.
+    """Pull and validate the Fabric secrets block for HTST.
 
-    Only `workspace` and `lakehouse` are mandatory.  The service-principal
-    keys (tenant_id / client_id / client_secret) are optional — when all
-    three are present they are pushed into env vars so DefaultAzureCredential
-    picks them up via EnvironmentCredential.  When absent, the credential
-    chain falls through to AzureCliCredential (i.e. your `az login` session).
-
-    Raises HTSTShipmentSourceError with a precise message naming the missing
-    keys so the operator can fix .streamlit/secrets.toml without guessing.
+    Thin wrapper around :func:`fabric_auth.read_section` that translates
+    its :class:`FabricAuthError` into our domain-specific error so the
+    page renders a clean message in the existing error path.
     """
-    # st.secrets raises StreamlitSecretNotFoundError when NO secrets.toml file
-    # exists at all (rather than returning False for `in` checks).  Catch it
-    # here and convert to our typed error so the page's HTSTShipmentSourceError
-    # handler renders a clean, actionable message instead of a stack trace.
     try:
-        has_section = "fabric_htst" in st.secrets
-    except Exception as exc:  # noqa: BLE001
-        raise HTSTShipmentSourceError(
-            "No .streamlit/secrets.toml file found.\n\n"
-            "To fix:\n"
-            "1. Copy .streamlit/secrets.toml.example to .streamlit/secrets.toml.\n"
-            "2. Fill in workspace, lakehouse, and table values.\n"
-            "3. Reload this page."
-        ) from exc
-
-    if not has_section:
-        raise HTSTShipmentSourceError(
-            "Missing [fabric_htst] section in .streamlit/secrets.toml.  "
-            "See .streamlit/secrets.toml.example for the required schema."
+        return read_section(
+            "fabric_htst",
+            required=("workspace", "lakehouse"),
+            defaults={"table": _DEFAULT_TABLE},
         )
-    cfg = dict(st.secrets["fabric_htst"])
-    missing = [k for k in _REQUIRED_SECRETS if not cfg.get(k)]
-    if missing:
-        raise HTSTShipmentSourceError(
-            f"[fabric_htst] is missing required keys: {', '.join(missing)}.  "
-            "See .streamlit/secrets.toml.example."
-        )
-    cfg.setdefault("table", _DEFAULT_TABLE)
-    return cfg
-
-
-def _maybe_promote_sp_secrets_to_env(cfg: dict[str, str]) -> None:
-    """If a service principal is configured in secrets, expose it via env vars.
-
-    DefaultAzureCredential's EnvironmentCredential reads AZURE_TENANT_ID /
-    AZURE_CLIENT_ID / AZURE_CLIENT_SECRET.  Copying them here means the same
-    code path supports both local-dev (az login, no SP) and production-with-SP
-    without any branching at the call site.
-
-    Only sets the vars when ALL THREE are present and non-empty.  Avoids
-    overwriting variables already set in the parent process (e.g. by an
-    operator who is running `az login` deliberately).
-    """
-    import os
-
-    keys = ("tenant_id", "client_id", "client_secret")
-    if not all(cfg.get(k) for k in keys):
-        return
-    env_map = {
-        "AZURE_TENANT_ID":     cfg["tenant_id"],
-        "AZURE_CLIENT_ID":     cfg["client_id"],
-        "AZURE_CLIENT_SECRET": cfg["client_secret"],
-    }
-    for env_name, value in env_map.items():
-        os.environ.setdefault(env_name, value)
+    except FabricAuthError as exc:
+        raise HTSTShipmentSourceError(str(exc)) from exc
 
 
 def _build_table_uri(workspace: str, lakehouse: str, table: str, schema: Optional[str] = None) -> str:
@@ -223,7 +166,7 @@ def _build_table_uri(workspace: str, lakehouse: str, table: str, schema: Optiona
     lakehouses created in 2025+) place tables under a schema namespace such
     as "dbo".  Older lakehouses store tables flat directly under Tables/.
     """
-    lakehouse_part = lakehouse if _GUID_RE.match(lakehouse) else f"{lakehouse}.Lakehouse"
+    lakehouse_part = lakehouse if GUID_RE.match(lakehouse) else f"{lakehouse}.Lakehouse"
     table_path = f"Tables/{schema}/{table}" if schema else f"Tables/{table}"
     return (
         f"abfss://{workspace}@onelake.dfs.fabric.microsoft.com/"
@@ -234,64 +177,17 @@ def _build_table_uri(workspace: str, lakehouse: str, table: str, schema: Optiona
 _TOKEN_CACHE_NAME = "streamlit_htst_shipment"
 
 
-@st.cache_resource(show_spinner=False)
-def _get_credential():
-    """Build a credential chain: env-vars (SP) → InteractiveBrowserCredential.
-
-    Cached at module level via @st.cache_resource so the ChainedTokenCredential
-    — and its in-memory MSAL cache — persists across Streamlit reruns within
-    a session.  On-disk persistence (TokenCachePersistenceOptions) handles
-    survival across server restarts and reboots.
-    """
-    try:
-        from azure.identity import (
-            ChainedTokenCredential,
-            EnvironmentCredential,
-            InteractiveBrowserCredential,
-            TokenCachePersistenceOptions,
-        )
-    except ImportError as exc:
-        raise HTSTShipmentSourceError(
-            "Python package 'azure-identity' is not installed.  Run: "
-            "pip install azure-identity"
-        ) from exc
-
-    # allow_unencrypted_storage=True is required on Windows workstations that
-    # lack a managed keyring (i.e. virtually all corporate-locked-down PCs).
-    # The cache file lives at %LOCALAPPDATA%\.IdentityService\<name> — a
-    # user-profile location that needs no admin rights and is excluded from
-    # most enterprise backup snapshots.
-    persistence = TokenCachePersistenceOptions(
-        name=_TOKEN_CACHE_NAME,
-        allow_unencrypted_storage=True,
-    )
-
-    return ChainedTokenCredential(
-        EnvironmentCredential(),
-        InteractiveBrowserCredential(
-            cache_persistence_options=persistence,
-        ),
-    )
-
-
 def _acquire_storage_token() -> str:
     """Acquire a bearer token for Azure Storage / OneLake.
 
-    First call typically opens a browser window for sign-in; subsequent calls
-    are silent (cached refresh token).  Wraps any underlying credential error
-    in our typed exception so the page renders a clean, actionable message.
+    Thin wrapper around :func:`fabric_auth.acquire_storage_token` that
+    translates its :class:`FabricAuthError` into our domain-specific
+    error so the page renders a clean, actionable message.
     """
-    credential = _get_credential()
     try:
-        return credential.get_token(_STORAGE_SCOPE).token
-    except Exception as exc:  # noqa: BLE001
-        raise HTSTShipmentSourceError(
-            "Could not acquire an Azure Storage token for OneLake.  "
-            "If a sign-in window opened, complete it and reload this page.  "
-            "If no window appeared, your browser may have blocked the popup "
-            "or your account is restricted from interactive auth.  "
-            f"Underlying error: {exc}"
-        ) from exc
+        return acquire_storage_token(_TOKEN_CACHE_NAME)
+    except FabricAuthError as exc:
+        raise HTSTShipmentSourceError(str(exc)) from exc
 
 
 # ── Core read path ────────────────────────────────────────────────────────────
@@ -409,7 +305,7 @@ def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, SnapshotMeta]:
     is True.
     """
     cfg = _read_config()
-    _maybe_promote_sp_secrets_to_env(cfg)
+    promote_sp_secrets_to_env(cfg)
     table_uri = _build_table_uri(
         cfg["workspace"],
         cfg["lakehouse"],

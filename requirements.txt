@@ -16,7 +16,13 @@ patsy>=0.5.0
 openpyxl>=3.0.0
 pywin32>=306; sys_platform == "win32"
 
-# Microsoft Fabric / OneLake Delta-table reader (HTST Shipment dataflow source).
+# Microsoft Fabric / OneLake — Delta-table reader (HTST Shipment dataflow
+# source) and ADLS-Gen2 blob client (Milk_Mover_Tracker JSON store).
 deltalake>=0.17.0
 azure-identity>=1.15.0
+azure-storage-file-datalake>=12.14.0
+
+# USDA milk-price PDF parser (Milk_Mover auto-update workflow). Pure-Python,
+# no system deps, deterministic text extraction.
+pdfplumber>=0.11.0
 

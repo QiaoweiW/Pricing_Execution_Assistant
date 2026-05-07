@@ -68,7 +68,7 @@ Select a page from the sidebar to get started.
   and upload your files.
 - The Milk Commodity Cost chart supports independent **Category (HTST vs ESL)**
   and **Class (I vs II)** filters; both are chart-only and never affect the
-  Milk Mover calculation or the backing table.
+  Milk Mover calculation or the mover_details_table.
 - Once files are processed, the upload panel is hidden automatically. Use the
   **Change files** button to re-upload.
 - Market index data auto-refreshes every **15 days** when valid API keys

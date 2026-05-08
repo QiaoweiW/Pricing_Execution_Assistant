@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Optional
 
 import streamlit as st
@@ -210,6 +211,63 @@ def _is_headless_runtime() -> bool:
     )
 
 
+# ── Device-code prompt plumbing ──────────────────────────────────────────────
+#
+# ``DeviceCodeCredential`` is our last-resort fallback when the more
+# convenient credentials in the chain (env-var SP, interactive browser,
+# Azure CLI) are unavailable.  By default azure-identity prints the
+# device-code prompt to stdout — fine for a developer running streamlit
+# from a terminal, but useless for a user who launched it via a desktop
+# shortcut or a service.  The custom prompt callback below stashes the
+# verification URL + user code into module-level state so the Streamlit
+# UI can render it as a banner via :func:`get_device_code_prompt`.
+#
+# We don't put this in ``st.session_state`` because the credential is
+# built inside an ``@st.cache_resource`` (process-wide) function and
+# captures the callback by reference; reading session_state from inside
+# would couple module-wide state to one specific session.
+
+_DEVICE_CODE_PROMPT: dict[str, str] | None = None
+_DEVICE_CODE_PROMPT_LOCK: threading.Lock = threading.Lock()
+
+
+def _device_code_prompt_callback(verification_uri: str, user_code: str, expires_at) -> None:
+    """Capture the device-code prompt for later rendering by the UI.
+
+    Also prints to stdout so a developer running ``streamlit run`` from
+    a terminal still sees the code without needing the in-app banner.
+    """
+    with _DEVICE_CODE_PROMPT_LOCK:
+        global _DEVICE_CODE_PROMPT
+        _DEVICE_CODE_PROMPT = {
+            "verification_uri": verification_uri,
+            "user_code": user_code,
+        }
+    print(
+        f"\n[fabric_auth] Device-code sign-in required.\n"
+        f"   1) Open {verification_uri}\n"
+        f"   2) Enter code: {user_code}\n",
+        flush=True,
+    )
+
+
+def get_device_code_prompt() -> dict[str, str] | None:
+    """Return the active device-code prompt, or ``None`` if none is pending.
+
+    Called by the page error-banner code so users can see the URL +
+    code without rooting around in the terminal that started Streamlit.
+    """
+    with _DEVICE_CODE_PROMPT_LOCK:
+        return None if _DEVICE_CODE_PROMPT is None else dict(_DEVICE_CODE_PROMPT)
+
+
+def clear_device_code_prompt() -> None:
+    """Drop the captured device-code prompt after a successful sign-in."""
+    with _DEVICE_CODE_PROMPT_LOCK:
+        global _DEVICE_CODE_PROMPT
+        _DEVICE_CODE_PROMPT = None
+
+
 @st.cache_resource(show_spinner=False)
 def _build_credential_cached(cache_name: str):
     """Build a credential chain with disk-persistent MSAL token cache.
@@ -218,17 +276,39 @@ def _build_credential_cached(cache_name: str):
     one in-memory credential object (and the same MSAL cache file on disk).
     In this codebase that's everyone: see :data:`DEFAULT_CACHE_NAME`.
 
-    Chain composition:
-      * ``EnvironmentCredential`` — picks up ``AZURE_TENANT_ID`` /
-        ``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET`` (set by
-        ``promote_sp_secrets_to_env``). Always first so a configured
-        service principal short-circuits the rest.
-      * ``InteractiveBrowserCredential`` — only added when running
-        with an attached browser (i.e. NOT on Streamlit Cloud or any
-        container deployment). See ``_is_headless_runtime``.
+    Chain composition (tried in order; first to succeed wins):
+      1. ``EnvironmentCredential`` — picks up ``AZURE_TENANT_ID`` /
+         ``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET`` (set by
+         ``promote_sp_secrets_to_env``).  Configured service principal
+         short-circuits everything else.
+      2. ``InteractiveBrowserCredential`` (workstation only) — best UX
+         when the browser actually launches; uses the disk-persistent
+         MSAL cache below so the sign-in is silent on subsequent runs.
+         Fails fast as ``CredentialUnavailable`` when ``webbrowser.open``
+         can't launch (locked-down corporate Windows defaults, missing
+         ``BROWSER`` env), so the chain proceeds rather than wedging.
+      3. ``AzureCliCredential`` (workstation only) — covers users who
+         already authenticated for other Microsoft tooling via
+         ``az login``.  Cheap to include: when ``az`` is not installed
+         the credential reports ``CredentialUnavailable`` and the chain
+         skips it without blocking.
+
+    A device-code flow is intentionally NOT in the default chain —
+    ``DeviceCodeCredential.get_token`` blocks for up to 60 s waiting
+    for the user to complete the flow, which would freeze every app
+    start on a workstation that can't open a browser.  The prompt
+    helpers (:func:`get_device_code_prompt`,
+    :func:`_device_code_prompt_callback`) remain available for a
+    future explicit "Sign in with device code" UI button.
+
+    Headless runtimes (Streamlit Cloud, containers) drop credentials 2+
+    entirely: the only thing that can possibly succeed there is a
+    configured service principal via ``EnvironmentCredential``.  See
+    :func:`_is_headless_runtime` for the detection logic.
     """
     try:
         from azure.identity import (
+            AzureCliCredential,
             ChainedTokenCredential,
             EnvironmentCredential,
             InteractiveBrowserCredential,
@@ -252,11 +332,12 @@ def _build_credential_cached(cache_name: str):
             name=cache_name,
             allow_unencrypted_storage=True,
         )
-        credentials.append(
+        credentials.extend([
             InteractiveBrowserCredential(
                 cache_persistence_options=persistence,
-            )
-        )
+            ),
+            AzureCliCredential(),
+        ])
 
     return ChainedTokenCredential(*credentials)
 
@@ -272,49 +353,139 @@ def get_credential(cache_name: str = DEFAULT_CACHE_NAME):
     return _build_credential_cached(cache_name)
 
 
+# ── Auth-failure short-circuit ───────────────────────────────────────────────
+#
+# The credential chain takes 2–10 seconds to fail on a workstation
+# without a working interactive credential (each adapter probes its
+# environment serially).  Without the failure cache below, every
+# downstream reader (resin store, milk-mover store, mover-details
+# store, …) would re-run the chain on every Streamlit rerun, stacking
+# multiple identical "Failed to open a browser" banners and leaving
+# the page visibly frozen for tens of seconds.
+#
+# The cache stores the last :class:`FabricAuthError` keyed by
+# ``cache_name`` (which is process-wide); within ``_AUTH_FAILURE_TTL``
+# seconds of a failure subsequent ``acquire_storage_token`` calls
+# raise the cached error immediately.  A new sign-in attempt is
+# permitted after the TTL elapses so a transient network blip doesn't
+# permanently disable the integration.
+#
+# The cache is cleared automatically on the first successful token
+# acquisition.  Manual override: :func:`reset_auth_failure_cache`.
+
+_AUTH_FAILURE_TTL_SECONDS: float = 60.0
+_AUTH_FAILURE_LOCK: threading.Lock = threading.Lock()
+_AUTH_FAILURES: dict[str, tuple[float, "FabricAuthError"]] = {}
+
+
+def reset_auth_failure_cache(cache_name: Optional[str] = None) -> None:
+    """Drop the cached auth failure so the next call retries the chain.
+
+    With ``cache_name=None`` clears every entry (used by the "Sign in"
+    button).  Pass a specific ``cache_name`` to clear just one slot.
+    """
+    with _AUTH_FAILURE_LOCK:
+        if cache_name is None:
+            _AUTH_FAILURES.clear()
+        else:
+            _AUTH_FAILURES.pop(cache_name, None)
+
+
+def _peek_auth_failure(cache_name: str) -> Optional["FabricAuthError"]:
+    """Return the cached failure if it's still within the TTL, else ``None``."""
+    with _AUTH_FAILURE_LOCK:
+        entry = _AUTH_FAILURES.get(cache_name)
+        if entry is None:
+            return None
+        ts, err = entry
+        if time.monotonic() - ts < _AUTH_FAILURE_TTL_SECONDS:
+            return err
+        del _AUTH_FAILURES[cache_name]
+        return None
+
+
+def _record_auth_failure(cache_name: str, err: "FabricAuthError") -> None:
+    """Stash an auth failure so subsequent calls fast-fail for the TTL."""
+    with _AUTH_FAILURE_LOCK:
+        _AUTH_FAILURES[cache_name] = (time.monotonic(), err)
+
+
 def acquire_storage_token(cache_name: str = DEFAULT_CACHE_NAME) -> str:
     """Acquire a bearer token for the OneLake Storage scope.
 
     On a workstation: first call typically opens a browser window for
-    sign-in; subsequent calls within the cache TTL are silent.
+    sign-in; subsequent calls within the cache TTL are silent.  When
+    the browser path fails (locked-down default, missing ``BROWSER``
+    env), the chain falls through to ``AzureCliCredential`` and finally
+    ``DeviceCodeCredential`` — see :func:`_build_credential_cached`.
 
     On a headless runtime (Streamlit Cloud / containers): only the
     service-principal env vars (``AZURE_TENANT_ID`` / ``AZURE_CLIENT_ID``
-    / ``AZURE_CLIENT_SECRET``) can satisfy this call. The error message
-    below adapts to surface that requirement clearly.
+    / ``AZURE_CLIENT_SECRET``) can satisfy this call.
+
+    A failed token acquisition is cached for
+    :data:`_AUTH_FAILURE_TTL_SECONDS` so retry storms don't block the
+    page render path.  Manual recovery via :func:`reset_auth_failure_cache`.
 
     Raises
     ------
     FabricAuthError
         On any underlying auth failure — caller should translate.
     """
+    cached_err = _peek_auth_failure(cache_name)
+    if cached_err is not None:
+        raise cached_err
+
     credential = get_credential(cache_name)
     try:
-        return credential.get_token(STORAGE_SCOPE).token
+        token = credential.get_token(STORAGE_SCOPE).token
     except Exception as exc:  # noqa: BLE001
+        # Log the verbose chain failure ONCE so it's available in the
+        # streamlit log for diagnosis, but keep the user-visible message
+        # concise — every downstream store renders ``str(err)`` in a
+        # caption, and stuffing the multi-page Azure Identity dump into
+        # 4-5 panels turns the page into a wall of text.
+        logger.warning(
+            "Fabric auth chain failed for cache %r: %s", cache_name, exc
+        )
         if _is_headless_runtime():
-            raise FabricAuthError(
-                "Could not acquire an Azure Storage token for OneLake on "
-                "this headless deployment.\n\n"
-                "A service principal is required to read Microsoft Fabric "
-                "from Streamlit Cloud (or any --server.headless runtime). "
-                "Add the following keys to your secrets in 'Manage app → "
-                "Settings → Secrets':\n"
-                "    tenant_id     = \"<Azure AD tenant GUID>\"\n"
-                "    client_id     = \"<App registration client GUID>\"\n"
-                "    client_secret = \"<Client secret value>\"\n"
-                "Place them inside the [fabric_htst] block (or any "
-                "[fabric_*] override block) — they are picked up by "
-                "EnvironmentCredential automatically.\n\n"
-                f"Underlying error: {exc}"
-            ) from exc
-        raise FabricAuthError(
-            "Could not acquire an Azure Storage token for OneLake. "
-            "If a sign-in window opened, complete it and reload this page. "
-            "If no window appeared, your browser may have blocked the popup "
-            "or your account is restricted from interactive auth. "
-            f"Underlying error: {exc}"
-        ) from exc
+            err = FabricAuthError(
+                "Microsoft Fabric not connected — service-principal "
+                "credentials required for headless deployments. Set "
+                "tenant_id / client_id / client_secret in [fabric_htst] "
+                "of .streamlit/secrets.toml."
+            )
+        else:
+            err = FabricAuthError(
+                "Microsoft Fabric not connected. Sign in by running "
+                "`az login` in a terminal (then reload this page), "
+                "ensure your default browser is set, or configure a "
+                "service principal in .streamlit/secrets.toml."
+            )
+        # Stash the underlying-error detail on the exception object so a
+        # diagnostics-friendly caller (e.g. an "auth banner" expander)
+        # can surface the full Azure Identity chain message without
+        # forcing it into every per-panel caption.
+        err.details = str(exc)
+        _record_auth_failure(cache_name, err)
+        raise err from exc
+
+    # Success path — clear any sticky failure and any pending device-code
+    # prompt the credential captured during the chain probe.
+    reset_auth_failure_cache(cache_name)
+    clear_device_code_prompt()
+    return token
+
+
+def cached_auth_error(cache_name: str = DEFAULT_CACHE_NAME) -> Optional["FabricAuthError"]:
+    """Return the cached :class:`FabricAuthError` (within TTL) or ``None``.
+
+    Pages call this once per render to detect "Fabric is currently
+    broken" so they can render a single page-level banner instead of
+    letting every downstream store paint its own copy of the same
+    error caption.
+    """
+    return _peek_auth_failure(cache_name)
 
 
 # ── Shared DuckDB connection ─────────────────────────────────────────────────
@@ -445,6 +616,10 @@ __all__ = [
     "promote_sp_secrets_to_env",
     "get_credential",
     "acquire_storage_token",
+    "cached_auth_error",
+    "reset_auth_failure_cache",
+    "get_device_code_prompt",
+    "clear_device_code_prompt",
     "get_duckdb_connection",
     "duckdb_lock",
     "bind_storage_token",

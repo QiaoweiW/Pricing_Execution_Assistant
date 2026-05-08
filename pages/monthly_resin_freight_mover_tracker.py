@@ -126,6 +126,7 @@ import streamlit as st
 # render time, and a separate orchestrator keeps it in sync with the USDA
 # advanced-prices PDF. None of the downstream calculation code has been
 # touched: only how the milk DataFrame enters this view changed.
+from data_sources import fabric_auth as _fabric_auth
 from data_sources import milk_mover_autoupdate as _milk_autoupdate
 from data_sources import milk_mover_store as _milk_store
 from data_sources import milk_usage_stable_store as _milk_usage_store
@@ -1932,6 +1933,53 @@ def _compute_all_outputs(
 
 # ── 7. UI fragments ───────────────────────────────────────────────────────────
 
+def _render_fabric_auth_banner_if_needed() -> bool:
+    """Render a single page-level banner when Fabric auth has cached failure.
+
+    Returns ``True`` when a banner was rendered (i.e. Fabric is currently
+    unreachable).  Callers can use the return value to suppress redundant
+    per-panel "OneLake unavailable" captions, since the user already has
+    a single, clear, actionable message at the top of the page.
+
+    The banner exposes:
+
+    * A concise headline naming the disconnected integration.
+    * The hint text from the cached :class:`FabricAuthError`.
+    * A "Show technical details" expander carrying the verbose Azure
+      Identity chain dump (useful only for diagnostics).
+    * A "Retry sign-in" button that clears the failure cache and reruns
+      the page so the chain is exercised again on the next render.
+
+    Implemented at the page level (rather than inside ``fabric_auth``)
+    so the wording can stay contextual to this page — e.g. it can name
+    the specific datasets that are blocked.
+    """
+    err = _fabric_auth.cached_auth_error()
+    if err is None:
+        return False
+
+    st.error(
+        "🔒 **Microsoft Fabric is not connected — Monthly Movers can't reach "
+        "OneLake right now.**\n\n"
+        f"{err}"
+    )
+    details = getattr(err, "details", None)
+    if details:
+        with st.expander("Show technical details", expanded=False):
+            st.code(details, language="text")
+    if st.button(
+        "🔁 Retry Microsoft Fabric sign-in",
+        key=f"{_SS_PREFIX}_fabric_auth_retry",
+        help=(
+            "Clear the cached auth failure and re-run the credential chain. "
+            "Useful after running `az login` or fixing your default browser."
+        ),
+    ):
+        _fabric_auth.reset_auth_failure_cache()
+        st.rerun()
+    return True
+
+
 def _render_monthly_sop_and_upload_intro() -> None:
     """SharePoint guidance + Monthly SOP — always visible for this fragment."""
     st.markdown(
@@ -3077,6 +3125,12 @@ def render_monthly_resin_freight_mover_tracker() -> None:
           the Impact section follow.
     """
     current_month = pd.Timestamp(date.today().replace(day=1))
+
+    # If Fabric auth is currently in a cached-failure state surface a
+    # SINGLE actionable banner at the top of the page.  Subsequent
+    # store-level error captions key off the same flag so the user
+    # never sees the same Azure Identity dump repeated across panels.
+    fabric_blocked = _render_fabric_auth_banner_if_needed()
 
     # Run the routine USDA auto-update tick once per *session*.  The
     # orchestrator is also TTL-guarded internally (1 h cooldown), but the

@@ -60,6 +60,7 @@ from data_sources.fabric_auth import (
     DEFAULT_CACHE_NAME,
     GUID_RE,
     FabricAuthError,
+    acquire_storage_token,
     get_credential,
     promote_sp_secrets_to_env,
     read_section,
@@ -180,6 +181,17 @@ def _get_file_system_client(secrets_section: str):
         # Single shared cache name across the whole app — see the note
         # at the top of fabric_auth.DEFAULT_CACHE_NAME.
         credential = get_credential(DEFAULT_CACHE_NAME)
+        # Pre-flight the token acquisition through OUR wrapper so:
+        #   1. The 60-second failure cache short-circuits subsequent
+        #      reads in the same render cycle (otherwise every store
+        #      re-runs the full Azure Identity chain — 5-10 s each).
+        #   2. Failures surface as our concise ``FabricAuthError`` text
+        #      rather than the multi-page ``ClientAuthenticationError``
+        #      dump the SDK would otherwise wrap into ``LakehouseIOError``.
+        # On success the bearer token is now warm in MSAL's in-memory
+        # cache, so the SDK's own ``credential.get_token`` call below is
+        # a sub-millisecond no-op.
+        acquire_storage_token(DEFAULT_CACHE_NAME)
     except FabricAuthError as exc:
         raise LakehouseIOError(str(exc)) from exc
 

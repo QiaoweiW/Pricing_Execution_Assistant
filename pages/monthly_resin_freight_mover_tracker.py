@@ -1934,49 +1934,126 @@ def _compute_all_outputs(
 # ── 7. UI fragments ───────────────────────────────────────────────────────────
 
 def _render_fabric_auth_banner_if_needed() -> bool:
-    """Render a single page-level banner when Fabric auth has cached failure.
+    """Render a single page-level banner when Fabric auth needs attention.
 
-    Returns ``True`` when a banner was rendered (i.e. Fabric is currently
-    unreachable).  Callers can use the return value to suppress redundant
-    per-panel "OneLake unavailable" captions, since the user already has
-    a single, clear, actionable message at the top of the page.
+    Returns ``True`` when a banner was rendered.  Caller uses the return
+    value to suppress redundant per-panel "OneLake unavailable" captions,
+    since the user already has a single, clear, actionable message at
+    the top of the page.
 
-    The banner exposes:
+    The banner has three mutually-exclusive states:
 
-    * A concise headline naming the disconnected integration.
-    * The hint text from the cached :class:`FabricAuthError`.
-    * A "Show technical details" expander carrying the verbose Azure
-      Identity chain dump (useful only for diagnostics).
-    * A "Retry sign-in" button that clears the failure cache and reruns
-      the page so the chain is exercised again on the next render.
+    1. **Device-code flow in progress** — show the verification URL +
+       user code prominently, plus a "Check sign-in status" button.
+       Takes precedence over a cached auth-error so the user isn't
+       distracted by the now-stale failure while their sign-in is
+       actively pending.
+    2. **Auth previously failed** — show the concise hint, a
+       "Show technical details" expander carrying ``err.details``, a
+       "🔁 Retry sign-in" button (clears the failure cache + reruns),
+       and a "🔐 Sign in with device code" button (kicks off the
+       no-browser-required flow).
+    3. **Recent sign-in succeeded** — quick toast + "Continue" button
+       that drops the success banner and lets the page carry on.
 
     Implemented at the page level (rather than inside ``fabric_auth``)
-    so the wording can stay contextual to this page — e.g. it can name
-    the specific datasets that are blocked.
+    so the wording stays contextual to this page (e.g. it can name the
+    specific datasets that are blocked).
     """
+    status = _fabric_auth.device_code_signin_status()
+
+    # ── (1) Device-code flow in progress ────────────────────────────────────
+    if status["thread_alive"] or status["state"] == "pending":
+        prompt = _fabric_auth.get_device_code_prompt()
+        if prompt is not None:
+            st.warning(
+                "🔐 **Microsoft Fabric — device-code sign-in in progress**\n\n"
+                f"1. Open: [{prompt['verification_uri']}]({prompt['verification_uri']})\n"
+                f"2. Enter code: **`{prompt['user_code']}`**\n\n"
+                "After completing sign-in in your browser, click "
+                "**Check sign-in status** below."
+            )
+        else:
+            st.info(
+                "🔐 Microsoft Fabric — initialising device-code sign-in… "
+                "Click **Check sign-in status** in a moment."
+            )
+        if st.button(
+            "🔄 Check sign-in status",
+            key=f"{_SS_PREFIX}_fabric_devcode_poll",
+            help="Re-check whether the device-code sign-in has completed.",
+        ):
+            st.rerun()
+        return True
+
+    # ── (3) Recent sign-in just succeeded ───────────────────────────────────
+    if status["state"] == "success":
+        st.success(
+            "✅ **Microsoft Fabric — device-code sign-in completed.**  "
+            "Reload the page or click **Continue** to refresh the data."
+        )
+        if st.button(
+            "Continue",
+            key=f"{_SS_PREFIX}_fabric_devcode_ack",
+            type="primary",
+        ):
+            _fabric_auth.reset_device_code_signin()
+            st.rerun()
+        return True
+
     err = _fabric_auth.cached_auth_error()
-    if err is None:
+    if err is None and status["state"] != "failed":
         return False
 
-    st.error(
-        "🔒 **Microsoft Fabric is not connected — Monthly Movers can't reach "
-        "OneLake right now.**\n\n"
-        f"{err}"
-    )
-    details = getattr(err, "details", None)
-    if details:
-        with st.expander("Show technical details", expanded=False):
-            st.code(details, language="text")
-    if st.button(
-        "🔁 Retry Microsoft Fabric sign-in",
-        key=f"{_SS_PREFIX}_fabric_auth_retry",
-        help=(
-            "Clear the cached auth failure and re-run the credential chain. "
-            "Useful after running `az login` or fixing your default browser."
-        ),
-    ):
-        _fabric_auth.reset_auth_failure_cache()
-        st.rerun()
+    # ── (2) Auth failed — show actionable banner with two recovery paths ──
+    if err is not None:
+        st.error(
+            "🔒 **Microsoft Fabric is not connected — Monthly Movers can't reach "
+            "OneLake right now.**\n\n"
+            f"{err}"
+        )
+        details = getattr(err, "details", None)
+        if details:
+            with st.expander("Show technical details", expanded=False):
+                st.code(details, language="text")
+
+    if status["state"] == "failed" and status["error"]:
+        st.error(
+            "🔒 **Device-code sign-in failed.**  "
+            "Try again, or use one of the alternatives in the banner above.\n\n"
+            f"Underlying error: {status['error']}"
+        )
+
+    btn_col1, btn_col2, _ = st.columns([1, 1, 2])
+    with btn_col1:
+        if st.button(
+            "🔁 Retry sign-in",
+            key=f"{_SS_PREFIX}_fabric_auth_retry",
+            help=(
+                "Clear the cached auth failure and re-run the credential "
+                "chain. Useful after running `az login` or fixing your "
+                "default browser."
+            ),
+            use_container_width=True,
+        ):
+            _fabric_auth.reset_auth_failure_cache()
+            _fabric_auth.reset_device_code_signin()
+            st.rerun()
+    with btn_col2:
+        if st.button(
+            "🔐 Sign in with device code",
+            key=f"{_SS_PREFIX}_fabric_auth_devcode",
+            help=(
+                "Start a sign-in flow that doesn't need a browser popup — "
+                "you'll be shown a URL + code to open in any browser. "
+                "Works even when `az` isn't installed and the default "
+                "browser launch is broken."
+            ),
+            use_container_width=True,
+            type="primary",
+        ):
+            _fabric_auth.start_device_code_signin()
+            st.rerun()
     return True
 
 

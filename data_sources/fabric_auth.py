@@ -268,6 +268,151 @@ def clear_device_code_prompt() -> None:
         _DEVICE_CODE_PROMPT = None
 
 
+# ── Background device-code sign-in ───────────────────────────────────────────
+#
+# Goal: let a user authenticate from inside the Streamlit UI even when
+# their workstation has no working browser-launch path AND no Azure CLI
+# installed (a pure ``webbrowser.open`` failure with ``az`` missing).
+#
+# Why a background thread?  ``DeviceCodeCredential.get_token`` blocks for
+# up to ``DEVICE_CODE_FLOW_TIMEOUT`` seconds while it polls Azure AD for
+# the user to complete sign-in.  Calling it directly on a button click
+# would freeze the entire Streamlit page during that wait, hiding the
+# very URL + code the user needs to see in order to complete it.  Off-
+# loading to a daemon thread lets the main thread render the prompt
+# immediately and poll for completion via :func:`device_code_signin_status`.
+#
+# State is module-level (process-wide) rather than ``st.session_state``
+# because the worker thread cannot touch session_state safely — it is
+# created in a non-ScriptRunner thread.  A single ``threading.Lock``
+# serialises all reads/writes to the state dict.
+#
+# Concurrency invariants:
+#   * Exactly one worker may be live at a time.  ``start_device_code_signin``
+#     is a no-op while a previous attempt is still polling.
+#   * The worker writes its outcome to ``_DEVICE_CODE_RESULT`` exactly
+#     once and clears ``_DEVICE_CODE_THREAD`` before returning.
+#   * On success the worker also resets the auth-failure cache and
+#     clears the device-code prompt so the next render re-checks the
+#     (now-warm) credential chain instead of the stale failure.
+
+_DEVICE_CODE_LOCK: threading.Lock = threading.Lock()
+_DEVICE_CODE_THREAD: Optional[threading.Thread] = None
+_DEVICE_CODE_RESULT: dict = {"state": "idle", "error": None}
+
+
+def start_device_code_signin(cache_name: str = DEFAULT_CACHE_NAME) -> bool:
+    """Kick off a device-code sign-in flow in a background daemon thread.
+
+    Returns ``True`` if a new flow was started, ``False`` if a previous
+    flow is still running (idempotent — safe to call repeatedly from a
+    button-click handler that triggers a Streamlit rerun).
+
+    The flow uses the same ``DEFAULT_CACHE_NAME`` MSAL token cache as
+    the rest of the credential chain; a successful sign-in here
+    therefore unlocks every other credential path silently.
+    """
+    global _DEVICE_CODE_THREAD
+
+    with _DEVICE_CODE_LOCK:
+        if _DEVICE_CODE_THREAD is not None and _DEVICE_CODE_THREAD.is_alive():
+            return False
+        _DEVICE_CODE_RESULT["state"] = "pending"
+        _DEVICE_CODE_RESULT["error"] = None
+
+    # Reset prompt + failure caches OUTSIDE the lock so we don't deadlock
+    # against the locks they take internally.
+    clear_device_code_prompt()
+
+    def _worker() -> None:
+        global _DEVICE_CODE_THREAD
+        try:
+            from azure.identity import (
+                DeviceCodeCredential,
+                TokenCachePersistenceOptions,
+            )
+
+            persistence = TokenCachePersistenceOptions(
+                name=cache_name,
+                allow_unencrypted_storage=True,
+            )
+            cred = DeviceCodeCredential(
+                cache_persistence_options=persistence,
+                prompt_callback=_device_code_prompt_callback,
+            )
+            # Blocking — the prompt_callback fires before this enters
+            # its polling loop, so the main thread already has the
+            # URL + code by the time we're stuck here.
+            cred.get_token(STORAGE_SCOPE)
+        except Exception as exc:  # noqa: BLE001 — surfaced to UI
+            with _DEVICE_CODE_LOCK:
+                _DEVICE_CODE_RESULT["state"] = "failed"
+                _DEVICE_CODE_RESULT["error"] = str(exc)
+            logger.warning("Device-code sign-in failed: %s", exc)
+        else:
+            # Success: drop the failure cache so the next render sees
+            # the warm MSAL token, and clear the prompt so the banner
+            # collapses naturally.
+            reset_auth_failure_cache(cache_name)
+            clear_device_code_prompt()
+            with _DEVICE_CODE_LOCK:
+                _DEVICE_CODE_RESULT["state"] = "success"
+                _DEVICE_CODE_RESULT["error"] = None
+        finally:
+            with _DEVICE_CODE_LOCK:
+                _DEVICE_CODE_THREAD = None
+
+    t = threading.Thread(
+        target=_worker,
+        name="fabric-device-code-signin",
+        daemon=True,
+    )
+    with _DEVICE_CODE_LOCK:
+        _DEVICE_CODE_THREAD = t
+    t.start()
+    return True
+
+
+def device_code_signin_status() -> dict:
+    """Return the current device-code sign-in state.
+
+    Schema::
+
+        {
+          "state": "idle" | "pending" | "success" | "failed",
+          "error": str | None,         # only meaningful when state == "failed"
+          "thread_alive": bool,        # True while the worker is still polling
+        }
+
+    The Streamlit page calls this once per render to decide whether to
+    show the "click here, enter code" prompt, a success toast, or a
+    failure banner.
+    """
+    with _DEVICE_CODE_LOCK:
+        thread_alive = (
+            _DEVICE_CODE_THREAD is not None and _DEVICE_CODE_THREAD.is_alive()
+        )
+        return {
+            "state": _DEVICE_CODE_RESULT["state"],
+            "error": _DEVICE_CODE_RESULT["error"],
+            "thread_alive": thread_alive,
+        }
+
+
+def reset_device_code_signin() -> None:
+    """Drop any remembered success / failure state.
+
+    Used by the page after a successful sign-in is acknowledged so the
+    banner doesn't keep showing a stale "✓ signed in" toast forever.
+    Has no effect on a still-pending flow.
+    """
+    with _DEVICE_CODE_LOCK:
+        if _DEVICE_CODE_THREAD is not None and _DEVICE_CODE_THREAD.is_alive():
+            return
+        _DEVICE_CODE_RESULT["state"] = "idle"
+        _DEVICE_CODE_RESULT["error"] = None
+
+
 @st.cache_resource(show_spinner=False)
 def _build_credential_cached(cache_name: str):
     """Build a credential chain with disk-persistent MSAL token cache.
@@ -620,6 +765,9 @@ __all__ = [
     "reset_auth_failure_cache",
     "get_device_code_prompt",
     "clear_device_code_prompt",
+    "start_device_code_signin",
+    "device_code_signin_status",
+    "reset_device_code_signin",
     "get_duckdb_connection",
     "duckdb_lock",
     "bind_storage_token",

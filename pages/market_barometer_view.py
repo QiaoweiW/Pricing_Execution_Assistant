@@ -41,6 +41,7 @@ import re
 import traceback
 from datetime import date, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -58,17 +59,46 @@ from utils.ui_helpers import apply_custom_css
 
 BASE_DIR = Path(__file__).parent.parent
 
-# Market Barometer processing module is loaded dynamically because it lives
-# outside the normal package hierarchy (processing/ folder, not pages/).
-_PROCESSING_FILE = BASE_DIR / "processing" / "Market_Barometer_Processing.py"
-_spec = importlib.util.spec_from_file_location("Market_Barometer_Processing", str(_PROCESSING_FILE))
-mbp = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(mbp)
-
 DATA_DIR       = BASE_DIR / "data" / "Market Barometer"
 CSV_FILE       = DATA_DIR / "inflation_data.csv"       # historical market data
 FUTURE_CSV_FILE = DATA_DIR / "future_data.csv"         # generated 24-month forecast
 API_KEYS_FILE  = DATA_DIR / "API_Keys.txt"
+
+# Market Barometer processing module location — loaded LAZILY by
+# :func:`_get_mbp` so the ~700-line ``Market_Barometer_Processing.py``
+# (with its ``requests``/``urllib3`` import chain and series configs) only
+# pays its import cost on the FIRST navigation that actually needs it
+# (API-key validation, auto-refresh, or forecast generation).  Eagerly
+# loading at module-import time turned out to be a measurable cold-start
+# hit on every app boot, even for users who never visit this view.
+_PROCESSING_FILE = BASE_DIR / "processing" / "Market_Barometer_Processing.py"
+
+
+@st.cache_resource(show_spinner=False)
+def _get_mbp() -> ModuleType:
+    """Return the lazily-loaded ``Market_Barometer_Processing`` module.
+
+    Cached at module level via ``@st.cache_resource`` so the dynamic
+    ``importlib.util.spec_from_file_location`` + ``exec_module`` chain
+    runs exactly once per Python process, regardless of how many call
+    sites reference it.
+
+    Why dynamic load and not a regular ``from processing import …``?
+    The ``processing/`` folder is intentionally NOT a Python package
+    (no ``__init__.py``); keeping the side-effecting analytics modules
+    out of the package hierarchy avoids polluting the import graph for
+    pages that don't need them.  This loader bridges that gap.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "Market_Barometer_Processing", str(_PROCESSING_FILE)
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"Could not build import spec for {_PROCESSING_FILE}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # ── 2. Configuration ──────────────────────────────────────────────────────────
@@ -193,7 +223,7 @@ def generate_forecast_data_cached(
 
     Returns a DataFrame with columns: Date, Series, Baseline, Upper, Lower.
     """
-    return mbp.get_forecast_data(df, horizon=horizon, output_path=output_path)
+    return _get_mbp().get_forecast_data(df, horizon=horizon, output_path=output_path)
 
 
 @st.cache_data
@@ -203,21 +233,29 @@ def _build_summary_table(
     start_date: date,
     end_date: date,
     max_historical_date: Optional[date],
-    df: pd.DataFrame,
-    future_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute per-series summary statistics for the selected date range.
 
-    Cached by file mtimes + date range so the aggregation runs at most once per
-    unique combination of source-data state and user-selected window.
+    Cached by ``(inflation_data_mtime, future_data_mtime, start_date,
+    end_date, max_historical_date)``.  The two source DataFrames are
+    re-loaded from disk *inside* this function — they are not parameters —
+    so Streamlit's cache key stays a handful of small primitives instead
+    of pickling two ~10–50k-row DataFrames on every call.  The on-disk
+    reads themselves are cached by :func:`_load_csv_cached` and keyed on
+    the same mtimes, so we still hit the disk at most once per change.
 
     Returns a DataFrame with columns:
       Series | Start Date | End Date | %Change | Source | Source_URL
     and optionally:
       Confidence Level  (only when end_date falls in the forecast horizon)
     """
+    df = _load_csv(CSV_FILE)
     if df.empty:
         return pd.DataFrame()
+
+    future_df = (
+        _load_csv(FUTURE_CSV_FILE) if future_data_mtime is not None else pd.DataFrame()
+    )
 
     max_hist_ts = pd.Timestamp(max_historical_date) if max_historical_date else df["Date"].max()
     df_filtered = df[
@@ -612,14 +650,17 @@ def _create_market_indices_dashboard(
     inflation_mtime = CSV_FILE.stat().st_mtime if CSV_FILE.exists() else 0.0
     future_mtime    = FUTURE_CSV_FILE.stat().st_mtime if FUTURE_CSV_FILE.exists() else None
 
+    # NOTE: We intentionally pass only the file mtimes + date window — not
+    # ``df`` / ``future_df`` themselves — so the cache key stays cheap to
+    # hash.  ``_build_summary_table`` re-loads the underlying CSVs through
+    # the mtime-keyed ``_load_csv`` cache, giving us the same data with a
+    # small-primitives-only cache key.
     summary_df = _build_summary_table(
         inflation_data_mtime=inflation_mtime,
         future_data_mtime=future_mtime,
         start_date=start_date,
         end_date=end_date,
         max_historical_date=max_historical_date,
-        df=df,
-        future_df=future_df,
     )
 
     if summary_df.empty:
@@ -643,22 +684,69 @@ def _create_market_indices_dashboard(
 
 # ── 5. API key & data management ──────────────────────────────────────────────
 
+# How long a successful API-key validation is trusted before we re-test
+# against FRED + EIA.  The keys realistically don't expire mid-session, so
+# 15 minutes is plenty short to surface a rotated key on the next visit
+# yet long enough to spare every page render the two synchronous HTTP
+# round-trips ``test_api_keys`` performs.
+_API_KEY_CHECK_TTL_SECONDS: int = 15 * 60
+
+
+@st.cache_data(ttl=_API_KEY_CHECK_TTL_SECONDS, show_spinner=False)
+def _check_api_keys_cached(
+    keys_file_mtime: float,
+    keys_file_size: int,
+) -> Tuple[bool, str]:
+    """Cached wrapper around the FRED + EIA API-key probes.
+
+    Cache key is ``(mtime, size)`` of ``API_KEYS_FILE`` so a freshly
+    uploaded keys file blows the cache automatically on the next call.
+    Returns the same ``(is_valid, error_message)`` tuple as the public
+    :func:`check_api_keys`.
+
+    NOTE: Streamlit caches ONLY successful return values, but it also
+    caches non-exception returns — including invalid-key tuples like
+    ``(False, "One or more API keys are invalid or expired")``.  That's
+    exactly what we want: a transient FRED 5xx still hits the network
+    next time (because the function raised), while a steady-state valid
+    key stays cached.
+    """
+    mbp = _get_mbp()
+    api_keys = mbp.load_api_keys(API_KEYS_FILE)
+    fred_valid, eia_valid = mbp.test_api_keys(api_keys)
+    if not fred_valid or not eia_valid:
+        return False, "One or more API keys are invalid or expired"
+    return True, ""
+
+
 def check_api_keys() -> Tuple[bool, str]:
     """Test whether the stored FRED and EIA API keys are valid.
 
-    Returns (is_valid, error_message). error_message is empty when valid.
+    Returns ``(is_valid, error_message)`` — ``error_message`` is the
+    empty string when valid.
+
+    Cached for :data:`_API_KEY_CHECK_TTL_SECONDS` keyed on the API key
+    file's mtime + size, so the two synchronous HTTP probes that back
+    this check don't fire on every page render.
     """
     if not API_KEYS_FILE.exists():
         return False, "API keys file not found"
 
     try:
-        api_keys = mbp.load_api_keys(API_KEYS_FILE)
-        fred_valid, eia_valid = mbp.test_api_keys(api_keys)
-        if not fred_valid or not eia_valid:
-            return False, "One or more API keys are invalid or expired"
-        return True, ""
-    except Exception as exc:
+        stat = API_KEYS_FILE.stat()
+        return _check_api_keys_cached(stat.st_mtime, stat.st_size)
+    except Exception as exc:  # noqa: BLE001 — surface as a user-friendly banner
         return False, str(exc)
+
+
+def _invalidate_api_keys_cache() -> None:
+    """Drop the cached API-key validation result.
+
+    Wired to the "Save API Keys" upload flow and to the future "Re-test
+    API keys" button so a user-triggered action immediately reflects the
+    new key state.
+    """
+    _check_api_keys_cached.clear()
 
 
 def _render_api_key_upload() -> None:
@@ -681,11 +769,14 @@ def _render_api_key_upload() -> None:
         try:
             API_KEYS_FILE.parent.mkdir(parents=True, exist_ok=True)
             API_KEYS_FILE.write_bytes(uploaded_file.getbuffer())
+            # Drop the cached "keys are invalid" answer so the next render
+            # tests the freshly-saved keys against FRED + EIA immediately.
+            _invalidate_api_keys_cache()
             st.success("✅ API keys file saved successfully!")
 
             with st.spinner("🔄 Fetching market data with new API keys..."):
                 try:
-                    mbp.main()
+                    _get_mbp().main()
                     st.cache_data.clear()
                     st.success("✅ Market data fetched and forecasts generated successfully!")
                 except Exception as exc:
@@ -702,6 +793,7 @@ def _handle_auto_refresh() -> None:
     when the file is absent. Clears all Streamlit caches after a successful update
     and reruns the page so the new data is immediately visible.
     """
+    mbp = _get_mbp()
     if CSV_FILE.exists():
         if not mbp.should_refresh_data(CSV_FILE):
             return  # data is fresh — nothing to do

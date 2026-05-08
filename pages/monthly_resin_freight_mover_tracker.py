@@ -476,6 +476,20 @@ def _run_milk_mover_autoupdate(*, force: bool = False) -> None:
 
 _SS_MILK_BOOTSTRAP_TRIED = "monthly_movers_milk_bootstrap_tried"
 
+# True once the routine ("force=False") USDA-PDF orchestrator has executed
+# in this Streamlit session.  The orchestrator is itself TTL-guarded
+# (1-hour cooldown via the ``Milk_cost_tracker/fmmo_state.json`` blob) so
+# subsequent calls are *cheap* logic-wise — but they still pay one OneLake
+# round-trip for the state read on every Streamlit rerun.  Streamlit
+# reruns the whole page on every widget interaction (slicer drags, button
+# clicks, etc.), so even a "cheap" idempotent call quickly turns into the
+# single biggest contributor to perceived page-load cost.  Guarding with
+# this flag pins the orchestrator to "exactly once per session" for the
+# default routine path, while the explicit "USDA refresh" button still
+# bypasses it via ``force=True`` (and clears this flag so a later routine
+# tick can re-fire if the user navigates away and returns).
+_SS_MILK_AUTOUPDATE_TICK_RAN = "monthly_movers_milk_autoupdate_tick_ran"
+
 
 def _inject_milk_mover_from_store(uploads: dict[str, _Uploaded]) -> None:
     """Populate ``uploads['milk_mover_tracker']`` from the OneLake store.
@@ -523,6 +537,9 @@ def _inject_milk_mover_from_store(uploads: dict[str, _Uploaded]) -> None:
     uploads.pop("milk_mover_tracker", None)
 
 
+_SS_MILK_USAGE_SEED_DONE = "monthly_movers_milk_usage_seed_done"
+
+
 def _load_milk_usage_stable_uploaded_from_store() -> Optional[_Uploaded]:
     """Return an ``_Uploaded`` populated from the OneLake Milk_Usage_Stable store.
 
@@ -530,11 +547,19 @@ def _load_milk_usage_stable_uploaded_from_store() -> Optional[_Uploaded]:
     Errors raised by the store are swallowed and surfaced through the
     auto-update result session-state slot, mirroring the milk-mover path
     so the page always renders a coherent caption.
+
+    The ``seed_from_csv_if_empty()`` bootstrap is gated by
+    :data:`_SS_MILK_USAGE_SEED_DONE` so the OneLake "is the blob empty?"
+    probe fires at most once per session; the read itself is cheap but
+    it's still a network round-trip on every Streamlit rerun without
+    this guard.
     """
     try:
-        # Cheap idempotent bootstrap — only writes on the first ever render
-        # against an empty lakehouse; a no-op afterwards.
-        _milk_usage_store.seed_from_csv_if_empty()
+        if not st.session_state.get(_SS_MILK_USAGE_SEED_DONE):
+            st.session_state[_SS_MILK_USAGE_SEED_DONE] = True
+            # Cheap idempotent bootstrap — only writes on the first ever render
+            # against an empty lakehouse; a no-op afterwards.
+            _milk_usage_store.seed_from_csv_if_empty()
         df = _milk_usage_store.read_milk_usage_stable_df()
     except _milk_usage_store.MilkUsageStableStoreError as exc:
         st.session_state[_SS_MILK_AUTOUPDATE_RESULT] = (
@@ -2173,6 +2198,11 @@ def _render_milk_autoupdate_status() -> None:
             # ``_inject_milk_mover_from_store`` is willing to retry the
             # whole path again if needed.
             st.session_state.pop(_SS_MILK_BOOTSTRAP_TRIED, None)
+            # Also clear the routine-tick gate so the next page load runs
+            # the orchestrator naturally again (we just bypassed it with
+            # ``force=True`` anyway, but the gate's invariant should
+            # remain "set ⇔ orchestrator already ran this session").
+            st.session_state.pop(_SS_MILK_AUTOUPDATE_TICK_RAN, None)
             st.rerun()
 
 
@@ -3048,10 +3078,18 @@ def render_monthly_resin_freight_mover_tracker() -> None:
     """
     current_month = pd.Timestamp(date.today().replace(day=1))
 
-    # Run the USDA auto-update once per render (TTL-guarded internally so
-    # this is a no-op on most reruns). The cached result is rendered as a
-    # status caption beneath the milk slicer.
-    _run_milk_mover_autoupdate(force=False)
+    # Run the routine USDA auto-update tick once per *session*.  The
+    # orchestrator is also TTL-guarded internally (1 h cooldown), but the
+    # TTL check itself reads ``fmmo_state.json`` from OneLake; under
+    # Streamlit's rerun-everything execution model that read fires on
+    # every widget interaction.  The session-state gate trims it to once
+    # per browser visit.  Manual "USDA refresh" clicks bypass this gate
+    # (they call ``_run_milk_mover_autoupdate(force=True)`` and clear
+    # the flag).  See :data:`_SS_MILK_AUTOUPDATE_TICK_RAN` for the full
+    # rationale.
+    if not st.session_state.get(_SS_MILK_AUTOUPDATE_TICK_RAN):
+        st.session_state[_SS_MILK_AUTOUPDATE_TICK_RAN] = True
+        _run_milk_mover_autoupdate(force=False)
 
     _render_monthly_sop_and_upload_intro()
 

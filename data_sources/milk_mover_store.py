@@ -173,9 +173,21 @@ def _read_rows_cached() -> list[dict[str, Any]]:
     return list(rows or [])
 
 
+# Per-session "we already paid for the slow-path bypass once" guard.  See
+# :func:`_read_rows_with_fallback` for the full rationale — without this
+# gate a *genuinely* empty FMMO blob would trigger an extra non-cached
+# HTTPS read on every Streamlit rerun.
+_SS_BYPASS_KEY = "milk_mover_store_bypass_done"
+
+
 def _invalidate_read_cache() -> None:
-    """Drop the cached row list after a write so the next read sees fresh data."""
+    """Drop the cached row list AND re-arm the once-per-session bypass guard."""
     _read_rows_cached.clear()
+    # Re-arming the bypass flag on cache invalidation is what makes the
+    # public "USDA refresh" / "Refresh" actions effective: the next call
+    # to :func:`_read_rows_with_fallback` is once again willing to hit
+    # OneLake directly when the cached answer comes back empty.
+    st.session_state.pop(_SS_BYPASS_KEY, None)
 
 
 def invalidate_read_cache() -> None:
@@ -190,20 +202,31 @@ def invalidate_read_cache() -> None:
 
 
 def _read_rows_with_fallback() -> list[dict[str, Any]]:
-    """Read rows with a one-shot retry that bypasses the local cache.
+    """Read rows with a once-per-session retry that bypasses the local cache.
 
     Mirrors the resin-store ``_read_with_fallback`` helper.  Plain
     :func:`_read_rows_cached` keeps even an empty list for up to
     ``_READ_CACHE_TTL_SECONDS``; that's normally fine but breaks the
     cold-start UX when the auto-updater seeds the blob a few hundred ms
-    after we've already cached "absent".  This helper invalidates the
-    cache once and re-reads directly when the cached answer is empty,
-    paying at most one extra HTTPS round-trip per page render.
+    after we've already cached "absent".
+
+    To unstick that case we perform exactly *one* direct (cache-free)
+    OneLake read per session — gated by :data:`_SS_BYPASS_KEY`.  In the
+    steady-state "blob really is empty" case we therefore avoid the
+    extra HTTPS round-trip on every rerun.  Manual refresh paths call
+    :func:`invalidate_read_cache` which clears the gate and re-arms
+    this fallback.
     """
     rows = _read_rows_cached()
     if rows:
         return rows
-    _invalidate_read_cache()
+    if st.session_state.get(_SS_BYPASS_KEY):
+        return rows  # already paid for the bypass this session.
+    st.session_state[_SS_BYPASS_KEY] = True
+
+    # Clear ONLY the cached row list here — *not* the bypass flag — so
+    # the gate we just set persists for the rest of the session.
+    _read_rows_cached.clear()
     try:
         rows, _etag = _io.read_json(_SECRETS_SECTION, _TABLE_BLOB_PATH)
     except _io.LakehouseIOError as exc:

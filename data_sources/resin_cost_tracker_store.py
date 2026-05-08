@@ -141,8 +141,16 @@ def _read_csv_cached(blob_path: str) -> Optional[pd.DataFrame]:
 
 
 def _invalidate_read_cache() -> None:
-    """Drop every cached frame after a write so the next read sees fresh data."""
+    """Drop every cached frame and re-arm the once-per-session bypass guard."""
     _read_csv_cached.clear()
+    # Re-arm the bypass guard so the next ``_read_with_fallback`` is
+    # willing to try a direct (non-cached) OneLake read again.  Without
+    # this reset a manual "Refresh" click would not actually re-probe
+    # OneLake on the very next render — it would just re-populate the
+    # (still-empty) cache via the slow path with stale confirmation.
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith(_SS_BYPASS_PREFIX):
+            del st.session_state[key]
 
 
 def invalidate_read_cache() -> None:
@@ -157,25 +165,49 @@ def invalidate_read_cache() -> None:
     _invalidate_read_cache()
 
 
+# Per-session "we already paid for the slow-path bypass once" guard.
+# Without it, a *genuinely* empty OneLake folder would force every
+# render to perform an extra non-cached HTTPS round-trip — see the
+# rationale in :func:`_read_with_fallback`.  Stored under a stable
+# prefix so :func:`_invalidate_read_cache` can sweep all entries when
+# the user explicitly clicks "Refresh".
+_SS_BYPASS_PREFIX = "resin_store_bypass_done::"
+
+
 def _read_with_fallback(blob_path: str) -> Optional[pd.DataFrame]:
-    """Read a blob with a one-shot retry that bypasses the local cache.
+    """Read a blob with a once-per-session retry that bypasses the local cache.
 
     The Streamlit ``cache_data`` decorator above keeps even ``None``
-    return values for up to ``_READ_CACHE_TTL_SECONDS``.  If a
-    user uploads the files into OneLake AFTER we already cached an
-    absent state, plain :func:`_read_csv_cached` would keep returning
-    ``None`` and the page would falsely report that the lakehouse is
-    empty.  This helper tries the cached read first (fast path); when
-    it returns ``None`` it invalidates the cache once and re-reads
-    directly via the lakehouse client to confirm whether the blob is
-    genuinely missing.  The slow-path read costs at most one HTTPS
-    round-trip per refresh — negligible compared to the user-visible
-    payoff of always seeing the live state of OneLake.
+    return values for up to ``_READ_CACHE_TTL_SECONDS``.  If a user
+    uploads the files into OneLake AFTER we already cached an absent
+    state, plain :func:`_read_csv_cached` would keep returning ``None``
+    and the page would falsely report that the lakehouse is empty.
+
+    To unstick that case we perform exactly *one* direct (cache-free)
+    OneLake read per session per blob path — gated by
+    :data:`_SS_BYPASS_PREFIX`.  The fast cached path is the default;
+    only an empty cached answer triggers the slow path, and the
+    session-state guard prevents the slow path from re-firing on every
+    rerun in the steady-state "blob really is empty" case.
+
+    Manual refresh clicks call :func:`invalidate_read_cache`, which
+    sweeps every ``_SS_BYPASS_PREFIX`` entry — that re-arms this
+    helper so the next render is willing to re-probe OneLake directly.
     """
     df = _read_csv_cached(blob_path)
     if df is not None and not df.empty:
         return df
-    _invalidate_read_cache()
+
+    flag_key = f"{_SS_BYPASS_PREFIX}{blob_path}"
+    if st.session_state.get(flag_key):
+        return df  # already paid for the bypass this session — trust the cache.
+    st.session_state[flag_key] = True
+
+    # Clear ONLY the cached-frame entries here — *not* the bypass flags
+    # (we just set ours and want it to persist for the rest of the
+    # session).  ``_invalidate_read_cache`` would sweep both, undoing
+    # the gate we just installed.
+    _read_csv_cached.clear()
     df, _etag = _io.read_csv(_SECRETS_SECTION, blob_path)
     return df
 

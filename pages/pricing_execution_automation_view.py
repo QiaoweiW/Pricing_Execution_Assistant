@@ -14,9 +14,12 @@ Key Features:
 - Output file caching in session state (5-minute TTL)
 - Excel automation error handling and display
 - Download functionality for generated VBCS files
+- Inline embed of the HTST & ESL PL Pricing Model Tracker workbook
+  (rendered above the tool picker so operators can review live tracker
+  numbers without leaving the page).
 
 Author: Pricing Execution Agent Team
-Last Updated: 2025-01-27
+Last Updated: 2026-05-08
 """
 import streamlit as st
 import pandas as pd
@@ -26,10 +29,125 @@ from pathlib import Path
 from collections import Counter
 import traceback
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit, urlunsplit
 
 from utils.ui_helpers import apply_custom_css, create_metric_box, safe_error_message
 from utils.data_helpers import load_existing_data
 from utils.processing_helpers import run_processing_script
+
+
+# ── SharePoint embed for the Pricing Model Tracker workbook ───────────────────
+#
+# Single source of truth for the SharePoint file location.  Kept at module
+# scope (rather than inlined) so future link rotations are a one-line edit
+# and so unit tests can assert the URL parsing helpers below stay correct.
+_PRICING_MODEL_TRACKER_SHAREPOINT_URL: str = (
+    "https://darigold1com.sharepoint.com/sites/CPPricing2/"
+    "Shared%20Documents/General/"
+    "Monthly%20and%20Quarterly%20Price%20Updates/"
+    "02%20Standard%20Pricing%20Models/Fresh_reference/"
+    "HTST%20&%20ESL%20PL%20Pricing%20Model_Tracker_v2.xlsx"
+)
+
+# Iframe height in pixels.  Tuned for an Excel-for-the-Web view: large
+# enough to show a meaningful slice of the worksheet while still leaving
+# room for the tool picker below the expander.
+_PRICING_MODEL_TRACKER_IFRAME_HEIGHT: int = 720
+
+
+def _build_pricing_model_tracker_embed_url(file_url: str) -> str:
+    """Convert a SharePoint file URL into an Office-for-the-Web embed URL.
+
+    Office for the Web honours ``?action=embedview`` plus
+    ``wdAllowInteractivity=True`` to render an interactive (sortable,
+    scrollable, formula-aware) iframe embed for Excel files hosted on
+    SharePoint Online.  We rebuild the query string deterministically so
+    a future change to ``_PRICING_MODEL_TRACKER_SHAREPOINT_URL`` (e.g.
+    a new ``?web=1`` form) keeps producing a clean embed URL.
+
+    Returns the original URL unchanged when parsing fails — defensive,
+    so a copy-paste typo manifests as a still-clickable "Open in
+    SharePoint" link rather than a hard error.
+    """
+    try:
+        parts = urlsplit(file_url)
+    except Exception:  # noqa: BLE001 — fall through to passthrough
+        return file_url
+    embed_query = "action=embedview&wdAllowInteractivity=True"
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, embed_query, parts.fragment)
+    )
+
+
+def _build_pricing_model_tracker_view_url(file_url: str) -> str:
+    """Return a SharePoint URL that opens the workbook for full editing.
+
+    Uses the ``?web=1`` query form — that's the one SharePoint hands out
+    via "Copy link", which renders the file in Excel for the Web with
+    full interactivity (edit/comment/share) for users who have the
+    appropriate permissions.
+    """
+    try:
+        parts = urlsplit(file_url)
+    except Exception:  # noqa: BLE001
+        return file_url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "web=1", parts.fragment))
+
+
+def _render_pricing_model_tracker_section() -> None:
+    """Render the inline Pricing Model Tracker workbook above the tool picker.
+
+    Layout
+    ------
+    A single collapsed-by-default :class:`st.expander` carrying:
+      1. A short rationale + a primary "Open in SharePoint" link button
+         (works for every user, regardless of iframe-embed support).
+      2. An :func:`st.components.v1.html` iframe embed of the workbook
+         using Office for the Web's ``?action=embedview`` mode — which
+         supports scrolling, cell selection and formula reveal so users
+         can interact with the tracker without leaving the page.
+
+    Failure mode
+    ------------
+    The iframe quietly displays a SharePoint error page when the user
+    isn't signed in to the tenant that hosts the file.  In that case
+    the explicit "Open in SharePoint" link directs them to the
+    canonical view, which prompts for sign-in as expected.  Either
+    way the rest of the page (tool picker, etc.) renders normally.
+    """
+    import streamlit.components.v1 as components
+
+    embed_url = _build_pricing_model_tracker_embed_url(
+        _PRICING_MODEL_TRACKER_SHAREPOINT_URL
+    )
+    view_url = _build_pricing_model_tracker_view_url(
+        _PRICING_MODEL_TRACKER_SHAREPOINT_URL
+    )
+
+    with st.expander(
+        "📊 HTST & ESL PL Pricing Model Tracker",
+        expanded=False,
+    ):
+        st.markdown(
+            "Live workbook embedded from SharePoint.  Scroll within the "
+            "frame to navigate sheets, click cells to inspect formulas, "
+            "or open the file in SharePoint for full edit / share access."
+        )
+        st.link_button(
+            "🔗 Open Pricing Model Tracker in SharePoint",
+            view_url,
+            type="primary",
+            use_container_width=False,
+            help=(
+                "Opens the workbook in a new tab via Excel for the Web — "
+                "use this for full edit, comment, and share access."
+            ),
+        )
+        components.iframe(
+            src=embed_url,
+            height=_PRICING_MODEL_TRACKER_IFRAME_HEIGHT,
+            scrolling=True,
+        )
 
 
 def _store_vbcs_in_cache(output_dataframes):
@@ -109,6 +227,13 @@ def render():
     # Load from session state cache
     data_files = st.session_state.get('vbcs_cache', {})
     output_dir = Path("data")  # Keep for compatibility, but files are in cache
+
+    # Pricing Model Tracker — sits ABOVE the tool-picker divider so the
+    # operator can review live tracker numbers (or jump out to SharePoint
+    # for edits) without scrolling past every tool below.  Collapsed by
+    # default so the page still opens to the same tool-picker layout
+    # operators are used to.
+    _render_pricing_model_tracker_section()
 
     # Tool selection at the top
     st.markdown("---")

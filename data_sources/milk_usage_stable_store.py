@@ -5,12 +5,16 @@ The Monthly Movers section of the Market Barometer page used to require
 the user to upload ``Milk_Usage_Stable.csv`` on every visit. The file is
 slow-changing reference data — the per-item Skim/Butterfat usage and
 Class/Category mapping — so it belongs in Fabric, alongside the
-already-migrated ``milk_mover_tracker.json``.
+already-migrated FMMO tracker.
 
 Storage layout
 --------------
-``Files/Milk_Usage_Stable.csv``  — the table, in its original CSV shape
-(``Item, Item Description, Class, Category, Skim Usage, Butterfat Usage``).
+``Files/Milk_cost_tracker/Milk_Usage_Stable.csv``  — the table, in its
+original CSV shape (``Item, Item Description, Class, Category,
+Skim Usage, Butterfat Usage``). Co-located with ``fmmo_tracker.json``
+and ``base_milk_cost_monthly_tracker.csv`` under the single
+``Milk_cost_tracker`` folder so every milk-cost artefact lives in one
+place a user can open in OneLake explorer.
 
 Why CSV and not JSON?
     * The file is 35 KB / ~685 rows — CSV stays human-readable in
@@ -60,12 +64,15 @@ class MilkUsageStableStoreError(RuntimeError):
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Same lakehouse as ``milk_mover_tracker.json`` by default. Change the
+# Same lakehouse as ``fmmo_tracker.json`` by default. Change the
 # secrets section name if you ever want this to live elsewhere.
 _SECRETS_SECTION: str = "fabric_milk_usage_stable"
 
-# Filename inside the lakehouse Files/ folder.
-_BLOB_PATH: str = "Milk_Usage_Stable.csv"
+# Path inside the lakehouse Files/ folder. Lives under the same
+# ``Milk_cost_tracker/`` subfolder as the FMMO tracker JSON and the
+# append-only base_milk_cost_monthly_tracker CSV — see
+# ``data_sources/milk_mover_store.py`` for the rationale.
+_BLOB_PATH: str = "Milk_cost_tracker/Milk_Usage_Stable.csv"
 
 # Streamlit-cache TTL for blob reads. The file is touched maybe once a
 # month — caching for 5 minutes is a fine balance between freshness and

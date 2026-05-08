@@ -25,7 +25,7 @@ automation.
 |------|-------------|
 | **Market Barometer** | Real-time view of key market indices (FRED, EIA) with a 24-month probabilistic forecast. Hosts the **Monthly Milk, Resin & Freight Movers** workflow (with a slicer- and Category/Class-filterable Milk Commodity Cost chart) and the **Walmart Fresh Tracker** for Walmart HTST fuel & resin cost reviews. |
 | **Bid Asset Intelligence** | Evaluate customer bid opportunities — volume, pricing method, delivery charges, pallet economics, and custom-label fees — to support competitive and profitable bid decisions. |
-| **HTST Activity Monitor** | Upload actual HTST shipment data to refresh site-level activity metrics, delivery charges, pallet status, and volume bracket classifications across your customer-site portfolio. |
+| **Shipment Monitor & HTST Requote** | Upload actual HTST shipment data to refresh site-level activity metrics, delivery charges, pallet status, and volume bracket classifications across your customer-site portfolio. |
 | **New Price Quote** | Generate rapid, on-demand price quotes for HTST products. |
 | **Pricing Execution Automation** | Generate VBCS files for Oracle upload. |
 | **Demand Planner Analytics** | Embedded Demand Planning BI dashboard, New Distribution Tracker, and an opt-in pull of the IBP Orders / Shipments Delta tables from the Microsoft Fabric Lakehouse. |
@@ -47,7 +47,7 @@ Select a page from the sidebar to get started.
 - **Evaluating a customer bid?**
   → **Bid Asset Intelligence**
 - **Refreshing shipment activity & charges?**
-  → **HTST Activity Monitor**
+  → **Shipment Monitor & HTST Requote**
 - **Need a quick price quote?**
   → **New Price Quote**
 - **Generating VBCS files for Oracle?**

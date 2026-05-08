@@ -26,7 +26,7 @@ the file. This honours the contract requested in the migration plan:
 
 Existing months are left untouched — even if the underlying milk_mover
 values changed (rare; happens only when someone manually edits
-milk_mover_tracker.json). If we ever want overwrite-on-existing semantics,
+``fmmo_tracker.json``). If we ever want overwrite-on-existing semantics,
 add a ``replace_for_end_month`` helper alongside this one.
 
 Storage layout

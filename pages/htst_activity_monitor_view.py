@@ -22,17 +22,21 @@ Sections
 
 Data flow
 ---------
-                  ┌─ DEFAULT (web-friendly) ─────────────────────────────┐
-                  │   User uploads HTST Shipment Report + lookup CSVs    │
-                  │   in one multi-file uploader → _detect_files         │
-                  │                                                       │
-                  ├─ OPT-IN (local desktop only) ────────────────────────┤
+                  ┌─ PRIMARY (Pricing Lakehouse pull) ───────────────────┐
                   │   _render_shipment_source pulls Shipments from the   │
                   │   Fabric Lakehouse Delta table; user uploads only    │
                   │   the lookup CSVs. A "Download HTST-Only Shipment    │
                   │   Data (CSV)" button is rendered here so users can   │
                   │   capture a local snapshot of the HTST-filtered raw  │
                   │   dataflow data, pre-merge.                          │
+                  │                                                       │
+                  ├─ FALLBACK (auto, on lakehouse failure) ──────────────┤
+                  │   When the lakehouse pull fails — typically because  │
+                  │   interactive Azure sign-in is unavailable on a      │
+                  │   Streamlit Cloud (web) deployment — the page        │
+                  │   automatically reveals the full upload section and  │
+                  │   accepts the HTST Shipment Report alongside all     │
+                  │   lookup CSVs in a single multi-file uploader.       │
                   └──────────────────────────────────────────────────────┘
                                      │
                                      ▼
@@ -49,19 +53,13 @@ Data flow
 
 Design notes
 ------------
-* Two ingest modes, gated by a single checkbox at the top of the page:
-    - DEFAULT (checkbox unchecked) — manual upload.  One multi-file
-      uploader accepts the HTST Shipment Report alongside all lookup
-      CSVs.  Required for Streamlit Cloud (web) users because the
-      dataflow path needs an interactive Azure browser sign-in that a
-      headless cloud server cannot complete.
-    - OPT-IN (checkbox checked, marked "DO NOT CLICK IF YOU ARE A WEB
-      USER") — fetches Shipments from Microsoft Fabric Lakehouse via
-      data_sources/htst_shipment.py.  Lookup CSVs are still uploaded.
-      A download button beside the dataflow caption emits the HTST-
-      filtered raw shipment table (no merges) as a CSV, so the user can
-      keep an offline snapshot or feed the manual-upload path in a later
-      session.
+* Single source-mode policy: the Pricing Lakehouse pull is always tried
+  FIRST (no checkbox toggle).  When it succeeds the page shows a
+  smaller "lookups only" upload panel.  When the pull fails — most
+  commonly because a headless Streamlit Cloud server cannot complete
+  the interactive Azure browser sign-in — the page automatically falls
+  back to the full multi-file uploader (HTST Shipment Report + lookup
+  CSVs).  No user action is required to switch between modes.
 * The "shipment" pattern is defined separately as _SHIPMENT_PATTERN so it
   is appended to the active pattern list only in default mode.  Pattern
   matching in _detect_files is first-match-wins, with the lookup
@@ -970,49 +968,57 @@ def _build_customer_site_summary(
 
 # ── 6. UI rendering ───────────────────────────────────────────────────────────
 
-def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[SnapshotMeta], Optional[str]]:
-    """Render the Microsoft Fabric Dataflow shipment-source section.
+class _ShipmentSourceResult(NamedTuple):
+    """Outcome of an attempted shipment-source pull.
 
-    Called only when the user has opted in to the dataflow path via the
-    "Use Microsoft Fabric Dataflow" checkbox in render().  Pulls the full
-    Shipments table from the Fabric Lakehouse Delta table via
-    data_sources.htst_shipment.fetch_htst_shipment_df(), shows a refresh
-    button that bypasses the 15-minute cache, and (when the fetch
-    succeeded) renders an HTST-only CSV download button so users can keep
-    a local snapshot of the raw HTST-filtered shipment data — pre-merge —
-    for offline analysis or to feed into the manual-upload path later.
+    Attributes
+    ----------
+    df          : Shipments DataFrame on success; None when the lakehouse
+                  fetch failed and the page should fall back to upload.
+    meta        : SnapshotMeta on success, else None.
+    signature   : meta.cache_key on success — used by render() as part of
+                  the enrichment-cache signature.
+    error       : Human-readable error message on failure (for diagnostics).
+                  None on success.
+    """
+    df:        Optional[pd.DataFrame]
+    meta:      Optional[SnapshotMeta]
+    signature: Optional[str]
+    error:     Optional[str]
+
+
+def _render_shipment_source() -> _ShipmentSourceResult:
+    """Render the Pricing Lakehouse shipment-source section.
+
+    The lakehouse pull is the page's default ingest mode — there is no
+    longer a user-facing toggle.  This function tries the pull, surfaces
+    the resulting "data as of" caption + HTST-only download button when it
+    succeeds, and returns a structured failure result (no inline error
+    rendering) when it fails so render() can switch into upload mode
+    without the user seeing a red banner.
 
     Returns
     -------
-    (shipment_df, meta, signature)
-        shipment_df : Full Shipments DataFrame from the dataflow, or None
-                      when the fetch failed (errors are surfaced inline).
-        meta        : SnapshotMeta describing the Delta version + last-
-                      modified timestamp + row count, or None on failure.
-        signature   : meta.cache_key on success, None on failure.  Used by
-                      render() as part of the enrichment-cache key so the
-                      pipeline reruns if-and-only-if the dataflow snapshot
-                      changes.
+    :class:`_ShipmentSourceResult`
+        Carries either the snapshot + cache signature (success) or a
+        plain-text failure reason (fallback path).
     """
-    st.markdown("### 🛰️ HTST Shipment Source — Microsoft Fabric Dataflow")
+    st.markdown("### 🛰️ HTST Shipment Source — Pricing Lakehouse")
 
     # The refresh button must be wired BEFORE fetch_htst_shipment_df() runs so
     # that clicking it clears the cache on this same render pass.
     refresh_clicked = st.button(
-        "🔄 Refresh from Dataflow",
+        "🔄 Refresh from Lakehouse",
         key="htst_shipment_refresh",
-        help="Bypass the 15-minute cache and re-read the latest dataflow snapshot.",
+        help="Bypass the 15-minute cache and re-read the latest lakehouse snapshot.",
     )
     try:
-        with st.spinner("Reading HTST Shipment Report from Microsoft Fabric…"):
+        with st.spinner("Reading HTST Shipment Report from the Pricing Lakehouse…"):
             df, meta = fetch_htst_shipment_df(force_refresh=refresh_clicked)
     except HTSTShipmentSourceError as exc:
-        st.error(f"❌ Could not load shipment data from the Fabric dataflow.\n\n{exc}")
-        st.info(
-            "Untick **Use Microsoft Fabric Dataflow** at the top of the page "
-            "to switch to manual upload."
-        )
-        return None, None, None
+        # Don't surface an error banner here — render() decides how loudly
+        # to message the fallback once it has the structured failure.
+        return _ShipmentSourceResult(None, None, None, str(exc))
 
     last_mod = meta.last_modified.strftime("%Y-%m-%d %H:%M UTC") if meta.last_modified else "unknown"
     st.caption(
@@ -1026,12 +1032,12 @@ def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[Snapshot
     # st.download_button streams over HTTP, not the WebSocket — there is no
     # client-side limit on the payload size.  CSV bytes are produced lazily
     # and cached by snapshot signature inside _htst_filtered_csv_bytes, so
-    # the filter + CSV-encode pass runs at most once per dataflow refresh.
+    # the filter + CSV-encode pass runs at most once per lakehouse refresh.
     try:
         csv_bytes = _htst_filtered_csv_bytes(df, meta.cache_key)
     except KeyError:
         st.warning(
-            "HTST-only download unavailable: the dataflow output is missing "
+            "HTST-only download unavailable: the lakehouse table is missing "
             "the 'PRODUCTGROUP' column."
         )
     else:
@@ -1044,12 +1050,12 @@ def _render_shipment_source() -> tuple[Optional[pd.DataFrame], Optional[Snapshot
                 mime="text/csv",
                 key="htst_dataflow_raw_download",
                 help=(
-                    "HTST-filtered raw shipment table from the dataflow, "
+                    "HTST-filtered raw shipment table from the lakehouse, "
                     "before any lookup merges or enrichment."
                 ),
             )
 
-    return df, meta, meta.cache_key
+    return _ShipmentSourceResult(df, meta, meta.cache_key, None)
 
 
 def _render_upload_section(*, include_shipment: bool) -> dict[str, object]:
@@ -1307,8 +1313,8 @@ def _render_output_section(filtered_df: pd.DataFrame) -> None:
 def render() -> None:
     """Render the HTST Activity Monitor page.
 
-    Flow: source-mode toggle → shipment input (upload OR dataflow) →
-          lookup uploads (and shipment in default mode) → validate →
+    Flow: lakehouse pull (auto) → on success, lookup-only uploads;
+          on failure, full upload (shipment + lookups) → validate →
           process (cached) → load optional lookups → filter →
           Customer-Site Details → Enriched Report.
 
@@ -1324,60 +1330,50 @@ def render() -> None:
     apply_custom_css()
 
     st.markdown(
-        '<h1 class="main-header">HTST Activity Monitor</h1>',
+        '<h1 class="main-header">Shipment Monitor &amp; HTST Requote</h1>',
         unsafe_allow_html=True,
     )
 
     # ── Welcome ───────────────────────────────────────────────────────────────
     st.markdown("### Welcome")
-    st.info("Upload the required reports to get the refreshed HTST activity level report.")
-    st.markdown("---")
-
-    # ── Source-mode toggle ────────────────────────────────────────────────────
-    # The dataflow path requires interactive Azure sign-in (browser popup) to
-    # acquire a OneLake storage token.  Streamlit Cloud is headless — the
-    # popup cannot open — so the dataflow option is gated behind an opt-in
-    # checkbox with a loud warning to keep web users on the upload path.
-    use_dataflow = st.checkbox(
-        "Use Microsoft Fabric Dataflow as the shipment source — "
-        "**DO NOT CLICK IF YOU ARE A WEB USER**",
-        value=False,
-        key="htst_use_dataflow",
-        help=(
-            "Default (unchecked): upload the HTST Shipment Report alongside "
-            "the lookup CSVs in the uploader below.  This is the right "
-            "choice for Streamlit Cloud (web) users.\n\n"
-            "Checked: fetch the shipment data directly from the Microsoft "
-            "Fabric Lakehouse Delta table.  Requires interactive Azure "
-            "sign-in or a service principal — only works in a local "
-            "desktop session, not on a headless Streamlit Cloud server."
-        ),
+    st.info(
+        "Shipment data is pulled automatically from the Pricing Lakehouse. "
+        "Upload the lookup CSVs below to refresh the HTST activity-level "
+        "report.  If the lakehouse pull fails (typically when running on "
+        "Streamlit Cloud), the full multi-file upload panel will appear "
+        "automatically as a fallback."
     )
     st.markdown("---")
 
-    # ── Shipment input ────────────────────────────────────────────────────────
-    # Default mode: shipment file is part of the multi-file uploader (handled
-    # below) and read into a DataFrame after the lookup-detection step.
-    # Dataflow mode: _render_shipment_source fetches it from Fabric and
-    # surfaces the HTST-only download button alongside.
-    if use_dataflow:
-        shipment_df, _shipment_meta, shipment_sig = _render_shipment_source()
-        st.markdown("---")
-        if shipment_df is None:
-            # _render_shipment_source already surfaced the error state.
-            return
-    else:
-        shipment_df = None
-        shipment_sig = None  # populated after the shipment file is read below.
+    # ── Shipment input — lakehouse first, upload fallback on failure ─────────
+    # No user-facing toggle: the page always tries the Pricing Lakehouse
+    # pull first.  If the pull fails (typical on a headless Streamlit Cloud
+    # session that cannot complete an interactive Azure sign-in), the page
+    # automatically reveals the full upload panel below — the user never
+    # has to click a checkbox to switch modes.
+    source_result = _render_shipment_source()
+    use_upload_fallback = source_result.df is None
+    shipment_df = source_result.df
+    shipment_sig = source_result.signature
 
-    # ── Lookup uploads (and the shipment file in default mode) ───────────────
-    detected = _render_upload_section(include_shipment=not use_dataflow)
+    if use_upload_fallback:
+        st.warning(
+            "⚠️ Could not pull the HTST Shipment Report from the Pricing "
+            "Lakehouse — falling back to manual upload.  Upload the HTST "
+            "Shipment Report alongside the lookup CSVs in the panel below."
+        )
+        with st.expander("Why did the lakehouse pull fail?", expanded=False):
+            st.code(source_result.error or "Unknown error.", language="text")
     st.markdown("---")
 
-    # In default mode, materialise the uploaded shipment CSV before the
+    # ── Lookup uploads (and the shipment file when in fallback mode) ─────────
+    detected = _render_upload_section(include_shipment=use_upload_fallback)
+    st.markdown("---")
+
+    # In fallback mode, materialise the uploaded shipment CSV before the
     # required-missing gate so its presence/absence is reflected in the
     # waiting message alongside the lookup files.
-    if not use_dataflow:
+    if use_upload_fallback:
         shipment_file = detected.get("shipment")
         if shipment_file is not None:
             try:
@@ -1387,17 +1383,25 @@ def render() -> None:
                 return
             shipment_sig = f"upload:{shipment_file.name}:{shipment_file.size}"
 
-    # Required-files gate.  In default mode we additionally check the
+    # Required-files gate.  In fallback mode we additionally check the
     # shipment file via shipment_df, since _SHIPMENT_PATTERN is not part of
     # _FILE_PATTERNS.
     required_missing = [
         p.label for p in _FILE_PATTERNS
         if p.required and detected.get(p.key) is None
     ]
-    if not use_dataflow and shipment_df is None:
+    if use_upload_fallback and shipment_df is None:
         required_missing.append(_SHIPMENT_PATTERN.label)
     if required_missing:
-        st.info("📤 File uploading and calculation in progress.")
+        # Surface the explicit list of files we're still waiting on so the
+        # user knows exactly what to upload — much clearer than the prior
+        # "calculation in progress" wording, which made the static
+        # waiting-state look like a hung pipeline.
+        missing_md = "\n".join(f"  • {label}" for label in required_missing)
+        st.info(
+            "⏳ Waiting for the following required report(s) before "
+            f"processing can begin:\n{missing_md}"
+        )
         return
 
     # ── Process main enrichment pipeline (session-state cached) ───────────────
@@ -1438,7 +1442,7 @@ def render() -> None:
 
     if enriched_df is None:
         # Defensive guard: cache entry missing (e.g. session was reset).
-        st.error("Processed data unavailable — please refresh the dataflow and re-upload the lookup files.")
+        st.error("Processed data unavailable — please refresh the lakehouse pull and re-upload the lookup files.")
         return
 
     # ── Load optional lookup tables from uploaded files ───────────────────────

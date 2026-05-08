@@ -19,11 +19,19 @@ this connector).  GUIDs are hard-coded as module-level constants because:
   azure-identity (interactive sign-in or service principal), so anyone
   without lakehouse Read access still cannot fetch rows.
 
-The auth + read pipeline mirrors :mod:`data_sources.htst_shipment` —
-ChainedTokenCredential → DuckDB ``delta_scan`` over OneLake — so the
-two modules share the same operational semantics, the same failure
-modes, and the same on-disk MSAL token cache (sign in once, both
-connectors stay authenticated).
+Auth + read pipeline
+--------------------
+This connector now uses the SHARED auth + DuckDB plumbing in
+:mod:`data_sources.fabric_auth` — the same credential and the same
+DuckDB connection (with the ``azure`` + ``delta`` extensions
+pre-loaded) that ``htst_shipment`` uses. Practical effects:
+
+* A user who has already signed in for HTST Shipment / Milk Mover does
+  not see a second browser sign-in when opening Demand Planner Analytics.
+* The ``LOAD azure`` / ``LOAD delta`` cost is paid once per process
+  rather than once per connector cold fetch.
+* TLS / CA-bundle handling lives in one place (``fabric_auth``) instead
+  of two slightly-different copies.
 """
 from __future__ import annotations
 
@@ -34,6 +42,14 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
+
+from data_sources.fabric_auth import (
+    FabricAuthError,
+    acquire_storage_token,
+    bind_storage_token,
+    duckdb_lock,
+    get_duckdb_connection,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -58,15 +74,6 @@ _TABLE_SHIPMENTS = "IBP Shipments"
 # typically refresh hourly or daily, so 15 min is conservative without
 # being chatty.
 _CACHE_TTL_SECONDS = 15 * 60
-
-# OneLake honors any token issued for the Azure Storage scope.
-_STORAGE_SCOPE = "https://storage.azure.com/.default"
-
-# Persisted MSAL cache name.  Distinct from the htst_shipment cache so
-# that signing out of one connector does not invalidate the other —
-# they share the same underlying refresh tokens at the OS level but
-# have independent cache slots.
-_TOKEN_CACHE_NAME = "streamlit_ibp_official"
 
 
 # ── Public types ──────────────────────────────────────────────────────────────
@@ -115,70 +122,18 @@ def _build_table_uri(table: str) -> str:
 
 # ── Credential acquisition ────────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner=False)
-def _get_credential():
-    """Build a credential chain reused across every fetch in a session.
-
-    Order of precedence (first that succeeds wins):
-
-    1. ``EnvironmentCredential`` — picks up ``AZURE_TENANT_ID`` /
-       ``AZURE_CLIENT_ID`` / ``AZURE_CLIENT_SECRET`` if they are set in
-       the process environment (the headless service-principal path).
-    2. ``InteractiveBrowserCredential`` — opens a browser the first
-       time, with persistent token caching to ``%LOCALAPPDATA%`` so
-       subsequent runs are silent for ~90 days.
-
-    Cached at module level via ``@st.cache_resource`` so the
-    ``ChainedTokenCredential`` survives Streamlit reruns inside a
-    session; on-disk persistence handles cross-restart survival.
-    """
-    try:
-        from azure.identity import (
-            ChainedTokenCredential,
-            EnvironmentCredential,
-            InteractiveBrowserCredential,
-            TokenCachePersistenceOptions,
-        )
-    except ImportError as exc:
-        raise IBPOfficialSourceError(
-            "Python package 'azure-identity' is not installed.  Run: "
-            "pip install azure-identity"
-        ) from exc
-
-    persistence = TokenCachePersistenceOptions(
-        name=_TOKEN_CACHE_NAME,
-        # Required on locked-down corporate workstations that lack a
-        # managed keyring — the cache file is stored under the user
-        # profile and needs no admin rights.
-        allow_unencrypted_storage=True,
-    )
-
-    return ChainedTokenCredential(
-        EnvironmentCredential(),
-        InteractiveBrowserCredential(
-            cache_persistence_options=persistence,
-        ),
-    )
-
-
 def _acquire_storage_token() -> str:
     """Acquire a bearer token for OneLake (Azure Storage scope).
 
-    First call typically triggers a browser sign-in; subsequent calls are
-    silent.  Wraps any underlying credential error in our typed exception
-    so the page renders a clean, actionable message.
+    Thin wrapper around :func:`fabric_auth.acquire_storage_token` that
+    translates :class:`FabricAuthError` into our domain-specific error.
+    Uses the process-shared default cache name so a sign-in in any
+    other Fabric-backed page also satisfies this connector.
     """
-    credential = _get_credential()
     try:
-        return credential.get_token(_STORAGE_SCOPE).token
-    except Exception as exc:  # noqa: BLE001
-        raise IBPOfficialSourceError(
-            "Could not acquire an Azure Storage token for OneLake.  "
-            "If a sign-in window opened, complete it and reload this page.  "
-            "If no window appeared, your browser may have blocked the popup "
-            "or your account is restricted from interactive auth.  "
-            f"Underlying error: {exc}"
-        ) from exc
+        return acquire_storage_token()
+    except FabricAuthError as exc:
+        raise IBPOfficialSourceError(str(exc)) from exc
 
 
 # ── Core read path ────────────────────────────────────────────────────────────
@@ -193,15 +148,10 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
     timestampNtz), which delta-rs rejects; DuckDB's delta extension uses
     the Databricks ``delta-kernel-rs`` crate and handles every Fabric
     protocol level cleanly.
-    """
-    try:
-        import duckdb  # noqa: WPS433  (lazy import keeps module import cheap)
-    except ImportError as exc:
-        raise IBPOfficialSourceError(
-            "Python package 'duckdb' is not installed.  Run: "
-            "pip install -r requirements.txt"
-        ) from exc
 
+    Uses the SHARED DuckDB connection (extensions pre-loaded) — see
+    :func:`fabric_auth.get_duckdb_connection`.
+    """
     # ── Best-effort metadata via delta-rs (non-fatal) ────────────────────────
     # The actual protocol-version check is performed inside delta-rs; we
     # tolerate failure here because the row data itself comes from DuckDB.
@@ -234,24 +184,14 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
             table_uri, meta_exc,
         )
 
-    # ── Authoritative read via DuckDB delta_scan ────────────────────────────
+    # ── Authoritative read via the shared DuckDB connection ────────────────
     try:
-        con = duckdb.connect(":memory:")
-        # Extensions auto-install on first use; subsequent runs hit the
-        # local extension cache and load in <50ms.
-        con.execute("INSTALL azure")
-        con.execute("LOAD azure")
-        con.execute("INSTALL delta")
-        con.execute("LOAD delta")
-        # Stash the bearer token in a duckdb SECRET so it never appears
-        # in the SQL log of subsequent queries.  CREATE OR REPLACE makes
-        # this idempotent across reruns.
-        con.execute(
-            "CREATE OR REPLACE SECRET onelake_token ("
-            "TYPE AZURE, PROVIDER ACCESS_TOKEN, "
-            f"ACCESS_TOKEN '{token}', ACCOUNT_NAME 'onelake')"
-        )
-        df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
+        con = get_duckdb_connection()
+        with duckdb_lock():
+            bind_storage_token(con, token)
+            df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
+    except FabricAuthError as exc:
+        raise IBPOfficialSourceError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise IBPOfficialSourceError(
             f"Could not read Delta table via DuckDB at {table_uri}.  "

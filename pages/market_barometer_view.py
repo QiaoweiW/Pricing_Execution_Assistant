@@ -786,6 +786,29 @@ statistical forecast is enabled for all key indices).
 """)
 
 
+def _render_annual_cola_movers_section() -> None:
+    """Render the **Annual COLA Movers** collapsible section.
+
+    Sits directly beneath **Monthly Milk, Resin & Freight Movers** and
+    serves as the home for the annual cost-of-living-adjustment (COLA)
+    workflow.  The section is intentionally minimal today — it claims a
+    permanent, predictable spot on the page so future COLA tooling
+    (annual driver values, projection charts, audit downloads) can land
+    here without forcing another navigation revamp.
+
+    Kept collapsed by default to match the visual treatment of the
+    Monthly Movers section above it.
+    """
+    with st.expander("📅 Annual COLA Movers", expanded=False):
+        st.info(
+            "🚧 **Annual COLA Movers tracker — coming soon.**\n\n"
+            "This section will host the annual cost-of-living-adjustment "
+            "(COLA) workflow alongside the Monthly Movers tracker above. "
+            "Reach out to the Pricing team with any drivers, summaries, or "
+            "audit downloads you'd like to see surfaced here."
+        )
+
+
 def _render_market_indices_section(df: pd.DataFrame) -> None:
     """Render the collapsible Market Indices dashboard with date range controls.
 
@@ -884,6 +907,17 @@ def render() -> None:
     # so uploads / edits here do not trigger reruns elsewhere.
     with st.expander("📦 Monthly Milk, Resin & Freight Movers", expanded=False):
         render_monthly_resin_freight_mover_tracker()
+
+    # Visual divider between the two foldable mover trackers so the page
+    # still reads as two distinct collapsible sections even when both are
+    # closed (an expander alone leaves no visible separator).
+    st.markdown("---")
+
+    # Placeholder home for the Annual COLA (cost-of-living-adjustment) Movers
+    # tracker.  Lives under its own collapsible section so the section can
+    # grow into a fully-fledged tracker without disturbing the surrounding
+    # page layout.
+    _render_annual_cola_movers_section()
 
     # API key management: show upload widget if keys are missing/invalid,
     # otherwise check whether a periodic auto-refresh is due.

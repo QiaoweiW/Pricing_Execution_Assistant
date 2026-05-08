@@ -130,6 +130,9 @@ from data_sources import milk_mover_autoupdate as _milk_autoupdate
 from data_sources import milk_mover_store as _milk_store
 from data_sources import milk_usage_stable_store as _milk_usage_store
 from data_sources import base_milk_cost_tracker_store as _base_milk_cost_tracker
+from data_sources import resin_cost_tracker_store as _resin_store
+from data_sources import mover_details_table_store as _mover_details_store
+from data_sources import monthly_pricing_execution_store as _mpe_store
 
 
 # ── 1. Constants ──────────────────────────────────────────────────────────────
@@ -157,16 +160,15 @@ _BREAKTHROUGH_FUEL_URL: str = (
 
 # Role → filename keyword mapping (case-insensitive, evaluated in order so
 # more specific keys win — e.g. "site_item_volume" must be tested before any
-# shorter key that could absorb it). The legacy ``milk_mover_tracker`` and
-# ``milk_usage_stable`` roles are intentionally absent: both DataFrames now
-# come from Microsoft Fabric Lakehouse blobs (see
-# ``data_sources/milk_mover_store.py`` and ``data_sources/milk_usage_stable_store.py``)
-# and are injected into the uploads dict in
-# ``render_monthly_resin_freight_mover_tracker``.
+# shorter key that could absorb it).  The legacy ``milk_mover_tracker``,
+# ``milk_usage_stable``, ``resin_calculator`` and ``resin_cost_tracker``
+# roles are intentionally absent: those DataFrames now come from Microsoft
+# Fabric Lakehouse blobs (see ``data_sources/milk_mover_store.py``,
+# ``data_sources/milk_usage_stable_store.py`` and
+# ``data_sources/resin_cost_tracker_store.py``) and are injected into the
+# uploads dict by ``render_monthly_resin_freight_mover_tracker``.
 _ROLE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("site_item_volume",   ("site_item_volume",)),
-    ("resin_calculator",   ("resin_calculator",)),
-    ("resin_cost_tracker", ("resin_cost_tracker",)),
     # Legacy filename ``Scrap_Tracker`` still classifies for backwards-compat.
     ("scrape_tracker",     ("scrape_tracker", "scrap_tracker")),
     ("packaging_index",    ("packaging_index",)),
@@ -174,26 +176,31 @@ _ROLE_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("example_prices",     ("example_prices",)),
 ]
 
-# Roles that MUST be uploaded before the Refresh step can run. Optional roles
-# (packaging_index/pkg_index, example_prices) are accepted but skipped
-# silently when absent. milk_usage_stable and milk_mover_tracker are sourced
-# from Fabric and are not part of the upload contract.
+# Roles that MUST be uploaded before the Refresh step can run.  Optional
+# roles (packaging_index/pkg_index, example_prices) are accepted but
+# skipped silently when absent.  ``milk_usage_stable``, ``milk_mover_tracker``,
+# ``resin_calculator`` and ``resin_cost_tracker`` are sourced from Fabric
+# and are not part of the upload contract.
 REQUIRED_ROLES: tuple[str, ...] = (
     "site_item_volume",
-    "resin_calculator",
-    "resin_cost_tracker",
     "scrape_tracker",
 )
 
 # ── Resin Calculator / Resin Cost Tracker canonical column names ─────────────
-_COL_PRODUCT_ID   = "Product ID"
-_COL_PRODUCT_DESC = "Product Description"
-_COL_RESIN        = "Resin"
-_COL_RESIN_GAL    = "Resin Cost ($/Gal)"
-_COL_MONTH        = "Month"
-_COL_PRICING_CAT  = "Pricing Category"
-_COL_USAGE_LBS    = "Usage (Lbs/Ea)"
-_COL_GAL_EA       = "Gal/Ea"
+#
+# Sourced from ``data_sources.resin_cost_tracker_store`` so the schema is
+# defined in exactly ONE place — the store itself.  This page used to
+# carry a parallel copy of these literals which had to be kept in lock-step
+# manually; the aliases below preserve every existing call-site (``_COL_*``)
+# while removing the duplication.
+_COL_PRODUCT_ID   = _resin_store.COL_PRODUCT_ID
+_COL_PRODUCT_DESC = _resin_store.COL_PRODUCT_DESC
+_COL_RESIN        = _resin_store.COL_RESIN
+_COL_RESIN_GAL    = _resin_store.COL_RESIN_GAL
+_COL_MONTH        = _resin_store.COL_MONTH
+_COL_PRICING_CAT  = _resin_store.COL_PRICING_CAT
+_COL_USAGE_LBS    = _resin_store.COL_USAGE_LBS
+_COL_GAL_EA       = _resin_store.COL_GAL_EA
 
 # ── Movers_Non_Milk_Tracker schema (the editable in-app table) ───────────────
 #
@@ -525,6 +532,103 @@ def _inject_milk_usage_stable_from_store(uploads: dict[str, _Uploaded]) -> None:
         uploads.pop("milk_usage_stable", None)
         return
     uploads["milk_usage_stable"] = sourced
+
+
+# ── 3b. Resin Calculator + Resin Cost Tracker OneLake source ─────────────────
+#
+# Both files used to be uploaded by the user on every visit; they are now
+# resolved from a Fabric Lakehouse Files/ folder via
+# ``data_sources/resin_cost_tracker_store.py``.  These helpers are the only
+# seam between the new storage layer and the unchanged downstream pipeline:
+# every consumer of ``uploads["resin_calculator"]`` / ``uploads["resin_cost_tracker"]``
+# keeps working byte-for-byte because :func:`read_resin_*_df` returns the
+# same column shape the legacy CSVs produced.
+
+# Session-state slot used to surface lakehouse pull failures in the UI
+# without crashing the rest of the page.
+_SS_RESIN_STORE_ERROR = f"{_SS_PREFIX}_resin_store_error"
+
+
+def _load_resin_uploaded_from_store(
+    role: str,
+    label_provider,
+    reader,
+) -> Optional[_Uploaded]:
+    """Generic helper that materialises one resin blob into an ``_Uploaded``.
+
+    Parameters
+    ----------
+    role
+        Role key the downstream pipeline keys on (e.g. ``"resin_calculator"``).
+    label_provider
+        Zero-argument callable returning a short OneLake path label, used as
+        the synthetic filename in the resulting ``_Uploaded`` so the page's
+        download/audit captions stay informative.
+    reader
+        Zero-argument callable returning the raw DataFrame from the store.
+
+    Returns ``None`` (and caches the error in session_state) on failure so
+    callers can surface a single status caption rather than crashing.
+    """
+    try:
+        df = reader()
+    except _resin_store.ResinCostTrackerStoreError as exc:
+        st.session_state[_SS_RESIN_STORE_ERROR] = (
+            f"OneLake read failed for {role}: {exc}"
+        )
+        return None
+    if df is None or df.empty:
+        return None
+    return _Uploaded(role=role, filename=label_provider(), df=df)
+
+
+def _inject_resin_inputs_from_store(uploads: dict[str, _Uploaded]) -> None:
+    """Populate ``uploads['resin_calculator']`` and ``uploads['resin_cost_tracker']``.
+
+    Mirrors :func:`_inject_milk_mover_from_store` so the three Fabric-sourced
+    inputs (milk mover, milk usage stable, resin pair) are wired the same
+    way.  The role keys match the values the legacy upload-classifier used
+    so every downstream consumer keeps working unchanged.
+    """
+    # Drop any stale error from a prior render — successful reads below will
+    # leave the slot empty, otherwise the helper will repopulate it.
+    st.session_state.pop(_SS_RESIN_STORE_ERROR, None)
+
+    calc = _load_resin_uploaded_from_store(
+        role="resin_calculator",
+        label_provider=_resin_store.get_calculator_label,
+        reader=_resin_store.read_resin_calculator_df,
+    )
+    if calc is None:
+        uploads.pop("resin_calculator", None)
+    else:
+        uploads["resin_calculator"] = calc
+
+    tracker = _load_resin_uploaded_from_store(
+        role="resin_cost_tracker",
+        label_provider=_resin_store.get_cost_tracker_label,
+        reader=_resin_store.read_resin_cost_tracker_df,
+    )
+    if tracker is None:
+        uploads.pop("resin_cost_tracker", None)
+    else:
+        uploads["resin_cost_tracker"] = tracker
+
+
+def _render_resin_store_status() -> None:
+    """Render a one-line caption describing the resin OneLake source.
+
+    Surfaces any error captured in session_state so the user has a
+    single, actionable place to look when the store is unreachable.
+    """
+    err = st.session_state.get(_SS_RESIN_STORE_ERROR)
+    if err:
+        st.caption(f"⚠️ {err}")
+        return
+    st.caption(
+        "🧪 Resin Calculator & Cost Tracker sourced from the Fabric Lakehouse "
+        f"(`{_resin_store.get_cost_tracker_label()}`)."
+    )
 
 
 # ── 4. Chart builder ──────────────────────────────────────────────────────────
@@ -1185,6 +1289,7 @@ def _fg_resin_lookup_by_desc(fg_df: pd.DataFrame) -> dict[str, float]:
 #
 # Canonical column names for the mover_details_table. Defined once so the builder,
 # the milk layer, and consumers all reference a single source of truth.
+_BK_COL_MONTH        = _mover_details_store.COL_MONTH
 _BK_COL_FREIGHT_GAL  = "Freight Mover $/Gal"
 _BK_COL_RESIN_GAL    = "Resin Mover $/Gal"
 _BK_COL_MILK_GAL     = "Milk Mover $/Gal"
@@ -1208,6 +1313,7 @@ def _build_mover_details_table_no_milk(
     movers_non_milk_df: pd.DataFrame,
     rest_htst_resin_mover_fg: pd.DataFrame,
     topco_resin_mover_fg: pd.DataFrame,
+    editing_month: pd.Timestamp,
 ) -> pd.DataFrame:
     """Single mover_details_table with Freight + Resin movers ($/Gal) and monthly totals.
 
@@ -1215,17 +1321,31 @@ def _build_mover_details_table_no_milk(
     :func:`_layer_milk_on_mover_details_table` so they react to the time-slicer without a
     Refresh.
 
+    A leading ``Month`` column is stamped with ``editing_month`` (the
+    last-row Month of the editable Movers Non-Milk Tracker) so the mover
+    details table can be appended to the cumulative Pricing Lakehouse copy
+    without losing track of which month each row was generated for.
+
     Per-row contract::
 
-        Freight Mover $/Gal = tracker.last_row[Tag-matched freight column]
-        Resin Mover $/Gal   = tracker.last_row[Tag-matched resin column], with
-                              FG fallback (rest_htst / topco_resin_mover_fg)
-                              when the direct lookup is blank for Rest HTST /
-                              TOPCO tags.
+        Month                 = editing_month (e.g. 2026-05-01) on every row
+        Freight Mover $/Gal   = tracker.last_row[Tag-matched freight column]
+        Resin Mover $/Gal     = tracker.last_row[Tag-matched resin column], with
+                                FG fallback (rest_htst / topco_resin_mover_fg)
+                                when the direct lookup is blank for Rest HTST /
+                                TOPCO tags.
         Monthly Freight Mover = Monthly Gallons × Pricing Method × Freight Mover $/Gal
         Monthly Resin Mover   = Monthly Gallons × Resin Mover $/Gal
     """
     base = _strip_df_columns(site_item_volume_df).copy()
+
+    # Stamp the Month column FIRST so the column appears at the leading
+    # edge of the mover_details_table even when the rest of the schema is
+    # short-circuited by the missing-Tag defensive branch below.  ISO
+    # first-of-month keeps duplicate detection in the lakehouse store
+    # trivial (string equality).
+    month_str = pd.Timestamp(editing_month).strftime("%Y-%m-01")
+    base.insert(0, _BK_COL_MONTH, month_str)
 
     # Defensive default when Tag is missing — keeps the schema stable for the
     # downstream milk-layering step regardless of source-file variants. Only
@@ -1633,6 +1753,30 @@ def _compute_all_outputs(
             st.error(f"❌ Missing required file: `{role}`. Please re-upload.")
             return None
 
+    # ``resin_calculator`` and ``resin_cost_tracker`` are no longer uploaded
+    # by the user — they're injected from the Pricing Lakehouse via
+    # :func:`_inject_resin_inputs_from_store`.  Validate them separately so
+    # the error message can route the operator to the right place
+    # (lakehouse permissions / connectivity, NOT the upload panel).
+    for role in ("resin_calculator", "resin_cost_tracker"):
+        if role not in uploads or uploads[role].df is None or uploads[role].df.empty:
+            err = st.session_state.get(_SS_RESIN_STORE_ERROR)
+            detail = f"\n\nUnderlying error: {err}" if err else ""
+            st.error(
+                f"❌ `{role}` is not available from the Pricing Lakehouse "
+                "(`Files/Resin_freight_cost_tracker/`).\n\n"
+                "**Try first:** click **🔄 Refresh** again — the page "
+                "drops the local 5-minute read cache on every Refresh, "
+                "so a freshly-uploaded OneLake file shows up immediately.\n\n"
+                "**If the error persists:** verify the "
+                "`[fabric_resin_cost_tracker]` (or `[fabric_htst]`) section "
+                "of `.streamlit/secrets.toml`, confirm your account has "
+                "Read access to "
+                "`Files/Resin_freight_cost_tracker/Resin_Calculator.csv` "
+                "and `Resin_Cost_Tracker.csv`, then reload the page." + detail
+            )
+            return None
+
     if movers_non_milk_df.empty:
         st.error(
             "❌ The Movers Non-Milk Tracker is empty. Add at least one row "
@@ -1676,12 +1820,15 @@ def _compute_all_outputs(
 
     # 2. mover_details_table (Freight + Resin only — milk is layered at render
     #    time). Freight + Resin totals don't depend on the milk slicer, so
-    #    they can be computed (and cached) here once per Refresh.
+    #    they can be computed (and cached) here once per Refresh.  The Month
+    #    column is stamped with ``editing_month`` so the cumulative
+    #    Lakehouse store can dedupe by month on append.
     combined_base = _build_mover_details_table_no_milk(
         uploads["site_item_volume"].df,
         movers_non_milk_df,
         rest_fg,
         topco_fg,
+        editing_month,
     )
     monthly_freight_total = float(
         pd.to_numeric(combined_base.get(_BK_COL_MONTHLY_FRT), errors="coerce")
@@ -1739,14 +1886,59 @@ def _render_monthly_sop_and_upload_intro() -> None:
 - Maintain and refresh source files (**DO NOT change file names**):
   - `Pkg_Index` (Procurement)
   - `example_prices` (RGM, update pricing)
-  - `Resin_Cost_Tracker` (RGM, after movers are finalized)
+  - `Resin_Cost_Tracker` (RGM, after movers are finalized — the file lives
+    in the Pricing Lakehouse and is **auto-appended** for each new month
+    when you click **Refresh**; you no longer need to upload it)
 - Use the **Movers Non-Milk Tracker** below to align mover values with
   commercial leaders; click **Refresh** to recompute the impact metrics and
   downloads.
-- Download and use the **"Mover Downloads"** for pricing updates. Save the
-  mover_details_table in the Monthly Pricing folder for tracking.
 
 _Files are matched automatically by filename keyword after upload._
+
+**Automatic resin-cost workflow**
+
+Both `Resin_Calculator.csv` and `Resin_Cost_Tracker.csv` are sourced from
+the Pricing Lakehouse — no upload needed.  When you click **Refresh**:
+
+1. The Resin Mover FGs are recomputed from the editable tracker's last
+   row, exactly as before.
+2. If the last-row Month is **new** (not already present in the
+   lakehouse `Resin_Cost_Tracker.csv`), the latest-month rows are
+   duplicated, the Month is restamped to the new month, and
+   `Resin Cost ($/Gal)` is overwritten by the FG outputs joined on
+   `Product ID`.  The new rows are then appended back to Fabric.
+3. The fully-built `mover_details_table` (with the new `Month` column) is
+   appended to `Files/Monthly_Mover_Reporting/mover_details_table.csv`
+   in the Pricing Lakehouse — but only when the editing month isn't
+   already present, so re-clicking Refresh for the same month is safe.
+4. The three Mover Downloads (`rest_htst_resin_mover_fg.csv`,
+   `topco_resin_mover_fg.csv`, `milk_mover.csv`) are published to
+   `Files/Monthly_Pricing_Execution/` in the Pricing Lakehouse —
+   authoritative replace on every Refresh, so the canonical drop-zone
+   always reflects the latest run.
+
+**Automatic milk-cost workflow**
+
+The milk pipeline is fully automated end-to-end — no manual file upload
+required for any milk artefact:
+
+1. **USDA publishes** a new
+   [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf)
+   → the page detects the change on next render (or click **🔄 USDA refresh**
+   to bypass the 1-hour cooldown) and appends the four FMMO rows
+   (HTST/ESL × Class I/II) to `fmmo_tracker.json` in Fabric.
+2. **Select a new End Month** in the Milk Commodity Cost slicer and click
+   **Refresh** → the `milk_mover` CSV becomes available in **Mover Downloads**
+   and the per-item end-month cost is appended to
+   `base_milk_cost_monthly_tracker.csv` in Fabric (append-only — existing
+   months are never overwritten).
+3. **HTST pricing unlocks** in the **New Price Quote** view: the Product
+   Milk Base Cost auto-update reads the latest end-month from
+   `base_milk_cost_monthly_tracker.csv` and refreshes downstream cost
+   inputs so a new HTST quote can be generated immediately.
+
+All three artefacts live together in `Files/Milk_cost_tracker/` in the
+Pricing Lakehouse for auditability.
         """.strip()
     )
 
@@ -1914,7 +2106,7 @@ def _render_milk_autoupdate_status() -> None:
         else:
             st.caption(
                 "🥛 Milk Mover data sourced from the Fabric Lakehouse "
-                "(`Files/milk_mover_tracker.json`), kept in sync with USDA's "
+                f"(`Files/{_milk_store.get_table_blob_path()}`), kept in sync with USDA's "
                 "[Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf)."
             )
     with col_btn:
@@ -2149,10 +2341,32 @@ def _render_table_and_refresh(
         )
 
     if refresh_clicked:
+        # Drop the resin-store read cache before re-injecting.  The
+        # underlying ``@st.cache_data`` decorator otherwise pins a
+        # potentially-stale "absent" answer for up to 5 minutes — which
+        # surfaces as a misleading "resin_calculator is not available"
+        # banner when the operator has just dropped fresh files into
+        # OneLake.  This is cheap (one HTTPS round-trip per blob) and
+        # only fires on an explicit Refresh click, never on every
+        # rerun.
+        try:
+            _resin_store.invalidate_read_cache()
+        except Exception:  # noqa: BLE001 — non-fatal cache invalidation
+            pass
+        _inject_resin_inputs_from_store(uploads)
+
         with st.spinner("Running impact calculations..."):
             outputs = _compute_all_outputs(uploads, edited, current_month)
         if outputs is not None:
             st.session_state[f"{_SS_PREFIX}_outputs"] = outputs
+            # Refresh-time Lakehouse writes:
+            #   1. Resin_Cost_Tracker.csv             → append-only, dedup by month.
+            #   2. mover_details_table.csv            → append-only, dedup by month.
+            #   3. Monthly_Pricing_Execution/*.csv    → authoritative replace.
+            # All three are idempotent and never raise — failures surface
+            # as small captions so the user-facing success message below
+            # remains accurate for the in-memory pipeline run.
+            _run_refresh_lakehouse_appends(outputs, uploads)
             st.success("✅ Calculations complete. Results below.")
 
 
@@ -2231,6 +2445,254 @@ def _maybe_append_to_base_milk_cost_tracker(
             f"✅ Appended {rows_appended} row(s) for {em:%Y-%m} to "
             f"{_base_milk_cost_tracker.get_store_label()}."
         )
+
+
+# ── Refresh-time Lakehouse appends ────────────────────────────────────────────
+#
+# Two append-only Fabric writes fire on a successful Refresh click:
+#   1. Resin_Cost_Tracker.csv  — duplicate latest-month rows for the new
+#      editing month, overwrite Resin Cost ($/Gal) from the FG outputs.
+#   2. mover_details_table.csv — append the freshly-built rows for the new
+#      editing month to the cumulative monthly-mover-reporting file.
+#
+# Both helpers are idempotent (the stores no-op when the month already
+# exists), so a re-click on Refresh for the same month is safe.  Errors are
+# surfaced as small captions; they NEVER raise, so the rest of the Refresh
+# pipeline is unaffected by transient lakehouse blips.
+
+# Session-state slots to short-circuit duplicate Fabric round-trips when the
+# user clicks Refresh repeatedly for the same editing month within a session.
+_SS_RESIN_TRACKER_LAST_MONTH         = f"{_SS_PREFIX}_resin_tracker_last_month"
+_SS_MOVER_DETAILS_TABLE_LAST_MONTH   = f"{_SS_PREFIX}_mover_details_table_last_month"
+
+
+def _combine_fg_new_resin_lookups(
+    rest_fg: pd.DataFrame,
+    topco_fg: pd.DataFrame,
+) -> dict[str, float]:
+    """Merge the two Resin Mover FG outputs into a ``{Product ID → New Resin Cost}``.
+
+    Both FGs carry the same column schema; the lookup combines them into
+    one map keyed on stripped ``Product ID``.  When a Product ID appears in
+    both FGs (rare; happens for shared SKUs) the Rest HTST value wins —
+    Rest HTST is the dominant SKU set in the Pricing Lakehouse, so its
+    value is the more representative one to keep in the long-term cost
+    tracker baseline.
+
+    Returns an empty dict when both FGs are empty or lack the expected
+    columns; the caller then short-circuits the append since there are no
+    new $/Gal values to write.
+    """
+    pid_col = _resin_store.COL_PRODUCT_ID
+    new_col = _FG_COL_NEW
+
+    def _one(fg_df: pd.DataFrame) -> dict[str, float]:
+        if (fg_df is None or fg_df.empty
+                or pid_col not in fg_df.columns
+                or new_col not in fg_df.columns):
+            return {}
+        sliced = fg_df[[pid_col, new_col]].dropna(subset=[new_col])
+        return {
+            str(pid).strip(): float(val)
+            for pid, val in zip(sliced[pid_col], sliced[new_col])
+            if str(pid).strip()
+        }
+
+    # Rest wins on collision — see docstring rationale.
+    combined = _one(topco_fg)
+    combined.update(_one(rest_fg))
+    return combined
+
+
+def _maybe_append_resin_cost_tracker_for_month(
+    rest_fg: pd.DataFrame,
+    topco_fg: pd.DataFrame,
+    editing_month: pd.Timestamp,
+) -> None:
+    """Append duplicated latest-month rows to Resin_Cost_Tracker.csv when new.
+
+    Implements the May-2026 contract verbatim:
+
+        "the resin_cost_tracker in lakehouse will be appended only when a
+         new month is created in the 'Movers Non-Milk Tracker' table and
+         after user hit refresh, it will be updated by duplicate the rows
+         from the latest month in the 'resin cost tracker' csv, change
+         month to the month in the last row of 'Movers Non-Milk Tracker'
+         table, and update the 'Resin Cost ($/Gal)' in the new month rows
+         only by pulling data from 'New Resin Cost ($/Gal)' column in both
+         'rest htst resin mover fg' csv and 'topco resin_mover_fg' csv
+         through product ID match."
+
+    No-op when ``editing_month`` is already present in the lakehouse copy
+    (the underlying store handles the dedup).  Failures surface as a small
+    caption — never raised — so a transient Fabric outage cannot break the
+    rest of the Refresh pipeline.
+    """
+    if editing_month is None:
+        return
+
+    em = pd.Timestamp(editing_month).normalize().replace(day=1)
+    if st.session_state.get(_SS_RESIN_TRACKER_LAST_MONTH) == em:
+        return  # already handled this editing month in this session
+
+    new_resin_lookup = _combine_fg_new_resin_lookups(rest_fg, topco_fg)
+    if not new_resin_lookup:
+        # FGs returned no usable Product-ID → $/Gal pairs — nothing to push.
+        return
+
+    try:
+        rows_appended, was_new = _resin_store.append_new_month_from_latest(
+            em, new_resin_cost_lookup=new_resin_lookup,
+        )
+    except _resin_store.ResinCostTrackerStoreError as exc:
+        st.caption(f"⚠️ Could not update Resin_Cost_Tracker: {exc}")
+        return
+
+    st.session_state[_SS_RESIN_TRACKER_LAST_MONTH] = em
+    if was_new and rows_appended:
+        # Drop the cached upload so the next render re-reads the new rows
+        # from Fabric — without this the page would still show the stale
+        # snapshot until the 5-minute TTL expires.
+        st.caption(
+            f"✅ Appended {rows_appended} row(s) for {em:%Y-%m} to "
+            f"{_resin_store.get_cost_tracker_label()}."
+        )
+
+
+def _maybe_append_mover_details_table_for_month(
+    mover_details_table: pd.DataFrame,
+    editing_month: pd.Timestamp,
+) -> None:
+    """Append the freshly-built mover_details_table rows to the cumulative file.
+
+    Implements the May-2026 contract verbatim:
+
+        "include a new column 'Month' and put value as the last month of
+         the 'Movers Non-Milk Tracker', and append the rows into the
+         [pricing lakehouse mover_details_table.csv] only when user hit
+         'refresh' and when a new month in the generated mover_details_table
+         csv does not exist in the one in the pricing lakehouse."
+
+    No-op when ``editing_month`` is already present in the lakehouse copy.
+    Failures surface as a small caption — never raised.
+    """
+    if mover_details_table is None or mover_details_table.empty or editing_month is None:
+        return
+
+    em = pd.Timestamp(editing_month).normalize().replace(day=1)
+    if st.session_state.get(_SS_MOVER_DETAILS_TABLE_LAST_MONTH) == em:
+        return  # already handled this editing month in this session
+
+    try:
+        rows_appended, was_new = _mover_details_store.append_for_month_if_new(
+            mover_details_table, em,
+        )
+    except _mover_details_store.MoverDetailsTableStoreError as exc:
+        st.caption(f"⚠️ Could not update mover_details_table: {exc}")
+        return
+
+    st.session_state[_SS_MOVER_DETAILS_TABLE_LAST_MONTH] = em
+    if was_new and rows_appended:
+        st.caption(
+            f"✅ Appended {rows_appended} row(s) for {em:%Y-%m} to "
+            f"{_mover_details_store.get_store_label()}."
+        )
+
+
+def _publish_mover_downloads_to_lakehouse(
+    rest_fg: pd.DataFrame,
+    topco_fg: pd.DataFrame,
+    milk_mover_df: Optional[pd.DataFrame],
+) -> None:
+    """Replace the canonical Monthly_Pricing_Execution CSVs on every Refresh.
+
+    Mirrors the contract from the May-2026 spec:
+
+        "change the code to a copy of the rest_htst_resin_mover fg,
+         topco resin mover fg and milk mover csv into this pricing
+         lakehouse: Files/Monthly_Pricing_Execution …; If there is
+         already data there, then replace the files there with new
+         generated files, only when user hit refresh."
+
+    Empty / missing frames are skipped silently so a partial pipeline
+    run (e.g. milk slicer not yet selected) cannot accidentally clobber
+    a prior good copy.  Failures surface as small captions — they NEVER
+    raise so a transient Fabric outage cannot break the rest of the
+    Refresh pipeline.
+    """
+    payload: dict[str, Optional[pd.DataFrame]] = {
+        "rest_fg":    rest_fg,
+        "topco_fg":   topco_fg,
+        "milk_mover": milk_mover_df,
+    }
+    try:
+        results = _mpe_store.replace_files(payload)
+    except _mpe_store.MonthlyPricingExecutionStoreError as exc:
+        st.caption(f"⚠️ Could not publish Mover Downloads to OneLake: {exc}")
+        return
+
+    written = [role for role, ok in results.items() if ok]
+    if not written:
+        return
+
+    label_for = {
+        "rest_fg":    "rest_htst_resin_mover_fg.csv",
+        "topco_fg":   "topco_resin_mover_fg.csv",
+        "milk_mover": "milk_mover.csv",
+    }
+    files_caption = ", ".join(label_for[r] for r in written)
+    st.caption(
+        f"✅ Published {files_caption} to "
+        f"{_mpe_store.get_folder_label()}."
+    )
+
+
+def _run_refresh_lakehouse_appends(outputs: dict, uploads: dict[str, _Uploaded]) -> None:
+    """Run every Refresh-time Lakehouse write with a single editing-month derivation.
+
+    Wired only from the Refresh button handler so reactive milk-slicer
+    changes (which don't change the editing month) never re-fire these
+    writes.  Auto-derives the editing month from the cached editable
+    tracker; falls back silently when the tracker is empty so a transient
+    state never raises here.
+
+    Three lakehouse writes happen here, in dependency order:
+
+      1. **Resin_Cost_Tracker.csv** — append-only, idempotent on
+         already-tracked months.
+      2. **mover_details_table.csv** — append-only, idempotent on
+         already-tracked months.
+      3. **Monthly_Pricing_Execution/{rest, topco, milk}.csv** —
+         authoritative replace on every Refresh (no month gate).
+    """
+    nmt_df: pd.DataFrame = st.session_state.get(_SS_NMT_DF)
+    if nmt_df is None or nmt_df.empty:
+        return
+    editing_month = _parse_month(nmt_df.iloc[-1][_NMT_COL_MONTH])
+    if editing_month is None:
+        return
+
+    rest_fg = outputs.get("rest_htst_resin_mover_fg", pd.DataFrame())
+    topco_fg = outputs.get("topco_resin_mover_fg", pd.DataFrame())
+    base_table: pd.DataFrame = outputs.get("mover_details_table_base", pd.DataFrame())
+
+    # Mover details table append uses the freshest available frame —
+    # ideally the milk-layered version so the historical record carries
+    # the milk columns too.  Fall back to the no-milk base when the milk
+    # pipeline didn't run (uploads incomplete or upstream error).
+    milk_usage_with_movers = _compute_milk_usage_for_render(uploads)
+    full_table, _ignored = _layer_milk_on_mover_details_table(
+        base_table, milk_usage_with_movers,
+    )
+
+    _maybe_append_resin_cost_tracker_for_month(rest_fg, topco_fg, editing_month)
+    _maybe_append_mover_details_table_for_month(full_table, editing_month)
+
+    # Authoritative replace of the three Mover Downloads in a dedicated
+    # Monthly_Pricing_Execution OneLake folder.  Always fires on Refresh —
+    # there is no month gate because the canonical drop-zone always
+    # holds the latest run's outputs.
+    _publish_mover_downloads_to_lakehouse(rest_fg, topco_fg, milk_usage_with_movers)
 
 
 def _compute_milk_usage_for_render(
@@ -2546,12 +3008,21 @@ def render_monthly_resin_freight_mover_tracker() -> None:
         st.session_state[f"{_SS_PREFIX}_sig"] = sig
         st.session_state.pop(f"{_SS_PREFIX}_outputs", None)
 
-    # Source the milk_mover_tracker AND milk_usage_stable DataFrames from
-    # the OneLake store. Neither file is a recognised upload role (see
-    # ``_ROLE_KEYWORDS``) so these two injections are the only place the
-    # milk DataFrames enter the section.
+    # Source the milk_mover_tracker, milk_usage_stable, resin_calculator
+    # and resin_cost_tracker DataFrames from the OneLake stores.  None of
+    # these files are recognised upload roles (see ``_ROLE_KEYWORDS``) so
+    # these injections are the only place those DataFrames enter the
+    # section.  Each helper is idempotent — the underlying readers are
+    # cached for ~5 minutes — so calling them on every render is cheap.
     _inject_milk_mover_from_store(uploads)
     _inject_milk_usage_stable_from_store(uploads)
+    _inject_resin_inputs_from_store(uploads)
+
+    # Surface any resin-store error captured during the inject above so the
+    # user has an actionable single point of feedback when the lakehouse is
+    # unreachable (vs. a silent "no data" state below).
+    if st.session_state.get(_SS_RESIN_STORE_ERROR):
+        _render_resin_store_status()
 
     # ── Processed state ───────────────────────────────────────────────────────
     if st.button(

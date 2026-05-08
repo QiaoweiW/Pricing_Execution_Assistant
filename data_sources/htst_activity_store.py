@@ -55,8 +55,17 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import streamlit as st
 
 from data_sources import fabric_lakehouse_io as _io
+
+
+# How long the ETag-listing cache lives. Keeps successive renders of the
+# New Price Quote page from hammering OneLake on every navigation while
+# still picking up out-of-band edits within ~60 s. Writes through this
+# module invalidate the cache immediately via ``_invalidate_etag_cache``,
+# so user-driven uploads see the new ETag without waiting for the TTL.
+_ETAG_CACHE_TTL_SECONDS: int = 60
 
 
 logger = logging.getLogger(__name__)
@@ -337,31 +346,61 @@ def bootstrap_from_local_if_empty(local_dir: Path) -> dict[str, bool]:
                 f"Failed bootstrapping {spec.filename}: {exc}"
             ) from exc
         written[spec.filename] = wrote
+
+    if any(written.values()):
+        # At least one bootstrap upload happened — invalidate the
+        # ETag-listing cache so the parquet-rebuild gate on the next
+        # render sees the freshly-seeded files.
+        _invalidate_etag_cache()
     return written
 
 
 # ── Public API: read ─────────────────────────────────────────────────────────
 
+@st.cache_data(ttl=_ETAG_CACHE_TTL_SECONDS, show_spinner=False)
+def _fabric_etags_cached() -> dict[str, Optional[str]]:
+    """Single-round-trip ``{filename: etag-or-None}`` for every expected file.
+
+    Implementation: ``list_files`` enumerates the entire
+    ``Activity_Model/`` folder in ONE request and returns ETag + size +
+    last-modified per entry. This replaces the legacy 9-file
+    ``download_file()`` fan-out (which downloaded every blob's body
+    just to read its ETag — ~1 s of redundant network I/O on every
+    page render against a corporate-network connection).
+
+    Files registered in :data:`EXPECTED_FILES` but missing from
+    OneLake are reported as ``None`` so the parquet-rebuild gate sees
+    them as "not yet bootstrapped" and doesn't short-circuit.
+    """
+    try:
+        listing = _io.list_files(_SECRETS_SECTION, _FOLDER)
+    except _io.LakehouseIOError as exc:
+        raise ActivityModelStoreError(
+            f"Failed listing OneLake folder Files/{_FOLDER}: {exc}"
+        ) from exc
+
+    by_name = {f.name: f for f in listing}
+    return {spec.filename: (by_name[spec.filename].etag if spec.filename in by_name else None)
+            for spec in EXPECTED_FILES}
+
+
 def fabric_etags() -> dict[str, Optional[str]]:
     """Return ``{filename: etag-or-None}`` for every expected file.
 
-    Used as the cache key for the parquet build so we only re-run the
-    processor when something in OneLake changed.
+    Used as the cache key for the parquet build so the processor only
+    re-runs when something in OneLake changed.
 
-    Single round trip per file — but ``list_files`` would also work.
-    Per-file reads are simpler and the 9-file overhead is ~1 second
-    against an Azure West region from a US dev box.
+    Backed by a 60-second Streamlit cache (see ``_fabric_etags_cached``);
+    upload paths in this module call :func:`_invalidate_etag_cache`
+    after a successful write so the next render sees the new ETag
+    immediately rather than waiting for the TTL.
     """
-    out: dict[str, Optional[str]] = {}
-    for spec in EXPECTED_FILES:
-        try:
-            _, etag = _io.read_bytes(_SECRETS_SECTION, spec.blob_path)
-        except _io.LakehouseIOError as exc:
-            raise ActivityModelStoreError(
-                f"Failed listing OneLake state for {spec.filename}: {exc}"
-            ) from exc
-        out[spec.filename] = etag
-    return out
+    return _fabric_etags_cached()
+
+
+def _invalidate_etag_cache() -> None:
+    """Drop the cached ``{filename: etag}`` mapping after a write."""
+    _fabric_etags_cached.clear()
 
 
 def read_raw_bytes(name: str) -> bytes:
@@ -442,6 +481,10 @@ def write_csv_bytes(name: str, raw_bytes: bytes) -> str:
         )
     except _io.LakehouseIOError as exc:
         raise ActivityModelStoreError(str(exc)) from exc
+
+    # Drop the ETag-listing cache so the very next call to
+    # ``fabric_etags()`` sees this freshly-uploaded blob.
+    _invalidate_etag_cache()
     return new_etag
 
 

@@ -31,26 +31,20 @@ Optional (only needed if you have a service principal):
   client_id      — Service principal application (client) ID
   client_secret  — Service principal client secret VALUE
 
-Auth model
-----------
-Uses a small ChainedTokenCredential built on azure-identity:
-  1. EnvironmentCredential          — picks up AZURE_TENANT_ID / AZURE_CLIENT_ID /
-                                      AZURE_CLIENT_SECRET if exported.  Populated
-                                      from secrets.toml when the optional SP keys
-                                      above are present (the production path).
-  2. InteractiveBrowserCredential   — opens a browser the first time, with
-                                      persistent token caching to disk.  After
-                                      the initial sign-in the cached refresh
-                                      token is used silently for ~90 days.
-                                      No admin rights, no installs — works on
-                                      locked-down corporate workstations.
+Auth + DuckDB model
+-------------------
+Auth and the DuckDB Delta-scan engine are owned by
+:mod:`data_sources.fabric_auth`. This module is a thin Delta-table
+adapter that:
 
-The token is acquired for the Azure Storage scope (which OneLake honors) and
-passed to delta-rs via the `bearer_token` storage option.
-
-The in-memory credential is cached via @st.cache_resource so it survives
-Streamlit's page-rerun cycle and the browser only opens once per session.
-The on-disk MSAL cache then survives across server restarts.
+* Asks ``fabric_auth.acquire_storage_token`` for a bearer token (the
+  process-shared MSAL cache means a sign-in for any other Fabric page
+  also satisfies this one).
+* Pulls the process-shared DuckDB connection from
+  ``fabric_auth.get_duckdb_connection`` (extensions pre-loaded once
+  per session) and runs ``delta_scan`` against the table URI.
+* Owns the corporate-network TLS / CA-bundle plumbing the bundled
+  libcurl needs (see :func:`_resolve_ca_cert_file` for the why).
 
 Dependencies
 ------------
@@ -60,9 +54,10 @@ azure-identity>=1.15 (credential chain + token acquisition)
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
@@ -71,6 +66,9 @@ from data_sources.fabric_auth import (
     GUID_RE,
     FabricAuthError,
     acquire_storage_token,
+    bind_storage_token,
+    duckdb_lock,
+    get_duckdb_connection,
     promote_sp_secrets_to_env,
     read_section,
 )
@@ -174,25 +172,74 @@ def _build_table_uri(workspace: str, lakehouse: str, table: str, schema: Optiona
     )
 
 
-_TOKEN_CACHE_NAME = "streamlit_htst_shipment"
-
-
 def _acquire_storage_token() -> str:
     """Acquire a bearer token for Azure Storage / OneLake.
 
     Thin wrapper around :func:`fabric_auth.acquire_storage_token` that
     translates its :class:`FabricAuthError` into our domain-specific
-    error so the page renders a clean, actionable message.
+    error so the page renders a clean, actionable message. Uses the
+    process-shared ``DEFAULT_CACHE_NAME`` so this connector signs in
+    only once across the whole app — see ``fabric_auth`` for the
+    rationale.
     """
     try:
-        return acquire_storage_token(_TOKEN_CACHE_NAME)
+        return acquire_storage_token()
     except FabricAuthError as exc:
         raise HTSTShipmentSourceError(str(exc)) from exc
 
 
+# ── TLS / CA-bundle plumbing for the bundled libcurl ─────────────────────────
+
+def _resolve_ca_cert_file(cfg: dict[str, str]) -> Optional[str]:
+    """Return a filesystem path to a CA bundle libcurl can use, or None.
+
+    Resolution order (first hit wins):
+      1. ``[fabric_htst].ca_cert_file`` from secrets — explicit override the
+         operator can set to a corporate root-CA bundle (e.g. when Zscaler /
+         Netskope / a forward-proxy is doing TLS inspection on
+         ``*.fabric.microsoft.com``).
+      2. ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` env vars — these are
+         already the de-facto standard for Python TLS clients on locked-down
+         corporate workstations, so we honor them transparently.
+      3. ``certifi.where()`` — the Mozilla root-CA bundle ships with
+         ``certifi`` (transitive dep of ``requests``), so it is virtually
+         always available.  Sufficient for any non-MITM connection.
+
+    Returning a real path lets the caller export ``CURL_CA_INFO`` /
+    ``CURL_CA_BUNDLE`` *before* DuckDB's azure extension initialises libcurl.
+    """
+    explicit = cfg.get("ca_cert_file")
+    if explicit and os.path.isfile(explicit):
+        return explicit
+
+    for env_name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        env_val = os.environ.get(env_name)
+        if env_val and os.path.isfile(env_val):
+            return env_val
+
+    try:
+        import certifi  # transitive dep of requests / azure-* — always present
+    except ImportError:
+        return None
+    bundle = certifi.where()
+    return bundle if os.path.isfile(bundle) else None
+
+
+def _ssl_verify_enabled(cfg: dict[str, str]) -> bool:
+    """Return True unless secrets opt out via ``ssl_verify = false``.
+
+    Last-resort escape hatch for situations where (a) a corporate MITM
+    proxy is in play, (b) the operator cannot get the corporate root CA
+    file, and (c) the alternative is the page being completely unusable.
+    Logged loudly so it is impossible to leave on by accident.
+    """
+    raw = str(cfg.get("ssl_verify", "true")).strip().lower()
+    return raw not in ("false", "0", "no", "off")
+
+
 # ── Core read path ────────────────────────────────────────────────────────────
 
-def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Optional[datetime]]:
+def _read_delta_table(table_uri: str, token: str, cfg: dict[str, str]) -> tuple[pd.DataFrame, int, Optional[datetime]]:
     """Materialise the Delta table at *table_uri* into a pandas DataFrame.
 
     Returns (df, version, last_modified_utc).  Version is taken from delta-rs
@@ -210,12 +257,15 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
 
     Read path
     ---------
-    1. duckdb's azure extension is configured with the pre-acquired bearer
-       token via a CREATE SECRET statement (PROVIDER ACCESS_TOKEN).
-    2. duckdb's delta extension does delta_scan() → arrow → pandas in a
-       single SQL query.  Column projection / filter pushdown can be added
-       later by parameterising the SELECT.
-    3. delta-rs is still used opportunistically for metadata (version,
+    1. The process-shared DuckDB connection (``fabric_auth.get_duckdb_connection``)
+       has the ``azure`` and ``delta`` extensions already loaded — we no
+       longer pay ``LOAD azure`` / ``LOAD delta`` (~300 ms) per fetch.
+    2. The bearer token is rebound on every call via
+       :func:`bind_storage_token` (``CREATE OR REPLACE SECRET``), so the
+       connection always sees a fresh, non-expired token.
+    3. duckdb's delta extension does delta_scan() → arrow → pandas in a
+       single SQL query.
+    4. delta-rs is still used opportunistically for metadata (version,
        commit timestamp).  When delta-rs cannot open the table at all (e.g.
        protocol v2 reject), we fall back to version=-1 and last_modified=None
        — the data is still returned, only the audit caption degrades.
@@ -223,14 +273,6 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
     Errors anywhere in the chain are wrapped in HTSTShipmentSourceError so
     the page renders one clean message instead of leaking SQL/Rust traces.
     """
-    try:
-        import duckdb  # noqa: WPS433  (lazy import keeps module import cheap)
-    except ImportError as exc:
-        raise HTSTShipmentSourceError(
-            "Python package 'duckdb' is not installed.  Run: "
-            "pip install -r requirements.txt"
-        ) from exc
-
     # ── Best-effort metadata via delta-rs (non-fatal) ────────────────────────
     # Fabric tables are at reader v2 which delta-rs rejects.  We still try
     # because (a) the rejection is fast and (b) future delta-rs releases or
@@ -263,31 +305,76 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
             table_uri, meta_exc,
         )
 
-    # ── Authoritative read via DuckDB delta_scan ────────────────────────────
-    try:
-        con = duckdb.connect(":memory:")
-        # Extensions auto-install on first use; subsequent runs hit the cache
-        # in %USERPROFILE%\.duckdb\extensions and load in <50ms.
-        con.execute("INSTALL azure")
-        con.execute("LOAD azure")
-        con.execute("INSTALL delta")
-        con.execute("LOAD delta")
-        # Stash the bearer token in a duckdb SECRET so it never appears in
-        # the SQL log of subsequent queries.  CREATE OR REPLACE makes this
-        # idempotent across reruns.
-        con.execute(
-            "CREATE OR REPLACE SECRET onelake_token ("
-            "TYPE AZURE, PROVIDER ACCESS_TOKEN, "
-            f"ACCESS_TOKEN '{token}', ACCOUNT_NAME 'onelake')"
+    # ── Pre-flight: TLS / CA bundle plumbing for the bundled libcurl ────────
+    # DuckDB's azure extension statically links the Azure SDK for C++ which
+    # uses libcurl as one of its transport adapters.  That bundled libcurl
+    # has no notion of the Windows certificate store and on Linux it looks
+    # for the CA bundle at the RHEL path (/etc/pki/tls/certs/ca-bundle.crt)
+    # which doesn't exist on Debian/Ubuntu.  When the bundle isn't found,
+    # the TLS handshake to onelake.blob.fabric.microsoft.com fails with
+    # 'Problem with the SSL CA cert (path? access rights?)' — which has
+    # nothing to do with the bearer token, the workspace identifiers, or
+    # network reachability.  See https://github.com/duckdb/duckdb_azure/issues/8
+    #
+    # Fix: resolve a real CA-bundle path via _resolve_ca_cert_file()
+    # (operator override → standard env vars → certifi) and export the
+    # libcurl-recognised env vars BEFORE the extension loads, then force
+    # the curl transport so the same code path is exercised on every OS.
+    ca_cert_file = _resolve_ca_cert_file(cfg)
+    ssl_verify = _ssl_verify_enabled(cfg)
+    if ca_cert_file:
+        os.environ.setdefault("CURL_CA_INFO", ca_cert_file)
+        os.environ.setdefault("CURL_CA_BUNDLE", ca_cert_file)
+        os.environ.setdefault("SSL_CERT_FILE", ca_cert_file)
+
+    # ── Authoritative read via the shared DuckDB connection ────────────────
+    if not ssl_verify:
+        # Loud, opt-in only.  Logged at WARNING because the operator
+        # explicitly asked for it via secrets.toml.
+        logger.warning(
+            "TLS certificate verification is DISABLED for OneLake reads "
+            "([fabric_htst].ssl_verify = false).  This is a corporate-"
+            "MITM workaround — restore verification by removing the flag "
+            "(or setting it to true) and providing a proper "
+            "[fabric_htst].ca_cert_file path."
         )
-        df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
+
+    try:
+        con = get_duckdb_connection()
+        with duckdb_lock():
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
+            df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
+    except FabricAuthError as exc:
+        raise HTSTShipmentSourceError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        ssl_hint = ""
+        if "SSL CA cert" in msg or "certificate" in msg.lower() or "ssl" in msg.lower():
+            ssl_hint = (
+                "\n\nThis looks like a TLS / CA-certificate failure inside "
+                "DuckDB's bundled libcurl, NOT a problem with your bearer "
+                "token, workspace identifiers, or lakehouse permissions.  "
+                "Two ways to fix it:\n"
+                "  (a) [PREFERRED] Point the connector at a CA bundle that "
+                "your environment trusts.  Add to .streamlit/secrets.toml "
+                "under [fabric_htst]:\n"
+                "        ca_cert_file = \"C:/path/to/your/corporate_ca.pem\"\n"
+                "      If your machine has no MITM proxy, the certifi bundle "
+                "(shipped with Python's 'requests' package) is auto-detected "
+                "— the most likely root cause is then a corporate firewall "
+                "rewriting *.fabric.microsoft.com certificates.\n"
+                "  (b) [LAST RESORT] Disable TLS verification by adding to "
+                "[fabric_htst]:\n"
+                "        ssl_verify = false\n"
+                "      Insecure — only use on a trusted network and revert "
+                "as soon as you have a proper CA bundle."
+            )
         raise HTSTShipmentSourceError(
             f"Could not read Delta table via DuckDB at {table_uri}.  "
             f"Verify (1) the workspace + lakehouse + table identifiers, "
             f"(2) your account has Read access to the lakehouse, and "
             f"(3) the dataflow refresh has actually populated the table.  "
-            f"Underlying error: {exc}"
+            f"Underlying error: {exc}{ssl_hint}"
         ) from exc
 
     return df, version, last_modified
@@ -313,7 +400,7 @@ def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, SnapshotMeta]:
         schema=cfg.get("schema"),
     )
     token = _acquire_storage_token()
-    df, version, last_modified = _read_delta_table(table_uri, token)
+    df, version, last_modified = _read_delta_table(table_uri, token, cfg)
     meta = SnapshotMeta(
         version=version,
         last_modified=last_modified,

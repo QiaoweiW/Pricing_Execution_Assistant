@@ -3,26 +3,31 @@ Generic Microsoft Fabric / OneLake Lakehouse Files I/O.
 
 A small reusable layer that sits between the per-feature stores
 (``milk_usage_stable_store``, ``htst_activity_store``,
-``base_milk_cost_tracker_store``, ``product_milk_base_cost_updater``)
-and the Azure Data Lake Storage Gen2 SDK. Every caller that just needs
-to read a CSV / write a CSV / list a folder / push back raw bytes goes
-through here so we do not keep duplicating ADLS-Gen2 boilerplate.
+``base_milk_cost_tracker_store``, ``milk_mover_store``,
+``product_milk_base_cost_updater``) and the Azure Data Lake Storage
+Gen2 SDK. Every caller that just needs to read / write / list / mutate
+a blob (CSV, JSON, raw bytes) goes through here so we do not duplicate
+ADLS-Gen2 boilerplate or grow parallel client / token caches.
 
-What this module is and is not
-------------------------------
-* IS:
-    - A thin, **stateless** wrapper around ``DataLakeFileClient``.
-    - The single home for ETag-based optimistic-concurrency retry logic
-      for arbitrary blob types (CSV, JSON, raw bytes).
-    - A small ``LakehouseRef`` value object so callers don't have to
-      repeat ``f"{lakehouse}.Lakehouse/Files/{path}"`` URI assembly.
-
-* IS NOT:
-    - A schema validator. Each per-feature store knows its own column
-      contracts and validates before calling ``write_csv``.
-    - A substitute for ``milk_mover_store.py``. That module owns its
-      own JSON-shaped storage layout and uses richer mutators; this
-      module is for "read/write a whole blob" CSV/bytes flows.
+Public surface area
+-------------------
+* Value objects:
+    ``LakehouseRef``                 — (secrets_section, blob_path) → display label
+    ``LakehouseFile``                — leaf returned by :func:`list_files`
+* Bytes I/O:
+    ``read_bytes`` / ``write_bytes`` / ``delete_blob``
+* Cheap metadata:
+    ``get_file_properties``          — (etag, size, last_modified) without body
+* Listing:
+    ``list_files``                   — single round-trip enumerate-folder
+* CSV helpers:
+    ``read_csv`` / ``write_csv`` / ``update_csv``
+* JSON helpers:
+    ``read_json`` / ``write_json`` / ``update_json``
+* Bootstrap:
+    ``bootstrap_bytes_if_absent``
+* Error type:
+    ``LakehouseIOError``
 
 Configuration
 -------------
@@ -34,10 +39,11 @@ keys (service-principal credentials) are picked up by the shared
 
 When several callers want to share workspace/lakehouse settings (the
 common case: everything lives in B2C Pricing > Pricing_Lakehouse), they
-pass the same section name. The auth credential and the
-``DataLakeServiceClient`` are cached by ``cache_name`` and by
-secrets-section identity respectively, so the user only sees one
-sign-in regardless of how many features pull from Fabric.
+pass the same section name OR omit the section and inherit from
+``[fabric_htst]``. The auth credential and the ``DataLakeServiceClient``
+are cached by ``fabric_auth.DEFAULT_CACHE_NAME`` and by secrets-section
+identity respectively, so the user sees one sign-in regardless of how
+many features pull from Fabric.
 """
 from __future__ import annotations
 
@@ -45,12 +51,13 @@ import io
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Optional
 
 import pandas as pd
 import streamlit as st
 
 from data_sources.fabric_auth import (
+    DEFAULT_CACHE_NAME,
     GUID_RE,
     FabricAuthError,
     get_credential,
@@ -78,13 +85,6 @@ class LakehouseIOError(RuntimeError):
 # OneLake's Azure Data Lake Storage Gen2 endpoint.
 _ONELAKE_ACCOUNT_URL: str = "https://onelake.dfs.fabric.microsoft.com"
 
-# Disk-persistent MSAL token-cache name. Reusing the existing HTST cache
-# means a single browser sign-in unlocks every Fabric feature: HTST
-# Shipment, Milk Mover, Milk Usage Stable, Activity_Model, the Base Milk
-# Cost tracker and the auto-update of Product_Milk Base Cost. Same scope,
-# same identity — there is no security reason to fragment the cache.
-_TOKEN_CACHE_NAME: str = "streamlit_htst_shipment"
-
 # Maximum retries for ETag-conflict writes. In practice this only fires
 # when two pages click "Push to Fabric" within ~1 second.
 _WRITE_RETRY_ATTEMPTS: int = 3
@@ -101,7 +101,7 @@ class LakehouseRef:
 
     @property
     def display(self) -> str:
-        """Human-readable label, e.g. 'OneLake/B2C Pricing/Pricing_Lakehouse/Files/<path>'."""
+        """Human-readable label, e.g. 'OneLake: Pricing_Lakehouse/Files/<path>'."""
         try:
             cfg = _read_lakehouse_config(self.secrets_section)
             return f"OneLake: {cfg['lakehouse']}/Files/{self.blob_path}"
@@ -119,8 +119,9 @@ def _read_lakehouse_config(secrets_section: str) -> dict[str, str]:
     (or omit the block entirely) and inherit them from ``[fabric_htst]``.
 
     Service-principal keys are promoted to env vars exactly as
-    ``milk_mover_store`` does, so EnvironmentCredential picks them up
-    on Streamlit Cloud / headless deployments.
+    ``fabric_auth.promote_sp_secrets_to_env`` does, so
+    ``EnvironmentCredential`` picks them up on Streamlit Cloud /
+    headless deployments.
     """
     htst_cfg: dict[str, str] = {}
     try:
@@ -163,7 +164,7 @@ def _get_file_system_client(secrets_section: str):
 
     Cached at module level via ``@st.cache_resource`` so every page rerun
     reuses the same authenticated client. The credential underneath is
-    itself cached in ``fabric_auth.get_credential``, so token refresh
+    itself cached in :func:`fabric_auth.get_credential`, so token refresh
     happens transparently inside the SDK.
     """
     try:
@@ -176,7 +177,9 @@ def _get_file_system_client(secrets_section: str):
 
     cfg = _read_lakehouse_config(secrets_section)
     try:
-        credential = get_credential(_TOKEN_CACHE_NAME)
+        # Single shared cache name across the whole app — see the note
+        # at the top of fabric_auth.DEFAULT_CACHE_NAME.
+        credential = get_credential(DEFAULT_CACHE_NAME)
     except FabricAuthError as exc:
         raise LakehouseIOError(str(exc)) from exc
 
@@ -194,16 +197,6 @@ def _file_client(secrets_section: str, blob_path: str):
     lh = cfg["lakehouse"]
     lakehouse_part = lh if GUID_RE.match(lh) else f"{lh}.Lakehouse"
     return fs.get_file_client(f"{lakehouse_part}/Files/{blob_path}")
-
-
-def _directory_client(secrets_section: str, folder_path: str):
-    """Return a ``DataLakeDirectoryClient`` for ``Files/<folder_path>``."""
-    fs, cfg = _get_file_system_client(secrets_section)
-    lh = cfg["lakehouse"]
-    lakehouse_part = lh if GUID_RE.match(lh) else f"{lh}.Lakehouse"
-    folder_part = folder_path.strip("/")
-    suffix = f"/{folder_part}" if folder_part else ""
-    return fs.get_directory_client(f"{lakehouse_part}/Files{suffix}")
 
 
 # ── Low-level read / write primitives ────────────────────────────────────────
@@ -290,6 +283,42 @@ def delete_blob(secrets_section: str, blob_path: str) -> bool:
         ) from exc
 
 
+@dataclass(frozen=True)
+class FileProperties:
+    """Lightweight metadata payload returned by :func:`get_file_properties`."""
+    etag: Optional[str]
+    size: Optional[int]
+    last_modified: Optional[str]
+
+
+def get_file_properties(
+    secrets_section: str,
+    blob_path: str,
+) -> Optional[FileProperties]:
+    """Return ``FileProperties`` for a blob without downloading its body.
+
+    Returns ``None`` when the blob is absent. Use this in preference to
+    :func:`read_bytes` whenever the caller only needs an ETag / size /
+    last-modified timestamp — saves the body-download bandwidth.
+    """
+    from azure.core.exceptions import ResourceNotFoundError
+
+    client = _file_client(secrets_section, blob_path)
+    try:
+        props = client.get_file_properties()
+    except ResourceNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        raise LakehouseIOError(
+            f"Could not read properties of OneLake blob 'Files/{blob_path}': {exc}"
+        ) from exc
+    return FileProperties(
+        etag=getattr(props, "etag", None),
+        size=getattr(props, "size", None),
+        last_modified=str(getattr(props, "last_modified", "") or "") or None,
+    )
+
+
 # ── List a folder ────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -308,7 +337,7 @@ def list_files(
     *,
     suffix: Optional[str] = None,
 ) -> list[LakehouseFile]:
-    """List immediate children of ``Files/<folder_path>``.
+    """List immediate children of ``Files/<folder_path>`` in one round-trip.
 
     Parameters
     ----------
@@ -408,8 +437,6 @@ def write_csv(
     return write_bytes(secrets_section, blob_path, payload, etag=etag)
 
 
-# ── Read-modify-write helper for CSV blobs ───────────────────────────────────
-
 def update_csv(
     secrets_section: str,
     blob_path: str,
@@ -432,26 +459,111 @@ def update_csv(
 
     Returns the new DataFrame that was successfully written.
     """
+    return _retry_write(
+        blob_path=blob_path,
+        read=lambda: read_csv(secrets_section, blob_path, read_csv_kwargs=read_csv_kwargs),
+        upload=lambda payload, etag: write_csv(
+            secrets_section, blob_path, payload, etag=etag, to_csv_kwargs=to_csv_kwargs,
+        ),
+        mutator=mutator,
+        initial_default=initial_default,
+    )
+
+
+# ── JSON-shaped helpers ──────────────────────────────────────────────────────
+
+def read_json(
+    secrets_section: str,
+    blob_path: str,
+) -> tuple[Optional[Any], Optional[str]]:
+    """Return ``(parsed_json, etag)`` for a JSON blob, or ``(None, None)`` when absent.
+
+    Unparseable JSON raises ``LakehouseIOError`` so a corrupt blob
+    surfaces immediately with an actionable message rather than
+    propagating a downstream ``KeyError``.
+    """
+    raw, etag = read_bytes(secrets_section, blob_path)
+    if raw is None:
+        return None, etag
+    if not raw:
+        return None, etag
+    try:
+        return json.loads(raw.decode("utf-8")), etag
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LakehouseIOError(
+            f"OneLake blob 'Files/{blob_path}' is not valid UTF-8 JSON: {exc}. "
+            "Inspect the file in OneLake; either fix it or delete it "
+            "(the next page load will re-bootstrap from any seed)."
+        ) from exc
+
+
+def write_json(
+    secrets_section: str,
+    blob_path: str,
+    payload: Any,
+    *,
+    etag: Optional[str] = None,
+    indent: Optional[int] = 2,
+    sort_keys: bool = False,
+) -> str:
+    """Serialise ``payload`` to UTF-8 JSON and upload. Returns the new ETag."""
+    body = json.dumps(payload, indent=indent, default=str, sort_keys=sort_keys).encode("utf-8")
+    return write_bytes(secrets_section, blob_path, body, etag=etag)
+
+
+def update_json(
+    secrets_section: str,
+    blob_path: str,
+    mutator: Callable[[Any], Any],
+    *,
+    initial_default: Any = None,
+    indent: Optional[int] = 2,
+    sort_keys: bool = False,
+) -> Any:
+    """Read-modify-write a JSON blob with bounded ETag-conflict retries.
+
+    Mirrors :func:`update_csv` for JSON. ``mutator`` receives the parsed
+    JSON value (or ``initial_default`` when the blob is absent) and
+    returns the new value to upload. Returns the new value on success.
+    """
+    return _retry_write(
+        blob_path=blob_path,
+        read=lambda: read_json(secrets_section, blob_path),
+        upload=lambda payload, etag: write_json(
+            secrets_section, blob_path, payload, etag=etag, indent=indent, sort_keys=sort_keys,
+        ),
+        mutator=mutator,
+        initial_default=initial_default,
+    )
+
+
+# ── Generic ETag-retry write helper (shared by update_csv / update_json) ─────
+
+def _retry_write(
+    *,
+    blob_path: str,
+    read: Callable[[], tuple[Any, Optional[str]]],
+    upload: Callable[[Any, Optional[str]], str],
+    mutator: Callable[[Any], Any],
+    initial_default: Any,
+) -> Any:
+    """Bounded read-modify-write loop shared by ``update_csv`` / ``update_json``.
+
+    Splitting this out keeps the CSV and JSON helpers single-purpose
+    while still sharing one retry implementation — a single place to
+    tune retry behaviour if it ever needs to grow (back-off, jitter,
+    metric counters, etc.).
+    """
     from azure.core.exceptions import ResourceModifiedError
 
     last_exc: Optional[Exception] = None
     for attempt in range(_WRITE_RETRY_ATTEMPTS):
-        current_df, etag = read_csv(
-            secrets_section,
-            blob_path,
-            read_csv_kwargs=read_csv_kwargs,
-        )
-        seed = current_df if current_df is not None else initial_default
-        new_df = mutator(seed)
+        current, etag = read()
+        seed = current if current is not None else initial_default
+        new_payload = mutator(seed)
         try:
-            write_csv(
-                secrets_section,
-                blob_path,
-                new_df,
-                etag=etag,
-                to_csv_kwargs=to_csv_kwargs,
-            )
-            return new_df
+            upload(new_payload, etag)
+            return new_payload
         except ResourceModifiedError as exc:
             last_exc = exc
             logger.warning(
@@ -489,12 +601,17 @@ __all__ = [
     "LakehouseIOError",
     "LakehouseRef",
     "LakehouseFile",
+    "FileProperties",
     "read_bytes",
     "write_bytes",
     "delete_blob",
+    "get_file_properties",
     "list_files",
     "read_csv",
     "write_csv",
     "update_csv",
+    "read_json",
+    "write_json",
+    "update_json",
     "bootstrap_bytes_if_absent",
 ]

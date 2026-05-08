@@ -27,7 +27,7 @@ PAGES_DIR = Path(__file__).parent / "pages"
 VIEW_NAME_MAPPING = {
     "home_view":                          "Home",
     "bid_asset_intelligence_view":        "Bid Asset Intelligence",
-    "htst_activity_monitor_view":         "HTST Activity Monitor",
+    "htst_activity_monitor_view":         "Shipment Monitor & HTST Requote",
     "new_price_quote_view":               "New Price Quote",
     "market_barometer_view":              "Market Barometer",
     "pricing_execution_automation_view":  "Pricing Execution Automation",
@@ -80,6 +80,62 @@ st.set_page_config(
 
 # Apply custom CSS
 apply_custom_css()
+
+
+# ── Microsoft Fabric warm-up ─────────────────────────────────────────────────
+#
+# Eagerly acquire the OneLake bearer token + initialise the shared DuckDB
+# connection ONCE per Streamlit session. Two reasons this lives here, not
+# inside each page:
+#
+#   1. Auth is consolidated to a single moment with explicit progress UI,
+#      so the rare browser sign-in happens up front — not hidden behind a
+#      mid-session navigation click.
+#   2. The DuckDB ``LOAD azure`` / ``LOAD delta`` cost (~300 ms) is paid
+#      exactly once per process; every subsequent Delta-table fetch on
+#      any page is hot.
+#
+# Best-effort: failures DO NOT block the app. A user without Fabric
+# access can still use the local-only pages (Home, Pricing Granularity,
+# etc.); pages that need Fabric will surface their own contextual error
+# when the user navigates to them.
+if "fabric_warm" not in st.session_state:
+    try:
+        from data_sources import fabric_auth
+        with st.status("Connecting to Microsoft Fabric…", expanded=False) as warm_status:
+            try:
+                fabric_auth.warmup()
+                warm_status.update(
+                    label="Microsoft Fabric ready.",
+                    state="complete",
+                    expanded=False,
+                )
+            except fabric_auth.FabricAuthError as exc:
+                # Pages that need Fabric will render their own contextual
+                # error when the user opens them; we don't gate the app.
+                warm_status.update(
+                    label=(
+                        "Microsoft Fabric not connected — pages that need it "
+                        "will prompt for sign-in on first use."
+                    ),
+                    state="error",
+                    expanded=False,
+                )
+                print(f"Fabric warm-up failed (non-fatal): {exc}")
+            except Exception as exc:  # noqa: BLE001  defensive top-level guard
+                warm_status.update(
+                    label=f"Microsoft Fabric warm-up errored ({exc}).",
+                    state="error",
+                    expanded=False,
+                )
+                print(f"Fabric warm-up errored (non-fatal): {exc}")
+    finally:
+        # Set the flag regardless of outcome — we only ever try ONCE per
+        # session. A failed warm-up does NOT permanently disable Fabric;
+        # any later page that calls into a Fabric connector will simply
+        # acquire the token lazily (the same legacy behaviour) and pop
+        # the sign-in then.
+        st.session_state["fabric_warm"] = True
 
 # --- Sidebar Navigation ---
 with st.sidebar:

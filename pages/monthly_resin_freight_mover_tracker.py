@@ -1939,6 +1939,15 @@ def _compute_all_outputs(
 # banner is still visible.
 _SS_FABRIC_RECOVERY_DONE = f"{_SS_PREFIX}_fabric_recovery_done"
 
+# Per-session "we already auto-started a device-code flow once" guard.
+# Without it, every transient auth failure (e.g. a slow ``az`` subprocess
+# call timing out during a file-upload rerun) would auto-fire a brand
+# new device-code prompt — confusing the user, who thinks they got
+# "kicked back" to sign-in even though they had already signed in.
+# After this gate is set the banner switches to a manual
+# "Try sign-in again" button that lets the user opt-in to a re-attempt.
+_SS_DEVCODE_AUTOSTARTED = f"{_SS_PREFIX}_devcode_autostarted"
+
 
 def _recover_after_fabric_signin() -> None:
     """Drop every stale state slot left behind by a failed-auth render.
@@ -1995,58 +2004,81 @@ def _render_fabric_auth_banner_if_needed() -> bool:
     return value to decide whether to skip rendering the SOP / charts /
     upload widgets while sign-in is still pending.
 
-    Flow (matches the simplified UX requested by the user):
+    State machine (in priority order — first match wins):
 
-    1. **Auth previously failed AND no sign-in flow is yet active**
-       — auto-kick off a device-code flow without making the user click
-       a separate button first.  The page then drops into the "pending"
-       state below on the very next render.
-    2. **Sign-in flow active** ("pending" / worker thread running) —
-       render a single banner with the verification URL + user code +
-       a "Check sign-in status" button, and stop here.
-    3. **Sign-in just succeeded** — silently run recovery (clear stale
+    A. **Sign-in just succeeded** — silently run recovery (clear stale
        caches + session-state markers from the failed render), reset
        the device-code state machine, and return ``False`` so the
        caller continues rendering the SOP / data normally.  No
-       "Continue" intermediary — the user already knows they signed
-       in and the next thing they want to see is data.
-    4. **Sign-in flow failed** (timeout / user cancelled / error) —
-       show a concise error + a single "Try again" button that resets
-       state and re-kicks the flow.
-    5. **Idle and no error** — return ``False``; page renders normally.
+       "Continue" intermediary.
+    B. **Auth is healthy** (``cached_auth_error()`` is ``None``) —
+       return ``False`` regardless of any orphan device-code worker
+       still polling in the background.  The credential chain works
+       via SOME path (interactive browser, Azure CLI, env-var SP) and
+       a still-running worker is harmless — it'll time out on its
+       own.  This is the fix for the "kicked back to Check sign-in
+       status after upload" bug: a stale ``thread_alive`` should not
+       gate the page when auth itself is fine.
+    C. **Auth broken, sign-in flow active** — show URL + code +
+       Check sign-in status button.
+    D. **Auth broken, NEVER auto-started a device-code flow this
+       session** — auto-fire one (this is the "first-time visitor
+       lands on an unauthenticated page" path) and immediately drop
+       into state C.
+    E. **Auth broken, already auto-started OR sign-in flow ended in
+       failure** — show a concise error + a manual "Try sign-in
+       again" button.  Crucially, we do NOT auto-fire a fresh flow
+       here: the most common cause of returning to this state mid-
+       session is a transient credential timeout (e.g. ``az`` sub-
+       process being slow on a file-upload rerun), and silently
+       re-popping the device-code prompt would confuse the user
+       into thinking they got logged out.
     """
     status = _fabric_auth.device_code_signin_status()
     err = _fabric_auth.cached_auth_error()
 
-    # ── (3) Sign-in just succeeded — run silent recovery, render normally ──
+    # ── (A) Sign-in just succeeded — silent recovery, render normally ──────
     if status["state"] == "success":
         if not st.session_state.get(_SS_FABRIC_RECOVERY_DONE):
             st.session_state[_SS_FABRIC_RECOVERY_DONE] = True
             _recover_after_fabric_signin()
-        # Reset state to idle so the success branch does NOT re-fire on
-        # subsequent renders — without this we'd keep re-running
-        # ``_recover_after_fabric_signin`` on every rerun (cheap but
-        # wasteful) and we'd never naturally fall through to the
-        # "idle, no error" branch below.
+        # Reset to idle so the success branch does NOT re-fire on
+        # subsequent renders.  ``reset_device_code_signin`` is a no-op
+        # while the worker is still alive — but the worker exits before
+        # writing "success", so this always succeeds in practice.
         _fabric_auth.reset_device_code_signin()
+        # A successful sign-in re-arms the auto-start gate so a future
+        # token expiry within the same session can offer device-code
+        # again on a brand-new failure.
+        st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
         return False
 
-    # ── (1) Auto-start device-code when auth has failed but no flow exists ──
+    # ── (B) Auth is healthy — render normally even if a worker is alive ────
+    # The credential chain just succeeded via some path (probably Azure
+    # CLI or the warm MSAL cache).  A stale device-code worker may still
+    # be polling from an earlier failed render, but it's harmless — the
+    # MSAL token is already cached.  Don't gate the page on it.
+    if err is None:
+        return False
+
+    # From here on we know auth is currently broken AND no recent success.
+
+    autostarted = bool(st.session_state.get(_SS_DEVCODE_AUTOSTARTED))
+
+    # ── (D) Auto-start device-code on the FIRST broken render only ─────────
     if (
-        err is not None
+        not autostarted
         and not status["thread_alive"]
         and status["state"] not in ("pending", "failed")
     ):
-        # Clear the recovery gate so a future success transition will
-        # re-fire ``_recover_after_fabric_signin``.
+        st.session_state[_SS_DEVCODE_AUTOSTARTED] = True
         st.session_state.pop(_SS_FABRIC_RECOVERY_DONE, None)
         _fabric_auth.start_device_code_signin()
-        # Re-poll the status — start_device_code_signin returns once
-        # the worker thread is launched; the prompt callback is fired
-        # a moment later from inside the thread.
+        # Re-poll status — the worker thread populates the prompt a
+        # moment later, but ``thread_alive`` is already True now.
         status = _fabric_auth.device_code_signin_status()
 
-    # ── (2) Sign-in flow active — show simple URL + code prompt ─────────────
+    # ── (C) Sign-in flow active — show URL + code prompt ───────────────────
     if status["thread_alive"] or status["state"] == "pending":
         st.markdown("### 🔐 Sign in to Microsoft Fabric")
         prompt = _fabric_auth.get_device_code_prompt()
@@ -2068,26 +2100,34 @@ def _render_fabric_auth_banner_if_needed() -> bool:
             st.rerun()
         return True
 
-    # ── (4) Sign-in flow failed — concise error + "Try again" ──────────────
-    if status["state"] == "failed":
-        st.error(
-            "🔒 **Microsoft Fabric sign-in failed.**\n\n"
-            f"{status['error'] or 'Unknown error.'}"
-        )
-        if st.button(
-            "🔁 Try sign-in again",
-            key=f"{_SS_PREFIX}_fabric_auth_retry",
-            type="primary",
-        ):
-            _fabric_auth.reset_auth_failure_cache()
-            _fabric_auth.reset_device_code_signin()
-            _recover_after_fabric_signin()
-            st.session_state.pop(_SS_FABRIC_RECOVERY_DONE, None)
-            st.rerun()
-        return True
-
-    # ── (5) Idle and no error — page renders normally ──────────────────────
-    return False
+    # ── (E) Already auto-started OR flow failed — manual retry only ────────
+    error_text = (
+        status["error"]
+        if (status["state"] == "failed" and status["error"])
+        else str(err)
+    )
+    st.error(
+        "🔒 **Microsoft Fabric is not connected.**\n\n"
+        f"{error_text}"
+    )
+    if st.button(
+        "🔁 Try sign-in again",
+        key=f"{_SS_PREFIX}_fabric_auth_retry",
+        type="primary",
+        help=(
+            "Clear the cached failure and start a fresh device-code "
+            "sign-in flow."
+        ),
+    ):
+        _fabric_auth.reset_auth_failure_cache()
+        _fabric_auth.reset_device_code_signin()
+        # Re-arm the auto-start gate so the next render will fire a
+        # fresh device-code flow naturally (branch D).
+        st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
+        _recover_after_fabric_signin()
+        st.session_state.pop(_SS_FABRIC_RECOVERY_DONE, None)
+        st.rerun()
+    return True
 
 
 def _render_monthly_sop_and_upload_intro() -> None:

@@ -350,14 +350,55 @@ def start_device_code_signin(cache_name: str = DEFAULT_CACHE_NAME) -> bool:
                 _DEVICE_CODE_RESULT["error"] = str(exc)
             logger.warning("Device-code sign-in failed: %s", exc)
         else:
-            # Success: drop the failure cache so the next render sees
-            # the warm MSAL token, and clear the prompt so the banner
-            # collapses naturally.
-            reset_auth_failure_cache(cache_name)
+            # Sign-in succeeded for the DeviceCodeCredential's own MSAL
+            # instance — but the rest of the app reads tokens through
+            # the SEPARATE ``InteractiveBrowserCredential`` cached
+            # inside :func:`_build_credential_cached`.  Both credentials
+            # share an on-disk MSAL cache file via the same
+            # ``TokenCachePersistenceOptions(name=cache_name)``, but
+            # the on-disk handoff can fail in rare cases (locked /
+            # unwritable cache file on a corporate-locked-down PC,
+            # azure-identity version mismatch where the persistent
+            # cache isn't actually re-read by the silent flow, etc.).
+            #
+            # Without an explicit verification step the user would
+            # only discover this on the NEXT page render when stores
+            # start failing — which previously surfaced as a confusing
+            # "kicked back to Check sign-in status" UX.  By verifying
+            # here we either declare a clean success the moment the
+            # warm chain CAN reuse the token, or we surface a precise
+            # failure the user can act on immediately.
+            #
+            # Order matters: clear the prompt + reset the failure cache
+            # FIRST so the verify call below actually exercises the
+            # chain instead of short-circuiting on the stale failure.
             clear_device_code_prompt()
-            with _DEVICE_CODE_LOCK:
-                _DEVICE_CODE_RESULT["state"] = "success"
-                _DEVICE_CODE_RESULT["error"] = None
+            reset_auth_failure_cache(cache_name)
+
+            try:
+                acquire_storage_token(cache_name)
+            except FabricAuthError as verify_exc:
+                logger.warning(
+                    "Device-code sign-in succeeded but the main "
+                    "credential chain cannot reuse the cached token: %s",
+                    verify_exc,
+                )
+                # ``acquire_storage_token`` already re-recorded the
+                # failure on its own failure path, so callers will
+                # see the same precise error on the next render.
+                with _DEVICE_CODE_LOCK:
+                    _DEVICE_CODE_RESULT["state"] = "failed"
+                    _DEVICE_CODE_RESULT["error"] = (
+                        "Sign-in succeeded but the main credential "
+                        "chain could not reuse the new token. This "
+                        "usually means the on-disk MSAL token cache "
+                        "is locked or unreadable. Try restarting "
+                        f"Streamlit. Underlying error: {verify_exc}"
+                    )
+            else:
+                with _DEVICE_CODE_LOCK:
+                    _DEVICE_CODE_RESULT["state"] = "success"
+                    _DEVICE_CODE_RESULT["error"] = None
         finally:
             with _DEVICE_CODE_LOCK:
                 _DEVICE_CODE_THREAD = None
@@ -413,6 +454,80 @@ def reset_device_code_signin() -> None:
         _DEVICE_CODE_RESULT["error"] = None
 
 
+# ── In-process AzureCliCredential token cache ───────────────────────────────
+#
+# ``AzureCliCredential`` shells out to ``az.exe account get-access-token``
+# on EVERY call — there is no in-process token cache built in.  On a
+# typical Monthly Movers render that does ~6–8 OneLake reads in
+# sequence, that's 6–8 subprocess spawns of ``az``, each ~300 ms–2 s on
+# a corporate-locked-down workstation.  Beyond the obvious latency
+# penalty, the slow-tail ``az`` invocations were what re-set the auth
+# failure cache mid-session and previously caused the "kicked back to
+# Check sign-in status" UX bug.
+#
+# This wrapper layers a tiny in-process cache over the upstream
+# credential, keyed by scope tuple.  Tokens are kept until they're
+# within :data:`_AZ_CLI_CACHE_BUFFER_SECONDS` of their natural
+# ``expires_on`` deadline (so we never hand out a near-expired token to
+# a slow downstream operation), at which point the next call re-runs
+# ``az`` to get a fresh one.  Concurrency-safe via a per-instance lock;
+# in practice contention is zero because Streamlit runs one
+# ScriptRunner thread per session in steady state.
+#
+# We deliberately do NOT cache failures — a transient ``az`` blip
+# should re-shell on the very next call, not poison the cache for
+# minutes at a time.
+
+_AZ_CLI_CACHE_BUFFER_SECONDS: int = 60
+
+
+class _CachedAzureCliCredential:
+    """Thin in-process token cache wrapping :class:`AzureCliCredential`.
+
+    Only :meth:`get_token` is required by ``ChainedTokenCredential`` —
+    we forward every other attribute access to the inner credential so
+    duck-typing checks (``.close()``, ``.get_token_info(...)`` on newer
+    SDKs, etc.) keep working.
+    """
+
+    def __init__(self) -> None:
+        from azure.identity import AzureCliCredential
+        self._inner = AzureCliCredential()
+        self._lock: threading.Lock = threading.Lock()
+        self._cache: dict[tuple[str, ...], object] = {}
+
+    def get_token(self, *scopes: str, **kwargs):  # type: ignore[no-untyped-def]
+        # ``ChainedTokenCredential`` always passes scopes positionally,
+        # so a tuple is a stable cache key.  ``kwargs`` (claims,
+        # tenant_id) are intentionally NOT in the key — those are not
+        # expected from the chain path and the cache is the wrong
+        # layer to handle them.
+        key = tuple(scopes)
+        now = int(time.time())
+
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None and (
+                getattr(cached, "expires_on", 0) - now
+                > _AZ_CLI_CACHE_BUFFER_SECONDS
+            ):
+                return cached
+
+        # Cache miss / near-expiry — go shell out to ``az``.  Do this
+        # OUTSIDE the lock so a slow subprocess can't block parallel
+        # readers waiting on a different scope.
+        token = self._inner.get_token(*scopes, **kwargs)
+        with self._lock:
+            self._cache[key] = token
+        return token
+
+    def __getattr__(self, name: str):  # noqa: D401 — passthrough
+        # Delegate everything else (close, get_token_info, etc.) to the
+        # inner credential so users of newer azure-identity APIs see no
+        # behavioural change.
+        return getattr(self._inner, name)
+
+
 @st.cache_resource(show_spinner=False)
 def _build_credential_cached(cache_name: str):
     """Build a credential chain with disk-persistent MSAL token cache.
@@ -432,11 +547,14 @@ def _build_credential_cached(cache_name: str):
          Fails fast as ``CredentialUnavailable`` when ``webbrowser.open``
          can't launch (locked-down corporate Windows defaults, missing
          ``BROWSER`` env), so the chain proceeds rather than wedging.
-      3. ``AzureCliCredential`` (workstation only) — covers users who
-         already authenticated for other Microsoft tooling via
-         ``az login``.  Cheap to include: when ``az`` is not installed
-         the credential reports ``CredentialUnavailable`` and the chain
-         skips it without blocking.
+      3. :class:`_CachedAzureCliCredential` (workstation only) — covers
+         users who already authenticated for other Microsoft tooling
+         via ``az login``.  Wrapped in an in-process token cache so a
+         single page render that triggers several OneLake reads pays
+         the ``az`` subprocess tax exactly once instead of once per
+         read.  When ``az`` is not installed the inner credential
+         reports ``CredentialUnavailable`` and the chain skips it
+         without blocking.
 
     A device-code flow is intentionally NOT in the default chain —
     ``DeviceCodeCredential.get_token`` blocks for up to 60 s waiting
@@ -453,7 +571,6 @@ def _build_credential_cached(cache_name: str):
     """
     try:
         from azure.identity import (
-            AzureCliCredential,
             ChainedTokenCredential,
             EnvironmentCredential,
             InteractiveBrowserCredential,
@@ -481,7 +598,7 @@ def _build_credential_cached(cache_name: str):
             InteractiveBrowserCredential(
                 cache_persistence_options=persistence,
             ),
-            AzureCliCredential(),
+            _CachedAzureCliCredential(),
         ])
 
     return ChainedTokenCredential(*credentials)

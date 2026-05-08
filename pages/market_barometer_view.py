@@ -39,7 +39,7 @@ import importlib
 import importlib.util
 import re
 import traceback
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Dict, List, Optional, Tuple
@@ -48,6 +48,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from data_sources import cola_program_tracker_store as _cola_store
 from pages.monthly_resin_freight_mover_tracker import (
     render_monthly_resin_freight_mover_tracker,
 )
@@ -878,27 +879,163 @@ statistical forecast is enabled for all key indices).
 """)
 
 
+# ── Annual COLA Movers section ────────────────────────────────────────────────
+#
+# OneLake-backed editable table.  The DataFrame is loaded on every render
+# from ``Files/Monthly_Pricing_Execution/COLA_Program_Tracker.csv`` (via
+# ``cola_program_tracker_store``); the user can freely add / edit / remove
+# rows in ``st.data_editor`` and click **Refresh** to push the working
+# copy back to OneLake (authoritative overwrite).  A second button
+# downloads the live working copy as a CSV.
+#
+# Why session-state keyed by editor key
+# -------------------------------------
+# Streamlit's data_editor returns the edited frame on every rerun.  The
+# Refresh handler needs to publish the LATEST frame, including in-flight
+# edits the user just typed before clicking the button — which means
+# reading the editor's value out of session state in the same render.
+# The editor key is module-private so other pages (or future re-uses of
+# this view) can't accidentally collide.
+
+# Editor widget key — also the session-state slot the Refresh handler
+# reads to publish the live working copy.
+_COLA_EDITOR_KEY: str = "market_barometer_cola_editor"
+
+# Friendly text shown in the empty state.  Kept short — when the blob
+# is genuinely empty the editor itself is the call-to-action.
+_COLA_EMPTY_HINT: str = (
+    "No rows yet.  Add rows in the editor below and click 🔄 Refresh "
+    "to publish the table to OneLake."
+)
+
+
+def _normalise_cola_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Best-effort normalisation of the COLA table for the editor.
+
+    The COLA workbook schema is owned by the Pricing team and may
+    evolve over time, so we deliberately do NOT enforce a fixed
+    column set — whatever the file holds is shown verbatim.  This
+    helper exists only to make the editor experience pleasant:
+
+    * Strip leading / trailing whitespace from column headers so the
+      editor's column resize / sort widgets aren't confused by stray
+      spaces operators added in Excel.
+    * Convert ``Object``-typed numeric columns whose values are all
+      coercible to numbers — gives the editor proper numeric input
+      affordances (right-align, validation) rather than free-text.
+
+    Returns a copy; the input is never mutated.
+    """
+    if df is None or df.empty:
+        return df.copy() if df is not None else pd.DataFrame()
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
 def _render_annual_cola_movers_section() -> None:
     """Render the **Annual COLA Movers** collapsible section.
 
     Sits directly beneath **Monthly Milk, Resin & Freight Movers** and
-    serves as the home for the annual cost-of-living-adjustment (COLA)
-    workflow.  The section is intentionally minimal today — it claims a
-    permanent, predictable spot on the page so future COLA tooling
-    (annual driver values, projection charts, audit downloads) can land
-    here without forcing another navigation revamp.
+    hosts the annual cost-of-living-adjustment (COLA) workflow.
 
-    Kept collapsed by default to match the visual treatment of the
-    Monthly Movers section above it.
+    Layout
+    ------
+    1. Short caption that names the underlying lakehouse blob.
+    2. Editable table (``st.data_editor`` with ``num_rows="dynamic"``)
+       backed by ``cola_program_tracker_store``.  Any column may be
+       edited; rows may be added or deleted.
+    3. A button column on the right with:
+         * **🔄 Refresh** — overwrite the OneLake blob with the live
+           editor contents, then re-read so the editor immediately
+           reflects what was published.
+         * **⬇️ Download CSV** — download whatever the editor currently
+           shows (including unsaved in-flight edits).
+
+    Kept collapsed by default so first page render stays fast — the
+    OneLake read fires only when the user opens this section.
+
+    Failure mode
+    ------------
+    Read failure (auth / network / corrupt blob) renders an error
+    caption inside the expander but never raises, so a transient
+    Fabric outage cannot break the rest of the Market Barometer view.
     """
     with st.expander("📅 Annual COLA Movers", expanded=False):
-        st.info(
-            "🚧 **Annual COLA Movers tracker — coming soon.**\n\n"
-            "This section will host the annual cost-of-living-adjustment "
-            "(COLA) workflow alongside the Monthly Movers tracker above. "
-            "Reach out to the Pricing team with any drivers, summaries, or "
-            "audit downloads you'd like to see surfaced here."
+        try:
+            current = _normalise_cola_frame(_cola_store.read_table())
+            read_error: Optional[str] = None
+        except _cola_store.ColaProgramTrackerStoreError as exc:
+            current = pd.DataFrame()
+            read_error = str(exc)
+
+        st.caption(
+            f"📡 Sourced from **{_cola_store.get_blob_label()}** in the Pricing "
+            "Lakehouse — edits are persisted only when you click **Refresh**."
         )
+        if read_error is not None:
+            st.error(
+                "❌ Could not load the COLA Program Tracker from OneLake. "
+                "Edits below will not be persisted until the connection is "
+                f"restored.\n\nUnderlying error: {read_error}"
+            )
+
+        col_table, col_btn = st.columns([5, 1])
+        with col_table:
+            if current.empty and read_error is None:
+                st.info(_COLA_EMPTY_HINT)
+            edited = st.data_editor(
+                current,
+                num_rows="dynamic",
+                use_container_width=True,
+                key=_COLA_EDITOR_KEY,
+                hide_index=True,
+            )
+
+        with col_btn:
+            # Top-align the buttons with the editor's first row to avoid
+            # a visually-floating Refresh button on tall tables.
+            st.markdown("<div style='margin-top: 2.2rem'></div>", unsafe_allow_html=True)
+            refresh_clicked = st.button(
+                "🔄 Refresh",
+                type="primary",
+                use_container_width=True,
+                key="market_barometer_cola_refresh",
+                help=(
+                    "Overwrite the OneLake `COLA_Program_Tracker.csv` "
+                    "with the table contents currently shown above."
+                ),
+                disabled=read_error is not None,
+            )
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=edited.to_csv(index=False).encode("utf-8"),
+                file_name=(
+                    f"COLA_Program_Tracker_{datetime.now():%Y%m%d}.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="market_barometer_cola_download",
+                help="Download the live editor contents as a CSV.",
+            )
+
+        if refresh_clicked:
+            with st.spinner("Publishing COLA Program Tracker to OneLake…"):
+                try:
+                    _cola_store.replace_table(edited)
+                except _cola_store.ColaProgramTrackerStoreError as exc:
+                    st.error(f"❌ OneLake write failed: {exc}")
+                else:
+                    rows = len(edited)
+                    cols = len(edited.columns)
+                    st.success(
+                        f"✅ Published {rows} row(s) × {cols} column(s) to "
+                        f"{_cola_store.get_blob_label()}."
+                    )
+                    # Force a fresh render of the editor with the just-
+                    # published bytes so a subsequent Refresh click sees
+                    # the canonical OneLake state, not a stale local copy.
+                    st.rerun()
 
 
 def _render_market_indices_section(df: pd.DataFrame) -> None:

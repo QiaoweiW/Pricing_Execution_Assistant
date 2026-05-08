@@ -134,6 +134,7 @@ from data_sources import base_milk_cost_tracker_store as _base_milk_cost_tracker
 from data_sources import resin_cost_tracker_store as _resin_store
 from data_sources import mover_details_table_store as _mover_details_store
 from data_sources import monthly_pricing_execution_store as _mpe_store
+from data_sources import cola_program_tracker_store as _cola_store
 
 
 # ── 1. Constants ──────────────────────────────────────────────────────────────
@@ -1978,6 +1979,7 @@ def _recover_after_fabric_signin() -> None:
         _resin_store.invalidate_read_cache,
         _milk_store.invalidate_read_cache,
         _milk_usage_store.invalidate_read_cache,
+        _cola_store.invalidate_read_cache,
     ):
         try:
             invalidator()
@@ -2131,7 +2133,17 @@ def _render_fabric_auth_banner_if_needed() -> bool:
 
 
 def _render_monthly_sop_and_upload_intro() -> None:
-    """SharePoint guidance + Monthly SOP — always visible for this fragment."""
+    """SharePoint guidance + Monthly SOP + foldable workflow details.
+
+    Layout
+    ------
+    1. SharePoint folder link + the always-visible Monthly SOP — these
+       are the at-a-glance instructions every user needs on every visit.
+    2. Two collapsed-by-default :class:`st.expander` blocks containing
+       the more detailed automated-workflow narratives (resin + milk).
+       Folding keeps the page tight on first load while preserving the
+       full reference text for users who want it.
+    """
     st.markdown(
         "Upload all files in this SharePoint Folder "
         f"([LINK]({_MONTHLY_MOVERS_SHAREPOINT_URL}))."
@@ -2151,9 +2163,12 @@ def _render_monthly_sop_and_upload_intro() -> None:
   downloads.
 
 _Files are matched automatically by filename keyword after upload._
+        """.strip()
+    )
 
-**Automatic resin-cost workflow**
-
+    with st.expander("ℹ️ Automatic resin-cost workflow", expanded=False):
+        st.markdown(
+            """
 Both `Resin_Calculator.csv` and `Resin_Cost_Tracker.csv` are sourced from
 the Pricing Lakehouse — no upload needed.  When you click **Refresh**:
 
@@ -2168,14 +2183,18 @@ the Pricing Lakehouse — no upload needed.  When you click **Refresh**:
    appended to `Files/Monthly_Mover_Reporting/mover_details_table.csv`
    in the Pricing Lakehouse — but only when the editing month isn't
    already present, so re-clicking Refresh for the same month is safe.
-4. The three Mover Downloads (`rest_htst_resin_mover_fg.csv`,
-   `topco_resin_mover_fg.csv`, `milk_mover.csv`) are published to
+4. The four Mover Downloads (`rest_htst_resin_mover_fg.csv`,
+   `topco_resin_mover_fg.csv`, `milk_mover.csv`,
+   `Movers_Non_Milk_Tracker.csv`) are published to
    `Files/Monthly_Pricing_Execution/` in the Pricing Lakehouse —
    authoritative replace on every Refresh, so the canonical drop-zone
    always reflects the latest run.
+            """.strip()
+        )
 
-**Automatic milk-cost workflow**
-
+    with st.expander("ℹ️ Automatic milk-cost workflow", expanded=False):
+        st.markdown(
+            """
 The milk pipeline is fully automated end-to-end — no manual file upload
 required for any milk artefact:
 
@@ -2196,8 +2215,8 @@ required for any milk artefact:
 
 All three artefacts live together in `Files/Milk_cost_tracker/` in the
 Pricing Lakehouse for auditability.
-        """.strip()
-    )
+            """.strip()
+        )
 
 
 def _render_upload_panel() -> list:
@@ -2891,6 +2910,7 @@ def _publish_mover_downloads_to_lakehouse(
     rest_fg: pd.DataFrame,
     topco_fg: pd.DataFrame,
     milk_mover_df: Optional[pd.DataFrame],
+    movers_non_milk_tracker_df: Optional[pd.DataFrame],
 ) -> None:
     """Replace the canonical Monthly_Pricing_Execution CSVs on every Refresh.
 
@@ -2902,16 +2922,22 @@ def _publish_mover_downloads_to_lakehouse(
          already data there, then replace the files there with new
          generated files, only when user hit refresh."
 
+    Extended in the May-2026-late spec to also publish the editable
+    Movers Non-Milk Tracker as ``Movers_Non_Milk_Tracker.csv`` so
+    downstream auditors / pipelines can see the exact mover values
+    that drove the FG outputs.
+
     Empty / missing frames are skipped silently so a partial pipeline
-    run (e.g. milk slicer not yet selected) cannot accidentally clobber
-    a prior good copy.  Failures surface as small captions — they NEVER
-    raise so a transient Fabric outage cannot break the rest of the
-    Refresh pipeline.
+    run (e.g. milk slicer not yet selected, or an empty tracker) cannot
+    accidentally clobber a prior good copy.  Failures surface as small
+    captions — they NEVER raise so a transient Fabric outage cannot
+    break the rest of the Refresh pipeline.
     """
     payload: dict[str, Optional[pd.DataFrame]] = {
-        "rest_fg":    rest_fg,
-        "topco_fg":   topco_fg,
-        "milk_mover": milk_mover_df,
+        "rest_fg":                 rest_fg,
+        "topco_fg":                topco_fg,
+        "milk_mover":              milk_mover_df,
+        "movers_non_milk_tracker": movers_non_milk_tracker_df,
     }
     try:
         results = _mpe_store.replace_files(payload)
@@ -2924,9 +2950,10 @@ def _publish_mover_downloads_to_lakehouse(
         return
 
     label_for = {
-        "rest_fg":    "rest_htst_resin_mover_fg.csv",
-        "topco_fg":   "topco_resin_mover_fg.csv",
-        "milk_mover": "milk_mover.csv",
+        "rest_fg":                 "rest_htst_resin_mover_fg.csv",
+        "topco_fg":                "topco_resin_mover_fg.csv",
+        "milk_mover":              "milk_mover.csv",
+        "movers_non_milk_tracker": "Movers_Non_Milk_Tracker.csv",
     }
     files_caption = ", ".join(label_for[r] for r in written)
     st.caption(
@@ -2976,11 +3003,15 @@ def _run_refresh_lakehouse_appends(outputs: dict, uploads: dict[str, _Uploaded])
     _maybe_append_resin_cost_tracker_for_month(rest_fg, topco_fg, editing_month)
     _maybe_append_mover_details_table_for_month(full_table, editing_month)
 
-    # Authoritative replace of the three Mover Downloads in a dedicated
+    # Authoritative replace of the four Mover Downloads in a dedicated
     # Monthly_Pricing_Execution OneLake folder.  Always fires on Refresh —
     # there is no month gate because the canonical drop-zone always
-    # holds the latest run's outputs.
-    _publish_mover_downloads_to_lakehouse(rest_fg, topco_fg, milk_usage_with_movers)
+    # holds the latest run's outputs.  Includes the editable Movers
+    # Non-Milk Tracker as-of-Refresh so the published FG outputs are
+    # auditable against the exact mover inputs that produced them.
+    _publish_mover_downloads_to_lakehouse(
+        rest_fg, topco_fg, milk_usage_with_movers, nmt_df,
+    )
 
 
 def _compute_milk_usage_for_render(

@@ -2,12 +2,15 @@
 OneLake-backed publisher for the **Monthly Pricing Execution** drop-zone.
 
 Every successful "Refresh" click on the Market Barometer's Monthly Movers
-section now publishes the three driver CSVs the downstream pricing
+section now publishes the four driver CSVs the downstream pricing
 pipelines consume to a single canonical OneLake folder:
 
 * ``rest_htst_resin_mover_fg.csv``  — Rest HTST Resin Mover FG output.
 * ``topco_resin_mover_fg.csv``      — TOPCO Resin Mover FG output.
 * ``milk_mover.csv``                — slicer-driven Milk Usage with movers.
+* ``Movers_Non_Milk_Tracker.csv``   — the editable Movers Non-Milk
+  tracker as-of-Refresh, so downstream auditors / pipelines see the
+  exact mover values that drove the published FG outputs.
 
 Storage layout
 --------------
@@ -16,8 +19,9 @@ Storage layout
 Public API
 ----------
 * :data:`REST_FG_BLOB_PATH`, :data:`TOPCO_FG_BLOB_PATH`,
-  :data:`MILK_MOVER_BLOB_PATH` — canonical paths.
-* :func:`replace_files`                — push all three CSVs in one call.
+  :data:`MILK_MOVER_BLOB_PATH`, :data:`MOVERS_NON_MILK_TRACKER_BLOB_PATH`
+  — canonical paths.
+* :func:`replace_files`                — push every CSV in one call.
 * :func:`replace_one`                  — push a single CSV (lower-level).
 * :func:`get_folder_label`             — short caption for the UI.
 * :func:`get_blob_label`               — per-file caption for the UI.
@@ -76,22 +80,31 @@ _SECRETS_SECTION: str = "fabric_monthly_pricing_execution"
 # the user shared in the May-2026 spec.
 _FOLDER_PREFIX: str = "Monthly_Pricing_Execution"
 
-REST_FG_BLOB_PATH:    str = f"{_FOLDER_PREFIX}/rest_htst_resin_mover_fg.csv"
-TOPCO_FG_BLOB_PATH:   str = f"{_FOLDER_PREFIX}/topco_resin_mover_fg.csv"
-MILK_MOVER_BLOB_PATH: str = f"{_FOLDER_PREFIX}/milk_mover.csv"
+REST_FG_BLOB_PATH:                  str = f"{_FOLDER_PREFIX}/rest_htst_resin_mover_fg.csv"
+TOPCO_FG_BLOB_PATH:                 str = f"{_FOLDER_PREFIX}/topco_resin_mover_fg.csv"
+MILK_MOVER_BLOB_PATH:               str = f"{_FOLDER_PREFIX}/milk_mover.csv"
+MOVERS_NON_MILK_TRACKER_BLOB_PATH:  str = f"{_FOLDER_PREFIX}/Movers_Non_Milk_Tracker.csv"
 
 # Logical role → blob path lookup.  Lets callers say
 # ``replace_files({"rest_fg": df_rest, "topco_fg": df_topco, ...})``
 # without having to know the exact filename of each artefact.
 _ROLE_TO_BLOB: Mapping[str, str] = {
-    "rest_fg":    REST_FG_BLOB_PATH,
-    "topco_fg":   TOPCO_FG_BLOB_PATH,
-    "milk_mover": MILK_MOVER_BLOB_PATH,
+    "rest_fg":                 REST_FG_BLOB_PATH,
+    "topco_fg":                TOPCO_FG_BLOB_PATH,
+    "milk_mover":              MILK_MOVER_BLOB_PATH,
+    "movers_non_milk_tracker": MOVERS_NON_MILK_TRACKER_BLOB_PATH,
 }
 
 # Order roles are written in.  Stable ordering keeps the user-facing
 # success caption deterministic across runs and makes log scraping easy.
-_REPLACE_ORDER: tuple[str, ...] = ("rest_fg", "topco_fg", "milk_mover")
+# Tracker last so downstream readers see the FG outputs first when a
+# polling job lands on the folder mid-publish.
+_REPLACE_ORDER: tuple[str, ...] = (
+    "rest_fg",
+    "topco_fg",
+    "milk_mover",
+    "movers_non_milk_tracker",
+)
 
 
 # ── Public API: writes ───────────────────────────────────────────────────────
@@ -201,6 +214,7 @@ __all__ = [
     "REST_FG_BLOB_PATH",
     "TOPCO_FG_BLOB_PATH",
     "MILK_MOVER_BLOB_PATH",
+    "MOVERS_NON_MILK_TRACKER_BLOB_PATH",
     "replace_one",
     "replace_files",
     "get_folder_label",

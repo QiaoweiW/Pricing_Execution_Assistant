@@ -117,6 +117,18 @@ def _invalidate_read_cache() -> None:
     _read_csv_cached.clear()
 
 
+def invalidate_read_cache() -> None:
+    """Public alias of :func:`_invalidate_read_cache`.
+
+    Pages call this after recovering from a Fabric auth failure so the
+    cached "absent" answer (which can persist for up to
+    ``_READ_CACHE_TTL_SECONDS``) is dropped before the next read.
+    Mirrors the same-named helper on the milk-mover and resin stores
+    for cross-store consistency.
+    """
+    _invalidate_read_cache()
+
+
 def _validate_columns(df: pd.DataFrame) -> None:
     """Raise if the DataFrame is missing any of the required columns.
 

@@ -49,31 +49,56 @@ _PRICING_MODEL_TRACKER_SHAREPOINT_URL: str = (
     "HTST%20&%20ESL%20PL%20Pricing%20Model_Tracker_v2.xlsx"
 )
 
-# Iframe height in pixels.  Tuned for an Excel-for-the-Web view: large
-# enough to show a meaningful slice of the worksheet while still leaving
-# room for the tool picker below the expander.
-_PRICING_MODEL_TRACKER_IFRAME_HEIGHT: int = 720
+# Iframe height in pixels.  Tuned for a full Excel-for-the-Web embed:
+# tall enough to show ~25 rows + the formula bar + sheet tabs without
+# the user having to scroll *outside* the iframe.  Streamlit will scale
+# it down on narrower viewports.
+_PRICING_MODEL_TRACKER_IFRAME_HEIGHT: int = 900
 
 
 def _build_pricing_model_tracker_embed_url(file_url: str) -> str:
     """Convert a SharePoint file URL into an Office-for-the-Web embed URL.
 
-    Office for the Web honours ``?action=embedview`` plus
-    ``wdAllowInteractivity=True`` to render an interactive (sortable,
-    scrollable, formula-aware) iframe embed for Excel files hosted on
-    SharePoint Online.  We rebuild the query string deterministically so
-    a future change to ``_PRICING_MODEL_TRACKER_SHAREPOINT_URL`` (e.g.
-    a new ``?web=1`` form) keeps producing a clean embed URL.
+    Office for the Web's ``?action=embedview`` viewer is the only
+    iframe-embeddable mode SharePoint Online whitelists (every other
+    action — ``edit``, ``view`` — is blocked by SharePoint's
+    ``X-Frame-Options: SAMEORIGIN`` header and refuses to render).
+    The query parameters below crank up every interactivity knob the
+    embed viewer exposes:
 
-    Returns the original URL unchanged when parsing fails — defensive,
-    so a copy-paste typo manifests as a still-clickable "Open in
-    SharePoint" link rather than a hard error.
+    * ``wdAllowInteractivity=True`` — cell selection, sheet-tab nav,
+      formula reveal, freeze-panes, sort & filter.
+    * ``ActiveCell=A1`` — anchor the initial selection so a fresh
+      load doesn't open with an arbitrary off-screen cell focused.
+    * ``wdHideGridlines=False`` — keep the spreadsheet gridlines
+      visible (the embed viewer hides them by default which makes
+      the workbook look more like a static report).
+    * ``wdHideHeaders=False`` — show row numbers + column letters so
+      users can reference the same coordinates as in desktop Excel.
+    * ``wdDownloadButton=True`` — surface the "Download" button in
+      the embed toolbar for users who want a local copy.
+    * ``wdInConfigurator=True`` — undocumented but well-known flag
+      that asks Office Web Apps to render in the richer "configurator"
+      shell instead of the bare-bones report shell.
+
+    For full edit access the page also exposes a separate "Open in
+    SharePoint" link (see :func:`_build_pricing_model_tracker_view_url`)
+    — full editing inside an iframe is impossible due to the SharePoint
+    frame headers above.
     """
     try:
         parts = urlsplit(file_url)
     except Exception:  # noqa: BLE001 — fall through to passthrough
         return file_url
-    embed_query = "action=embedview&wdAllowInteractivity=True"
+    embed_query = (
+        "action=embedview"
+        "&wdAllowInteractivity=True"
+        "&ActiveCell=A1"
+        "&wdHideGridlines=False"
+        "&wdHideHeaders=False"
+        "&wdDownloadButton=True"
+        "&wdInConfigurator=True"
+    )
     return urlunsplit(
         (parts.scheme, parts.netloc, parts.path, embed_query, parts.fragment)
     )
@@ -99,21 +124,27 @@ def _render_pricing_model_tracker_section() -> None:
 
     Layout
     ------
-    A single collapsed-by-default :class:`st.expander` carrying:
-      1. A short rationale + a primary "Open in SharePoint" link button
-         (works for every user, regardless of iframe-embed support).
-      2. An :func:`st.components.v1.html` iframe embed of the workbook
-         using Office for the Web's ``?action=embedview`` mode — which
-         supports scrolling, cell selection and formula reveal so users
-         can interact with the tracker without leaving the page.
+    An :class:`st.expander` (default-expanded so the workbook is visible
+    on first load) carrying:
+
+      1. Short usage notes describing what the user CAN and CANNOT do
+         inside the iframe (SharePoint blocks in-place editing for
+         iframed Excel — see ``_build_pricing_model_tracker_embed_url``
+         for the technical reason).
+      2. A primary "Open in SharePoint" link button that opens the
+         workbook in a new tab with full edit / comment / share rights.
+      3. The Office-for-the-Web interactive embed itself, sized to a
+         comfortable ~900 px so users see the formula bar, sheet tabs,
+         and a meaningful slice of rows without nesting scroll bars.
 
     Failure mode
     ------------
-    The iframe quietly displays a SharePoint error page when the user
-    isn't signed in to the tenant that hosts the file.  In that case
-    the explicit "Open in SharePoint" link directs them to the
-    canonical view, which prompts for sign-in as expected.  Either
-    way the rest of the page (tool picker, etc.) renders normally.
+    The iframe quietly displays a SharePoint sign-in page when the
+    user's browser isn't signed in to the Darigold tenant.  Once the
+    user signs in via the "Open in SharePoint" tab (or any other
+    SharePoint page in the same browser) the embed will work for the
+    rest of the session — SharePoint shares the auth cookie across
+    same-origin frames.
     """
     import streamlit.components.v1 as components
 
@@ -126,27 +157,48 @@ def _render_pricing_model_tracker_section() -> None:
 
     with st.expander(
         "📊 HTST & ESL PL Pricing Model Tracker",
-        expanded=False,
+        expanded=True,
     ):
         st.markdown(
-            "Live workbook embedded from SharePoint.  Scroll within the "
-            "frame to navigate sheets, click cells to inspect formulas, "
-            "or open the file in SharePoint for full edit / share access."
+            "**Live workbook embedded from SharePoint.**  You can:\n\n"
+            "- Scroll, switch sheet tabs, sort/filter columns\n"
+            "- Click any cell to inspect its value or formula\n"
+            "- Use **Find** (Ctrl+F inside the workbook frame)\n"
+            "- Download a local copy via the toolbar's ⬇️ button\n\n"
+            "To **edit**, click the button below — SharePoint blocks "
+            "in-place editing for embedded workbooks, so editing happens "
+            "in a dedicated Excel-for-the-Web tab."
         )
         st.link_button(
-            "🔗 Open Pricing Model Tracker in SharePoint",
+            "✏️ Open & Edit in SharePoint (Excel for the Web)",
             view_url,
             type="primary",
             use_container_width=False,
             help=(
-                "Opens the workbook in a new tab via Excel for the Web — "
-                "use this for full edit, comment, and share access."
+                "Opens the workbook in a new tab via Excel for the Web "
+                "for full edit, comment, and share access.  Sign in with "
+                "your Darigold Microsoft account if prompted."
             ),
         )
-        components.iframe(
-            src=embed_url,
-            height=_PRICING_MODEL_TRACKER_IFRAME_HEIGHT,
-            scrolling=True,
+        # Use components.html (not components.iframe) so we can pass an
+        # explicit ``allow`` attribute — this enables clipboard-paste
+        # into cells and full-screen mode, neither of which the default
+        # Streamlit iframe wrapper exposes.
+        components.html(
+            f"""
+            <iframe
+                src="{embed_url}"
+                width="100%"
+                height="{_PRICING_MODEL_TRACKER_IFRAME_HEIGHT}"
+                frameborder="0"
+                scrolling="yes"
+                allow="clipboard-read; clipboard-write; fullscreen"
+                allowfullscreen
+                title="HTST & ESL PL Pricing Model Tracker"
+            ></iframe>
+            """,
+            height=_PRICING_MODEL_TRACKER_IFRAME_HEIGHT + 20,
+            scrolling=False,
         )
 
 

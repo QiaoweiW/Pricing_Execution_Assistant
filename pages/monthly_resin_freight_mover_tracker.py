@@ -474,19 +474,53 @@ def _run_milk_mover_autoupdate(*, force: bool = False) -> None:
     st.session_state[_SS_MILK_AUTOUPDATE_RESULT] = result
 
 
+_SS_MILK_BOOTSTRAP_TRIED = "monthly_movers_milk_bootstrap_tried"
+
+
 def _inject_milk_mover_from_store(uploads: dict[str, _Uploaded]) -> None:
     """Populate ``uploads['milk_mover_tracker']`` from the OneLake store.
 
     Done in-place so callers don't need to thread a new dict through the
-    rest of the section. If the store is empty (or unreachable) the key
-    is left absent — ``_render_milk_commodity`` then renders the
-    empty-state branch instead of the chart.
+    rest of the section.  When the store reads back empty on a cold
+    start (no local seed CSV, no prior auto-update run) we make ONE
+    bootstrap attempt — invalidate the cache, force the USDA-PDF
+    auto-updater, then re-read — before declaring the store empty.
+    Subsequent renders skip the bootstrap (a session-state flag dedupes)
+    so reactive widgets never trigger a redundant USDA round-trip.
+
+    If the second read still returns empty the key is left absent so
+    ``_render_milk_commodity`` renders the actionable empty-state branch
+    (which exposes a manual "USDA refresh" button + a link to the seed
+    location).
     """
     sourced = _load_milk_mover_uploaded_from_store()
-    if sourced is None:
-        uploads.pop("milk_mover_tracker", None)
+    if sourced is not None:
+        uploads["milk_mover_tracker"] = sourced
         return
-    uploads["milk_mover_tracker"] = sourced
+
+    # Cold-start bootstrap: try ONCE per session to coax the auto-updater
+    # into seeding the FMMO table from USDA.  Without this the page sits
+    # stuck on the empty-state message until the user manually clicks
+    # the "USDA refresh" button — a confusing first impression on a
+    # fresh deployment with no local seed CSV checked in.
+    already_tried = bool(st.session_state.get(_SS_MILK_BOOTSTRAP_TRIED))
+    if not already_tried:
+        st.session_state[_SS_MILK_BOOTSTRAP_TRIED] = True
+        try:
+            _milk_store.invalidate_read_cache()
+        except Exception:  # noqa: BLE001 — non-fatal cache bust
+            pass
+        _run_milk_mover_autoupdate(force=True)
+        try:
+            _milk_store.invalidate_read_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        sourced = _load_milk_mover_uploaded_from_store()
+        if sourced is not None:
+            uploads["milk_mover_tracker"] = sourced
+            return
+
+    uploads.pop("milk_mover_tracker", None)
 
 
 def _load_milk_usage_stable_uploaded_from_store() -> Optional[_Uploaded]:
@@ -2121,7 +2155,24 @@ def _render_milk_autoupdate_status() -> None:
             use_container_width=True,
         ):
             with st.spinner("Checking USDA…"):
+                # Drop the read cache before AND after the orchestrator
+                # so a manual click always sees the live blob state — even
+                # when the USDA PDF was unchanged and ``insert_rows`` was
+                # never called (which is the only path that auto-busts
+                # the cache).
+                try:
+                    _milk_store.invalidate_read_cache()
+                except Exception:  # noqa: BLE001
+                    pass
                 _run_milk_mover_autoupdate(force=True)
+                try:
+                    _milk_store.invalidate_read_cache()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Reset the per-session bootstrap flag so the next render's
+            # ``_inject_milk_mover_from_store`` is willing to retry the
+            # whole path again if needed.
+            st.session_state.pop(_SS_MILK_BOOTSTRAP_TRIED, None)
             st.rerun()
 
 
@@ -2140,15 +2191,24 @@ def _render_milk_commodity(
     milk = uploads.get("milk_mover_tracker")
     if milk is None:
         # The OneLake store is the only source of truth — an empty result
-        # means either the seed CSV is missing or OneLake is unreachable.
-        # Both cases surface in the auto-update status caption below.
+        # means the auto-updater hasn't yet seeded
+        # ``Files/Milk_cost_tracker/fmmo_tracker.json`` from USDA's
+        # advanced-prices PDF.  Page render already attempted ONE
+        # auto-bootstrap in :func:`_inject_milk_mover_from_store`; the
+        # status caption + manual "USDA refresh" button below surface
+        # the actual error if that attempt failed.
         st.info(
-            "🥛 Milk Mover store is empty or unreachable. Verify the "
-            "`[fabric_htst]` (or `[fabric_milk_mover]`) section of "
-            "`.streamlit/secrets.toml`, ensure your account has access "
-            "to the lakehouse, and reload the page. If this is a fresh "
-            "deployment, confirm `Milk_Mover_Tracker.csv` exists in "
-            "`data/Market Barometer/Montly Movers/` so it can seed the store."
+            "🥛 The Milk Mover Lakehouse table is empty.  Click "
+            "**🔄 USDA refresh** below to fetch the latest "
+            "[advanced-prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf) "
+            "and seed the FMMO rows.\n\n"
+            "If the refresh fails, verify the `[fabric_htst]` (or "
+            "`[fabric_milk_mover]`) section of `.streamlit/secrets.toml`, "
+            "confirm your account has Read/Write access to "
+            f"`Files/{_milk_store.get_table_blob_path()}`, and reload the page.  "
+            "(For a fully offline bootstrap you can also drop a "
+            "`Milk_Mover_Tracker.csv` into "
+            "`data/Market Barometer/Montly Movers/`.)"
         )
         _render_milk_autoupdate_status()
         return

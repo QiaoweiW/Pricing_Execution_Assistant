@@ -158,7 +158,14 @@ def _normalise_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 @st.cache_data(ttl=_READ_CACHE_TTL_SECONDS, show_spinner=False)
 def _read_rows_cached() -> list[dict[str, Any]]:
-    """Cached fetch of the raw row list. Cleared by every write helper."""
+    """Cached fetch of the raw row list. Cleared by every write helper.
+
+    NOTE: callers are expected to bypass this cache (via
+    :func:`invalidate_read_cache`) when they observe an empty list on a
+    cold read — otherwise an "absent blob" answer pins for up to
+    ``_READ_CACHE_TTL_SECONDS`` even after the auto-updater (or a manual
+    out-of-band write) populates the blob in OneLake.
+    """
     try:
         rows, _etag = _io.read_json(_SECRETS_SECTION, _TABLE_BLOB_PATH)
     except _io.LakehouseIOError as exc:
@@ -171,6 +178,39 @@ def _invalidate_read_cache() -> None:
     _read_rows_cached.clear()
 
 
+def invalidate_read_cache() -> None:
+    """Public alias of :func:`_invalidate_read_cache`.
+
+    Page code calls this immediately before re-reading the FMMO table
+    after triggering the auto-updater (or after the user clicks
+    "USDA refresh"), so a cached "blob empty" answer is dropped before
+    the next read.
+    """
+    _invalidate_read_cache()
+
+
+def _read_rows_with_fallback() -> list[dict[str, Any]]:
+    """Read rows with a one-shot retry that bypasses the local cache.
+
+    Mirrors the resin-store ``_read_with_fallback`` helper.  Plain
+    :func:`_read_rows_cached` keeps even an empty list for up to
+    ``_READ_CACHE_TTL_SECONDS``; that's normally fine but breaks the
+    cold-start UX when the auto-updater seeds the blob a few hundred ms
+    after we've already cached "absent".  This helper invalidates the
+    cache once and re-reads directly when the cached answer is empty,
+    paying at most one extra HTTPS round-trip per page render.
+    """
+    rows = _read_rows_cached()
+    if rows:
+        return rows
+    _invalidate_read_cache()
+    try:
+        rows, _etag = _io.read_json(_SECRETS_SECTION, _TABLE_BLOB_PATH)
+    except _io.LakehouseIOError as exc:
+        raise MilkMoverStoreError(str(exc)) from exc
+    return list(rows or [])
+
+
 # ── Public API: data table ───────────────────────────────────────────────────
 
 def read_milk_mover_df() -> pd.DataFrame:
@@ -180,8 +220,11 @@ def read_milk_mover_df() -> pd.DataFrame:
     Butterfat Rate``. Months are returned as ``M/D/YYYY`` strings (no
     zero-padding) — the same format the legacy CSV used — so existing
     parsers (``_parse_month``) accept them unchanged.
+
+    Uses :func:`_read_rows_with_fallback` so a cached empty answer from
+    a prior cold render does not mask a freshly-seeded OneLake blob.
     """
-    rows = _read_rows_cached()
+    rows = _read_rows_with_fallback()
     if not rows:
         return pd.DataFrame(columns=list(ALL_COLUMNS))
 
@@ -367,6 +410,7 @@ __all__ = [
     "COL_BUTTERFAT",
     "ALL_COLUMNS",
     "read_milk_mover_df",
+    "invalidate_read_cache",
     "latest_month",
     "has_rows_for_month",
     "insert_rows",

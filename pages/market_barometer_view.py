@@ -49,6 +49,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from data_sources import cola_program_tracker_store as _cola_store
+from data_sources import fabric_auth as _fabric_auth
 from pages.monthly_resin_freight_mover_tracker import (
     render_monthly_resin_freight_mover_tracker,
 )
@@ -974,11 +975,37 @@ def _render_annual_cola_movers_section() -> None:
             "Lakehouse — edits are persisted only when you click **Refresh**."
         )
         if read_error is not None:
+            # Render the precise error text inline so a user with a
+            # secrets-config issue still sees the actionable detail,
+            # then offer a one-click "Retry connection" path.  The
+            # retry sweeps every cache the auth chain consults
+            # (process-wide failure cache + per-session bypass flag +
+            # the @st.cache_data result) so the next render gets a
+            # genuinely fresh OneLake attempt.  Most often this is the
+            # only fix needed when the user signed in AFTER an earlier
+            # render had already cached a failure.
             st.error(
                 "❌ Could not load the COLA Program Tracker from OneLake. "
                 "Edits below will not be persisted until the connection is "
                 f"restored.\n\nUnderlying error: {read_error}"
             )
+            if st.button(
+                "🔁 Retry connection",
+                key="market_barometer_cola_retry",
+                type="primary",
+                help=(
+                    "Drop the cached auth failure and re-attempt the "
+                    "OneLake read.  Use after signing in to Microsoft "
+                    "Fabric (e.g. via `az login`) to pick up the new "
+                    "credential without reloading the page."
+                ),
+            ):
+                try:
+                    _fabric_auth.reset_auth_failure_cache()
+                except Exception:  # noqa: BLE001 — best-effort recovery
+                    pass
+                _cola_store.invalidate_read_cache()
+                st.rerun()
 
         col_table, col_btn = st.columns([5, 1])
         with col_table:

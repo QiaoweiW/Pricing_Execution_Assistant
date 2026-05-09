@@ -857,14 +857,29 @@ def warmup(*, cache_name: str = DEFAULT_CACHE_NAME) -> None:
     Best-effort: failures are surfaced via the raised
     :class:`FabricAuthError` so the caller can render a clean banner
     and continue (pages that don't need Fabric remain usable).
+
+    Why ``reset_auth_failure_cache`` here
+    -------------------------------------
+    The 60-second failure cache is process-wide — if a previous session
+    failed to authenticate (e.g. user hadn't ``az login``'d yet) the
+    failure entry survives the new session's warmup unless we
+    explicitly clear it.  That otherwise produces a confusing race
+    where the user signs in, reloads the page, and STILL sees the
+    cached "Microsoft Fabric not connected" error for up to 60 seconds.
+    Resetting before the warmup call guarantees every fresh session
+    gets a fresh chain attempt.
     """
     # 1. Force the credential to be built.
     get_credential(cache_name)
-    # 2. Acquire one token. After this MSAL has a refresh token cached
+    # 2. Drop any process-wide stale failure entry so a fresh session
+    #    always re-exercises the chain (defensive against the cross-
+    #    session staleness window described above).
+    reset_auth_failure_cache(cache_name)
+    # 3. Acquire one token. After this MSAL has a refresh token cached
     #    on disk (or in memory if a SP is configured), so subsequent
     #    get_token calls are silent.
     acquire_storage_token(cache_name)
-    # 3. Eagerly initialise the DuckDB connection so the first
+    # 4. Eagerly initialise the DuckDB connection so the first
     #    Delta-scan-driven fetch on any page is hot.
     get_duckdb_connection()
 

@@ -1973,6 +1973,18 @@ def _recover_after_fabric_signin() -> None:
     to sweep its own bypass flags, so we just have to call it; the rest
     is straightforward session-state cleanup.
     """
+    # Drop the process-wide auth failure cache so the next read against
+    # ANY Fabric-backed store re-exercises the credential chain — even
+    # if the failure was recorded just seconds ago.  Without this the
+    # 60-second TTL keeps surfacing "Microsoft Fabric not connected"
+    # banners for stores whose first read happens shortly after the
+    # user successfully signs in (e.g. the COLA section in Market
+    # Barometer, which only reads once the user expands its panel).
+    try:
+        _fabric_auth.reset_auth_failure_cache()
+    except Exception:  # noqa: BLE001 — best-effort cleanup
+        pass
+
     # Per-store cache busts — each clears its own ``@st.cache_data``
     # frames AND any once-per-session bypass flag it owns.
     for invalidator in (

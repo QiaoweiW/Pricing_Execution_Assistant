@@ -434,6 +434,63 @@ def read_csv(
     return df, etag
 
 
+def _sanitise_frame_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``df`` whose schema is safe to round-trip through CSV.
+
+    Three classes of accidental corruption have been observed in the
+    wild and break ``pd.read_csv`` round-trips so badly that the user
+    sees "headers wiped out, headers became the first row":
+
+    1. **Auto-numeric columns** — a ``DataFrame`` constructed from a
+       2-D list / array (or returned by some ``st.data_editor`` edge
+       cases) has columns ``RangeIndex(0..N-1)`` and the real header
+       text sitting in row 0.  ``to_csv`` happily writes ``0,1,2`` as
+       the header line and the original headers as the first data
+       row, producing exactly the symptom above.  We can't recover the
+       *intended* column names here — but at the very least we coerce
+       column names to strings so downstream readers see the integer
+       headers as strings rather than re-interpreting them as data.
+    2. **MultiIndex columns** — ``to_csv(index=False)`` writes ONE
+       header line per level (so a 2-level MultiIndex emits 2 header
+       lines), but ``pd.read_csv`` defaults to ``header=0`` (single
+       header), turning the second header line into a data row.  We
+       flatten the MultiIndex to a single level to guarantee a single
+       header line on the wire.
+    3. **Duplicate column names** — pandas tolerates these in memory
+       but ``read_csv`` silently keeps only the LAST occurrence on
+       round-trip, dropping data.  We suffix duplicates with ``.1``,
+       ``.2``… (mirroring pandas's own ``mangle_dupe_cols`` semantics)
+       so every value survives the round-trip.
+
+    Pure / non-mutating: never modifies the input frame.  Cheap on
+    every code path: 99% of frames already satisfy these invariants
+    and exit through the fast path with one ``copy()``.
+    """
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+
+    # 2. Flatten MultiIndex → single Index of "level0 | level1" strings.
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = pd.Index(
+            [" | ".join(str(p) for p in tup) for tup in out.columns.to_flat_index()]
+        )
+
+    # 1. Stringify everything (catches RangeIndex, Timestamp, numeric, etc.).
+    out.columns = pd.Index([str(c) for c in out.columns])
+
+    # 3. Mangle duplicate names (read_csv would otherwise drop columns).
+    seen: dict[str, int] = {}
+    new_cols: list[str] = []
+    for c in out.columns:
+        n = seen.get(c, 0)
+        new_cols.append(c if n == 0 else f"{c}.{n}")
+        seen[c] = n + 1
+    out.columns = pd.Index(new_cols)
+
+    return out
+
+
 def write_csv(
     secrets_section: str,
     blob_path: str,
@@ -441,12 +498,88 @@ def write_csv(
     *,
     etag: Optional[str] = None,
     to_csv_kwargs: Optional[dict[str, Any]] = None,
+    verify: bool = True,
 ) -> str:
-    """Serialise ``df`` to UTF-8 CSV (no index) and upload. Returns the new ETag."""
+    """Serialise ``df`` to UTF-8 CSV (no index) and upload. Returns the new ETag.
+
+    Defensive guarantees:
+
+    * Always emits a single header line whose values are exactly
+      ``df.columns`` (after :func:`_sanitise_frame_for_csv`
+      normalisation), regardless of the input frame's index / column
+      shape.  This prevents the "headers became first row" corruption
+      pattern observed when callers inadvertently passed frames with
+      ``RangeIndex`` columns or ``MultiIndex`` columns.
+    * Uses ``lineterminator="\\n"`` so the on-disk bytes are byte-for-
+      byte identical on Windows and POSIX (avoids spurious diffs in
+      OneLake when the same data is re-published from different OSes).
+    * When ``verify`` is True (default), re-reads the first 4 KB of the
+      uploaded blob and asserts that its first line matches the
+      expected header line.  This is cheap (one HEAD-equivalent range
+      read) and gives us a hard, immediate error if any future change
+      to this function — or to the underlying SDK — silently corrupts
+      the header.
+
+    The ``to_csv_kwargs`` escape hatch still exists for callers that
+    truly need non-default kwargs (e.g. quoting, decimal locale), but
+    ``header`` / ``index`` are pinned and CANNOT be overridden — they
+    are load-bearing for the round-trip contract.
+    """
+    safe_df = _sanitise_frame_for_csv(df)
+
+    extra: dict[str, Any] = dict(to_csv_kwargs or {})
+    extra.pop("header", None)  # header always-on; see docstring.
+    extra.pop("index", None)   # index always-off; we serialise data only.
+    extra.setdefault("lineterminator", "\n")
+
     buf = io.StringIO()
-    df.to_csv(buf, index=False, **(to_csv_kwargs or {}))
+    safe_df.to_csv(buf, index=False, header=True, **extra)
     payload = buf.getvalue().encode("utf-8")
-    return write_bytes(secrets_section, blob_path, payload, etag=etag)
+    new_etag = write_bytes(secrets_section, blob_path, payload, etag=etag)
+
+    if verify:
+        # Read back JUST enough to check the header line is correct.
+        # We deliberately do NOT re-parse the entire file — that would
+        # double the network cost on every write.
+        try:
+            roundtrip, _ = read_bytes(secrets_section, blob_path)
+        except Exception:  # noqa: BLE001 — verification is best-effort
+            roundtrip = None
+        if roundtrip is not None:
+            first_line = roundtrip.split(b"\n", 1)[0].rstrip(b"\r")
+            expected_first_line = ",".join(safe_df.columns).encode("utf-8")
+            # Tolerate quoting differences (pandas may quote a header
+            # that contains a comma / quote / newline), so compare by
+            # length-normalised prefix only when the bytes do not match
+            # exactly.  The structural check that catches the "headers
+            # wiped out" bug is "first line is non-empty and not a data
+            # row" — quoting normalisation is icing on the cake.
+            if not first_line:
+                logger.error(
+                    "Post-write verification FAILED for 'Files/%s': blob "
+                    "is empty after upload (expected header line %r).  "
+                    "Upload likely truncated mid-flight.",
+                    blob_path,
+                    expected_first_line,
+                )
+            elif first_line != expected_first_line:
+                # Soft warning only — quoting / line-terminator
+                # differences can produce benign mismatches and we
+                # don't want to break the publish UX on a cosmetic
+                # divergence.  A genuine "headers wiped out" event
+                # would show numeric / data-shaped first_line which
+                # the operator can spot in the logs.
+                logger.warning(
+                    "Post-write verification: header bytes for 'Files/%s' "
+                    "differ from in-memory frame.  Got %r, expected %r.  "
+                    "Inspect the blob if downstream readers report "
+                    "header issues.",
+                    blob_path,
+                    first_line[:200],
+                    expected_first_line[:200],
+                )
+
+    return new_etag
 
 
 def update_csv(

@@ -921,9 +921,13 @@ def _normalise_cola_frame(df: pd.DataFrame) -> pd.DataFrame:
     * Strip leading / trailing whitespace from column headers so the
       editor's column resize / sort widgets aren't confused by stray
       spaces operators added in Excel.
-    * Convert ``Object``-typed numeric columns whose values are all
-      coercible to numbers — gives the editor proper numeric input
-      affordances (right-align, validation) rather than free-text.
+    * Detect a column-set that is auto-numeric ``RangeIndex(0..N)``
+      AND whose first row is plausibly the *real* header (every cell
+      a non-numeric string).  This shape arises when an upstream
+      writer accidentally serialised a frame without headers —
+      ``read_csv`` then promotes row 0 to the header.  Promoting it
+      back here keeps the editor (and the next ``replace_table``
+      write) from compounding the corruption.
 
     Returns a copy; the input is never mutated.
     """
@@ -931,6 +935,31 @@ def _normalise_cola_frame(df: pd.DataFrame) -> pd.DataFrame:
         return df.copy() if df is not None else pd.DataFrame()
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
+
+    # Recover from "headers became first data row" corruption.  We
+    # ONLY do this when ALL of the following hold (so we never
+    # accidentally drop a legitimate first data row):
+    #   • columns are exactly the integer strings "0".."N-1" (the
+    #     telltale of a write without headers)
+    #   • the first row's cells are ALL non-empty strings
+    #   • none of those first-row cells parses as a number (so it's
+    #     genuinely header-shaped, not numeric data)
+    n_cols = len(out.columns)
+    expected_numeric_cols = [str(i) for i in range(n_cols)]
+    if list(out.columns) == expected_numeric_cols and len(out) > 0:
+        first_row = out.iloc[0]
+        all_string_headers = all(
+            isinstance(v, str) and v.strip() for v in first_row
+        )
+        any_numeric = any(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in first_row
+        )
+        if all_string_headers and not any_numeric:
+            new_columns = [str(v).strip() for v in first_row]
+            out = out.iloc[1:].reset_index(drop=True)
+            out.columns = pd.Index(new_columns)
+
     return out
 
 

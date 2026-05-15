@@ -1613,6 +1613,50 @@ _MilkRateTuple = tuple[
 _MILK_RATES_NONE: _MilkRateTuple = (None, None, None, None)
 
 
+def _normalise_milk_usage_class(raw: object) -> str:
+    """Map usage-table ``Class`` labels onto FMMO tracker tokens (``I`` / ``II``).
+
+    ``Milk_Usage_Stable`` historically spells milk class as full phrases
+    (e.g. ``"Class II"``) while ``fmmo_tracker`` rows carry the terse
+    token ``"II"``.  Without this shim, lookups build keys like
+    ``("COTTAGE CHEESE", "CLASS II")`` which never match
+    ``("COTTAGE CHEESE", "II")``, so Start/End butterfat columns for
+    Cottage Cheese silently read as blank and ``fillna(0)`` washes
+    the milk mover arithmetic.
+    """
+    s = str(raw).strip().upper()
+    if s in {"I", "1", "CLASS I", "CLASS 1"}:
+        return "I"
+    if s in {"II", "2", "CLASS II", "CLASS 2"}:
+        return "II"
+    return s
+
+
+def _patch_cottage_cheese_bfat_from_esl_class_ii(
+    keys: list[tuple[str, str]],
+    rate_tuples: list[_MilkRateTuple],
+    month_lookup: dict[tuple[str, str], _MilkRateTuple],
+) -> list[_MilkRateTuple]:
+    """Force Cottage Cheese butterfat to match ESL Class II for this month-side.
+
+    Business rule (May-2026 milk pipeline): Cottage Cheese uses the Class II
+    butterfat pricing factor published for ESL Class II—the same skim/butterfat
+    pair as ``("ESL", "II")`` in the mover table after class normalisation.
+
+    We still take Protein / Other Solids from the Cottage Cheese tracker row,
+    only the butterfat slot is authoritative-copied so a stale or partial
+    cottage row cannot drift from ESL Class II.
+    """
+    esl_bf = month_lookup.get(("ESL", "II"), _MILK_RATES_NONE)[1]
+    patched: list[_MilkRateTuple] = []
+    for key, tup in zip(keys, rate_tuples):
+        if key[0] == "COTTAGE CHEESE":
+            patched.append((tup[0], esl_bf, tup[2], tup[3]))
+        else:
+            patched.append(tup)
+    return patched
+
+
 def _milk_rate_lookup_for_month(
     milk_mover_tracker_df: pd.DataFrame,
     target_month: Optional[pd.Timestamp],
@@ -1661,7 +1705,7 @@ def _milk_rate_lookup_for_month(
     for _, row in matched.iterrows():
         key = (
             str(row["Category"]).strip().upper(),
-            str(row["Class"]).strip().upper(),
+            _normalise_milk_usage_class(row["Class"]),
         )
         out[key] = (
             _parse_money(row[skim_col])    if skim_col    else None,
@@ -1740,6 +1784,13 @@ def _build_milk_usage_with_movers(
 
     ``Milk Cost Mover $/Gal`` = End Month Milk Cost − Start Month Milk Cost.
 
+    Class labels on ``Milk_Usage_Stable`` rows are passed through
+    :func:`_normalise_milk_usage_class` before joining so ``"Class II"``
+    lines match tracker keys that use ``"II"``.  For **Cottage Cheese**
+    category rows, Start and End Month **Butterfat** rates always mirror
+    the ESL Class II butterfat pulled from the same month’s lookup—even
+    if a tracker row drifted—see :func:`_patch_cottage_cheese_bfat_from_esl_class_ii`.
+
     Why ``fillna(0)`` on every multiplicative input?
         Either a missing rate (legacy row in fmmo_tracker.json that
         predates the May-2026 schema) or a missing usage (Cottage Cheese
@@ -1769,7 +1820,7 @@ def _build_milk_usage_with_movers(
     # Vectorised (Category, Class) key construction — one upper-cased pair
     # per row, used to fetch both Start and End month rates.
     cat = out["Category"].astype(str).str.strip().str.upper()
-    cls = out["Class"].astype(str).str.strip().str.upper()
+    cls = out["Class"].map(_normalise_milk_usage_class)
     keys = list(zip(cat, cls))
 
     # Bulk-resolve every rate tuple once per (key, month-side). Indexing
@@ -1777,6 +1828,12 @@ def _build_milk_usage_with_movers(
     # per row on large frames.
     start_tuples = [start_lookup.get(k, _MILK_RATES_NONE) for k in keys]
     end_tuples   = [end_lookup.get(k,   _MILK_RATES_NONE) for k in keys]
+    start_tuples = _patch_cottage_cheese_bfat_from_esl_class_ii(
+        keys, start_tuples, start_lookup,
+    )
+    end_tuples = _patch_cottage_cheese_bfat_from_esl_class_ii(
+        keys, end_tuples, end_lookup,
+    )
 
     out[_MUM_COL_START_SKIM]         = [t[0] for t in start_tuples]
     out[_MUM_COL_START_BF]           = [t[1] for t in start_tuples]

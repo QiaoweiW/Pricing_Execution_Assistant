@@ -150,6 +150,16 @@ _LABEL_PATTERNS: dict[str, re.Pattern[str]] = {
     "class_i_esl_adj_raw":  re.compile(
         r"Class I ESL Adjustment[^:\n]*:\s*" + _VALUE_PATTERN
     ),
+    # Class II Nonfat Solids Price ($/lb). Source for the Cottage Cheese
+    # category's Protein Rate AND Other Solids Rate (both intentionally
+    # carry the same value per the May-2026 spec). The label uniquely
+    # appears once as the headline value on page 1; the page-1 monthly
+    # tables ALSO contain "Nonfat Solids Price" as a table header which
+    # is matched by a separate parser below (see
+    # parse_class_ii_nonfat_solids_history).
+    "class_ii_nonfat_solids": re.compile(
+        r"Class II Nonfat Solids Price[^:\n]*:\s*" + _VALUE_PATTERN
+    ),
 }
 
 
@@ -160,14 +170,17 @@ def _is_negative(text: str, match: re.Match[str]) -> bool:
 
 
 def parse_advanced_prices(pdf_bytes: bytes) -> dict[str, float]:
-    """Parse the four headline values from ``dymadvancedprices.pdf``.
+    """Parse the five headline values from ``dymadvancedprices.pdf``.
 
     Returns a dict with keys:
 
-    * ``class_i_skim_raw``      — "Base Skim Milk Price for Class I" ($/cwt)
-    * ``advanced_butterfat``    — "Advanced Butterfat Pricing Factor" ($/lb)
-    * ``class_ii_skim_raw``     — "Class II Skim Milk Price" ($/cwt)
-    * ``class_i_esl_adj_raw``   — "Class I ESL Adjustment" ($/cwt, signed)
+    * ``class_i_skim_raw``       — "Base Skim Milk Price for Class I" ($/cwt)
+    * ``advanced_butterfat``     — "Advanced Butterfat Pricing Factor" ($/lb)
+    * ``class_ii_skim_raw``      — "Class II Skim Milk Price" ($/cwt)
+    * ``class_i_esl_adj_raw``    — "Class I ESL Adjustment" ($/cwt, signed)
+    * ``class_ii_nonfat_solids`` — "Class II Nonfat Solids Price" ($/lb).
+                                    Used as both the Cottage Cheese
+                                    Protein Rate AND Other Solids Rate.
 
     Raises ``ValueError`` listing every missing label so the orchestrator can
     surface a single actionable error message instead of failing silently.
@@ -196,6 +209,102 @@ def parse_advanced_prices(pdf_bytes: bytes) -> dict[str, float]:
             + ", ".join(missing)
             + ". The USDA PDF layout may have changed."
         )
+    return out
+
+
+# ── Advanced Prices page-1 monthly history (Class II Nonfat Solids) ────────
+#
+# The page-1 monthly tables on ``dymadvancedprices.pdf`` are titled
+# "Federal Milk Order Class I and Class II Advanced Prices and Pricing
+# Factors, <year>" — one per year (current + prior calendar year). Each
+# data row follows the same fixed column layout:
+#
+#     <MonAbbr> <Class I Base> <Base Skim Class I> <Adv Class III Skim>
+#               <Adv Class IV Skim> <Adv Butterfat> <Class II Skim>
+#               <Class II Nonfat Solids>
+#
+# pdfplumber's text extraction collapses each row into a single line with
+# the 8 numbers in column order. We anchor on the year header and capture
+# the rightmost (8th) value from every following month-row. The "Avg"
+# row is intentionally NOT included because it doesn't map onto a
+# (year, month) key.
+
+_NFS_MONTH_ROW_RE = re.compile(
+    r"^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
+    r"(-?\d+\.\d+)\s+"   # 1: Class I Base Price
+    r"(-?\d+\.\d+)\s+"   # 2: Base Skim Milk Price for Class I
+    r"(-?\d+\.\d+)\s+"   # 3: Advanced Class III Skim Milk Pricing Factor
+    r"(-?\d+\.\d+)\s+"   # 4: Advanced Class IV Skim Milk Pricing Factor
+    r"(-?\d+\.\d+)\s+"   # 5: Advanced Butterfat Pricing Factor
+    r"(-?\d+\.\d+)\s+"   # 6: Class II Skim Milk Price
+    r"(-?\d+\.\d+)\s*$", # 7: Class II Nonfat Solids Price
+    re.MULTILINE,
+)
+
+# Header anchor for the per-year Advanced-Prices table. The wording is
+# "Federal Milk Order Class I and Class II Advanced Prices and Pricing
+# Factors, <year>". We accept any 4-digit year and segment the page-1
+# text into per-year blocks using the next-header position as a bound.
+_ADV_YEAR_HEADER_RE = re.compile(
+    r"Federal Milk Order Class I[^,]*and\s*Class II[^,]*Advanced Prices "
+    r"and Pricing Factors[^,]*,\s*(\d{4})"
+)
+
+
+def parse_class_ii_nonfat_solids_history(
+    pdf_bytes: bytes,
+) -> dict[tuple[int, int], float]:
+    """Return ``{(year, month) → Class II Nonfat Solids Price}`` history.
+
+    Reads the per-year monthly tables on page 1 of
+    ``dymadvancedprices.pdf``. The current year (partial — only months
+    published so far) and the previous full calendar year are both
+    available; anything older is not in this PDF and will simply be
+    absent from the returned dict.
+
+    Never raises on a layout drift — instead returns whatever rows it
+    *could* parse. Callers that need a specific (year, month) handle
+    the missing-key case themselves (the auto-update orchestrator emits
+    a ``null`` rate for unresolved months, per the May-2026 spec).
+    """
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        # Year tables live on page 1; reading all pages is cheap and
+        # keeps us resilient against future paginations of the same
+        # report layout.
+        text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+
+    headers = list(_ADV_YEAR_HEADER_RE.finditer(text))
+    if not headers:
+        return {}
+
+    # Build per-year text blocks the same way parse_class_ii_butterfat
+    # does, then mine each block for monthly rows. ``end`` is bounded
+    # by the NEXT year-header (or end of text) so unrelated trailing
+    # content can't contribute spurious matches.
+    # Local month-abbr → int (mirrors _MONTH_INDEX defined later for
+    # the Class Prices parser; kept local so the helpers stay independent
+    # and import order within the module doesn't matter).
+    month_to_int: dict[str, int] = {
+        "Jan": 1, "Feb": 2,  "Mar": 3,  "Apr": 4,  "May": 5,  "Jun": 6,
+        "Jul": 7, "Aug": 8,  "Sep": 9,  "Oct": 10, "Nov": 11, "Dec": 12,
+    }
+    out: dict[tuple[int, int], float] = {}
+    for i, m in enumerate(headers):
+        block_year = int(m.group(1))
+        start = m.end()
+        end   = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        block = text[start:end]
+        for row in _NFS_MONTH_ROW_RE.finditer(block):
+            month_int = month_to_int.get(row.group(1))
+            if month_int is None:
+                continue
+            # Group 8 is the rightmost (Class II Nonfat Solids) value.
+            try:
+                out[(block_year, month_int)] = float(row.group(8))
+            except (TypeError, ValueError):
+                # Unparseable cell — silently skip rather than poison
+                # the dict; the caller handles missing keys.
+                continue
     return out
 
 

@@ -95,15 +95,31 @@ _FOLDER_PREFIX: str = "Milk_cost_tracker"
 _TABLE_BLOB_PATH: str = f"{_FOLDER_PREFIX}/fmmo_tracker.json"
 _STATE_BLOB_PATH: str = f"{_FOLDER_PREFIX}/milk_mover_state.json"
 
-# Canonical column names — same shape as the legacy CSV / SQLite schema
-# so every downstream consumer of read_milk_mover_df() keeps working
-# unchanged.
-COL_CATEGORY  = "Category"
-COL_MONTH     = "Month"
-COL_CLASS     = "Class"
-COL_SKIM      = "Skim Rate"
-COL_BUTTERFAT = "Butterfat Rate"
-ALL_COLUMNS: tuple[str, ...] = (COL_CATEGORY, COL_MONTH, COL_CLASS, COL_SKIM, COL_BUTTERFAT)
+# Canonical column names — the original five preserve the legacy CSV /
+# SQLite schema so every downstream consumer of ``read_milk_mover_df()``
+# keeps working unchanged. ``Protein Rate`` and ``Other Solids Rate``
+# were introduced for the Cottage Cheese category (May-2026); they are
+# additive — legacy rows simply have ``null`` for these two fields and
+# round-trip back to ``NaN`` when read into pandas.
+COL_CATEGORY     = "Category"
+COL_MONTH        = "Month"
+COL_CLASS        = "Class"
+COL_SKIM         = "Skim Rate"
+COL_BUTTERFAT    = "Butterfat Rate"
+COL_PROTEIN      = "Protein Rate"
+COL_OTHER_SOLIDS = "Other Solids Rate"
+
+# Numeric rate columns. Defined once so ``_normalise_rows`` and any
+# future schema-evolution helpers iterate over a single tuple instead of
+# repeating the column literals.
+_RATE_COLUMNS: tuple[str, ...] = (
+    COL_SKIM, COL_BUTTERFAT, COL_PROTEIN, COL_OTHER_SOLIDS,
+)
+
+ALL_COLUMNS: tuple[str, ...] = (
+    COL_CATEGORY, COL_MONTH, COL_CLASS,
+    COL_SKIM, COL_BUTTERFAT, COL_PROTEIN, COL_OTHER_SOLIDS,
+)
 
 # Streamlit-cache TTL for blob reads. OneLake reads cost ~50–200 ms;
 # caching for one minute makes the page feel instant on rapid reruns
@@ -133,8 +149,12 @@ def _normalise_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Coerce every row to the canonical column set & types.
 
     * Month is normalised to ``YYYY-MM-DD`` so JSON sorting is chronological.
-    * NaNs become ``None`` (i.e. JSON null) so a future re-read by pandas
-      yields ``NaN`` consistently.
+    * Every numeric rate (``Skim Rate``, ``Butterfat Rate``, ``Protein
+      Rate``, ``Other Solids Rate``) coerces to ``float`` when present;
+      missing / NaN values become ``None`` so JSON stores ``null`` and a
+      future re-read by pandas yields ``NaN`` consistently.
+    * Categorical fields are whitespace-trimmed so ``"HTST "`` and
+      ``"HTST"`` collapse to a single dedup key.
     """
     out: list[dict[str, Any]] = []
     for raw in rows:
@@ -145,7 +165,7 @@ def _normalise_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 # Skip rows with un-parseable months — never crash the pipeline.
                 continue
             cleaned[COL_MONTH] = ts.normalize().strftime("%Y-%m-%d")
-        for c in (COL_SKIM, COL_BUTTERFAT):
+        for c in _RATE_COLUMNS:
             v = cleaned[c]
             cleaned[c] = None if (v is None or pd.isna(v)) else float(v)
         cleaned[COL_CATEGORY] = str(cleaned[COL_CATEGORY]).strip()
@@ -237,12 +257,18 @@ def _read_rows_with_fallback() -> list[dict[str, Any]]:
 # ── Public API: data table ───────────────────────────────────────────────────
 
 def read_milk_mover_df() -> pd.DataFrame:
-    """Return the FMMO table as a DataFrame matching the legacy CSV shape.
+    """Return the FMMO table as a DataFrame.
 
     Output columns (in order): ``Category, Month, Class, Skim Rate,
-    Butterfat Rate``. Months are returned as ``M/D/YYYY`` strings (no
-    zero-padding) — the same format the legacy CSV used — so existing
-    parsers (``_parse_month``) accept them unchanged.
+    Butterfat Rate, Protein Rate, Other Solids Rate``. The first five
+    preserve the legacy CSV shape; the trailing two were introduced for
+    the Cottage Cheese category (May-2026) and read back as ``NaN`` for
+    every legacy row that predates the schema change.
+
+    Months are returned as ``M/D/YYYY`` strings (no zero-padding) — the
+    same format the legacy CSV used — so existing parsers
+    (``_parse_month`` in ``monthly_resin_freight_mover_tracker``) accept
+    them unchanged.
 
     Uses :func:`_read_rows_with_fallback` so a cached empty answer from
     a prior cold render does not mask a freshly-seeded OneLake blob.
@@ -273,6 +299,37 @@ def has_rows_for_month(target_month: pd.Timestamp) -> bool:
     """Return True when at least one row exists for ``target_month``."""
     target_str = pd.Timestamp(target_month).normalize().strftime("%Y-%m-%d")
     return any(r.get(COL_MONTH) == target_str for r in _read_rows_cached())
+
+
+def months_missing_category(category: str) -> list[pd.Timestamp]:
+    """Return every distinct ``Month`` that lacks a row for ``category``.
+
+    Used by the one-shot Cottage Cheese backfill so the auto-update
+    orchestrator can decide cheaply (in-memory, no HTTPS round-trip)
+    whether any historical months still need to be filled in. Returns
+    an empty list once every month already has a row for ``category``.
+
+    Comparison is case-insensitive and whitespace-tolerant so a stray
+    ``"COTTAGE CHEESE "`` row still counts as present.
+    """
+    target = category.strip().casefold()
+    months_present: set[str] = set()
+    months_with_category: set[str] = set()
+    for r in _read_rows_cached():
+        month = r.get(COL_MONTH)
+        if not month:
+            continue
+        months_present.add(month)
+        row_cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
+        if row_cat == target:
+            months_with_category.add(month)
+
+    missing = months_present - months_with_category
+    if not missing:
+        return []
+    parsed = pd.to_datetime(sorted(missing), errors="coerce")
+    return [pd.Timestamp(ts).normalize().replace(day=1)
+            for ts in parsed if not pd.isna(ts)]
 
 
 def insert_rows(rows: Iterable[dict[str, Any]], *, source: str = "auto-update") -> int:
@@ -431,11 +488,14 @@ __all__ = [
     "COL_CLASS",
     "COL_SKIM",
     "COL_BUTTERFAT",
+    "COL_PROTEIN",
+    "COL_OTHER_SOLIDS",
     "ALL_COLUMNS",
     "read_milk_mover_df",
     "invalidate_read_cache",
     "latest_month",
     "has_rows_for_month",
+    "months_missing_category",
     "insert_rows",
     "seed_from_csv_if_empty",
     "get_pdf_state",

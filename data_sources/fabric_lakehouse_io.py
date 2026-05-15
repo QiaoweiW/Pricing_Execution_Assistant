@@ -4,7 +4,7 @@ Generic Microsoft Fabric / OneLake Lakehouse Files I/O.
 A small reusable layer that sits between the per-feature stores
 (``milk_usage_stable_store``, ``htst_activity_store``,
 ``base_milk_cost_tracker_store``, ``milk_mover_store``,
-``product_milk_base_cost_updater``) and the Azure Data Lake Storage
+``activity_model_monthly_updater``) and the Azure Data Lake Storage
 Gen2 SDK. Every caller that just needs to read / write / list / mutate
 a blob (CSV, JSON, raw bytes) goes through here so we do not duplicate
 ADLS-Gen2 boilerplate or grow parallel client / token caches.

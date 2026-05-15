@@ -49,7 +49,7 @@ from typing import Optional
 from utils.ui_helpers import apply_custom_css
 
 from data_sources import htst_activity_store as _activity_store
-from data_sources import product_milk_base_cost_updater as _pmbc_updater
+from data_sources import activity_model_monthly_updater as _am_updater
 
 # Required CSV files for database creation. Kept in sync with the
 # ``htst_activity_store.EXPECTED_FILES`` table at import time so the
@@ -67,20 +67,20 @@ _PARQUET_SIDECAR_NAME: str = "pricing_data.fabric_signature.json"
 # round-trip is cheaper).
 _SS_BOOTSTRAP_DONE: str = "_npq_activity_bootstrap_done"
 
-# Session-state slot recording the most recent PMBC auto-update outcome.
-# We re-run on every page render (so a tab-switch back from Market
-# Barometer picks up newly-appended tracker rows quickly), but skip
-# the Fabric round-trip when the previous run in this session SUCCEEDED
-# within the freshness window below — keeps the UI responsive on
-# Streamlit reruns triggered by filter clicks etc.
-_SS_PMBC_LAST_RUN: str = "_npq_pmbc_last_auto_update"
+# Session-state slot recording the most recent Activity_Model monthly
+# auto-update outcome. The orchestrator is gated by a calendar-month
+# cursor in OneLake, so re-running inside the same session is already
+# cheap (cursor-current short-circuit); the in-session freshness
+# sentinel below avoids the OneLake round-trip on rapid Streamlit reruns
+# (filter clicks, etc.) once we've confirmed the cursor.
+_SS_AM_LAST_RUN: str = "_npq_activity_model_last_run"
 
-# How long a successful auto-update is considered "fresh" within the
-# same Streamlit session. Re-running inside this window is a no-op
-# (no Fabric I/O); after the window we re-evaluate against the
-# tracker's latest month so a Market-Barometer Refresh in another
-# tab is picked up promptly.
-_PMBC_FRESHNESS_SECONDS: int = 60
+# How long a successful auto-update result is considered "fresh"
+# within the same Streamlit session. Re-running inside this window is
+# a no-op (no Fabric I/O); after the window we re-evaluate the cursor
+# so a midnight-tick crossing into a new calendar month is picked up
+# promptly without waiting for a session restart.
+_AM_FRESHNESS_SECONDS: int = 60
 
 
 def load_pricing_data():
@@ -330,131 +330,137 @@ def _ensure_pricing_data_from_fabric() -> tuple[Optional[pd.DataFrame], int, flo
     return df, rc, mb, mt, None
 
 
-# ── Product_Milk Base Cost auto-update ───────────────────────────────────────
+# ── Activity_Model monthly auto-update ───────────────────────────────────────
 #
-# Single source of truth: the tracker's latest End Month
-# (``base_milk_cost_monthly_tracker.csv``). On every render we ask the
-# updater "is PMBC behind the tracker?" — if yes, refresh PMBC by
-# left-joining tracker rows for that month onto PMBC by Item; if no,
-# silently no-op. A session-state freshness sentinel skips the Fabric
-# round-trip when the previous successful run is still inside
-# ``_PMBC_FRESHNESS_SECONDS``.
+# Single orchestrator covering THREE rules — Delivery, PMBC, and PPPI
+# — gated by a calendar-month cursor in OneLake
+# (``Files/Activity_Model/activity_model_monthly_state.json``):
+#
+#   * Delivery   — ``Delivery_Miles Tier_Drop Size Tier_Fee.csv``
+#                  gains the new month's Rest HTST Freight Mover.
+#   * PMBC       — ``Product_Milk Base Cost.csv`` is left-joined to
+#                  the tracker's latest End Month.
+#   * PPPI       — ``Product_Processing_Pkg_Ing.csv`` gains the latest
+#                  Resin Mover ($/Gal) per matched Product ID.
+#
+# All-or-nothing semantics: the cursor advances only when all three
+# rules succeed in the SAME render; if any prerequisite is missing the
+# render is a clean no-op and we retry next time. PMBC's stand-alone
+# updater module has been folded in here.
 
-def _pmbc_run_was_recent_success() -> bool:
-    """Return True when the previous auto-update in this session
-    succeeded inside the freshness window. Used to skip redundant
-    Fabric I/O on rapid Streamlit reruns (filter clicks etc.).
+def _am_run_was_recent_success() -> bool:
+    """Return True when the previous orchestrator run in this session
+    succeeded inside the freshness window. Skips redundant Fabric I/O
+    on rapid Streamlit reruns (filter clicks etc.).
     """
-    last = st.session_state.get(_SS_PMBC_LAST_RUN, {})
+    last = st.session_state.get(_SS_AM_LAST_RUN, {})
     if not last.get("ok"):
         return False
     ran_at = last.get("ran_at_epoch")
     if ran_at is None:
         return False
-    return (datetime.datetime.now().timestamp() - ran_at) < _PMBC_FRESHNESS_SECONDS
+    return (datetime.datetime.now().timestamp() - ran_at) < _AM_FRESHNESS_SECONDS
 
 
-def _run_pmbc_auto_update(*, force: bool = False) -> None:
-    """Run the tracker-driven PMBC auto-update. Idempotent and silent
-    on success.
+def _run_activity_model_auto_update(*, force: bool = False) -> None:
+    """Run the calendar-month-gated Activity_Model orchestrator.
 
-    Behaviour
-    ---------
-    * Reads ``base_milk_cost_monthly_tracker.latest_month()``; if PMBC's
-      ``Month`` already matches (or exceeds) it, no-op.
-    * Otherwise refreshes PMBC by left-joining the tracker's rows for
-      that month onto PMBC by ``Item``.
-    * Skips the Fabric round-trip when the last successful run in this
-      session is still inside the freshness window (unless ``force``).
-    * On failure, renders a yellow warning + retry button so the user
-      can act without leaving the page.
+    Idempotent: re-running inside the same calendar month is an O(1)
+    cursor read. The session-state freshness sentinel further skips
+    even THAT round-trip on rapid reruns.
+
+    On a successful fire the success banner names which rules mutated;
+    on a soft block (prereq missing) it renders a yellow caption and
+    a retry button so the operator can act without leaving the page;
+    on a hard failure (write error after preflight passed) it surfaces
+    the per-rule message.
     """
-    if not force and _pmbc_run_was_recent_success():
+    if not force and _am_run_was_recent_success():
         return
 
     try:
-        result = _pmbc_updater.update_if_needed()
-    except Exception as exc:  # noqa: BLE001 — defensive top-level guard
-        result = _pmbc_updater.UpdateResult(
-            ok=False, target_month=None,
-            message=f"Unexpected error during auto-update: {exc}",
-        )
+        result = _am_updater.run_if_due(force=force)
+    except Exception as exc:  # noqa: BLE001 — top-level defensive guard
+        result = _am_updater.ActivityModelUpdateResult()
+        result.errors.append(f"Unexpected error during monthly update: {exc}")
 
-    st.session_state[_SS_PMBC_LAST_RUN] = {
+    st.session_state[_SS_AM_LAST_RUN] = {
         "ok": result.ok,
-        "message": result.message,
+        "fired": result.fired,
+        "message": result.as_caption(),
         "skipped_reason": result.skipped_reason,
-        "rows_updated": result.rows_updated,
-        "rows_blanked": result.rows_blanked,
-        "rows_unmatched": result.rows_unmatched,
         "target_month": (
             result.target_month.isoformat() if result.target_month is not None else None
         ),
-        "ran_at_epoch": datetime.datetime.now().timestamp(),
+        "cursor_after": (
+            result.cursor_after.isoformat() if result.cursor_after is not None else None
+        ),
+        "delivery_rows":  (result.delivery.rows_changed if result.delivery else 0),
+        "pmbc_rows":      (result.pmbc.rows_changed     if result.pmbc     else 0),
+        "pppi_rows":      (result.pppi.rows_changed     if result.pppi     else 0),
+        "ran_at_epoch":   datetime.datetime.now().timestamp(),
     }
 
-    if not result.ok:
+    # Hard failure (write error or unexpected exception).
+    if not result.ok and result.errors:
         st.warning(
-            "⚠️ **Product_Milk Base Cost auto-update failed.** "
-            f"{result.message} "
+            "⚠️ **Activity-Model monthly auto-update failed.** "
+            f"{'; '.join(result.errors)} "
             "The pricing database is still using the last known values. "
-            "Click the button below to retry."
+            "Click the button below to retry once the underlying issue is fixed."
         )
         if st.button(
-            "🔁 Run auto-update now",
-            key="npq_pmbc_manual_retry",
+            "🔁 Run monthly updates now",
+            key="npq_am_manual_retry",
             type="primary",
         ):
-            _run_pmbc_auto_update(force=True)
+            _run_activity_model_auto_update(force=True)
             st.rerun()
         return
 
-    # Success branches. Stay quiet in steady state; surface info when
-    # the tracker is empty (the common first-time-bootstrap state) and
-    # show a success banner when an actual write happened.
-    if result.skipped_reason == "tracker-empty":
-        return  # quiet — first-load before any Market Barometer refresh
-    if result.skipped_reason == "already-current":
-        return  # quiet — nothing to do
-    if result.rows_updated or result.rows_blanked:
-        st.success(f"☁️ Auto-updated Product_Milk Base Cost: {result.message}")
-
-
-def _render_pmbc_manual_panel() -> None:
-    """Render a status caption + always-visible manual "Run now" button.
-
-    Placed inside the Fabric data-management section so an operator can
-    force a refresh after a back-dated tracker edit, or kick the
-    update from a different tab session, without waiting on the
-    freshness window.
-    """
-    last = st.session_state.get(_SS_PMBC_LAST_RUN, {})
-    target = last.get("target_month")
-    msg = last.get("message", "")
-    if last.get("ok"):
-        if last.get("rows_updated", 0) or last.get("rows_blanked", 0):
-            tone = "✅"
-        elif last.get("skipped_reason") == "tracker-empty":
-            tone = "ℹ️"
-        else:
-            tone = "✅"
-        st.caption(
-            f"{tone} Last auto-update: target month "
-            f"{target or 'n/a'} — {msg or 'no changes needed.'}"
+    # Soft block — prereq missing (yellow info-bar, not an error).
+    if not result.fired and result.skipped_reason and result.skipped_reason != "cursor-current":
+        st.info(
+            f"⏸ Activity-Model monthly update deferred: {result.skipped_reason}. "
+            "It will retry automatically on the next render."
         )
-    elif msg:
-        st.caption(f"⚠️ Last auto-update failed: {msg}")
+        return
+
+    # Success branches. Stay quiet in steady state; surface a success
+    # banner only when an actual write happened.
+    if result.fired and result.ok:
+        st.success(f"☁️ {result.as_caption()}")
+
+
+def _render_am_manual_panel() -> None:
+    """Render the status caption + always-visible manual "Run now"
+    button for the Activity_Model monthly orchestrator.
+
+    Placed inside the Fabric data-management section so an operator
+    can force a re-fire after fixing a missing prerequisite (e.g. a
+    Market-Barometer Refresh for the current month) without leaving
+    the page.
+    """
+    last = st.session_state.get(_SS_AM_LAST_RUN, {})
+    msg = last.get("message", "")
+    if msg:
+        if last.get("ok"):
+            tone = "✅" if last.get("fired") else "ℹ️"
+        else:
+            tone = "⚠️"
+        st.caption(f"{tone} {msg}")
 
     if st.button(
-        "🔁 Run Product_Milk Base Cost auto-update now",
-        key="npq_pmbc_manual_panel_button",
+        "🔁 Run Activity-Model monthly updates now",
+        key="npq_am_manual_panel_button",
         help=(
-            "Force a refresh of Product_Milk Base Cost from the latest "
-            "End Month in base_milk_cost_monthly_tracker.csv. Normally "
-            "runs automatically on every page load."
+            "Force a one-shot run of all three monthly rules (Delivery, "
+            "Product Milk Base Cost, Product Processing/Packaging). "
+            "Normally runs automatically on the first render of each "
+            "new calendar month."
         ),
     ):
-        _run_pmbc_auto_update(force=True)
+        _run_activity_model_auto_update(force=True)
         st.rerun()
 
 
@@ -613,11 +619,12 @@ def render():
             f"({_activity_store.get_store_label()})."
         )
 
-    # Auto-update Product_Milk Base Cost on the first day of each month
-    # (or the first page-load thereafter that hits this branch). Cheap
-    # when no update is needed; surfaces a banner + manual button on
-    # any failure.
-    _run_pmbc_auto_update()
+    # Auto-update the three Activity_Model files on the first render
+    # of each new calendar month (Delivery, Product_Milk Base Cost,
+    # Product_Processing_Pkg_Ing). Cheap O(1) cursor check when no
+    # update is needed; surfaces a banner + manual button on any
+    # failure or deferral.
+    _run_activity_model_auto_update()
 
     # Pull data from Fabric → parquet, with a sidecar ETag signature so we
     # only reprocess when something in Fabric changed.
@@ -820,10 +827,11 @@ def render():
     # (see _ensure_pricing_data_from_fabric). This panel exposes:
     #   * the download / upload-to-replace round-trip so RGM can change
     #     Fabric data without leaving the app, and
-    #   * the manual PMBC auto-update trigger + status caption.
+    #   * the manual Activity_Model monthly-update trigger + status caption
+    #     (Delivery + PMBC + PPPI rules — see activity_model_monthly_updater).
     st.markdown("---")
     _render_fabric_data_panel()
-    _render_pmbc_manual_panel()
+    _render_am_manual_panel()
 
     # Finalize Quote Section
     if df is not None:

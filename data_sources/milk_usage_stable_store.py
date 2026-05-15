@@ -10,11 +10,19 @@ already-migrated FMMO tracker.
 Storage layout
 --------------
 ``Files/Milk_cost_tracker/Milk_Usage_Stable.csv``  — the table, in its
-original CSV shape (``Item, Item Description, Class, Category,
-Skim Usage, Butterfat Usage``). Co-located with ``fmmo_tracker.json``
-and ``base_milk_cost_monthly_tracker.csv`` under the single
+canonical CSV shape (``Item, Item Description, Class, Category,
+Skim Usage, Butterfat Usage, Protein Usage, Other Solids Usage``).
+Co-located with ``fmmo_tracker.json`` and
+``base_milk_cost_monthly_tracker.csv`` under the single
 ``Milk_cost_tracker`` folder so every milk-cost artefact lives in one
 place a user can open in OneLake explorer.
+
+``Protein Usage`` and ``Other Solids Usage`` were introduced for the
+Cottage Cheese category (May-2026). HTST/ESL items carry ``0`` for both
+so the additive cost formula in
+``_build_milk_usage_with_movers`` collapses back to the legacy
+Skim+Butterfat behaviour for non-Cottage-Cheese items — the new schema
+is fully backward-compatible for cost arithmetic.
 
 Why CSV and not JSON?
     * The file is 35 KB / ~685 rows — CSV stays human-readable in
@@ -79,8 +87,13 @@ _BLOB_PATH: str = "Milk_cost_tracker/Milk_Usage_Stable.csv"
 # avoiding redundant OneLake round-trips on rapid Streamlit reruns.
 _READ_CACHE_TTL_SECONDS: int = 300
 
-# Required column set — must match the legacy CSV exactly so downstream
-# ``_build_milk_usage_with_movers`` keeps working unchanged.
+# Required column set — strict. Downstream
+# ``_build_milk_usage_with_movers`` references each name by literal
+# string, so a silent column-drift bug is much worse than a loud
+# "missing column" error at read time. ``Protein Usage`` and
+# ``Other Solids Usage`` were added in May-2026 for the Cottage Cheese
+# category; legacy HTST/ESL items must carry ``0`` for both to preserve
+# their existing cost.
 _REQUIRED_COLUMNS: tuple[str, ...] = (
     "Item",
     "Item Description",
@@ -88,6 +101,8 @@ _REQUIRED_COLUMNS: tuple[str, ...] = (
     "Category",
     "Skim Usage",
     "Butterfat Usage",
+    "Protein Usage",
+    "Other Solids Usage",
 )
 
 # Default seed CSV — used to bootstrap a fresh OneLake blob on first ever
@@ -140,10 +155,18 @@ def _validate_columns(df: pd.DataFrame) -> None:
     """
     missing = [c for c in _REQUIRED_COLUMNS if c not in df.columns]
     if missing:
+        # Detailed, action-oriented error so the operator can fix in
+        # one round-trip: lists missing columns, the canonical schema,
+        # AND the columns we DID see — making rename / case-drift bugs
+        # diagnosable from the message alone.
         raise MilkUsageStableStoreError(
             f"Milk_Usage_Stable is missing required columns {missing!r}. "
             f"Expected exactly: {list(_REQUIRED_COLUMNS)}. "
-            "Re-upload the file with the canonical schema."
+            f"Got columns: {list(df.columns)!r}. "
+            "Re-upload the file with the canonical schema "
+            "(HTST/ESL rows must use 0 for Protein Usage and "
+            "Other Solids Usage; Cottage Cheese rows carry the real "
+            "per-item usage values)."
         )
 
 

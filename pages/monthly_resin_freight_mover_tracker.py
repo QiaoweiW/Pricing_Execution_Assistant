@@ -91,13 +91,21 @@ Calculation contract (matches the May-2026 product spec)
   3. Milk pipeline (driven by the Start/End Month time slicer above the
      Milk Commodity Cost chart):
 
-         Start Month Milk Cost =
-             (Start Skim Rate × Skim Usage + Start Butterfat Rate × Butterfat Usage)
-             × (1 + Milk Scrape%)
+         Start Month Milk Cost = (
+                 Start Skim Rate         × Skim Usage
+               + Start Butterfat Rate    × Butterfat Usage
+               + Start Protein Rate      × Protein Usage          (May-2026)
+               + Start Other Solids Rate × Other Solids Usage     (May-2026)
+             ) × (1 + Milk Scrape%)
          End Month Milk Cost   = same formula with End-month rates.
          Milk Cost Mover $/Gal = End Month Milk Cost − Start Month Milk Cost.
 
-     Skim/Butterfat rates per (Category, Class) come from
+     The two new terms drive the Cottage Cheese category (added May-2026).
+     HTST/ESL items carry ``0`` for Protein Usage / Other Solids Usage in
+     ``Milk_Usage_Stable``, so the formula collapses back to the legacy
+     Skim+Butterfat shape for them — backward-compatible by construction.
+
+     All four rates per (Category, Class) come from
      ``Milk_Mover_Tracker`` for the slicer-selected months. Milk Scrape%
      is the last-row ``Milk`` cell of ``Scrape_Tracker``. The result is
      joined onto the mover_details_table by Item Description ↔ PRODUCTDESC match and
@@ -763,15 +771,27 @@ def _build_packaging_index_chart(pkg_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-# Color map for the milk-commodity chart. Each (Category, Class) pair gets its
-# own colour; Skim is rendered as a solid line on the primary y-axis and
-# Butterfat as a dashed line on the secondary y-axis (the two metrics live on
-# very different scales — Skim ≈ 0.08–0.15, Butterfat ≈ 1.4–3.0).
+# Color map for the milk-commodity chart. Each (Category, Class) pair
+# gets its own colour. The line style encodes the metric:
+#
+#   Skim         → solid line on the PRIMARY (left) $/cwt-scaled axis
+#                  (Skim ≈ 0.08–0.15)
+#   Butterfat    → dashed line on the SECONDARY (right) $/lb-scaled axis
+#                  (Butterfat ≈ 1.4–3.0)
+#   Protein      → dotted line on the SECONDARY axis (Cottage Cheese only)
+#   Other Solids → dash-dot line on the SECONDARY axis (Cottage Cheese only)
+#
+# Cottage Cheese has no Skim component; its three metrics all sit on the
+# secondary $/lb axis. Since Protein Rate and Other Solids Rate carry the
+# SAME value for Cottage Cheese (both equal the Class II Nonfat Solids
+# Price), those two lines overlap visually — both still appear in the
+# legend so the user can confirm both are populated.
 _MILK_COLOR_MAP: dict[tuple[str, str], str] = {
-    ("HTST", "I"):  "#1f77b4",
-    ("HTST", "II"): "#aec7e8",
-    ("ESL",  "I"):  "#d62728",
-    ("ESL",  "II"): "#ff9896",
+    ("HTST",           "I"):  "#1f77b4",
+    ("HTST",           "II"): "#aec7e8",
+    ("ESL",            "I"):  "#d62728",
+    ("ESL",            "II"): "#ff9896",
+    ("COTTAGE CHEESE", "II"): "#2ca02c",
 }
 
 
@@ -782,27 +802,33 @@ def _build_milk_commodity_chart(
     category_filter: Optional[str] = None,
     class_filter: Optional[str] = None,
 ) -> go.Figure:
-    """Multi-series time-series chart of milk Skim & Butterfat rates.
+    """Multi-series time-series chart of milk Skim, Butterfat, Protein,
+    and Other Solids rates.
 
-    The chart visualises every (Category, Class) combination that exists in
-    ``Milk_Mover_Tracker``. Skim Rate plots on the primary y-axis (solid
-    lines); Butterfat Rate plots on the secondary y-axis (dashed lines). When
-    a column or combination is missing the corresponding traces are skipped
-    silently — the chart degrades gracefully rather than raising.
+    The chart visualises every (Category, Class) combination that
+    exists in ``Milk_Mover_Tracker``. Skim Rate plots on the primary
+    y-axis (solid); Butterfat / Protein / Other Solids plot on the
+    secondary y-axis (dashed, dotted, dash-dot respectively). The two
+    Cottage Cheese-only metrics (Protein, Other Solids) auto-suppress
+    for HTST/ESL series since those rows carry ``null`` rates for them.
+    Missing-column / all-null traces are skipped silently — the chart
+    degrades gracefully rather than raising.
 
     The optional ``start_month`` / ``end_month`` arguments restrict the
-    plotted x-range so the chart reacts to the time slicer rendered above it.
-    Both bounds are inclusive; ``None`` means "no bound on that side".
+    plotted x-range so the chart reacts to the time slicer rendered
+    above it. Both bounds are inclusive; ``None`` means "no bound on
+    that side".
 
-    ``category_filter`` is a chart-only knob that restricts which Category
-    families are drawn — accepts ``"HTST"`` / ``"ESL"`` (case-insensitive) to
-    isolate one family, or ``None`` / ``"All"`` to draw every series.
+    ``category_filter`` is a chart-only knob that restricts which
+    Category families are drawn — accepts ``"HTST"`` / ``"ESL"`` /
+    ``"Cottage Cheese"`` (case-insensitive) to isolate one family, or
+    ``None`` / ``"All"`` to draw every series.
 
-    ``class_filter`` is the parallel chart-only knob for Class — accepts
-    ``"I"`` / ``"II"`` (case-insensitive) to isolate one milk class, or
-    ``None`` / ``"All"`` to draw every class. The two filters compose
-    (``category_filter="HTST"`` + ``class_filter="I"`` shows HTST Class I
-    only).
+    ``class_filter`` is the parallel chart-only knob for Class —
+    accepts ``"I"`` / ``"II"`` (case-insensitive) to isolate one milk
+    class, or ``None`` / ``"All"`` to draw every class. The two filters
+    compose (``category_filter="HTST"`` + ``class_filter="I"`` shows
+    HTST Class I only).
 
     Neither filter influences any downstream calculation (metrics,
     mover_details_table, milk_mover downloads, example-prices enrichment) — those continue
@@ -826,17 +852,30 @@ def _build_milk_commodity_chart(
         return go.Figure()
 
     # Tolerant column resolution — header drift like "Skim Rate " or
-    # "Butterfat Rate $" still resolves to the expected metric.
-    skim_col = next((c for c in df.columns if "skim" in c.lower()), None)
-    bf_col   = next((c for c in df.columns if "butter" in c.lower()), None)
-    if skim_col is None and bf_col is None:
+    # "Butterfat Rate $" still resolves to the expected metric. "Other
+    # Solids" is matched FIRST so it can't be greedily absorbed by a
+    # future column named just "solids"; "Skim" excludes "Nonfat Solids"
+    # defensively (cheap insurance against future PDF labelling).
+    def _resolve_chart_col(predicate) -> Optional[str]:
+        return next((c for c in df.columns if predicate(c.lower())), None)
+
+    other_col   = _resolve_chart_col(lambda c: "other solids" in c)
+    protein_col = _resolve_chart_col(lambda c: "protein" in c)
+    bf_col      = _resolve_chart_col(lambda c: "butter" in c)
+    skim_col    = _resolve_chart_col(
+        lambda c: "skim" in c and "nonfat" not in c and "non-fat" not in c
+    )
+    if all(c is None for c in (skim_col, bf_col, protein_col, other_col)):
         return go.Figure()
 
-    # Normalise the chart-only category filter once. Anything outside the
-    # known {"HTST", "ESL"} set falls back to "show everything" so unexpected
-    # values can never silently blank out the chart.
+    # Normalise the chart-only category filter once. Anything outside
+    # the known set falls back to "show everything" so unexpected values
+    # can never silently blank out the chart. Cottage Cheese was added
+    # in May-2026; the comparison set is uppercased once so the chart's
+    # case-insensitive matching stays consistent below.
+    _VALID_CAT_FILTERS = {"HTST", "ESL", "COTTAGE CHEESE"}
     cat_filter = (category_filter or "").strip().upper()
-    if cat_filter not in {"HTST", "ESL"}:
+    if cat_filter not in _VALID_CAT_FILTERS:
         cat_filter = ""
 
     # Same defensive normalisation for the chart-only class filter; the keys
@@ -858,40 +897,93 @@ def _build_milk_commodity_chart(
         if sub.empty:
             continue
 
-        if skim_col is not None:
-            fig.add_trace(go.Scatter(
-                x=sub["Month"],
-                y=pd.to_numeric(sub[skim_col], errors="coerce"),
-                mode="lines+markers",
-                name=f"{cat} Class {cls} Skim",
-                line=dict(color=color, width=2, dash="solid"),
-                marker=dict(size=4),
-                hovertemplate=(
-                    f"<b>{cat} Class {cls} Skim</b><br>"
-                    "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
-                ),
-            ))
+        # Display label uses the canonical mixed-case spelling so the
+        # legend reads "Cottage Cheese Class II Butterfat" rather than
+        # "COTTAGE CHEESE Class II Butterfat".
+        display_cat = cat.title() if cat == "COTTAGE CHEESE" else cat
 
+        # ── Skim — primary axis (only relevant for HTST / ESL) ─────────
+        if skim_col is not None:
+            skim_y = pd.to_numeric(sub[skim_col], errors="coerce")
+            # Skip drawing when every value is null (e.g. Cottage Cheese
+            # rows have null Skim Rate by design — no point in adding an
+            # empty trace and cluttering the legend).
+            if skim_y.notna().any():
+                fig.add_trace(go.Scatter(
+                    x=sub["Month"],
+                    y=skim_y,
+                    mode="lines+markers",
+                    name=f"{display_cat} Class {cls} Skim",
+                    line=dict(color=color, width=2, dash="solid"),
+                    marker=dict(size=4),
+                    hovertemplate=(
+                        f"<b>{display_cat} Class {cls} Skim</b><br>"
+                        "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
+                    ),
+                ))
+
+        # ── Butterfat — secondary axis ────────────────────────────────
         if bf_col is not None:
-            fig.add_trace(go.Scatter(
-                x=sub["Month"],
-                y=pd.to_numeric(sub[bf_col], errors="coerce"),
-                mode="lines+markers",
-                name=f"{cat} Class {cls} Butterfat",
-                line=dict(color=color, width=2, dash="dash"),
-                marker=dict(size=4, symbol="diamond"),
-                yaxis="y2",
-                hovertemplate=(
-                    f"<b>{cat} Class {cls} Butterfat</b><br>"
-                    "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
-                ),
-            ))
+            bf_y = pd.to_numeric(sub[bf_col], errors="coerce")
+            if bf_y.notna().any():
+                fig.add_trace(go.Scatter(
+                    x=sub["Month"],
+                    y=bf_y,
+                    mode="lines+markers",
+                    name=f"{display_cat} Class {cls} Butterfat",
+                    line=dict(color=color, width=2, dash="dash"),
+                    marker=dict(size=4, symbol="diamond"),
+                    yaxis="y2",
+                    hovertemplate=(
+                        f"<b>{display_cat} Class {cls} Butterfat</b><br>"
+                        "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
+                    ),
+                ))
+
+        # ── Protein — secondary axis (Cottage Cheese only by data) ────
+        if protein_col is not None:
+            protein_y = pd.to_numeric(sub[protein_col], errors="coerce")
+            if protein_y.notna().any():
+                fig.add_trace(go.Scatter(
+                    x=sub["Month"],
+                    y=protein_y,
+                    mode="lines+markers",
+                    name=f"{display_cat} Class {cls} Protein",
+                    line=dict(color=color, width=2, dash="dot"),
+                    marker=dict(size=4, symbol="square"),
+                    yaxis="y2",
+                    hovertemplate=(
+                        f"<b>{display_cat} Class {cls} Protein</b><br>"
+                        "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
+                    ),
+                ))
+
+        # ── Other Solids — secondary axis (Cottage Cheese only by data)
+        if other_col is not None:
+            other_y = pd.to_numeric(sub[other_col], errors="coerce")
+            if other_y.notna().any():
+                fig.add_trace(go.Scatter(
+                    x=sub["Month"],
+                    y=other_y,
+                    mode="lines+markers",
+                    name=f"{display_cat} Class {cls} Other Solids",
+                    line=dict(color=color, width=2, dash="dashdot"),
+                    marker=dict(size=4, symbol="triangle-up"),
+                    yaxis="y2",
+                    hovertemplate=(
+                        f"<b>{display_cat} Class {cls} Other Solids</b><br>"
+                        "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
+                    ),
+                ))
 
     fig.update_layout(
         xaxis=dict(title="", showgrid=False, showline=True, linecolor="#e0e0e0"),
         yaxis=dict(title="Skim Rate ($)", showgrid=True, gridcolor="#f0f0f0",
                    showline=True, linecolor="#e0e0e0", rangemode="tozero"),
-        yaxis2=dict(title="Butterfat Rate ($)", overlaying="y", side="right",
+        # The right axis carries Butterfat, Protein, and Other Solids
+        # rates — all three quoted in $/lb so they share a scale.
+        yaxis2=dict(title="Butterfat / Protein / Other Solids Rate ($/lb)",
+                    overlaying="y", side="right",
                     showgrid=False, showline=True, linecolor="#e0e0e0",
                     rangemode="tozero"),
         plot_bgcolor="white",
@@ -932,11 +1024,16 @@ _SS_MILK_CATEGORY = f"{_SS_PREFIX}_milk_category_filter"
 _SS_MILK_CLASS    = f"{_SS_PREFIX}_milk_class_filter"
 
 # Filter options for the chart-only category selector. ``"All"`` is the
-# default and preserves the legacy four-line view; ``"HTST"`` / ``"ESL"``
-# isolate the two pasteurisation methods so users can compare classes within
-# a single family without legend clutter.
+# default and preserves the legacy multi-line view; ``"HTST"`` / ``"ESL"``
+# isolate the two pasteurisation methods so users can compare classes
+# within a single family without legend clutter. ``"Cottage Cheese"``
+# was added in May-2026 alongside the Class II Nonfat Solids ingestion
+# — selecting it isolates Cottage Cheese's three $/lb rate series
+# (Butterfat, Protein, Other Solids).
 _MILK_CATEGORY_ALL: str = "All"
-_MILK_CATEGORY_OPTIONS: tuple[str, ...] = (_MILK_CATEGORY_ALL, "HTST", "ESL")
+_MILK_CATEGORY_OPTIONS: tuple[str, ...] = (
+    _MILK_CATEGORY_ALL, "HTST", "ESL", "Cottage Cheese",
+)
 
 # Filter options for the chart-only class selector. ``"All"`` preserves the
 # default view (both Class I and Class II for whatever Category is selected);
@@ -1503,16 +1600,35 @@ def _latest_milk_scrape_fraction(scrape_tracker_df: pd.DataFrame) -> float:
     return float(val) if val is not None else 0.0
 
 
+# Type alias for the four (Category, Class) → rate values returned by
+# :func:`_milk_rate_lookup_for_month`. Tuple order is intentional and
+# referenced by index throughout the milk pipeline:
+#   0 → Skim Rate
+#   1 → Butterfat Rate
+#   2 → Protein Rate
+#   3 → Other Solids Rate
+_MilkRateTuple = tuple[
+    Optional[float], Optional[float], Optional[float], Optional[float]
+]
+_MILK_RATES_NONE: _MilkRateTuple = (None, None, None, None)
+
+
 def _milk_rate_lookup_for_month(
     milk_mover_tracker_df: pd.DataFrame,
     target_month: Optional[pd.Timestamp],
-) -> dict[tuple[str, str], tuple[Optional[float], Optional[float]]]:
-    """Return ``{(Category, Class) → (Skim Rate, Butterfat Rate)}`` for a month.
+) -> dict[tuple[str, str], _MilkRateTuple]:
+    """Return ``{(Category, Class) → (Skim, Butterfat, Protein, OtherSolids)}``.
 
     Lookup keys are upper-cased + whitespace-trimmed for tolerant matching
     against ``Milk_Usage_Stable``. Returns an empty dict (so downstream
     rates collapse to ``None``) when the source file lacks the expected
     columns or has no rows for ``target_month``.
+
+    Column resolution is case- and whitespace-tolerant so header drift
+    (``"Skim Rate "``, ``"Protein Rate $"``) still maps to the expected
+    metric. The Protein / Other Solids columns are only present for
+    rows inserted on/after the May-2026 schema bump; on older rows they
+    read back as ``NaN`` and become ``None`` in the tuple.
     """
     if target_month is None:
         return {}
@@ -1526,30 +1642,72 @@ def _milk_rate_lookup_for_month(
     if matched.empty:
         return {}
 
-    skim_col = next((c for c in df.columns if "skim" in c.lower()), None)
-    bf_col   = next((c for c in df.columns if "butter" in c.lower()), None)
+    # Resolve each metric column tolerantly. "other solids" is matched
+    # FIRST so it can't be greedily absorbed by a future column that
+    # contains "solids" alone. Skim is matched with a negative match
+    # against "non-fat solids" defensively (none currently exists, but
+    # the FMMO PDF uses that wording elsewhere — cheap insurance).
+    def _resolve(predicate) -> Optional[str]:
+        return next((c for c in df.columns if predicate(c.lower())), None)
 
-    out: dict[tuple[str, str], tuple[Optional[float], Optional[float]]] = {}
+    other_col = _resolve(lambda c: "other solids" in c)
+    protein_col = _resolve(lambda c: "protein" in c)
+    bf_col      = _resolve(lambda c: "butter" in c)
+    skim_col    = _resolve(
+        lambda c: "skim" in c and "nonfat" not in c and "non-fat" not in c
+    )
+
+    out: dict[tuple[str, str], _MilkRateTuple] = {}
     for _, row in matched.iterrows():
         key = (
             str(row["Category"]).strip().upper(),
             str(row["Class"]).strip().upper(),
         )
-        skim = _parse_money(row[skim_col]) if skim_col else None
-        bf   = _parse_money(row[bf_col])   if bf_col   else None
-        out[key] = (skim, bf)
+        out[key] = (
+            _parse_money(row[skim_col])    if skim_col    else None,
+            _parse_money(row[bf_col])      if bf_col      else None,
+            _parse_money(row[protein_col]) if protein_col else None,
+            _parse_money(row[other_col])   if other_col   else None,
+        )
     return out
 
 
-# Canonical column names added by _build_milk_usage_with_movers. Defined here
-# so the builder, the layering step, and any consumer reference one source.
-_MUM_COL_START_SKIM    = "Start Month Skim Rate"
-_MUM_COL_START_BF      = "Start Month Butterfat Rate"
-_MUM_COL_START_COST    = "Start Month Milk Cost"
-_MUM_COL_END_SKIM      = "End Month Skim Rate"
-_MUM_COL_END_BF        = "End Month Butterfat Rate"
-_MUM_COL_END_COST      = "End Month Milk Cost"
-_MUM_COL_MILK_COST_GAL = "Milk Cost Mover $/Gal"
+# Canonical column names added by _build_milk_usage_with_movers. Defined
+# here so the builder, the layering step, downstream Mover-Downloads
+# publishing, and any future consumer all reference exactly one source.
+# Order matters: the deterministic-column-order reindex at the bottom of
+# the builder uses these literals.
+_MUM_COL_START_SKIM           = "Start Month Skim Rate"
+_MUM_COL_START_BF             = "Start Month Butterfat Rate"
+_MUM_COL_START_PROTEIN        = "Start Month Protein Rate"
+_MUM_COL_START_OTHER_SOLIDS   = "Start Month Other Solids Rate"
+_MUM_COL_START_COST           = "Start Month Milk Cost"
+_MUM_COL_END_SKIM             = "End Month Skim Rate"
+_MUM_COL_END_BF               = "End Month Butterfat Rate"
+_MUM_COL_END_PROTEIN          = "End Month Protein Rate"
+_MUM_COL_END_OTHER_SOLIDS     = "End Month Other Solids Rate"
+_MUM_COL_END_COST             = "End Month Milk Cost"
+_MUM_COL_MILK_COST_GAL        = "Milk Cost Mover $/Gal"
+
+# Canonical column order for the published ``milk_mover.csv``. Pulls the
+# stable upstream columns first (preserving the exact left-side header
+# the user updated in the OneLake Milk_Usage_Stable.csv), then the per-
+# month rates grouped together with their cost, then the headline mover.
+# Any extra columns that happen to be on the input frame (defensively
+# tolerated) get appended at the END so we never silently lose data.
+_MUM_INPUT_COLUMNS: tuple[str, ...] = (
+    "Item", "Item Description", "Class", "Category",
+    "Skim Usage", "Butterfat Usage", "Protein Usage", "Other Solids Usage",
+)
+_MUM_OUTPUT_ORDER: tuple[str, ...] = _MUM_INPUT_COLUMNS + (
+    _MUM_COL_START_SKIM, _MUM_COL_START_BF,
+    _MUM_COL_START_PROTEIN, _MUM_COL_START_OTHER_SOLIDS,
+    _MUM_COL_START_COST,
+    _MUM_COL_END_SKIM, _MUM_COL_END_BF,
+    _MUM_COL_END_PROTEIN, _MUM_COL_END_OTHER_SOLIDS,
+    _MUM_COL_END_COST,
+    _MUM_COL_MILK_COST_GAL,
+)
 
 
 def _build_milk_usage_with_movers(
@@ -1561,25 +1719,47 @@ def _build_milk_usage_with_movers(
 ) -> pd.DataFrame:
     """Enrich ``Milk_Usage_Stable`` with Start/End month rates, costs, and Mover.
 
-    Columns appended (in order)::
+    Columns appended (in canonical order — see :data:`_MUM_OUTPUT_ORDER`)::
 
-        Start Month Skim Rate | Start Month Butterfat Rate | Start Month Milk Cost
-        End Month Skim Rate   | End Month Butterfat Rate   | End Month Milk Cost
+        Start Month Skim Rate | Start Month Butterfat Rate
+        Start Month Protein Rate | Start Month Other Solids Rate
+        Start Month Milk Cost
+        End Month Skim Rate   | End Month Butterfat Rate
+        End Month Protein Rate   | End Month Other Solids Rate
+        End Month Milk Cost
         Milk Cost Mover $/Gal
 
     Per-row formula (Start side; End side is symmetric)::
 
-        Start Month Milk Cost =
-            (Start Skim Rate × Skim Usage + Start Butterfat Rate × Butterfat Usage)
-            × (1 + Milk Scrape%)
+        Start Month Milk Cost = (
+              Start Skim Rate          × Skim Usage
+            + Start Butterfat Rate     × Butterfat Usage
+            + Start Protein Rate       × Protein Usage
+            + Start Other Solids Rate  × Other Solids Usage
+        ) × (1 + Milk Scrape%)
 
     ``Milk Cost Mover $/Gal`` = End Month Milk Cost − Start Month Milk Cost.
+
+    Why ``fillna(0)`` on every multiplicative input?
+        Either a missing rate (legacy row in fmmo_tracker.json that
+        predates the May-2026 schema) or a missing usage (Cottage Cheese
+        items have ``Skim Usage=0`` literally; future-added items might
+        miss other columns) would otherwise produce ``NaN × 0 = NaN``
+        which poisons the sum and blanks the whole cost. Coercing to
+        zero is the desired contract: an unknown rate contributes zero
+        cost. Strict validation upstream (the
+        ``milk_usage_stable_store`` required-columns check) prevents
+        the schema itself from drifting silently.
 
     Returns an empty DataFrame when the source has no rows or the required
     columns are missing — callers handle the "no milk impact" case gracefully.
     """
     out = _strip_df_columns(milk_usage_stable_df).copy()
-    required = {"Item Description", "Class", "Category", "Skim Usage", "Butterfat Usage"}
+    required = {
+        "Item Description", "Class", "Category",
+        "Skim Usage", "Butterfat Usage",
+        "Protein Usage", "Other Solids Usage",
+    }
     if out.empty or not required.issubset(out.columns):
         return pd.DataFrame()
 
@@ -1592,25 +1772,70 @@ def _build_milk_usage_with_movers(
     cls = out["Class"].astype(str).str.strip().str.upper()
     keys = list(zip(cat, cls))
 
-    out[_MUM_COL_START_SKIM] = [start_lookup.get(k, (None, None))[0] for k in keys]
-    out[_MUM_COL_START_BF]   = [start_lookup.get(k, (None, None))[1] for k in keys]
-    out[_MUM_COL_END_SKIM]   = [end_lookup.get(k,   (None, None))[0] for k in keys]
-    out[_MUM_COL_END_BF]     = [end_lookup.get(k,   (None, None))[1] for k in keys]
+    # Bulk-resolve every rate tuple once per (key, month-side). Indexing
+    # tuples is materially faster than four separate ``get()[i]`` calls
+    # per row on large frames.
+    start_tuples = [start_lookup.get(k, _MILK_RATES_NONE) for k in keys]
+    end_tuples   = [end_lookup.get(k,   _MILK_RATES_NONE) for k in keys]
 
-    skim_usage = pd.to_numeric(out["Skim Usage"], errors="coerce")
-    bf_usage   = pd.to_numeric(out["Butterfat Usage"], errors="coerce")
-    s_skim = pd.to_numeric(out[_MUM_COL_START_SKIM], errors="coerce")
-    s_bf   = pd.to_numeric(out[_MUM_COL_START_BF],   errors="coerce")
-    e_skim = pd.to_numeric(out[_MUM_COL_END_SKIM],   errors="coerce")
-    e_bf   = pd.to_numeric(out[_MUM_COL_END_BF],     errors="coerce")
+    out[_MUM_COL_START_SKIM]         = [t[0] for t in start_tuples]
+    out[_MUM_COL_START_BF]           = [t[1] for t in start_tuples]
+    out[_MUM_COL_START_PROTEIN]      = [t[2] for t in start_tuples]
+    out[_MUM_COL_START_OTHER_SOLIDS] = [t[3] for t in start_tuples]
+    out[_MUM_COL_END_SKIM]           = [t[0] for t in end_tuples]
+    out[_MUM_COL_END_BF]             = [t[1] for t in end_tuples]
+    out[_MUM_COL_END_PROTEIN]        = [t[2] for t in end_tuples]
+    out[_MUM_COL_END_OTHER_SOLIDS]   = [t[3] for t in end_tuples]
+
+    # Coerce every multiplicand to a float Series with ``NaN → 0`` so
+    # missing rates / usages contribute zero (see docstring above).
+    def _num(series: pd.Series) -> pd.Series:
+        return pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+    skim_usage    = _num(out["Skim Usage"])
+    bf_usage      = _num(out["Butterfat Usage"])
+    protein_usage = _num(out["Protein Usage"])
+    other_usage   = _num(out["Other Solids Usage"])
+
+    s_skim    = _num(out[_MUM_COL_START_SKIM])
+    s_bf      = _num(out[_MUM_COL_START_BF])
+    s_protein = _num(out[_MUM_COL_START_PROTEIN])
+    s_other   = _num(out[_MUM_COL_START_OTHER_SOLIDS])
+    e_skim    = _num(out[_MUM_COL_END_SKIM])
+    e_bf      = _num(out[_MUM_COL_END_BF])
+    e_protein = _num(out[_MUM_COL_END_PROTEIN])
+    e_other   = _num(out[_MUM_COL_END_OTHER_SOLIDS])
 
     scrape_factor = 1.0 + float(milk_scrape_fraction)
-    out[_MUM_COL_START_COST]    = ((s_skim * skim_usage + s_bf * bf_usage) * scrape_factor).round(4)
-    out[_MUM_COL_END_COST]      = ((e_skim * skim_usage + e_bf * bf_usage) * scrape_factor).round(4)
+    out[_MUM_COL_START_COST] = (
+        (
+            s_skim    * skim_usage
+            + s_bf      * bf_usage
+            + s_protein * protein_usage
+            + s_other   * other_usage
+        )
+        * scrape_factor
+    ).round(4)
+    out[_MUM_COL_END_COST] = (
+        (
+            e_skim    * skim_usage
+            + e_bf      * bf_usage
+            + e_protein * protein_usage
+            + e_other   * other_usage
+        )
+        * scrape_factor
+    ).round(4)
     out[_MUM_COL_MILK_COST_GAL] = (
         out[_MUM_COL_END_COST] - out[_MUM_COL_START_COST]
     ).round(4)
-    return out
+
+    # Deterministic column ordering — guarantees the published
+    # ``milk_mover.csv`` matches the canonical layout regardless of
+    # pandas insertion behaviour. Any unexpected upstream columns are
+    # preserved at the END so we never silently drop data.
+    ordered = [c for c in _MUM_OUTPUT_ORDER if c in out.columns]
+    extras  = [c for c in out.columns       if c not in _MUM_OUTPUT_ORDER]
+    return out[ordered + extras]
 
 
 def _milk_lookup_by_desc(milk_usage_with_movers_df: pd.DataFrame) -> dict[str, float]:

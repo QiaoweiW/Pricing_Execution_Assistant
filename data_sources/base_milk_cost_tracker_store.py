@@ -12,7 +12,9 @@ file is the single source of truth for every per-month milk-cost lookup
 downstream — currently used by:
 
 * The "Base Milk Cost per Gallon" auto-update on Product_Milk Base Cost
-  (see ``data_sources/product_milk_base_cost_updater.py``).
+  (see ``data_sources/activity_model_monthly_updater.py`` — the PMBC
+  rule, folded together with the Delivery and PPPI rules into a
+  single monthly orchestrator as of May 2026).
 * Future audit dashboards that need per-item milk-cost history.
 
 Append-only by design

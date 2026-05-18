@@ -2216,20 +2216,15 @@ def _compute_all_outputs(
 
 # ── 7. UI fragments ───────────────────────────────────────────────────────────
 
-# Per-session "we already cleared stale caches after a sign-in" guard.  See
-# :func:`_recover_after_fabric_signin` for the full rationale — without
-# this gate the recovery would re-fire on every rerun while the success
-# banner is still visible.
+# Per-session gate: guards the one-time per-store cache invalidation that
+# runs immediately after a successful Fabric sign-in is detected.  Without
+# this gate the invalidation would re-fire on every Streamlit rerun while
+# the module is still within the same session.
+#
+# NOTE: The device-code sign-in flow itself (URL + code + "Check status"
+# button) was moved to the Home & Fabric Sign-in page and lives in
+# utils/fabric_signin_widget.py.  This module no longer owns that UI.
 _SS_FABRIC_RECOVERY_DONE = f"{_SS_PREFIX}_fabric_recovery_done"
-
-# Per-session "we already auto-started a device-code flow once" guard.
-# Without it, every transient auth failure (e.g. a slow ``az`` subprocess
-# call timing out during a file-upload rerun) would auto-fire a brand
-# new device-code prompt — confusing the user, who thinks they got
-# "kicked back" to sign-in even though they had already signed in.
-# After this gate is set the banner switches to a manual
-# "Try sign-in again" button that lets the user opt-in to a re-attempt.
-_SS_DEVCODE_AUTOSTARTED = f"{_SS_PREFIX}_devcode_autostarted"
 
 
 def _recover_after_fabric_signin() -> None:
@@ -2292,137 +2287,55 @@ def _recover_after_fabric_signin() -> None:
         st.session_state.pop(key, None)
 
 
-def _render_fabric_auth_banner_if_needed() -> bool:
-    """Render the page-level Microsoft Fabric sign-in banner, when needed.
+def _require_fabric_auth() -> bool:
+    """Gate on Fabric auth; return True if auth is broken (caller should stop rendering).
 
-    Returns ``True`` when the banner has fully *replaced* the rest of
-    the page (i.e. the user is not yet signed in).  Caller uses the
-    return value to decide whether to skip rendering the SOP / charts /
-    upload widgets while sign-in is still pending.
+    Checks auth status and runs per-store cache recovery when a sign-in that
+    was completed on the **Home & Fabric Sign-in** page is detected for the
+    first time in this session.
 
-    State machine (in priority order — first match wins):
+    The interactive sign-in UI (device-code URL, "Check status" button, retry
+    button) now lives exclusively on the Home & Fabric Sign-in page
+    (``utils/fabric_signin_widget.py``).  This function no longer renders any
+    sign-in widgets — it only gates rendering and runs the per-store recovery
+    that is specific to this module.
 
-    A. **Sign-in just succeeded** — silently run recovery (clear stale
-       caches + session-state markers from the failed render), reset
-       the device-code state machine, and return ``False`` so the
-       caller continues rendering the SOP / data normally.  No
-       "Continue" intermediary.
-    B. **Auth is healthy** (``cached_auth_error()`` is ``None``) —
-       return ``False`` regardless of any orphan device-code worker
-       still polling in the background.  The credential chain works
-       via SOME path (interactive browser, Azure CLI, env-var SP) and
-       a still-running worker is harmless — it'll time out on its
-       own.  This is the fix for the "kicked back to Check sign-in
-       status after upload" bug: a stale ``thread_alive`` should not
-       gate the page when auth itself is fine.
-    C. **Auth broken, sign-in flow active** — show URL + code +
-       Check sign-in status button.
-    D. **Auth broken, NEVER auto-started a device-code flow this
-       session** — auto-fire one (this is the "first-time visitor
-       lands on an unauthenticated page" path) and immediately drop
-       into state C.
-    E. **Auth broken, already auto-started OR sign-in flow ended in
-       failure** — show a concise error + a manual "Try sign-in
-       again" button.  Crucially, we do NOT auto-fire a fresh flow
-       here: the most common cause of returning to this state mid-
-       session is a transient credential timeout (e.g. ``az`` sub-
-       process being slow on a file-upload rerun), and silently
-       re-popping the device-code prompt would confuse the user
-       into thinking they got logged out.
+    State machine (first matching branch wins)
+    ------------------------------------------
+    A. **Sign-in just succeeded** — run per-store cache recovery once per
+       session, reset device-code state, return False (render normally).
+    B. **Auth healthy** — return False immediately.
+    C. **Auth broken** — show a concise warning directing the user to
+       Home & Fabric Sign-in, return True (stop rendering this section).
     """
     status = _fabric_auth.device_code_signin_status()
-    err = _fabric_auth.cached_auth_error()
+    err    = _fabric_auth.cached_auth_error()
 
-    # ── (A) Sign-in just succeeded — silent recovery, render normally ──────
+    # ── (A) Sign-in just succeeded — run per-store recovery once ─────────────
+    # The sign-in was completed on the Home & Fabric Sign-in page.  Detect it
+    # via the process-wide device_code_signin_status() and run the per-store
+    # invalidation exactly once per session so stale empty-cache frames from
+    # the pre-sign-in render are evicted before this module tries to read them.
     if status["state"] == "success":
         if not st.session_state.get(_SS_FABRIC_RECOVERY_DONE):
             st.session_state[_SS_FABRIC_RECOVERY_DONE] = True
             _recover_after_fabric_signin()
-        # Reset to idle so the success branch does NOT re-fire on
-        # subsequent renders.  ``reset_device_code_signin`` is a no-op
-        # while the worker is still alive — but the worker exits before
-        # writing "success", so this always succeeds in practice.
+        # Reset to "idle" so this branch doesn't re-fire on subsequent renders.
+        # reset_device_code_signin() is a no-op while the worker is alive, but
+        # the worker exits before writing "success", so this always succeeds.
         _fabric_auth.reset_device_code_signin()
-        # A successful sign-in re-arms the auto-start gate so a future
-        # token expiry within the same session can offer device-code
-        # again on a brand-new failure.
-        st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
         return False
 
-    # ── (B) Auth is healthy — render normally even if a worker is alive ────
-    # The credential chain just succeeded via some path (probably Azure
-    # CLI or the warm MSAL cache).  A stale device-code worker may still
-    # be polling from an earlier failed render, but it's harmless — the
-    # MSAL token is already cached.  Don't gate the page on it.
+    # ── (B) Auth healthy — render the module normally ─────────────────────────
     if err is None:
         return False
 
-    # From here on we know auth is currently broken AND no recent success.
-
-    autostarted = bool(st.session_state.get(_SS_DEVCODE_AUTOSTARTED))
-
-    # ── (D) Auto-start device-code on the FIRST broken render only ─────────
-    if (
-        not autostarted
-        and not status["thread_alive"]
-        and status["state"] not in ("pending", "failed")
-    ):
-        st.session_state[_SS_DEVCODE_AUTOSTARTED] = True
-        st.session_state.pop(_SS_FABRIC_RECOVERY_DONE, None)
-        _fabric_auth.start_device_code_signin()
-        # Re-poll status — the worker thread populates the prompt a
-        # moment later, but ``thread_alive`` is already True now.
-        status = _fabric_auth.device_code_signin_status()
-
-    # ── (C) Sign-in flow active — show URL + code prompt ───────────────────
-    if status["thread_alive"] or status["state"] == "pending":
-        st.markdown("### 🔐 Sign in to Microsoft Fabric")
-        prompt = _fabric_auth.get_device_code_prompt()
-        if prompt is not None:
-            st.markdown(
-                f"1. Open **[{prompt['verification_uri']}]({prompt['verification_uri']})**\n\n"
-                f"2. Enter the code: **`{prompt['user_code']}`**\n\n"
-                "3. Sign in with your Darigold Microsoft account.\n\n"
-                "4. Click **Check sign-in status** below."
-            )
-        else:
-            st.info("Initialising sign-in… click **Check sign-in status** in a moment.")
-        if st.button(
-            "🔄 Check sign-in status",
-            key=f"{_SS_PREFIX}_fabric_devcode_poll",
-            type="primary",
-            help="Re-check whether your sign-in has completed.",
-        ):
-            st.rerun()
-        return True
-
-    # ── (E) Already auto-started OR flow failed — manual retry only ────────
-    error_text = (
-        status["error"]
-        if (status["state"] == "failed" and status["error"])
-        else str(err)
-    )
-    st.error(
+    # ── (C) Auth broken — direct user to the centralized sign-in page ─────────
+    st.warning(
         "🔒 **Microsoft Fabric is not connected.**\n\n"
-        f"{error_text}"
+        "Please visit **Home & Fabric Sign-in** in the sidebar to sign in. "
+        "Once signed in, return here — this module will load automatically."
     )
-    if st.button(
-        "🔁 Try sign-in again",
-        key=f"{_SS_PREFIX}_fabric_auth_retry",
-        type="primary",
-        help=(
-            "Clear the cached failure and start a fresh device-code "
-            "sign-in flow."
-        ),
-    ):
-        _fabric_auth.reset_auth_failure_cache()
-        _fabric_auth.reset_device_code_signin()
-        # Re-arm the auto-start gate so the next render will fire a
-        # fresh device-code flow naturally (branch D).
-        st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
-        _recover_after_fabric_signin()
-        st.session_state.pop(_SS_FABRIC_RECOVERY_DONE, None)
-        st.rerun()
     return True
 
 
@@ -3601,13 +3514,12 @@ def render_monthly_resin_freight_mover_tracker() -> None:
     """
     current_month = pd.Timestamp(date.today().replace(day=1))
 
-    # Microsoft Fabric sign-in gate.  When auth is broken or a sign-in
-    # flow is currently pending, the banner takes over the section
-    # entirely — we don't render the SOP, upload widgets, charts or
-    # any OneLake reads until the user has signed in.  This keeps the
-    # UX focused on a single task ("sign in") instead of confusing
-    # the user with a half-empty page sprinkled with error captions.
-    if _render_fabric_auth_banner_if_needed():
+    # Fabric auth gate.  If auth is broken, show a warning directing the user
+    # to Home & Fabric Sign-in and stop rendering.  If a sign-in was just
+    # completed (detected via shared device-code state), run per-store cache
+    # recovery before proceeding.  The interactive sign-in UI is on the Home
+    # page; this module only gates and recovers.
+    if _require_fabric_auth():
         return
 
     # Run the routine USDA auto-update tick once per *session*.  The

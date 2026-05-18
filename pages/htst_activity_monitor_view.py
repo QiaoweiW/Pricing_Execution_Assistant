@@ -1360,7 +1360,9 @@ def render() -> None:
         st.warning(
             "⚠️ Could not pull the HTST Shipment Report from the Pricing "
             "Lakehouse — falling back to manual upload.  Upload the HTST "
-            "Shipment Report alongside the lookup CSVs in the panel below."
+            "Shipment Report alongside the lookup CSVs in the panel below.\n\n"
+            "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+            "in the sidebar to sign in, then return to this page."
         )
         with st.expander("Why did the lakehouse pull fail?", expanded=False):
             st.code(source_result.error or "Unknown error.", language="text")

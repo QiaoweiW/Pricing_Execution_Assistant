@@ -25,7 +25,7 @@ PAGES_DIR = Path(__file__).parent / "pages"
 # Mapping of view file names to display names.
 # Only views listed here are eligible for sidebar navigation.
 VIEW_NAME_MAPPING = {
-    "home_view":                          "Home",
+    "home_view":                          "Home & Fabric Sign-in",
     "bid_asset_intelligence_view":        "Bid Asset Intelligence",
     "htst_activity_monitor_view":         "Shipment Monitor & HTST Requote",
     "new_price_quote_view":               "New Price Quote",
@@ -150,9 +150,9 @@ with st.sidebar:
     # Page selection buttons - dynamically generated from available views
     # Sort views to ensure Home is first, then alphabetical order
     sorted_views = sorted(AVAILABLE_VIEWS.keys())
-    if "Home" in sorted_views:
-        sorted_views.remove("Home")
-        sorted_views.insert(0, "Home")
+    if "Home & Fabric Sign-in" in sorted_views:
+        sorted_views.remove("Home & Fabric Sign-in")
+        sorted_views.insert(0, "Home & Fabric Sign-in")
     
     for display_name in sorted_views:
         # Create a safe key from the display name
@@ -181,9 +181,9 @@ with st.sidebar:
 
 # Initialize session state if not exists
 if 'selected_page' not in st.session_state:
-    # Default to Home if available, otherwise first available view
-    if "Home" in PAGE_ROUTER:
-        st.session_state.selected_page = "Home"
+    # Default to Home & Fabric Sign-in if available, otherwise first available view
+    if "Home & Fabric Sign-in" in PAGE_ROUTER:
+        st.session_state.selected_page = "Home & Fabric Sign-in"
     elif PAGE_ROUTER:
         st.session_state.selected_page = list(PAGE_ROUTER.keys())[0]
     else:
@@ -205,9 +205,9 @@ if render_function:
 else:
     # Default to Home if unknown page (shouldn't happen, but safety check)
     st.warning(f"⚠️ Unknown page: {st.session_state.selected_page}. Redirecting to Home.")
-    if "Home" in PAGE_ROUTER:
-        st.session_state.selected_page = "Home"
-        PAGE_ROUTER["Home"]()
+    if "Home & Fabric Sign-in" in PAGE_ROUTER:
+        st.session_state.selected_page = "Home & Fabric Sign-in"
+        PAGE_ROUTER["Home & Fabric Sign-in"]()
     elif PAGE_ROUTER:
         # Fallback to first available view
         first_view = list(PAGE_ROUTER.keys())[0]

@@ -1,28 +1,35 @@
-"""
-Bid Asset Intelligence page view.
+"""Bid Asset Intelligence page view.
+
+The page pulls bid-asset CSVs directly from the Microsoft Fabric Lakehouse,
+renders four analytical sections, and lets operators edit the Item-level
+Details and publish their changes back to the lakehouse.
 
 Sections
 --------
-1. Types & constants     (_FilterResult, _FINANCIAL_COLS, _GROUP_COLS,
-                          _STATUS_RULES, _DEFAULT_STATUS_COLOR, _COLOR_LEGEND,
-                          _CHART_FONT, _SHAREPOINT_URL, _OVERVIEW_TABLE_COLS)
-2. Formatting helpers    (_fmt_currency, _fmt_volume, _fmt_pct, _to_csv_bytes,
-                          _apply_display_formats)
-3. Data helpers          (_month_sort_key, _coerce_month_to_label, _sel_hash,
-                          _excel_serial_to_date, _parse_currency_col,
-                          _filter_by_month_range)
-4. Chart helpers         (_round_num, _make_bid_label, _status_color,
-                          _prepare_chart_data, _build_overview_chart)
-5. Data loading          (_load_and_normalise)
-6. Page sections         (_multiselect_filter, _render_overview_table,
-                          _render_bid_overview, _render_search_filters,
-                          _render_rfp_summary, _render_detail_table)
-7. Entry point           (render)
+1. Types & constants     (``_FilterResult``, ``_GROUP_COLS``, status colour
+                          rules, ``_CHART_FONT``, ``_LAKEHOUSE_FOLDER``,
+                          ``_OVERVIEW_TABLE_COLS``, ``_ROW_ID_COL`` and
+                          session-state key helpers).
+2. Formatting helpers    (``_fmt_currency``, ``_fmt_volume``, ``_fmt_pct``,
+                          ``_to_csv_bytes``, ``_apply_display_formats``).
+3. Data helpers          (``_month_sort_key``, ``_sel_hash``,
+                          ``_filter_by_month_range``).
+4. Chart helpers         (``_round_num``, ``_make_bid_label``,
+                          ``_status_color``, ``_prepare_chart_data``,
+                          ``_build_overview_chart``).
+5. Page sections         (``_multiselect_filter``, ``_render_overview_table``,
+                          ``_render_bid_overview``, ``_render_search_filters``,
+                          ``_render_rfp_summary``, ``_render_program_tracker``,
+                          ``_render_editable_item_details``).
+6. Entry point           (``render``).
+
+All Lakehouse I/O, schema normalisation, and currency parsing live in
+``data_sources.bid_asset_store``; this module is presentation only.
 """
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import NamedTuple, Optional
 
 import pandas as pd
@@ -30,6 +37,9 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from data_sources import bid_asset_store as _bid_store
+from data_sources.bid_asset_store import BidAssetStoreError
+from utils import fabric_signin_widget
 from utils.ui_helpers import apply_custom_css
 
 # ── 1. Types & constants ──────────────────────────────────────────────────────
@@ -47,9 +57,9 @@ class _FilterResult(NamedTuple):
     sel_round:   list[str]
 
 
-# Used for both currency parsing on load AND aggregation/display in tables.
-# Single source of truth — no separate SUM_COLS / NUMERIC_COLS needed.
-_FINANCIAL_COLS = ["Volume (lbs)", "FOB Revenue $/Yr", "PCM $/Yr", "GP $/Yr"]
+# Financial columns are owned by ``bid_asset_store`` (single source of truth
+# for the data shape). This alias keeps the page's call sites short.
+_FINANCIAL_COLS: tuple[str, ...] = _bid_store.FINANCIAL_COLS
 
 # Column names used to group rows in the RFP Summary aggregation.
 _GROUP_COLS = [
@@ -89,14 +99,17 @@ _OVERVIEW_TABLE_COLS: list[tuple[str, str]] = [
     ("Status",          "Status"),
 ]
 
-_SHAREPOINT_URL = (
-    "https://darigold1com.sharepoint.com/sites/BrandedPricing/Shared%20Documents"
-    "/Forms/AllItems.aspx?id=%2Fsites%2FBrandedPricing%2FShared%20Documents"
-    "%2FGeneral%2F02%20Resources%2FStreamlit%20Folders%20%28DO%20NOT%20DELETE%29"
-    "%2FRFP%20Management%2FUpload&viewid=9103ebc3%2Df944%2D4451%2Dbe05%2Dd0cb7479e27e"
-    "&newTargetListUrl=%2Fsites%2FBrandedPricing%2FShared%20Documents"
-    "&viewpath=%2Fsites%2FBrandedPricing%2FShared%20Documents%2FForms%2FAllItems%2Easpx"
-)
+# Fabric Lakehouse folder that stores bid-asset CSV files.
+# Uses the shared [fabric_htst] secrets section (workspace + lakehouse).
+# Files are listed from this path and the most recently modified CSV is
+# loaded automatically.  Users can override the selection via the picker
+# that appears when more than one CSV is present in the folder.
+_LAKEHOUSE_FOLDER: str = "Program_Bid_Management"
+
+# Internal column injected into the in-memory copy of the bid DataFrame to
+# give every row a stable identifier ``st.data_editor`` can use to map edits
+# back to their source rows. Hidden from the user via ``column_order``.
+_ROW_ID_COL: str = "__row_id"
 
 # ── 2. Formatting helpers ─────────────────────────────────────────────────────
 
@@ -146,37 +159,31 @@ def _apply_display_formats(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 # ── 3. Data helpers ───────────────────────────────────────────────────────────
 
-def _month_sort_key(m_str: str) -> datetime:
-    """Parse a canonical 'Mon YYYY' string to datetime for sorting/comparison.
+# Month formats we attempt before falling back to pandas' flexible parser.
+# Ordered by frequency in real source data so common cases short-circuit fast.
+_MONTH_FORMATS: tuple[str, ...] = (
+    "%b %Y", "%B %Y", "%m/%d/%Y", "%m/%Y", "%Y-%m-%d", "%Y-%m",
+)
 
-    Returns datetime.min on failure so unparseable values sort to the front
-    without raising.  After _load_and_normalise runs, every Month value is
-    guaranteed to be in this format, so failure should never occur in practice.
+
+def _month_sort_key(m_str: str) -> datetime:
+    """Parse any common Month representation into a datetime for sort/compare.
+
+    Handles both the canonical ``"Mon YYYY"`` (e.g. ``"Mar 2026"``) AND the
+    raw ``"M/D/YYYY"`` (e.g. ``"3/1/2026"``) forms that may live untouched in
+    the Lakehouse CSV. Returns ``datetime.min`` on failure so unparseable
+    values sort to the front without raising.
     """
+    s = str(m_str).strip()
+    for fmt in _MONTH_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
     try:
-        return datetime.strptime(str(m_str).strip(), "%b %Y")
+        return pd.to_datetime(s, errors="raise").to_pydatetime()
     except Exception:
         return datetime.min
-
-
-def _coerce_month_to_label(val) -> str:
-    """Normalise any common month representation to the canonical 'Mon YYYY' label.
-
-    Tries a series of explicit strptime formats first (fastest, most predictable),
-    then falls back to pandas' flexible parser.  This is the single place that
-    bridges the variety of month formats found in uploaded CSVs to the format
-    expected by _month_sort_key and the month-range slider.
-    """
-    s = str(val).strip()
-    for fmt in ("%b %Y", "%B %Y", "%Y-%m", "%m/%Y", "%m-%Y", "%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%b %Y")
-        except ValueError:
-            pass
-    try:
-        return pd.to_datetime(s).strftime("%b %Y")
-    except Exception:
-        return s  # return as-is; slider will display it but filtering may not work
 
 
 def _sel_hash(*selections) -> str:
@@ -192,36 +199,6 @@ def _sel_hash(*selections) -> str:
     return hashlib.md5(combined.encode()).hexdigest()[:8]
 
 
-def _excel_serial_to_date(serial) -> str:
-    """Convert an Excel date serial integer to a 'Mon YYYY' label."""
-    try:
-        dt = datetime(1899, 12, 30) + timedelta(days=int(float(serial)))
-        return dt.strftime("%b %Y")
-    except Exception:
-        return str(serial)
-
-
-def _parse_currency_col(series: pd.Series) -> pd.Series:
-    """Convert currency strings like '$424,236' or '$(3,846)' to floats.
-
-    Numeric series are returned unchanged.  Negative values expressed with
-    parentheses (accounting notation) are converted to negative floats.
-    """
-    if pd.api.types.is_numeric_dtype(series):
-        return series
-    cleaned = (
-        series.astype(str)
-        .str.strip()
-        .str.replace(r"\$", "", regex=True)
-        .str.replace(",",   "", regex=False)
-        .str.replace(" ",   "", regex=False)
-    )
-    is_neg = cleaned.str.startswith("(")
-    cleaned = cleaned.str.replace(r"[()]", "", regex=True)
-    result  = pd.to_numeric(cleaned, errors="coerce")
-    return result.where(~is_neg, -result)
-
-
 def _filter_by_month_range(
     df: pd.DataFrame,
     start_dt: Optional[datetime],
@@ -229,13 +206,14 @@ def _filter_by_month_range(
 ) -> pd.DataFrame:
     """Return rows whose Month falls within [start_dt, end_dt] (inclusive).
 
-    Vectorized via pd.to_datetime — avoids row-by-row Python apply overhead.
-    Relies on Month having been normalised to 'Mon YYYY' by _load_and_normalise;
-    unparseable values become NaT and are excluded from the result.
+    Uses pandas' flexible date parser (no format hint) so the same code works
+    whether the source CSV stores Month as ``"Mar 2026"`` (canonical label) or
+    ``"3/1/2026"`` (raw spreadsheet date). Unparseable values become ``NaT``
+    and are silently excluded from the result.
     """
     if "Month" not in df.columns or start_dt is None or end_dt is None:
         return df
-    month_dts = pd.to_datetime(df["Month"], format="%b %Y", errors="coerce")
+    month_dts = pd.to_datetime(df["Month"], errors="coerce")
     return df[(month_dts >= start_dt) & (month_dts <= end_dt)]
 
 
@@ -453,43 +431,30 @@ def _build_overview_chart(
     return fig
 
 
-# ── 5. Data loading & normalisation ───────────────────────────────────────────
+# ── 5. Editor session-state helpers ───────────────────────────────────────────
+#
+# Lakehouse I/O lives in ``data_sources.bid_asset_store`` — this section holds
+# only the per-file session-state keys that back the editable Item-level grid.
 
-def _load_and_normalise(uploaded_file) -> Optional[pd.DataFrame]:
-    """Read the uploaded CSV and normalise it in-place:
+def _session_df_key(file_path: str) -> str:
+    return f"_bid_edit_df::{file_path}"
 
-    - Strip column-name whitespace.
-    - Rename 'Rounds' → 'Round' for schema consistency.
-    - Convert Month to canonical 'Mon YYYY' labels, handling numeric Excel
-      serials and any string format via _coerce_month_to_label.  This step
-      is critical: without it, _month_sort_key returns datetime.min for all
-      values, making the month-range slider a silent no-op.
-    - Parse financial columns to float via _parse_currency_col.
 
-    Returns None (with st.error displayed) on read failure.
-    """
-    try:
-        df = pd.read_csv(uploaded_file)
-    except Exception as exc:
-        st.error(f"Could not read the uploaded file: {exc}")
-        return None
+def _session_etag_key(file_path: str) -> str:
+    return f"_bid_edit_etag::{file_path}"
 
-    df.columns = df.columns.str.strip()
 
-    if "Rounds" in df.columns:
-        df = df.rename(columns={"Rounds": "Round"})
+def _session_dirty_key(file_path: str) -> str:
+    return f"_bid_edit_dirty::{file_path}"
 
-    if "Month" in df.columns:
-        if pd.api.types.is_numeric_dtype(df["Month"]):
-            df["Month"] = df["Month"].apply(_excel_serial_to_date)
-        else:
-            df["Month"] = df["Month"].apply(_coerce_month_to_label)
 
-    for col in _FINANCIAL_COLS:
-        if col in df.columns:
-            df[col] = _parse_currency_col(df[col])
-
-    return df
+def _initialise_edit_state(file_path: str, df: pd.DataFrame, etag: Optional[str]) -> None:
+    """Seed per-file edit state in session with a stable row identifier."""
+    keyed = df.copy()
+    keyed[_ROW_ID_COL] = range(len(keyed))
+    st.session_state[_session_df_key(file_path)] = keyed
+    st.session_state[_session_etag_key(file_path)] = etag
+    st.session_state[_session_dirty_key(file_path)] = False
 
 
 # ── 6. Page sections ──────────────────────────────────────────────────────────
@@ -531,11 +496,38 @@ def _multiselect_filter(
         sorted(src[col].dropna().astype(str).unique().tolist())
         if col in src.columns else []
     )
-    sel = st.multiselect(label, options=opts, default=opts, key=key)
+
+    # Defensive: when widget keys are stable across reruns (no cascading-hash
+    # reset), the user's prior selection may contain values that no longer
+    # appear in the current option pool — e.g. because an upstream filter has
+    # narrowed the available options. Streamlit raises when the persisted
+    # selection isn't a subset of `options`, so we sanitise session state in
+    # place before the widget renders. This is the fix that makes
+    # Bid Description / Round / Format dropdowns interactable across reruns.
+    if key in st.session_state:
+        try:
+            current = [v for v in st.session_state[key] if v in opts]
+        except TypeError:
+            current = []
+        if current != st.session_state[key]:
+            st.session_state[key] = current
 
     if not opts:
-        # Column is absent — nothing to filter on; pass pool through unchanged.
-        return sel, pool_df
+        # Column is absent or has no values — show a disabled placeholder so
+        # the user sees *why* the dropdown is empty rather than thinking the
+        # widget is broken.
+        st.multiselect(
+            label,
+            options=[],
+            default=[],
+            key=key,
+            disabled=True,
+            placeholder=f"No {label.lower()} values available",
+        )
+        return [], pool_df
+
+    sel = st.multiselect(label, options=opts, default=opts, key=key)
+
     if not sel:
         # User explicitly cleared the widget; return an empty frame so downstream
         # sections know there is no valid selection rather than showing all rows.
@@ -729,6 +721,12 @@ def _render_search_filters(
     # Company options always come from the full dataset (raw_df) so known
     # companies are never hidden by the month filter, while actual row filtering
     # still operates on the month-scoped pool (df_month).
+    # ── Cascading dropdowns with STABLE widget keys ───────────────────────────
+    # Using stable (non-hashed) keys lets the user pick Bid Description / Round
+    # / Format independently without the widget being recreated every time a
+    # parent's selection changes. _multiselect_filter() above prunes any stale
+    # values from session_state before each render, so an upstream narrowing
+    # never throws on a now-invalid persisted selection.
     f1, f2, f3, f4 = st.columns(4)
     with f1:
         sel_company, df1 = _multiselect_filter(
@@ -738,17 +736,17 @@ def _render_search_filters(
     with f2:
         sel_bid, df2 = _multiselect_filter(
             "Bid Description", "Bid Description", df1,
-            key=f"ms_bid_{_sel_hash(sel_company)}",
+            key="ms_bid_desc",
         )
     with f3:
         sel_round, df3 = _multiselect_filter(
             "Round", "Round", df2,
-            key=f"ms_round_{_sel_hash(sel_company, sel_bid)}",
+            key="ms_round",
         )
     with f4:
         sel_format, filtered_df = _multiselect_filter(
             "Format", "Format", df3,
-            key=f"ms_format_{_sel_hash(sel_company, sel_bid, sel_round)}",
+            key="ms_format",
         )
 
     empty = [
@@ -843,27 +841,199 @@ def _render_rfp_summary(result: _FilterResult) -> None:
     )
 
 
-def _render_detail_table(filtered_df: pd.DataFrame) -> None:
-    """Render the Detailed Item-Level Data section."""
-    st.markdown("### 📋 Item-level Details")
-    st.caption("Full extract of the CSV filtered by the search criteria above.")
+# ── Editable Item-level Details ───────────────────────────────────────────────
 
-    available_sum = [c for c in _FINANCIAL_COLS if c in filtered_df.columns]
+# Cascading order used by the Item-level Details quick filters. The DataFrame
+# is narrowed by each filter in turn, so the options offered by each downstream
+# multiselect are restricted to values that co-occur with the upstream picks.
+_EDIT_FILTER_COLS: tuple[str, ...] = (
+    "Company",
+    "Bid Description",
+    "Round",
+    "Status",
+    "Referenced Item",
+)
 
-    detail_download = filtered_df.copy()
-    for col in filtered_df.columns:
-        if "$/ea" in col.lower() and pd.api.types.is_numeric_dtype(detail_download[col]):
-            detail_download[col] = detail_download[col].round(4)
 
-    detail_display = _apply_display_formats(detail_download, available_sum)
+def _edit_filter_key(col_name: str) -> str:
+    """Stable session-state key for an Item-level Details quick-filter widget."""
+    return f"edit_filter_{col_name}"
 
-    st.dataframe(detail_display, use_container_width=True, hide_index=True)
+
+def _render_editable_item_details(file_path: str) -> None:
+    """Render the editable item-level table with right-aligned publish action.
+
+    Layout (top → bottom)
+    ---------------------
+    1. Section heading + caption + (right-aligned) Refresh & Publish to Fabric button.
+    2. Optional "unsaved edits" banner.
+    3. Cascading quick-filter row with Select All / Clear All shortcuts. Order:
+       Company → Bid Description → Round → Status → Referenced Item.
+    4. The editable ``st.data_editor`` table itself, with:
+         • ``Bid Description`` pinned (frozen) to the left while scrolling.
+         • Internal ``__row_id`` column hidden from view via ``column_order``.
+    5. Download CSV button.
+
+    Editing semantics
+    -----------------
+    Edits are merged into ``st.session_state`` keyed by file path on every
+    rerun, so the user can edit many rows across many filter views without
+    losing any in-progress changes. The page reruns triggered by data-editor
+    interactions only rebuild the visible widgets; they never reset edits,
+    filter selections, or scroll position. Only the **Refresh & Publish to
+    Fabric** button writes to the lakehouse and forces a full re-sync.
+
+    On publish:
+        a. Overwrite the selected file in the Fabric Lakehouse (ETag-aware).
+        b. Re-read the file from the lakehouse to capture the new ETag.
+        c. ``st.rerun()`` so every other section on this page (Bid Overview,
+           RFP Program-level Details, Program Implementation Tracker) reflects
+           the lakehouse source-of-truth in the same interaction.
+    """
+    df_key = _session_df_key(file_path)
+    dirty_key = _session_dirty_key(file_path)
+    etag_key = _session_etag_key(file_path)
+    edit_df = st.session_state[df_key]
+
+    # ── Header row: title (left) + Refresh & Publish button (right) ───────────
+    head_col, action_col = st.columns([5, 2])
+    with head_col:
+        st.markdown("### 📋 Item-level Details")
+        st.caption(
+            "Edit any cell directly. Filters cascade left-to-right; you can edit "
+            "rows in any filter view without losing changes from other views. "
+            "Click **Refresh & Publish to Fabric** when you are ready to save all "
+            "edits to the lakehouse and re-sync every section on this page."
+        )
+    with action_col:
+        # Vertical spacer keeps the button visually aligned with the table edge
+        # (matches the typical Streamlit baseline of caption + heading).
+        st.markdown("<div style='height: 0.75rem;'></div>", unsafe_allow_html=True)
+        publish_clicked = st.button(
+            "🔄 Refresh & Publish to Fabric",
+            key=f"publish_bid_{hash(file_path)}",
+            type="primary",
+            help="Save current edits to the Fabric Lakehouse and re-sync every section on this page.",
+            use_container_width=True,
+        )
+
+    if st.session_state.get(dirty_key):
+        st.warning("Unsaved edits detected. Click **Refresh & Publish to Fabric** to persist changes.")
+
+    # ── Bulk-filter shortcuts: Select All / Clear All ────────────────────────
+    # Manipulating session state in the button handlers is safe because
+    # Streamlit auto-reruns after a button click; the multiselects below
+    # render with the freshly-applied state on that next pass.
+    btn_all, btn_clear, btn_spacer = st.columns([1, 1, 6])
+    with btn_all:
+        if st.button(
+            "✅ Select All",
+            key="edit_filters_select_all",
+            help="Reset every Item-level filter to include all available values.",
+            use_container_width=True,
+        ):
+            for col_name in _EDIT_FILTER_COLS:
+                st.session_state.pop(_edit_filter_key(col_name), None)
+    with btn_clear:
+        if st.button(
+            "✖ Clear All",
+            key="edit_filters_clear_all",
+            help="Clear every Item-level filter so the grid shows zero rows.",
+            use_container_width=True,
+        ):
+            for col_name in _EDIT_FILTER_COLS:
+                st.session_state[_edit_filter_key(col_name)] = []
+
+    # ── Cascading quick filters ───────────────────────────────────────────────
+    # Each filter's option pool is derived from the rows that survived the
+    # upstream filters, so picking a Company instantly narrows the Bid
+    # Description options, picking a Bid Description narrows Round, etc.
+    # ``_multiselect_filter`` prunes stale session-state values before each
+    # render, so cascading narrows never throw on invalid persisted selections.
+    fcols = st.columns(len(_EDIT_FILTER_COLS))
+    filtered = edit_df
+    for col_name, col_slot in zip(_EDIT_FILTER_COLS, fcols):
+        with col_slot:
+            _sel, filtered = _multiselect_filter(
+                col_name,
+                col_name,
+                filtered,
+                key=_edit_filter_key(col_name),
+            )
+
+    # ── Editable data grid ────────────────────────────────────────────────────
+    # Display order: Bid Description first (pinned), then the rest of the file's
+    # columns in their original order. The internal `__row_id` column stays in
+    # the DataFrame so we can map edits back to the source rows, but it is
+    # excluded from `column_order` to keep it visually hidden from the user.
+    other_cols = [c for c in edit_df.columns if c not in (_ROW_ID_COL, "Bid Description")]
+    visible_cols = (["Bid Description"] if "Bid Description" in edit_df.columns else []) + other_cols
+
+    column_config: dict[str, object] = {}
+    if "Bid Description" in visible_cols:
+        column_config["Bid Description"] = st.column_config.Column(
+            label="Bid Description",
+            help="Frozen column — stays in view as you scroll horizontally.",
+            pinned=True,
+        )
+
+    editor_frame = filtered[[_ROW_ID_COL] + visible_cols].copy()
+    edited_frame = st.data_editor(
+        editor_frame,
+        key=f"item_details_editor_{hash(file_path)}",
+        use_container_width=True,
+        hide_index=True,
+        disabled=[_ROW_ID_COL],
+        column_order=visible_cols,  # `__row_id` is omitted → visually hidden.
+        column_config=column_config,
+        num_rows="fixed",
+    )
+
+    # Merge edits back into session state (only the columns the user can see;
+    # `__row_id` is the merge key and remains read-only).
+    if not edited_frame.empty:
+        base = edit_df.set_index(_ROW_ID_COL)
+        patch = edited_frame.set_index(_ROW_ID_COL)
+        for col in visible_cols:
+            if col in patch.columns:
+                base.loc[patch.index, col] = patch[col]
+        merged = base.reset_index()
+        if not merged.equals(edit_df):
+            st.session_state[df_key] = merged
+            st.session_state[dirty_key] = True
+
+    # ── Publish: write → re-read from lakehouse → rerun ───────────────────────
+    # Runs AFTER applying in-run editor patches, so the push always uses the
+    # most recent user edits visible in this render.
+    if publish_clicked:
+        publish_df = st.session_state[df_key].drop(columns=[_ROW_ID_COL], errors="ignore")
+        try:
+            _bid_store.overwrite_bid_file(
+                file_path,
+                publish_df,
+                etag=st.session_state.get(etag_key),
+            )
+            # Force re-read from lakehouse so every downstream section on this
+            # page (Program Tracker, RFP table, Bid Overview) reflects the
+            # authoritative source-of-truth on the very next render.
+            source_df, source_etag = _bid_store.read_bid_file(file_path)
+        except BidAssetStoreError as exc:
+            st.error(
+                f"Could not publish edits to Fabric Lakehouse: {exc}\n\n"
+                "Tip: Reload from Lakehouse and re-apply your edits if the source file "
+                "was updated by another user."
+            )
+        else:
+            _initialise_edit_state(file_path, source_df, source_etag)
+            st.success("Published and re-synced from Fabric Lakehouse.")
+            st.rerun()
+
     st.download_button(
-        label="⬇️ Download Detailed Table (CSV)",
-        data=_to_csv_bytes(detail_download),
+        label="⬇️ Download Current Item-level Details (CSV)",
+        data=_to_csv_bytes(st.session_state[df_key].drop(columns=[_ROW_ID_COL], errors="ignore")),
         file_name=f"bid_asset_detail_{datetime.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
-        key="download_detail",
+        key=f"download_detail_{hash(file_path)}",
     )
 
 
@@ -890,32 +1060,45 @@ _TRACKER_DISPLAY_COLS = {
 }
 
 
-def _render_pricing_tracker(raw_df: pd.DataFrame) -> None:
-    """Render the Pricing Implementation Tracker summary table."""
-    st.markdown("### 🗂️ Pricing Implementation Tracker")
-    st.caption("Accepted bids only — sourced from the full uploaded CSV (not filtered by search criteria above).")
-
-    present_cols = [c for c in _TRACKER_SOURCE_COLS if c in raw_df.columns]
-    missing_cols = [c for c in _TRACKER_SOURCE_COLS if c not in raw_df.columns]
-
-    if missing_cols:
-        st.warning(
-            f"The following expected columns were not found in the CSV and will be omitted: "
-            f"{', '.join(missing_cols)}"
-        )
-
-    if "Status" not in raw_df.columns:
-        st.info("No **Status** column found — cannot filter for accepted rows.")
-        return
-
-    tracker_df = raw_df[raw_df["Status"].astype(str).str.strip().str.lower() == "accept"][present_cols].copy()
-
+def _render_program_tracker(raw_df: pd.DataFrame) -> None:
+    """Render Program Implementation Tracker with required priority ordering."""
+    st.markdown("### 🗂️ Program Implementation Tracker")
+    st.caption(
+        "Accepted bids only. Sorted by Price Implementation Status priority "
+        "(Not Started first), then Price Implementation Time descending."
+    )
+    tracker_df = _bid_store.build_program_tracker(raw_df)
     if tracker_df.empty:
-        st.info("No rows with Status = \"Accept\" found in the uploaded CSV.")
+        st.info("No rows available for Program Implementation Tracker.")
         return
 
-    tracker_df = tracker_df.rename(columns=_TRACKER_DISPLAY_COLS)
-    st.dataframe(tracker_df, use_container_width=True, hide_index=True)
+    # Friendlier display labels — internal column name stays canonical
+    # (matches the source CSV) for round-trip safety; the rename here is
+    # cosmetic only.
+    display_status_label = "Price Implementation Status"
+    display = tracker_df.rename(
+        columns={
+            "Price Implement Time":   "Price Implementation Time",
+            _bid_store.COL_STATUS:    display_status_label,
+        }
+    )
+
+    def _status_font_color(val: object) -> str:
+        # Use the centralised canonical mapping so spelling variants like
+        # "Not-started" (with a hyphen) and "start soon" (lower-case) still
+        # trigger the red emphasis.
+        if (
+            _bid_store.status_is_not_started(val)
+            or _bid_store.status_is_start_soon(val)
+        ):
+            return "color: #d32f2f; font-weight: 600;"
+        return ""
+
+    st.dataframe(
+        display.style.applymap(_status_font_color, subset=[display_status_label]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # ── 8. Entry point ────────────────────────────────────────────────────────────
@@ -923,9 +1106,13 @@ def _render_pricing_tracker(raw_df: pd.DataFrame) -> None:
 def render() -> None:
     """Render the Bid Asset Intelligence page.
 
-    Orchestrates the four page sections in order.  Each section is self-contained:
-    it reads Streamlit widget state, computes its own data slice, and renders its
-    own UI.  render() itself carries no business logic.
+    Data is pulled automatically from the Fabric Lakehouse (``Files/Program_Bid_Management``).
+    No file upload is required; users must be signed in to Microsoft Fabric via the
+    Home & Fabric Sign-in page.
+
+    Orchestrates the four analysis sections in order.  Each section is self-contained:
+    it reads Streamlit widget state, computes its own data slice, and renders its own UI.
+    render() itself carries no business logic beyond routing the loaded DataFrame.
     """
     apply_custom_css()
 
@@ -943,24 +1130,113 @@ and sharpen future bid strategies. Key resources include:
 - **Visualizations:** Charts for bid comparisons.
 - **RFP Program-level Table:** High-level tracking of program size, status and key financials.
 - **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
+
+Data is loaded automatically from the **Fabric Lakehouse** (`Files/Program_Bid_Management`).
+Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data does not appear.
 """)
     st.markdown("---")
 
-    st.markdown("### 📤 Upload Bid Asset CSV File")
-    st.markdown(f"Upload Bid Asset CSV export saved in the [SharePoint Folder]({_SHAREPOINT_URL})")
-
-    uploaded_file = st.file_uploader(
-        "Select Bid Asset CSV", type=["csv"], key="bid_asset_uploader"
-    )
-    if uploaded_file is None:
-        st.info("👆 Upload a CSV file above to unlock the search and analysis tables.")
+    # ── Fabric auth gate ──────────────────────────────────────────────────────
+    # If the user is not signed in, show a concise redirect warning and stop.
+    # The actual sign-in UI lives exclusively on the Home & Fabric Sign-in page.
+    if not fabric_signin_widget.is_fabric_signed_in():
+        st.warning(
+            "🔒 **Microsoft Fabric is not connected.**\n\n"
+            "Please visit **Home & Fabric Sign-in** in the sidebar to sign in. "
+            "Once signed in, return here — bid data will load automatically."
+        )
         return
 
-    raw_df = _load_and_normalise(uploaded_file)
-    if raw_df is None:
+    # ── List CSV files in the Lakehouse folder ────────────────────────────────
+    # Show a spinner during the directory listing (first render or after cache
+    # expiry); subsequent reruns within the 5-minute TTL use the cached result.
+    with st.spinner("Checking Fabric Lakehouse for bid asset files…"):
+        try:
+            available_files = _bid_store.list_bid_files()
+        except BidAssetStoreError as exc:
+            st.error(
+                f"Could not list files in `Files/{_LAKEHOUSE_FOLDER}`: {exc}\n\n"
+                "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+                "in the sidebar to sign in, then return here."
+            )
+            return
+
+    if not available_files:
+        st.info(
+            f"No CSV files found in `Files/{_LAKEHOUSE_FOLDER}` on the Fabric Lakehouse. "
+            "Please upload the Bid Asset CSV to that folder and refresh this page."
+        )
         return
 
-    st.success(f"✅ File loaded — **{len(raw_df):,} rows**, **{len(raw_df.columns)} columns**")
+    # Sort newest-first so the default selection is always the latest file.
+    file_labels = [
+        f"{f.name}  ({f.last_modified or 'unknown date'})"
+        for f in available_files
+    ]
+
+    # ── File picker (only shown when multiple files are present) ──────────────
+    # Single file → auto-select silently.  Multiple files → show a selectbox
+    # so users can access historical snapshots without navigating OneLake.
+    st.markdown("### 📂 Bid Asset Data — Fabric Lakehouse")
+    if len(available_files) == 1:
+        selected_file = available_files[0]
+        st.caption(
+            f"Auto-loaded: `{selected_file.name}` "
+            f"(last modified: {selected_file.last_modified or 'unknown'})"
+        )
+    else:
+        chosen_label = st.selectbox(
+            "Select file to load",
+            options=file_labels,
+            index=0,
+            key="bid_asset_file_picker",
+            help=(
+                "Files are sorted newest-first. The most recently modified file "
+                "is selected by default."
+            ),
+        )
+        chosen_idx = file_labels.index(chosen_label)
+        selected_file = available_files[chosen_idx]
+
+    # ── Load & cache the selected file ───────────────────────────────────────
+    # On first render (or after Reload) we fetch the file via
+    # ``bid_asset_store.read_bid_file`` and stash the result in session state
+    # so subsequent reruns (slider drags, filter changes, edits in the data
+    # editor) don't re-hit OneLake. ``Refresh & Publish to Fabric`` and the
+    # Reload button below are the only paths that re-fetch from the lakehouse.
+    col_info, col_reload = st.columns([4, 1])
+    with col_reload:
+        if st.button(
+            "🔄 Reload from Lakehouse",
+            key="bid_asset_reload",
+            help="Discard local edits and re-fetch the selected file from OneLake.",
+        ):
+            st.session_state.pop(_session_df_key(selected_file.full_path), None)
+            st.session_state.pop(_session_etag_key(selected_file.full_path), None)
+            st.session_state.pop(_session_dirty_key(selected_file.full_path), None)
+            st.rerun()
+
+    df_key = _session_df_key(selected_file.full_path)
+    etag_key = _session_etag_key(selected_file.full_path)
+    if df_key not in st.session_state:
+        try:
+            source_df, source_etag = _bid_store.read_bid_file(selected_file.full_path)
+        except BidAssetStoreError as exc:
+            st.error(
+                f"Could not read bid data from Fabric Lakehouse: {exc}\n\n"
+                "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+                "in the sidebar to sign in, then return here."
+            )
+            return
+        _initialise_edit_state(selected_file.full_path, source_df, source_etag)
+
+    raw_df = st.session_state[df_key].drop(columns=[_ROW_ID_COL], errors="ignore")
+
+    with col_info:
+        st.success(
+            f"✅ Loaded `{selected_file.name}` — "
+            f"**{len(raw_df):,} rows**, **{len(raw_df.columns)} columns**"
+        )
     st.markdown("---")
 
     # Sorted month list computed once and shared by both sliders.
@@ -973,12 +1249,17 @@ and sharpen future bid strategies. Key resources include:
     st.markdown("---")
 
     result = _render_search_filters(raw_df, all_months_sorted)
-    if result is None:
-        return
+    if result is not None:
+        st.markdown("---")
+        _render_rfp_summary(result)
+        st.markdown("---")
+    else:
+        st.info(
+            "RFP Program-level Table is hidden until all required Search & Filter "
+            "selections are set. Item-level editing remains available below."
+        )
+        st.markdown("---")
 
+    _render_program_tracker(raw_df)
     st.markdown("---")
-    _render_rfp_summary(result)
-    st.markdown("---")
-    _render_detail_table(result.df)
-    st.markdown("---")
-    _render_pricing_tracker(raw_df)
+    _render_editable_item_details(selected_file.full_path)

@@ -30,7 +30,14 @@ from pathlib import Path
 from collections import Counter
 import traceback
 from datetime import datetime, timedelta
+from typing import Optional
 
+from data_sources import bid_asset_store as _bid_store
+from data_sources import task_manager_store as _task_store
+from data_sources.bid_asset_store import BidAssetStoreError
+from data_sources.task_manager_store import TaskManagerStoreError
+from utils import notification_helpers as _notify
+from utils.notification_helpers import NotificationError
 from utils.ui_helpers import apply_custom_css, create_metric_box, safe_error_message
 from utils.data_helpers import load_existing_data
 from utils.processing_helpers import run_processing_script
@@ -128,6 +135,285 @@ def _cleanup_vbcs_cache():
                 del st.session_state.vbcs_cache_timestamps[filename]
 
 
+def _load_latest_bid_df_for_rules():
+    """Load the most recent bid asset file for Start-Soon rule evaluation."""
+    files = _bid_store.list_bid_files()
+    if not files:
+        return None
+    df, _etag = _bid_store.read_bid_file(files[0].full_path)
+    return df
+
+
+def _run_task_automation_once() -> tuple[int, int]:
+    """Run auto-task rule reconciliation + due-soon email reminders.
+
+    Returns
+    -------
+    tuple[int, int]
+        * **rule_delta** — net change from the Start-Soon rolled-up rule:
+          ``+1`` if the auto-task was just created, ``-1`` if it was just
+          removed (because no Start Soon rows remain), ``0`` if no change.
+        * **reminder_emails_sent** — number of distinct assignee summary
+          emails sent for tasks due in exactly 5 days.
+    """
+    rule_delta = 0
+    reminders_sent = 0
+
+    bid_df = _load_latest_bid_df_for_rules()
+    if bid_df is not None:
+        rule_delta = _task_store.sync_start_soon_tasks_from_bid_df(bid_df)
+
+    due_df = _task_store.tasks_due_in_days(days=5)
+    if not due_df.empty:
+        sent = _notify.send_due_soon_summary(due_df)
+        sent_task_ids = [tid for ids in sent.values() for tid in ids]
+        _task_store.mark_reminder_sent(sent_task_ids)
+        reminders_sent = len(sent)
+
+    return rule_delta, reminders_sent
+
+
+def _render_task_card(task_row, lane_index: int, lane_count: int) -> None:
+    """Render one task card with quick move, edit, and delete actions."""
+    task_id = str(task_row["task_id"])
+    title = str(task_row.get("title", "")).strip() or "(untitled task)"
+    description = str(task_row.get("description", "")).strip()
+    assignee = str(task_row.get("assignee_email", "")).strip() or "Unassigned"
+    due_date = str(task_row.get("due_date", "")).strip() or "No due date"
+    status = str(task_row.get("status", "")).strip()
+
+    with st.container(border=True):
+        st.markdown(f"**{title}**")
+        st.caption(f"Assignee: {assignee} | Due: {due_date} | Status: {status}")
+        if description:
+            st.write(description)
+
+        move_left_col, move_right_col, delete_col = st.columns(3)
+        if lane_index > 0:
+            if move_left_col.button("⬅️ Move", key=f"task_move_left_{task_id}"):
+                _task_store.move_task(task_id, _task_store.ALL_STATUSES[lane_index - 1])
+                st.rerun()
+        if lane_index < lane_count - 1:
+            if move_right_col.button("Move ➡️", key=f"task_move_right_{task_id}"):
+                _task_store.move_task(task_id, _task_store.ALL_STATUSES[lane_index + 1])
+                st.rerun()
+        if delete_col.button("🗑️ Delete", key=f"task_delete_{task_id}"):
+            _task_store.soft_delete_task(task_id)
+            st.rerun()
+
+        with st.expander("Edit task", expanded=False):
+            new_title = st.text_input("Title", value=title, key=f"task_title_{task_id}")
+            new_desc = st.text_area("Description", value=description, key=f"task_desc_{task_id}")
+            parsed_due = pd.to_datetime(task_row.get("due_date"), errors="coerce")
+            default_due = (parsed_due.date() if pd.notna(parsed_due) else datetime.now().date())
+            new_due = st.date_input("Due date", value=default_due, key=f"task_due_{task_id}")
+            new_email = st.text_input("Assignee email", value=str(task_row.get("assignee_email", "")), key=f"task_email_{task_id}")
+            new_status = st.selectbox(
+                "Status",
+                options=list(_task_store.ALL_STATUSES),
+                index=list(_task_store.ALL_STATUSES).index(status) if status in _task_store.ALL_STATUSES else 0,
+                key=f"task_status_{task_id}",
+            )
+            if st.button("Save changes", key=f"task_save_{task_id}", type="primary"):
+                _task_store.upsert_task(
+                    {
+                        "task_id": task_id,
+                        "title": new_title,
+                        "description": new_desc,
+                        "assignee_email": new_email,
+                        "due_date": new_due.isoformat(),
+                        "status": new_status,
+                        "source_rule": task_row.get("source_rule"),
+                        "source_key": task_row.get("source_key"),
+                    }
+                )
+                st.rerun()
+
+
+def _render_task_manager_section() -> None:
+    """Render the kanban task manager at the bottom of the page."""
+    st.markdown("---")
+    st.markdown("## Task Manager")
+    st.caption(
+        "Create and track pricing execution tasks. Completed tasks are automatically "
+        "removed after 60 days."
+    )
+
+    # Best-effort automatic rule + reminder evaluation while the app is running.
+    # This keeps behavior automatic without requiring a separate background worker.
+    auto_key = "_task_automation_ran_this_session"
+    if not st.session_state.get(auto_key):
+        try:
+            _run_task_automation_once()
+        except (TaskManagerStoreError, BidAssetStoreError, NotificationError):
+            # Non-fatal: explicit button below lets operators retry on demand.
+            pass
+        st.session_state[auto_key] = True
+
+    auto_col, create_col = st.columns([1, 3])
+    with auto_col:
+        if st.button("Run Rule Sync + Reminders", key="task_auto_run", type="primary"):
+            try:
+                delta, reminders = _run_task_automation_once()
+            except (TaskManagerStoreError, BidAssetStoreError, NotificationError) as exc:
+                st.error(f"Automation failed: {exc}")
+            else:
+                # `delta` is the *net* lifecycle change from the rolled-up rule:
+                #   +1 → auto-task created, -1 → auto-task auto-removed (no
+                #   more Start Soon rows), 0 → no change (idempotent).
+                if delta > 0:
+                    rule_msg = "Start-Soon auto-task created."
+                elif delta < 0:
+                    rule_msg = "Start-Soon auto-task removed (no Start Soon rows remaining)."
+                else:
+                    rule_msg = "Start-Soon rule already in sync."
+                st.success(
+                    f"Automation complete. {rule_msg} Sent {reminders} reminder email(s)."
+                )
+                st.rerun()
+    with create_col:
+        with st.expander("Start New Task", expanded=False):
+            new_title = st.text_input("Task title", key="task_new_title")
+            new_desc = st.text_area("Task description", key="task_new_desc")
+            new_due = st.date_input("Due date", value=datetime.now().date(), key="task_new_due")
+            new_assignee = st.text_input("Assignee email", key="task_new_assignee")
+            new_status = st.selectbox("Status", options=list(_task_store.ALL_STATUSES), key="task_new_status")
+            if st.button("Create Task", key="task_create_btn", type="primary"):
+                if not new_title.strip():
+                    st.warning("Task title is required.")
+                else:
+                    _task_store.upsert_task(
+                        {
+                            "title": new_title,
+                            "description": new_desc,
+                            "assignee_email": new_assignee,
+                            "due_date": new_due.isoformat(),
+                            "status": new_status,
+                        }
+                    )
+                    st.rerun()
+
+    try:
+        tasks = _task_store.list_tasks()
+    except TaskManagerStoreError as exc:
+        st.error(f"Could not load task manager data: {exc}")
+        return
+
+    if tasks.empty:
+        st.info("No active tasks. Create one from 'Start New Task'.")
+        return
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    # Two filters narrow which tasks appear in the kanban below:
+    #   • Assignee  — multiselect, including an "(Unassigned)" sentinel for
+    #     tasks whose ``assignee_email`` is blank.
+    #   • Due within — selectbox; "All open tasks" means no due-date narrowing
+    #     and Done tasks always remain visible regardless of due date so they
+    #     don't disappear from history.
+    filtered_tasks = _apply_task_filters(tasks)
+    if filtered_tasks.empty:
+        st.info("No tasks match the current filters. Adjust them above to see tasks.")
+        return
+
+    # ── Kanban lanes ──────────────────────────────────────────────────────────
+    lane_cols = st.columns(3)
+    for lane_index, lane_status in enumerate(_task_store.ALL_STATUSES):
+        with lane_cols[lane_index]:
+            lane_df = filtered_tasks[filtered_tasks["status"] == lane_status].copy()
+            st.markdown(f"### {lane_status} ({len(lane_df)})")
+            lane_df = lane_df.sort_values(
+                by=["due_date", "updated_at"],
+                ascending=[True, False],
+                na_position="last",
+            )
+            if lane_df.empty:
+                st.caption("No tasks.")
+                continue
+            for _, row in lane_df.iterrows():
+                _render_task_card(row, lane_index, len(_task_store.ALL_STATUSES))
+
+
+# ── Task Manager filters ──────────────────────────────────────────────────────
+
+# Sentinel used inside the Assignee multiselect for rows with no email so the
+# user can include/exclude unassigned tasks just like any other assignee group.
+_UNASSIGNED_SENTINEL: str = "(Unassigned)"
+
+# Due-within selectbox options. Mapping value → cutoff in days; ``None`` means
+# "do not apply a due-date filter" (i.e. show every task regardless of due).
+_DUE_FILTER_OPTIONS: tuple[tuple[str, Optional[int]], ...] = (
+    ("All open tasks", None),
+    ("Due within 1 day", 1),
+    ("Due within 5 days", 5),
+    ("Due within 10 days", 10),
+)
+
+
+def _apply_task_filters(tasks: pd.DataFrame) -> pd.DataFrame:
+    """Render the Assignee + Due-within filter row and return the narrowed frame.
+
+    Filters are kept entirely UI-local — they never mutate the underlying task
+    store. The function preserves the original index/order so the downstream
+    sort in ``_render_task_manager_section`` continues to apply.
+    """
+    # Build the assignee option pool. We map blank emails to a sentinel so the
+    # user can explicitly include or exclude unassigned tasks; otherwise the
+    # multiselect would silently swallow them.
+    emails = tasks["assignee_email"].fillna("").astype(str).str.strip()
+    assignee_options = sorted({email if email else _UNASSIGNED_SENTINEL for email in emails})
+
+    flt_assignee, flt_due, _spacer = st.columns([3, 2, 3])
+    with flt_assignee:
+        # Defensive: drop persisted assignees that no longer exist (e.g. after
+        # a task was reassigned or deleted) so the widget never raises.
+        key_assignee = "task_filter_assignee"
+        if key_assignee in st.session_state:
+            preserved = [v for v in st.session_state[key_assignee] if v in assignee_options]
+            if preserved != st.session_state[key_assignee]:
+                st.session_state[key_assignee] = preserved
+        selected_assignees = st.multiselect(
+            "Assignee",
+            options=assignee_options,
+            default=assignee_options,
+            key=key_assignee,
+            help="Filter tasks by assignee email. '(Unassigned)' covers tasks with no email.",
+        )
+
+    with flt_due:
+        due_label = st.selectbox(
+            "Due within",
+            options=[label for label, _ in _DUE_FILTER_OPTIONS],
+            index=0,
+            key="task_filter_due_within",
+            help=(
+                "Limits the kanban to open tasks (To Do / In Progress) whose due date "
+                "falls within the chosen window. Done tasks are always shown so history "
+                "is never hidden."
+            ),
+        )
+
+    # ── Apply Assignee filter ────────────────────────────────────────────────
+    assignee_norm = emails.where(emails != "", _UNASSIGNED_SENTINEL)
+    assignee_mask = assignee_norm.isin(selected_assignees)
+
+    # ── Apply Due-within filter (open tasks only; Done is always preserved) ──
+    due_cutoff_days: Optional[int] = dict(_DUE_FILTER_OPTIONS)[due_label]
+    if due_cutoff_days is None:
+        due_mask = pd.Series(True, index=tasks.index)
+    else:
+        today = datetime.now().date()
+        cutoff = today + timedelta(days=due_cutoff_days)
+        due_dates = pd.to_datetime(tasks["due_date"], errors="coerce").dt.date
+        open_lane_mask = tasks["status"].isin(
+            [_task_store.STATUS_TODO, _task_store.STATUS_IN_PROGRESS]
+        )
+        in_window = (due_dates >= today) & (due_dates <= cutoff)
+        # Hide open tasks that fall outside the window; keep all Done tasks.
+        due_mask = (~open_lane_mask) | in_window
+
+    return tasks[assignee_mask & due_mask].copy()
+
+
 def render():
     """
     Render the main Pricing Execution Automation page.
@@ -217,6 +503,9 @@ def render():
         run_combine_vbcs(data_files)
     elif st.session_state.selected_tool == "Pricing Update Validation":
         run_pricing_validation(data_files)
+
+    # Bottom section: shared execution task manager
+    _render_task_manager_section()
 
 
 def run_fixed_pricing(data_files):

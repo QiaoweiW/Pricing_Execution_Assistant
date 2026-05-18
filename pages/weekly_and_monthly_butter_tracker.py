@@ -460,7 +460,11 @@ def _render_cme_column() -> None:
     try:
         df = _cme_store.read_df()
     except _cme_store.CMESpotCallStoreError as exc:
-        st.error(f"Could not read CME store: {exc}")
+        st.error(
+            f"Could not read CME store: {exc}\n\n"
+            "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+            "in the sidebar to sign in, then return here."
+        )
         return
 
     _start, _end, df_filtered = _slicer_window(df, key_prefix=f"{_SS_PREFIX}cme")
@@ -600,7 +604,11 @@ def _render_usda_column() -> None:
     try:
         df = _usda_store.read_df()
     except _usda_store.USDADairyProductsStoreError as exc:
-        st.error(f"Could not read USDA store: {exc}")
+        st.error(
+            f"Could not read USDA store: {exc}\n\n"
+            "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+            "in the sidebar to sign in, then return here."
+        )
         return
 
     _start, _end, df_filtered = _slicer_window(df, key_prefix=f"{_SS_PREFIX}usda")

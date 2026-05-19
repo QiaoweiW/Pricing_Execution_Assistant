@@ -1094,8 +1094,14 @@ def _render_program_tracker(raw_df: pd.DataFrame) -> None:
             return "color: #d32f2f; font-weight: 600;"
         return ""
 
+    # Use ``Styler.map`` (the elementwise-CSS API in pandas 2.1+). The older
+    # ``Styler.applymap`` alias was removed in pandas 3.0, so Streamlit Cloud
+    # — which often installs the latest pandas — raised AttributeError here.
+    # ``Styler.map`` is also a no-op when the subset column is absent, so this
+    # call is safe even on legacy CSVs that never had the status column.
+    styled = display.style.map(_status_font_color, subset=[display_status_label])
     st.dataframe(
-        display.style.applymap(_status_font_color, subset=[display_status_label]),
+        styled,
         use_container_width=True,
         hide_index=True,
     )

@@ -30,7 +30,7 @@ Sections
                               Top-level: _compute_all_outputs)
 7. UI fragments              (intro, upload, milk-commodity chart + slicer,
                               packaging chart, freight outlook,
-                              editable table + Refresh + Confirm,
+                              editable table + single Refresh button,
                               mover downloads, results, state clearers)
 8. Public API                (render_monthly_resin_freight_mover_tracker)
 
@@ -40,19 +40,37 @@ Isolation
   Every key this fragment writes into ``st.session_state`` is namespaced under
   ``_SS_PREFIX`` so it never collides with other Market Barometer sections.
   The public entry point is a ``@st.fragment`` so uploads, edits, and the
-  Refresh / Confirm buttons only rerun this block.
+  Refresh button only rerun this block.
 
-Trigger split (Refresh vs Confirm)
-  * **Refresh** runs the impact pipeline and writes the *replace-style*
-    OneLake artefacts (``Resin_Cost_Tracker.csv``, ``Product_Milk Base
-    Cost.csv``, the four ``Monthly_Pricing_Execution/*.csv`` Mover
-    Downloads).  Iterating Refresh never pollutes the cumulative
-    tracking history.
-  * **Confirm** upserts the latest Refresh into the two cumulative
-    *tracking* files (``mover_details_table.csv``,
-    ``base_milk_cost_monthly_tracker.csv``) under each file's own gate.
-    Existing months may be overwritten on Confirm — see the workflow
-    expander rendered in :func:`_render_monthly_sop_and_upload_intro`.
+Single-trigger model (Refresh)
+  The May-2026-late contract collapses the previous Refresh / Confirm
+  split into a single **🔄 Refresh** button.  One click runs the whole
+  impact pipeline AND every dependent OneLake write under that write's
+  own gate:
+
+  * ``Resin_Cost_Tracker.csv`` — upsert for every ``(Month, Side)``
+    key present in the editable NMT × Resin_Calculator payload.
+    Months in the file but absent from the NMT (e.g. Sep–Nov 2025) are
+    PRESERVED verbatim.
+  * ``rest_htst_resin_mover_fg.csv`` / ``topco_resin_mover_fg.csv`` —
+    regenerated from the persisted tracker, per-side
+    ``latest_month_for_side`` (New) and ``latest − 1 calendar month``
+    (Old).
+  * ``milk_mover.csv``, ``Movers_Non_Milk_Tracker.csv`` — authoritative
+    replace, no month gate.
+  * ``Product_Milk Base Cost.csv`` — overwrite ``Base Milk Cost per
+    Gallon`` by Item match; gated on ``End Month ≥ file's max Month +
+    1 calendar month``.
+  * ``mover_details_table.csv`` — upsert the editing month; gated on
+    "a new row has been INSERTED into the editable NMT since the last
+    successful publish" (row-count delta).  Existing month data is
+    OVERWRITTEN when the gate is open.  Edit-in-place on the last row
+    does NOT qualify.
+  * ``base_milk_cost_monthly_tracker.csv`` — upsert the slicer's End
+    Month; gated on ``End Month = Start Month + 1 calendar month``.
+
+  See :func:`_render_monthly_sop_and_upload_intro` for the
+  operator-facing workflow expander.
 
 Robustness
   * Files are matched by filename keyword — exact dated filenames are not
@@ -80,16 +98,17 @@ Calculation contract (matches the May-2026 product spec)
      where both ``Old`` and ``New`` are joined from the lakehouse
      ``Resin_Cost_Tracker.csv`` filtered on the matching Side
      (``Rest`` for ``rest_htst_resin_mover_fg``, ``TOPCO`` for
-     ``topco_resin_mover_fg``) and absolute calendar months:
+     ``topco_resin_mover_fg``).  The two anchor months are derived
+     **per-side from the tracker** (May-2026-late contract):
 
-         old_month = pd.Timestamp.today().replace(day=1)
-         new_month = old_month + 1 calendar month
+         new_month_<side> = max(Month where Side == <side>)  in tracker
+         old_month_<side> = new_month_<side> − 1 calendar month
 
-     This makes the mover calendar-anchored — no dependence on the
-     editing tracker's last-row Month for Old/New selection.  Each FG
-     is exposed as a CSV download.  No monthly-gallons /
-     monthly-impact columns live here — those live on the
-     mover_details_table.
+     The subtraction is strict — a missing ``old_month_<side>`` row
+     in the tracker surfaces an actionable warning rather than
+     silently borrowing from another month.  Each FG is exposed as a
+     CSV download.  No monthly-gallons / monthly-impact columns live
+     here — those live on the mover_details_table.
 
   2. mover_details_table = ONE copy of ``site_item_volume`` with the
      following columns appended (in this order):
@@ -930,6 +949,78 @@ def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _milk_commodity_visible_slice(
+    milk_df: pd.DataFrame,
+    *,
+    start_month: Optional[pd.Timestamp] = None,
+    end_month: Optional[pd.Timestamp] = None,
+    category_filter: Optional[str] = None,
+    class_filter: Optional[str] = None,
+) -> pd.DataFrame:
+    """Return the FMMO rows the Milk Commodity Cost chart actually plots.
+
+    The chart applies a fixed sequence of filters before drawing — slicer
+    bounds, the CC II → ESL II Skim/Bfat mirror, and the chart-only
+    Category / Class knobs.  This helper applies the SAME transformations
+    so an "Export visible series" download surfaces exactly the data the
+    operator sees on screen.
+
+    Parameters mirror :func:`_build_milk_commodity_chart` — pass the
+    live slicer values and the chart-only Category / Class filters
+    (``None`` / ``"All"`` ⇒ no filter on that axis).
+
+    Returns the canonical FMMO columns (``Category``, ``Month``,
+    ``Class``, ``Skim Rate``, ``Butterfat Rate``, ``Protein Rate``,
+    ``Other Solids Rate``) with ``Month`` rendered as a first-of-month
+    ``YYYY-MM-DD`` string for spreadsheet-friendly sorting.
+    """
+    if milk_df is None or milk_df.empty:
+        return pd.DataFrame()
+
+    df = _strip_df_columns(milk_df).copy()
+    if "Month" not in df.columns or "Category" not in df.columns or "Class" not in df.columns:
+        return pd.DataFrame()
+
+    # ── Month normalisation + slicer bounds ──────────────────────────────
+    df["Month"] = pd.to_datetime(df["Month"], errors="coerce")
+    df = df.dropna(subset=["Month"]).sort_values(["Month", "Category", "Class"])
+    if start_month is not None:
+        df = df[df["Month"] >= pd.Timestamp(start_month)]
+    if end_month is not None:
+        df = df[df["Month"] <= pd.Timestamp(end_month)]
+    if df.empty:
+        return pd.DataFrame()
+
+    # ── Mirror Cottage Cheese II Skim/Bfat from ESL II ───────────────────
+    # Same defence-in-depth as the chart builder — legacy rows with null
+    # CC II skim/bfat get their values from the matching ESL II row.
+    df = _mirror_cc_ii_skim_bfat_from_esl_ii(df)
+
+    # ── Chart-only Category + Class knobs ────────────────────────────────
+    _VALID_CAT = {"HTST", "ESL", "COTTAGE CHEESE"}
+    cat_filter = (category_filter or "").strip().upper()
+    if cat_filter and cat_filter in _VALID_CAT:
+        df = df[df["Category"].astype(str).str.upper() == cat_filter]
+
+    cls_filter = (class_filter or "").strip().upper()
+    if cls_filter in {"I", "II"}:
+        df = df[df["Class"].astype(str).str.upper() == cls_filter]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Spreadsheet-friendly Month rendering.  Keep the existing FMMO
+    # column ordering so the download mirrors the lakehouse schema.
+    df = df.copy()
+    df["Month"] = df["Month"].dt.strftime("%Y-%m-%d")
+    canonical_cols = [
+        "Category", "Month", "Class",
+        "Skim Rate", "Butterfat Rate",
+        "Protein Rate", "Other Solids Rate",
+    ]
+    return df[[c for c in canonical_cols if c in df.columns]].reset_index(drop=True)
+
+
 def _build_milk_commodity_chart(
     milk_df: pd.DataFrame,
     start_month: Optional[pd.Timestamp] = None,
@@ -1147,10 +1238,26 @@ def _build_milk_commodity_chart(
 
 # ── 5. Editable Movers_Non_Milk_Tracker ───────────────────────────────────────
 
-# Session-state key for the Movers_Non_Milk_Tracker DataFrame. Persisting it
-# here lets edits survive Refresh clicks and Streamlit reruns without a
-# round-trip to disk.
+# Session-state key for the **stable seed** DataFrame passed to
+# ``st.data_editor``.  Seeded exactly once per session (and on header
+# migrations) and otherwise NEVER overwritten — see the bug-fix note in
+# :func:`_render_movers_non_milk_editor` for the rationale.  Downstream
+# consumers do NOT read from this slot; they read the editor's live
+# output from :data:`_SS_NMT_EDITED_VIEW` instead.
 _SS_NMT_DF = f"{_SS_PREFIX}_movers_non_milk_df"
+
+# Session-state key for the editor's coerced output (Month → datetime,
+# numerics → float64).  Repopulated on every rerun by
+# :func:`_render_movers_non_milk_editor` and consumed by the Refresh
+# orchestrator, the editing-month resolver, and the Mover Downloads
+# publisher.  Decoupling it from ``_SS_NMT_DF`` (the editor's seed)
+# is what fixes the "entries disappear on ENTER" bug.
+_SS_NMT_EDITED_VIEW = f"{_SS_PREFIX}_movers_non_milk_edited_view"
+
+# Internal Streamlit session-state key the ``st.data_editor`` widget
+# uses to persist the per-cell edit deltas across reruns.  Centralised
+# here so test code can locate it without re-deriving the prefix.
+_SS_NMT_EDITOR_KEY = f"{_SS_PREFIX}_nmt_editor"
 
 # Session-state keys for the Milk Commodity Cost time slicer. Persisted here
 # so changing the slicer reactively re-layers the milk columns on the mover_details_table
@@ -1242,6 +1349,22 @@ def _ensure_movers_non_milk_state() -> None:
         st.session_state[_SS_NMT_DF] = migrated
 
 
+def _coerce_nmt_edited_frame(edited: pd.DataFrame) -> pd.DataFrame:
+    """Re-type ``edited`` so downstream readers don't need to re-coerce.
+
+    Month → ``datetime64[ns]``; every numeric column → ``float64``.
+    Returns a fresh copy so callers can mutate freely without poking
+    the widget's internal state.
+    """
+    out = edited.copy()
+    if _NMT_COL_MONTH in out.columns:
+        out[_NMT_COL_MONTH] = pd.to_datetime(out[_NMT_COL_MONTH], errors="coerce")
+    for col in _NMT_NUMERIC_COLUMNS:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+    return out
+
+
 def _render_movers_non_milk_editor() -> pd.DataFrame:
     """Render the editable Movers_Non_Milk_Tracker; return the latest frame.
 
@@ -1250,14 +1373,34 @@ def _render_movers_non_milk_editor() -> pd.DataFrame:
     * All cells (including Month) are editable.
     * Rows can be added / removed via the editor's built-in toolbar
       (``num_rows="dynamic"``).
-    * The current state is persisted in ``session_state`` after every rerun
-      so subsequent calculations and downloads see the user's edits.
+    * The returned frame is the coerced view (Month → ``datetime64``,
+      numerics → ``float64``) so downstream calculations don't need to
+      re-coerce.  A copy of that view is also stashed in
+      :data:`_SS_NMT_EDITED_VIEW` for orchestrators that re-read NMT
+      state outside of this fragment's render call (e.g. the Refresh
+      orchestrator's Mover Downloads publisher).
 
-    Returns the latest DataFrame (typed: Month → datetime, the rest →
-    float64), so downstream calculations don't need to re-coerce.
+    Bug-fix notes (May-2026-late "entries disappear on ENTER")
+    ----------------------------------------------------------
+    The previous version wrote ``edited`` BACK to ``_SS_NMT_DF`` on
+    every rerun.  ``st.data_editor`` is delta-based: it owns its own
+    edit state under ``key=`` and applies that state to the ``data=``
+    frame on every render.  When ``data=`` changes between renders
+    (which is exactly what writing ``edited`` back does), the widget
+    re-rebases its deltas onto a frame that *already* contains them —
+    and the most-recently typed cell ends up clobbered, OR a freshly-
+    added row gets dropped because the rebase can't find it.
+
+    The fix is **stop the feedback loop**: pass the original seed
+    DataFrame to ``st.data_editor`` and never overwrite it.  Every
+    edit lives in the widget's internal state under
+    :data:`_SS_NMT_EDITOR_KEY`; the widget returns the fully-applied
+    frame as ``edited`` and we just coerce + cache that for downstream
+    reads.  Header migrations remain the only path that mutates the
+    seed slot (see :func:`_ensure_movers_non_milk_state`).
     """
     _ensure_movers_non_milk_state()
-    current_df: pd.DataFrame = st.session_state[_SS_NMT_DF]
+    seed_df: pd.DataFrame = st.session_state[_SS_NMT_DF]
 
     # Column config: Month as DateColumn (M/D/YYYY for parity with source),
     # numerics as NumberColumn with 4-decimal precision (same as $/lbs / $/Gal
@@ -1279,23 +1422,36 @@ def _render_movers_non_milk_editor() -> pd.DataFrame:
         )
 
     edited = st.data_editor(
-        current_df,
+        seed_df,
         column_config=column_config,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
-        key=f"{_SS_PREFIX}_nmt_editor",
+        key=_SS_NMT_EDITOR_KEY,
     )
 
-    # Re-coerce numeric dtypes after the round-trip and keep the Month as a
-    # proper Timestamp so iloc[-1] arithmetic stays well-typed.
-    edited = edited.copy()
-    edited[_NMT_COL_MONTH] = pd.to_datetime(edited[_NMT_COL_MONTH], errors="coerce")
-    for col in _NMT_NUMERIC_COLUMNS:
-        edited[col] = pd.to_numeric(edited[col], errors="coerce").astype("float64")
+    # Build the coerced view AND stash it for downstream reads.  We do
+    # NOT touch ``_SS_NMT_DF`` — that slot stays at the seed shape so
+    # ``st.data_editor`` keeps its delta state stable across reruns.
+    edited_view = _coerce_nmt_edited_frame(edited)
+    st.session_state[_SS_NMT_EDITED_VIEW] = edited_view
+    return edited_view
 
-    st.session_state[_SS_NMT_DF] = edited
-    return edited
+
+def _get_nmt_edited_view() -> Optional[pd.DataFrame]:
+    """Return the cached, coerced NMT edited view (or ``None``).
+
+    Read by orchestrators that need NMT state outside of the editor's
+    render call (Mover Downloads publisher, editing-month resolver,
+    Refresh orchestrator).  Falls back to ``_SS_NMT_DF`` (the seed)
+    only on the very first render, before
+    :func:`_render_movers_non_milk_editor` has executed in this
+    session — the seed is correctly shaped, just not yet edited.
+    """
+    view = st.session_state.get(_SS_NMT_EDITED_VIEW)
+    if view is not None:
+        return view
+    return st.session_state.get(_SS_NMT_DF)
 
 
 # ── 6. Calculations ───────────────────────────────────────────────────────────
@@ -1357,27 +1513,6 @@ _FG_OUTPUT_COLUMNS: tuple[str, ...] = (
     _COL_PRODUCT_ID, _COL_PRODUCT_DESC, _COL_RESIN,
     _FG_COL_OLD, _FG_COL_NEW, _FG_COL_MOVER,
 )
-
-
-# ── Calendar anchor for FG Old/New month selection ───────────────────────────
-#
-# May-2026 contract:
-#
-#   "old month is always current calendar month
-#    (e.g., today is May/20/2026, old month = May 2026);
-#    new month = old month + 1."
-#
-# The anchor is read fresh each call so renders that straddle a month
-# boundary advance automatically — no session-state caching.
-
-def _today_old_month() -> pd.Timestamp:
-    """Return the FG's "Old" month: today's calendar month, first-of-month."""
-    return pd.Timestamp(date.today().replace(day=1))
-
-
-def _today_new_month() -> pd.Timestamp:
-    """Return the FG's "New" month: ``_today_old_month()`` + 1 calendar month."""
-    return _today_old_month() + pd.DateOffset(months=1)
 
 
 # ── Resin_Cost_Tracker payload builders (NMT + Resin_Calculator → tracker rows) ─
@@ -1446,12 +1581,10 @@ def _build_tracker_rows_for_nmt(
 
     Used by:
 
-    * The Refresh writer (filters to "months that already exist in the
-      persisted tracker" then rewrites them via
-      :func:`resin_cost_tracker_store.rewrite_existing_months_for_sides`).
-    * The Confirm writer (filters to the single new month =
-      :func:`_today_new_month`, then appends via
-      :func:`resin_cost_tracker_store.append_new_month_if_after_latest`).
+    * The single Refresh writer (passes the entire payload through
+      :func:`resin_cost_tracker_store.upsert_for_sides` — that one
+      call performs both overwrite-existing and append-new in a
+      single ETag-guarded write).
     * The in-memory FG builder (merged with the persisted tracker into
       an "effective tracker" so Refresh-time FG metrics reflect the
       operator's just-edited NMT before the lakehouse write lands).
@@ -1504,16 +1637,6 @@ def _build_tracker_rows_for_nmt(
     return out[leading_present + trailing]
 
 
-def _persisted_tracker_months(persisted_tracker_df: pd.DataFrame) -> set[pd.Timestamp]:
-    """Return the set of first-of-month timestamps present in the persisted tracker."""
-    if persisted_tracker_df is None or persisted_tracker_df.empty:
-        return set()
-    if _COL_MONTH not in persisted_tracker_df.columns:
-        return set()
-    months = persisted_tracker_df[_COL_MONTH].apply(_parse_month).dropna()
-    return set(months)
-
-
 def _build_effective_resin_cost_tracker(
     persisted_tracker_df: pd.DataFrame,
     payload_rows: pd.DataFrame,
@@ -1530,7 +1653,7 @@ def _build_effective_resin_cost_tracker(
     The effective tracker is purely an in-memory artefact — it never
     touches OneLake on its own.  The actual lakehouse write is performed
     by the orchestrator helpers below using a side payload subset that
-    matches the spec's Refresh-vs-Confirm split.
+    matches the single-Refresh upsert path.
     """
     if persisted_tracker_df is None or persisted_tracker_df.empty:
         return payload_rows.copy() if payload_rows is not None else pd.DataFrame()
@@ -1653,30 +1776,145 @@ def _build_resin_mover_fg_from_tracker(
     return merged[[c for c in _FG_OUTPUT_COLUMNS if c in merged.columns]].reset_index(drop=True)
 
 
+@dataclass(frozen=True)
+class _ResinFGSelection:
+    """The per-side anchor months used to build one Resin Mover FG.
+
+    Surfaces both timestamps + a list of human-readable warning strings
+    so the caller can render an actionable ``st.warning`` when the
+    tracker is missing the strict ``new − 1 calendar month`` row.  The
+    warnings list is empty in the happy path — keeps the orchestrator
+    side simple ("if warnings: render banner").
+    """
+    side:        str
+    new_month:   Optional[pd.Timestamp]
+    old_month:   Optional[pd.Timestamp]
+    warnings:    tuple[str, ...]
+
+
+def _select_resin_fg_months(
+    effective_tracker_df: pd.DataFrame,
+    *,
+    side: str,
+) -> _ResinFGSelection:
+    """Pick the per-side ``(new_month, old_month)`` anchors for the FG.
+
+    May-2026-late contract:
+      * ``new_month`` = ``max(Month where Side == side)`` in the
+        EFFECTIVE tracker (persisted ∪ payload — so a just-typed NMT
+        row participates in Refresh-time FG metrics even before the
+        lakehouse upsert lands).
+      * ``old_month`` = ``new_month − 1 calendar month`` (strict
+        calendar subtraction; NOT the next-newest month present).
+        A missing ``old_month`` row in the tracker surfaces a warning.
+
+    Returns a :class:`_ResinFGSelection` carrying:
+      * ``side`` — the canonical Side label.
+      * ``new_month`` / ``old_month`` — the chosen anchors (``None``
+        only when the side has no rows in the tracker at all).
+      * ``warnings`` — operator-actionable strings, empty in the happy
+        path.  Examples::
+
+            "Resin_Cost_Tracker has no rows for the Rest side — add
+             at least one row before Refresh can build the FG."
+            "Resin_Cost_Tracker is missing the Old month (May 2026) for
+             TOPCO — Old Resin Cost ($/Gal) will appear blank.  Add the
+             missing row to the lakehouse, then click Refresh again."
+    """
+    canon = _resin_store.normalise_side(side)
+    if canon is None:
+        return _ResinFGSelection(side=side, new_month=None, old_month=None,
+                                 warnings=(f"Unknown Side label {side!r}.",))
+
+    if effective_tracker_df is None or effective_tracker_df.empty:
+        return _ResinFGSelection(
+            side=canon, new_month=None, old_month=None,
+            warnings=(
+                f"Resin_Cost_Tracker has no rows for the {canon} side — "
+                "add at least one row before Refresh can build the FG.",
+            ),
+        )
+
+    df = effective_tracker_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if _COL_MONTH not in df.columns or _TRACKER_COL_SIDE not in df.columns:
+        return _ResinFGSelection(
+            side=canon, new_month=None, old_month=None,
+            warnings=(
+                "Resin_Cost_Tracker is missing the required "
+                f"{_TRACKER_COL_SIDE!r} or {_COL_MONTH!r} column.",
+            ),
+        )
+
+    months_for_side = (
+        df.loc[df[_TRACKER_COL_SIDE].apply(_resin_store.normalise_side) == canon,
+               _COL_MONTH]
+        .apply(_parse_month)
+        .dropna()
+    )
+    if months_for_side.empty:
+        return _ResinFGSelection(
+            side=canon, new_month=None, old_month=None,
+            warnings=(
+                f"Resin_Cost_Tracker has no rows for the {canon} side — "
+                "add at least one row before Refresh can build the FG.",
+            ),
+        )
+
+    new_month = pd.Timestamp(months_for_side.max())
+    old_month = (new_month - pd.DateOffset(months=1)).normalize().replace(day=1)
+
+    # Strict calendar subtraction — a missing Old-month row is the
+    # spec's hard-warning case (user asked for this in B1).
+    side_months_set = set(months_for_side.tolist())
+    warnings: list[str] = []
+    if old_month not in side_months_set:
+        warnings.append(
+            f"Resin_Cost_Tracker is missing the Old month "
+            f"({old_month:%b %Y}) for {canon} — Old Resin Cost ($/Gal) "
+            "will appear blank in the FG.  Add the missing row to the "
+            "lakehouse (or to the Movers Non-Milk Tracker), then click "
+            "Refresh again."
+        )
+
+    return _ResinFGSelection(
+        side=canon, new_month=new_month, old_month=old_month,
+        warnings=tuple(warnings),
+    )
+
+
 def _build_two_resin_mover_fgs(
     effective_tracker_df: pd.DataFrame,
-    old_month: pd.Timestamp,
-    new_month: pd.Timestamp,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return ``(rest_fg, topco_fg)`` from the effective Resin_Cost_Tracker.
+) -> tuple[pd.DataFrame, pd.DataFrame, tuple[str, ...]]:
+    """Return ``(rest_fg, topco_fg, warnings)`` from the effective tracker.
 
-    Thin convenience wrapper around
-    :func:`_build_resin_mover_fg_from_tracker` so the caller doesn't have
-    to plumb the Side label twice.  Old/New month selection is
-    calendar-anchored (see :func:`_today_old_month` /
-    :func:`_today_new_month`) and identical for both sides.
+    Each side picks its OWN anchor pair via :func:`_select_resin_fg_months`
+    (``new = max(Side)``, ``old = new − 1`` calendar month).  This
+    decouples Rest and TOPCO so an operator who has only published the
+    new month for one side still sees a clean FG for the other.
+
+    The returned ``warnings`` tuple aggregates BOTH sides' warnings —
+    the orchestrator renders them as ``st.warning`` banners exactly
+    once per Refresh so the operator knows precisely which row to fill
+    in.
     """
-    rest_fg = _build_resin_mover_fg_from_tracker(
-        effective_tracker_df,
-        old_month=old_month, new_month=new_month,
-        side=_TRACKER_SIDE_REST,
-    )
-    topco_fg = _build_resin_mover_fg_from_tracker(
-        effective_tracker_df,
-        old_month=old_month, new_month=new_month,
-        side=_TRACKER_SIDE_TOPCO,
-    )
-    return rest_fg, topco_fg
+    rest_sel = _select_resin_fg_months(effective_tracker_df, side=_TRACKER_SIDE_REST)
+    topco_sel = _select_resin_fg_months(effective_tracker_df, side=_TRACKER_SIDE_TOPCO)
+
+    def _build_or_empty(sel: _ResinFGSelection) -> pd.DataFrame:
+        if sel.new_month is None or sel.old_month is None:
+            return pd.DataFrame(columns=list(_FG_OUTPUT_COLUMNS))
+        return _build_resin_mover_fg_from_tracker(
+            effective_tracker_df,
+            old_month=sel.old_month,
+            new_month=sel.new_month,
+            side=sel.side,
+        )
+
+    rest_fg  = _build_or_empty(rest_sel)
+    topco_fg = _build_or_empty(topco_sel)
+
+    return rest_fg, topco_fg, (*rest_sel.warnings, *topco_sel.warnings)
 
 
 # 6b. Tag → tracker-column resolution ─────────────────────────────────────────
@@ -2460,8 +2698,8 @@ def _compute_all_outputs(
 ) -> Optional[dict]:
     """Run the full impact pipeline. Returns ``None`` on missing inputs.
 
-    Pipeline (May-2026 contract)
-    ----------------------------
+    Pipeline (May-2026-late contract)
+    ---------------------------------
 
     1. Validate required uploads + injected lakehouse inputs.
     2. Materialise the per-(Month × Side) Resin_Cost_Tracker payload
@@ -2470,9 +2708,12 @@ def _compute_all_outputs(
     3. Merge that payload onto the persisted Resin_Cost_Tracker to form
        the in-memory "effective tracker"
        (:func:`_build_effective_resin_cost_tracker`).
-    4. Build both Resin Mover FGs from the effective tracker using
-       calendar-anchored Old/New months
-       (:func:`_today_old_month` / :func:`_today_new_month`).
+    4. Build both Resin Mover FGs from the effective tracker, with
+       Old/New month anchors picked PER SIDE
+       (:func:`_select_resin_fg_months`): ``new = max(Side)``, ``old =
+       new − 1 calendar month``.  Missing Old-month rows in the
+       tracker surface as warning strings (rendered as
+       ``st.warning`` banners by the orchestrator).
     5. Build the mover_details_table base (Freight + Resin only — milk
        is layered at render time so it reacts to the time slicer).
     6. Roll up the two headline Incremental Revenue totals.
@@ -2490,13 +2731,13 @@ def _compute_all_outputs(
         Revenue vs. Last Month, resin).
       * ``rest_htst_freight_per_gal`` — Optional[float] (used by example prices).
       * ``example_prices_impact`` — Optional[DataFrame] (None when no upload).
-      * ``resin_tracker_rewrite_payload`` — DataFrame.  Subset of the
-        full NMT-derived payload whose months already exist in the
-        persisted tracker.  Refresh-side writer consumes this.
-      * ``resin_tracker_new_month_payload`` — DataFrame.  Subset whose
-        Month equals ``_today_new_month()`` AND the NMT actually
-        contains that month.  Confirm-side writer consumes this; empty
-        when the operator has not yet added the new month to the NMT.
+      * ``resin_tracker_upsert_payload`` — DataFrame.  Full NMT-derived
+        payload covering every ``(Month, Side)`` row the upsert should
+        write.  The single Refresh writer consumes this directly.
+      * ``resin_fg_warnings`` — tuple[str, ...].  Operator-actionable
+        warnings about missing Old-month rows in the persisted
+        tracker (one entry per affected side).  Rendered as
+        ``st.warning`` banners by ``_run_refresh_lakehouse_writes``.
       * ``_meta`` — single-row diagnostics DataFrame for debugging.
 
     Internal dict keys ``monthly_*_impact_total`` retain the legacy
@@ -2574,47 +2815,32 @@ def _compute_all_outputs(
         persisted_tracker, full_payload,
     )
 
-    # ── 3. Resin Mover FGs read from the effective tracker, anchored to
-    #       today's calendar month (Old) and Old + 1 (New).  Calendar
-    #       anchoring decouples the FG from the NMT's last-row Month
-    #       per the May-2026 contract.
-    old_month = _today_old_month()
-    new_month = _today_new_month()
-    rest_fg, topco_fg = _build_two_resin_mover_fgs(
-        effective_tracker, old_month, new_month,
+    # ── 3. Resin Mover FGs — per-side anchors picked from the EFFECTIVE
+    #       tracker.  Each side gets its own ``new = max(Side)`` and
+    #       ``old = new − 1 calendar month`` (strict subtraction).
+    #       Missing Old-month rows surface as warnings rendered by the
+    #       Refresh orchestrator.
+    rest_fg, topco_fg, fg_warnings = _build_two_resin_mover_fgs(
+        effective_tracker,
     )
 
-    # ── 4. Partition the payload into Refresh / Confirm subsets:
-    #
-    #       * Refresh writes ONLY rows whose Month already exists in
-    #         the persisted tracker — preserves the "Sep–Nov 25 stay
-    #         as-is" invariant for months that are in the file but not
-    #         in the NMT (those rows are simply absent from the
-    #         payload).
-    #
-    #       * Confirm writes the single new-month payload IFF
-    #         ``new_month == _today_new_month()`` exists in the NMT
-    #         (i.e. the operator has materially added the new-month
-    #         row, not just left it blank).  The strict > comparison
-    #         against the persisted max happens inside the store.
-    persisted_months = _persisted_tracker_months(persisted_tracker)
-    if full_payload.empty:
-        rewrite_payload = pd.DataFrame()
-        new_month_payload = pd.DataFrame()
-    else:
-        payload_month_ts = full_payload[_COL_MONTH].apply(_parse_month)
-        rewrite_mask = payload_month_ts.apply(
-            lambda m: m in persisted_months if m is not None else False
-        )
-        rewrite_payload = full_payload.loc[rewrite_mask].reset_index(drop=True)
-
-        new_month_mask = payload_month_ts.apply(lambda m: m == new_month)
-        new_month_payload = full_payload.loc[new_month_mask].reset_index(drop=True)
+    # ── 4. Resin tracker upsert payload — the single Refresh writer
+    #       consumes the FULL NMT-derived payload directly.  No more
+    #       Refresh-vs-Confirm split: ``upsert_for_sides`` performs
+    #       overwrite-existing AND append-new in one ETag-guarded
+    #       write.  Months in the file but absent from the NMT (e.g.
+    #       Sep–Nov 2025) are PRESERVED verbatim — they're simply not
+    #       in the payload.
+    resin_tracker_upsert_payload = (
+        full_payload.reset_index(drop=True)
+        if full_payload is not None and not full_payload.empty
+        else pd.DataFrame()
+    )
 
     # ── 5. mover_details_table (Freight + Resin only — milk is layered
     #       at render time).  The Month column is stamped with
     #       ``editing_month`` so the cumulative Lakehouse store can
-    #       dedupe by month on Confirm-upsert.
+    #       dedupe by month on the Refresh-time upsert.
     combined_base = _build_mover_details_table_no_milk(
         uploads["site_item_volume"].df,
         movers_non_milk_df,
@@ -2653,18 +2879,18 @@ def _compute_all_outputs(
         "monthly_resin_impact_total":       monthly_resin_total,
         "rest_htst_freight_per_gal":        rest_freight_gal,
         "example_prices_impact":            example_impact,
-        # Tracker write payloads — Refresh / Confirm orchestrators
-        # consume these directly.  Pre-partitioned here so the runners
-        # are pure dispatchers.
-        "resin_tracker_rewrite_payload":    rewrite_payload,
-        "resin_tracker_new_month_payload":  new_month_payload,
+        # Single resin tracker write payload — the Refresh orchestrator
+        # passes it straight to :func:`_resin_store.upsert_for_sides`.
+        "resin_tracker_upsert_payload":     resin_tracker_upsert_payload,
+        # Per-side FG warnings (missing Old-month rows in the tracker).
+        # Rendered as ``st.warning`` banners by the Refresh
+        # orchestrator so operators know exactly which row to fill in.
+        "resin_fg_warnings":                fg_warnings,
         "_meta": pd.DataFrame([{
             "scrape_fraction":      scrape_fraction,
             "rest_freight_$/gal":   rest_freight_gal,
             "current_month":        current_month.strftime("%Y-%m-%d"),
             "editing_month":        editing_month.strftime("%Y-%m-%d"),
-            "fg_old_month":         old_month.strftime("%Y-%m-%d"),
-            "fg_new_month":         new_month.strftime("%Y-%m-%d"),
         }]),
     }
 
@@ -2817,20 +3043,21 @@ def _render_monthly_sop_and_upload_intro() -> None:
 - Maintain and refresh source files (**DO NOT change file names**):
   - `Pkg_Index` (Procurement)
   - `example_prices` (RGM, update pricing)
-  - `Resin_Cost_Tracker` (RGM, after movers are finalized — the file lives
-    in the Pricing Lakehouse and is **auto-appended** for each new month
-    when you click **Refresh**; you no longer need to upload it)
+  - `Resin_Cost_Tracker` (RGM — sourced from the Pricing Lakehouse;
+    no upload needed.  Updated automatically on **Refresh**.)
 - Use the **Movers Non-Milk Tracker** below to align mover values with
   commercial leaders.
   - Click **🔄 Refresh** to recompute the Incremental Revenue vs. Last
-    Month metrics and refresh the *replace-style* lakehouse files
-    (`Resin_Cost_Tracker`, `Product_Milk Base Cost`, the four Mover
-    Downloads).
-  - Click **✅ Confirm** to bake the latest Refresh into the two
-    cumulative *tracking* files (`mover_details_table.csv`,
-    `base_milk_cost_monthly_tracker.csv`).  Existing months may be
-    overwritten on Confirm — each tracker has its own gate (see the
-    workflow expander below).
+    Month metrics AND update every dependent OneLake artefact under
+    that artefact's own gate (`Resin_Cost_Tracker`, the two Resin
+    Mover FGs, `Product_Milk Base Cost`, the four Mover Downloads,
+    `mover_details_table`, `base_milk_cost_monthly_tracker`).  See
+    the workflow expander below for the per-file gates.
+  - Click **🔄 USDA refresh** (above the Milk Commodity chart) to
+    check USDA for a new advance-prices PDF outside the 1-hour
+    cooldown.  A new month is appended to `fmmo_tracker.json` ONLY
+    when the freshly-scraped rates actually differ from the latest
+    month already in the file.
 
 _Files are matched automatically by filename keyword after upload._
         """.strip()
@@ -2842,7 +3069,7 @@ _Files are matched automatically by filename keyword after upload._
 Both `Resin_Calculator.csv` and `Resin_Cost_Tracker.csv` are sourced from
 the Pricing Lakehouse — no upload needed.
 
-#### Tracker schema (May-2026 contract)
+#### Tracker schema
 
 `Resin_Cost_Tracker.csv` carries a leading **`Rest Market vs TOPCO`**
 dimension immediately before `Product ID`, so each month materialises
@@ -2857,42 +3084,34 @@ formula::
 
     Resin Cost ($/Gal) = $/lbs × Usage (Lbs/Ea) × (1 + Scrape%) ÷ Gal/Ea
 
-where `$/lbs` is pulled from the matching NMT row
-(`Rest HTST Resin Cost ($/lbs)` for Rest,
-`TOPCO HTST Resin Cost ($/lbs)` for TOPCO).
+where `$/lbs` is pulled from the matching Movers Non-Milk Tracker (NMT)
+row — `Rest HTST Resin Cost ($/lbs)` for Rest,
+`TOPCO HTST Resin Cost ($/lbs)` for TOPCO.
 
-#### Refresh vs. Confirm split
+#### Single-Refresh write contract (May-2026-late)
 
-| Trigger | Resin_Cost_Tracker write | What gets touched |
+| Trigger | What the writer does | Scope |
 |---|---|---|
-| **🔄 Refresh** | **Rewrite** every `(Month, Side)` row already in the file using the NMT × Resin_Calculator payload. | Existing months only — months in the file but absent from the NMT (e.g. Sep–Nov 2025) pass through untouched.  No new-month rows. |
-| **✅ Confirm** | **Append** the new-month rows (Month = today + 1 calendar month). | Gated on (a) the operator added a NMT row for that month with both `$/lbs` cells filled in, AND (b) that month is strictly greater than the file's current max month.  Refusal surfaces a friendly "add the row first" caption. |
+| **🔄 Refresh** | One ETag-guarded **upsert** keyed by `(Month, Side)`.  For every NMT row × side, drops the matching persisted rows and concats the freshly-computed payload onto the survivors. | Overwrites existing `(Month, Side)` keys AND appends new ones in the same call.  Persisted rows whose key is NOT in the payload (e.g. Sep–Nov 2025) are PRESERVED verbatim. |
 
 #### Resin Mover FGs
 
-Both `rest_htst_resin_mover_fg` and `topco_resin_mover_fg` pull
-`Resin Cost ($/Gal)` straight from `Resin_Cost_Tracker.csv` — filtered
-on the matching Side — for two absolute calendar months:
+`rest_htst_resin_mover_fg.csv` and `topco_resin_mover_fg.csv` are
+regenerated on every Refresh from the just-upserted tracker.  Anchors
+are picked **per side**:
 
-* **Old month** = today's calendar month, first-of-month.
-* **New month** = Old month + 1 calendar month.
+* **`new_month_<side>`** = `max(Month where Rest Market vs TOPCO == <side>)`
+* **`old_month_<side>`** = `new_month_<side> − 1 calendar month`
+  (strict calendar subtraction — NOT "the next-newest month present")
 
 Per Product ID::
 
     Resin Mover ($/Gal) = New Resin Cost ($/Gal) − Old Resin Cost ($/Gal)
 
-The FGs are calendar-anchored — they no longer key off the NMT's
-last-row Month.  In practice this means:
-
-1. Click **Refresh**: the persisted tracker is rewritten in-place for
-   every NMT month already in the file, AND an in-memory effective
-   tracker is built that also includes the new-month rows the operator
-   has just typed into the NMT.  The FGs read from the effective
-   tracker, so the Incremental Revenue metrics reflect the operator's
-   latest edits before Confirm bakes them in.
-2. Click **Confirm**: the new-month rows are appended to the persisted
-   `Resin_Cost_Tracker.csv` so future renders see them on a cold read
-   too.
+If the tracker is missing the `old_month_<side>` row, the FG renders
+that side's `Old Resin Cost ($/Gal)` as blank AND surfaces an
+actionable warning above the table — fill the missing row into
+`Resin_Cost_Tracker.csv` (or add it to the NMT and Refresh again).
 
 #### Mover Downloads + cumulative trackers (downstream)
 
@@ -2901,20 +3120,19 @@ last-row Month.  In practice this means:
   `Movers_Non_Milk_Tracker.csv`) are published to
   `Files/Monthly_Pricing_Execution/` on every Refresh —
   authoritative replace, no month gate.
-* The fully-built `mover_details_table` is upserted into
-  `Files/Monthly_Mover_Reporting/mover_details_table.csv` on
-  **Confirm** — but ONLY when a new row was inserted into the
-  Movers Non-Milk Tracker since the last successful publish
-  (row-count delta).  Existing month data is OVERWRITTEN.
-  Edit-in-place on the existing last row does NOT qualify and renders
-  a small "no-op" caption.
+* `mover_details_table.csv` is upserted on **Refresh** but ONLY
+  when a new row was inserted into the Movers Non-Milk Tracker
+  since the last successful publish (row-count delta).  Existing
+  month data is OVERWRITTEN when the gate is open.  Edit-in-place
+  on the existing last row does NOT qualify and renders a small
+  no-op caption — that's what keeps Refresh-iteration safe.
 
 #### Out of scope
 
 The Walmart, Costco HTST and Costco KS sites do NOT participate in
-`Resin_Cost_Tracker.csv` rewrites or appends — their resin mover
-columns in the NMT live on for the per-row mover_details_table fallback
-but never reach the Side-keyed tracker.
+`Resin_Cost_Tracker.csv` upserts — their resin mover columns in the
+NMT live on for the per-row mover_details_table fallback but never
+reach the Side-keyed tracker.
             """.strip()
         )
 
@@ -2926,44 +3144,50 @@ upload required for any milk artefact.  The matrix below names every
 lakehouse file the workflow touches, the exact trigger that fires the
 write, and the gate conditions that must hold before the write lands.
 
-The two top-of-page buttons partition the work cleanly:
+Two buttons partition the work:
 
-* **🔄 Refresh** updates metrics + the replace-style files.  Iterate
-  freely — Refresh never pollutes the cumulative tracking history.
-* **✅ Confirm** publishes the latest Refresh into the two cumulative
-  tracking files.  Existing months may be overwritten under each
-  file's own gate.
+* **🔄 USDA refresh** (above the Milk Commodity chart) checks the
+  USDA advanced-prices PDF for a new month and appends `fmmo_tracker.json`
+  ONLY when the freshly-scraped rates differ from the latest month
+  already in the file.  Existing rows are never mutated.
+* **🔄 Refresh** (below the NMT) updates every downstream artefact
+  under its own gate (see rows 2–5 below).
 
 #### Per-file trigger / condition matrix
 
 | # | Lakehouse file | Trigger | Conditions that must hold |
 |---|---|---|---|
-| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf) (detected on next render, or click **🔄 USDA refresh** to bypass the 1-hour cooldown) | New month is **not** already present in `fmmo_tracker.json`.  Cottage Cheese rows always carry **Class II** with **Skim Rate & Butterfat Rate identical to ESL Class II** for the same month — only **Protein Rate** and **Other Solids Rate** are scraped (both equal Class II Nonfat Solids Price).  A new month must NOT appear in this file until the PDF has actually published — selecting a future month in the slicer is not possible until then. |
+| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System scrapes all rates from the PDF and compares them against the matching cells of the latest month already in `fmmo_tracker.json`.**  A new month row is appended (labelled `max(file) + 1 calendar month`, always first-of-month) ONLY when at least one of the **seven canonical reconcilable cells** differs — HTST I Skim & Bfat, HTST II Skim & Bfat, ESL I Skim, CC II Protein, CC II Other Solids.  All other cells are derived from these seven by spec (ESL II / CC II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the USDA Class II Butterfat for the target month is missing (USDA cadence lag), the orchestrator REFUSES the write and surfaces a warning so the operator can fill the cell into the lakehouse manually. |
 | 2 | `Files/Monthly_Pricing_Execution/milk_mover.csv` | User clicks **🔄 Refresh** | Authoritative replace on every Refresh — no month gate.  When the slicer's End Month has no rows in `fmmo_tracker.json`, rates collapse to zero (silent `$0` cost) so the published file structure stays stable. |
-| 3 | `Files/Activity_Model/Product_Milk Base Cost.csv` (column `Base Milk Cost per Gallon`) | User clicks **🔄 Refresh** | **Refresh is the sole writer.**  Slicer's **End Month ≥ file's max Month + 1 calendar month**.  Update is by Item match (left-merge); unmatched rows are stale-stamped. |
-| 4 | `Files/Monthly_Mover_Reporting/mover_details_table.csv` | User clicks **✅ Confirm** | A **new row was inserted** into the Movers Non-Milk Tracker since the last successful publish (row-count delta).  **Existing months may be overwritten** — the upsert wins for the current editing month. |
-| 5 | `Files/Milk_cost_tracker/base_milk_cost_monthly_tracker.csv` | User clicks **✅ Confirm** | Slicer's **End Month = Start Month + 1 calendar month**.  **Existing months may be overwritten** — the upsert wins for the slicer's End Month. |
+| 3 | `Files/Activity_Model/Product_Milk Base Cost.csv` (column `Base Milk Cost per Gallon`) | User clicks **🔄 Refresh** | Slicer's **End Month ≥ file's max Month + 1 calendar month**.  Update is by Item match (left-merge); unmatched rows are stale-stamped. |
+| 4 | `Files/Monthly_Mover_Reporting/mover_details_table.csv` | User clicks **🔄 Refresh** | A **new row was inserted** into the Movers Non-Milk Tracker since the last successful publish (row-count delta).  Edit-in-place on the existing last row does NOT qualify.  **Existing months may be overwritten** when the gate is open — the upsert wins for the current editing month. |
+| 5 | `Files/Milk_cost_tracker/base_milk_cost_monthly_tracker.csv` | User clicks **🔄 Refresh** | Slicer's **End Month = Start Month + 1 calendar month**.  **Existing months may be overwritten** — the upsert wins for the slicer's End Month. |
 
 #### Operator-facing checklist
 
 1. **Wait for USDA**: if the End Month you need isn't in the Milk
-   Commodity slicer, the advanced-prices PDF hasn't been published
-   yet.  Click **🔄 USDA refresh** to force a check.
+   Commodity slicer, the advanced-prices PDF hasn't yet published
+   different rates than the latest month on file.  Click **🔄 USDA
+   refresh** to re-check.  When USDA's Class II Butterfat lags
+   advance-prices, you'll see a yellow warning naming the missing
+   month — fill it into the lakehouse, then click USDA refresh
+   again.
 2. **Pick `(Start Month, End Month)` in the slicer**.  For the
-   `base_milk_cost_monthly_tracker` Confirm upsert to fire, the pair
-   must be exactly one calendar month apart.
+   `base_milk_cost_monthly_tracker` upsert to fire, the pair must be
+   exactly one calendar month apart.
 3. **Edit the Movers Non-Milk Tracker** below.  To trigger the
-   `mover_details_table` Confirm upsert you must **insert a new row**
-   for the new month — editing the existing last row is not enough.
-4. **Click Refresh** to recompute metrics + the replace-style files.
-   Each write that runs / skips / fails surfaces a small caption.
-5. **Click Confirm** when the run looks correct.  The two cumulative
-   tracking files are upserted under the gates listed above; existing
-   months are overwritten.
-6. **HTST pricing unlocks**: the New Price Quote view reads
+   `mover_details_table` upsert you must **insert a new row** for the
+   new month — editing the existing last row is not enough.
+4. **Click Refresh**.  Every downstream artefact runs under its own
+   gate; each write that runs / skips / fails surfaces a small
+   caption.  Iterate freely — the row-count gate on
+   `mover_details_table` and the calendar-adjacency gate on
+   `base_milk_cost_monthly_tracker` together prevent accidental
+   pollution of the cumulative audit history.
+5. **HTST pricing unlocks**: the New Price Quote view reads
    `Product_Milk Base Cost.csv` directly, so the new $/gal flows
-   through immediately after step 4 — no Confirm or calendar-rollover
-   wait required.
+   through immediately after step 4 — no calendar-rollover wait
+   required.
 
 All three milk artefacts (`fmmo_tracker.json`,
 `base_milk_cost_monthly_tracker.csv`, and the canonical drop-zone
@@ -3243,6 +3467,32 @@ def _render_milk_commodity(
     )
     st.plotly_chart(fig, use_container_width=True, key=f"{_SS_PREFIX}_milk_chart")
 
+    # ── Download: the EXACT slice rendered on the chart ─────────────────────
+    # Pulled through the same filter pipeline as the chart (slicer bounds,
+    # CC II → ESL II mirror, Category / Class knobs) so the CSV always
+    # matches what the operator sees on screen.  Hidden silently when the
+    # slice would be empty (no need for an "empty CSV" download button).
+    visible_slice = _milk_commodity_visible_slice(
+        milk.df,
+        start_month=start_month,
+        end_month=end_month,
+        category_filter=category_filter,
+        class_filter=class_filter,
+    )
+    if not visible_slice.empty:
+        st.download_button(
+            label="⬇️ Download CSV",
+            data=_to_csv_bytes(visible_slice),
+            file_name=f"Milk_Commodity_Cost_{datetime.now():%Y%m%d}.csv",
+            mime="text/csv",
+            key=f"{_SS_PREFIX}_milk_chart_download",
+            help=(
+                "Download the rows currently visible on the chart — slicer "
+                "bounds and the Category / Class filters are applied so the "
+                "CSV matches what you see on screen."
+            ),
+        )
+
 
 # Session-state keys for the Packaging Index time slicer + index filter.
 # Both default to "All" / full range on first render and persist across
@@ -3510,37 +3760,33 @@ def _render_table_and_refresh(
     uploads: dict[str, _Uploaded],
     current_month: pd.Timestamp,
 ) -> None:
-    """Render the Movers Non-Milk Tracker editor with Refresh + Confirm + Download.
+    """Render the Movers Non-Milk Tracker editor with Refresh + Download.
 
     Layout
     ------
     The editable table sits on the left (~5/6 of the row); a vertical button
-    stack on the right holds three controls (top to bottom):
+    stack on the right holds two controls (top to bottom):
 
-      1. **🔄 Refresh** — recompute the impact pipeline using the LAST row of
-         this table.  Refreshes the in-memory results, the metrics shown
-         below, and the *replace-style* OneLake artefacts
-         (``Resin_Cost_Tracker.csv``, ``Product_Milk Base Cost.csv``, and
-         the four ``Monthly_Pricing_Execution/*.csv`` Mover Downloads).
-         Does NOT touch the two append/upsert tracking CSVs.
-      2. **✅ Confirm** — promote the latest Refresh into the two cumulative
-         tracking files (``mover_details_table.csv``,
-         ``base_milk_cost_monthly_tracker.csv``).  Each file is upserted
-         under its own gate; existing months may be overwritten.  Disabled
-         until at least one Refresh has succeeded in this session.
-      3. **⬇️ Download CSV** — download the current state of the editable
+      1. **🔄 Refresh** — single-trigger orchestrator that runs the
+         impact pipeline AND every dependent OneLake write under that
+         write's own gate (see
+         :func:`_run_refresh_lakehouse_writes` for the full list of
+         downstream artefacts and their gates).  Iterating Refresh
+         while only tweaking the existing last row's $/lbs cells is
+         safe: the cumulative tracking writes
+         (``mover_details_table.csv``,
+         ``base_milk_cost_monthly_tracker.csv``) are individually
+         gated on "new row inserted in NMT" and "End=Start+1" so
+         they never publish stale or duplicate state.
+      2. **⬇️ Download CSV** — download the current state of the editable
          tracker (including unsaved edits and newly added rows).
-
-    The split-trigger design lets operators iterate freely with Refresh
-    (mid-month adjustments, what-ifs) without polluting the cumulative
-    audit history; only an explicit Confirm bakes a month into the
-    canonical record.
     """
     st.markdown("#### 📝 Movers Non-Milk Tracker — fully editable")
     st.caption(
         "Add, remove, or edit rows freely.  The **last row** drives the "
-        "Incremental Revenue vs. Last Month calculations on **Refresh**.  "
-        "Click **Confirm** to publish the run to the cumulative tracking files."
+        "Incremental Revenue vs. Last Month calculations.  Click "
+        "**Refresh** to recompute metrics and update every dependent "
+        "lakehouse file under its own gate."
     )
 
     col_table, col_btn = st.columns([5, 1])
@@ -3555,29 +3801,14 @@ def _render_table_and_refresh(
             key=f"{_SS_PREFIX}_refresh",
             help=(
                 "Recompute the Incremental Revenue vs. Last Month metrics "
-                "from the LAST row of this table.  Also rewrites "
-                "Resin_Cost_Tracker (existing months only), Product_Milk "
-                "Base Cost, and the four Mover Downloads in OneLake.  "
-                "Does NOT touch the cumulative tracking CSVs — use "
-                "Confirm for those."
-            ),
-        )
-        # Confirm is only meaningful after a Refresh has populated outputs;
-        # disable the button until then so the operator can't publish a
-        # stale or empty state into the cumulative tracking files.
-        confirm_enabled = bool(st.session_state.get(f"{_SS_PREFIX}_outputs"))
-        confirm_clicked = st.button(
-            "✅ Confirm",
-            type="secondary",
-            use_container_width=True,
-            key=f"{_SS_PREFIX}_confirm",
-            disabled=not confirm_enabled,
-            help=(
-                "Publish the latest Refresh into the cumulative tracking "
-                "files (mover_details_table.csv and "
-                "base_milk_cost_monthly_tracker.csv).  Each file has its "
-                "own gate; existing months may be overwritten.  Click "
-                "Refresh first to populate the run."
+                "from the LAST row of this table.  Upserts Resin_Cost_Tracker "
+                "(both Rest + TOPCO sides, every NMT month), regenerates the "
+                "two Resin Mover FGs, rewrites Product_Milk Base Cost, and "
+                "publishes the four Mover Downloads.  Also upserts "
+                "mover_details_table.csv (when a NEW row has been inserted "
+                "into the tracker since the last successful publish) and "
+                "base_milk_cost_monthly_tracker.csv (when the slicer's End "
+                "Month = Start Month + 1 calendar month)."
             ),
         )
         st.download_button(
@@ -3609,24 +3840,11 @@ def _render_table_and_refresh(
             outputs = _compute_all_outputs(uploads, edited, current_month)
         if outputs is not None:
             st.session_state[f"{_SS_PREFIX}_outputs"] = outputs
-            # Refresh-time OneLake writes: replace-style only, no cumulative
-            # mutation.  Failures surface as small captions inside the
-            # helper so they never raise into this success branch.
-            _run_refresh_lakehouse_writes(outputs, uploads)
+            # The single Refresh orchestrator runs every dependent
+            # OneLake write under its own gate.  Failures surface as
+            # small captions inside the helpers — they never raise.
+            _run_refresh_lakehouse_writes(outputs, uploads, edited)
             st.success("✅ Calculations complete. Results below.")
-
-    if confirm_clicked:
-        outputs = st.session_state.get(f"{_SS_PREFIX}_outputs")
-        if not outputs:
-            # Defensive: the disabled flag above should prevent this, but
-            # keep a graceful inline error in case state is desynced.
-            st.warning(
-                "Click **🔄 Refresh** first — Confirm has nothing to publish "
-                "until an Incremental Revenue run has been computed."
-            )
-        else:
-            with st.spinner("Publishing to cumulative tracking files..."):
-                _run_confirm_lakehouse_writes(outputs, uploads, edited)
 
 
 def _is_calendar_month_plus_one(
@@ -3635,7 +3853,7 @@ def _is_calendar_month_plus_one(
 ) -> bool:
     """Return True when ``end_month`` is exactly one calendar month after ``start_month``.
 
-    Used by the May-2026 base_milk_cost_monthly_tracker Confirm gate:
+    Used by the base_milk_cost_monthly_tracker Refresh gate:
 
         "End Month = Start Month + 1 calendar month"
 
@@ -3653,12 +3871,12 @@ def _maybe_upsert_base_milk_cost_tracker(
     start_month: Optional[pd.Timestamp],
     end_month: Optional[pd.Timestamp],
 ) -> None:
-    """Confirm-driven upsert into ``base_milk_cost_monthly_tracker.csv``.
+    """Refresh-driven upsert into ``base_milk_cost_monthly_tracker.csv``.
 
-    Honours the May-2026 contract verbatim:
+    Honours the May-2026-late contract verbatim:
 
         "base_milk_cost_monthly_tracker.csv is updated when user hits
-         Confirm AND the slicer's End Month = Start Month + 1
+         Refresh AND the slicer's End Month = Start Month + 1
          calendar month.  Existing month can be overwritten."
 
     Conditions enforced here:
@@ -3672,12 +3890,12 @@ def _maybe_upsert_base_milk_cost_tracker(
 
     NOTE on overwrite semantics: the underlying store's
     :func:`upsert_rows_for_end_month` drops any pre-existing rows for
-    the End Month before inserting the new payload.  Re-Confirming a
+    the End Month before inserting the new payload.  Re-Refreshing a
     month after editing usage values therefore produces a truthful
-    rewrite rather than a silent skip — this is the May-2026 change.
+    rewrite rather than a silent skip — this is the May-2026 contract.
 
     Failures are swallowed into a small caption — they NEVER raise,
-    so a transient Fabric outage cannot break the rest of the Confirm
+    so a transient Fabric outage cannot break the rest of the Refresh
     pipeline.
     """
     if (milk_usage_with_movers is None
@@ -3695,7 +3913,7 @@ def _maybe_upsert_base_milk_cost_tracker(
             f"ℹ️ base_milk_cost_monthly_tracker not updated: End Month "
             f"({em:%Y-%m}) must be exactly one calendar month after "
             f"Start Month ({sm:%Y-%m}).  Adjust the slicer and click "
-            f"Confirm again."
+            f"Refresh again."
         )
         return
 
@@ -3811,47 +4029,40 @@ def _maybe_update_product_milk_base_cost(
         st.caption(result.as_caption())
 
 
-# ── Refresh + Confirm Lakehouse writes ───────────────────────────────────────
+# ── Refresh-driven Lakehouse writes (single-trigger contract) ────────────────
 #
-# Two trigger modes, five cumulative artefacts, one shared computation
-# pipeline.  All helpers below are idempotent and NEVER raise — failures
-# surface as small captions so a transient Fabric outage cannot break the
-# rest of the user's session.
+# One Refresh click, five cumulative artefacts, all helpers idempotent
+# and NEVER raise — failures surface as small captions so a transient
+# Fabric outage cannot break the rest of the user's session.  Each
+# write has its own gate so Refresh-iteration on the existing last row
+# remains safe (no surprise pollution of cumulative audit history).
 #
-# Refresh fires (replace-style; safe to iterate):
-#   1. Resin_Cost_Tracker.csv         — rewrite every ``(Month, Side)`` row
-#                                       already in the file using the
-#                                       fresh NMT × Resin_Calculator
-#                                       payload.  Months in the file but
-#                                       absent from the NMT (e.g. Sep–Nov
-#                                       2025) pass through untouched.
-#                                       New-month rows are deferred to
-#                                       the Confirm-side append.
+#   1. Resin_Cost_Tracker.csv         — single ``upsert_for_sides`` over
+#                                       every ``(Month, Side)`` key in
+#                                       the NMT × Resin_Calculator
+#                                       payload.  Overwrites existing
+#                                       AND appends new in the same
+#                                       call.  Months in the file but
+#                                       absent from the NMT (e.g.
+#                                       Sep–Nov 2025) pass through
+#                                       untouched.
 #   2. Product_Milk Base Cost.csv     — rewrite ``Base Milk Cost per Gallon``
 #                                       by Item match when the slicer's End
 #                                       Month is at least one calendar month
 #                                       newer than the file's max Month.
 #   3. Monthly_Pricing_Execution/*.csv — authoritative replace of the four
-#                                       Mover Downloads.
-#
-# Confirm fires (cumulative tracking, upsert-style — overwrite allowed):
+#                                       Mover Downloads (no month gate).
 #   4. mover_details_table.csv        — upsert the freshly-built rows for the
 #                                       editing month.  Gated on a strict
 #                                       "row-count delta > 0" on the editable
 #                                       Movers Non-Milk Tracker (a NEW row
-#                                       was inserted since the last successful
-#                                       Confirm).  Existing months may be
-#                                       overwritten.
+#                                       was inserted since the last
+#                                       successful publish).  Existing months
+#                                       are overwritten when the gate opens.
 #   5. base_milk_cost_monthly_tracker.csv — upsert per-item End Month Milk
 #                                       Cost.  Gated on "End = Start + 1
 #                                       calendar month".  Existing months
-#                                       may be overwritten.
-#   6. Resin_Cost_Tracker.csv         — append the new-month rows (= today's
-#                                       calendar month + 1) IFF that month
-#                                       is present in the NMT AND strictly
-#                                       greater than the file's current max.
-#                                       NOT touched by Refresh — Refresh
-#                                       only rewrites existing months.
+#                                       are overwritten when the gate opens.
 
 # Session-state slot used to short-circuit the Product_Milk Base Cost
 # rewrite when Refresh is clicked repeatedly for the same End Month.
@@ -3860,39 +4071,40 @@ def _maybe_update_product_milk_base_cost(
 # of the hot path is still worthwhile during rapid slicer toggling.
 _SS_PMBC_LAST_END                    = f"{_SS_PREFIX}_pmbc_last_end"
 
-# Session-state slot for the strict mover_details_table Confirm trigger.
+# Session-state slot for the strict mover_details_table Refresh gate.
 # Holds the row count of the editable Movers Non-Milk Tracker at the
-# moment of the most-recent successful Confirm.  A later Confirm fires
-# the upsert ONLY when the user has materially inserted a new row
-# (count went up).  Edits to existing rows therefore do NOT re-fire the
-# upsert, even though the underlying store now allows overwrite.
+# moment of the most-recent successful publish.  A later Refresh fires
+# the mover_details_table upsert ONLY when the user has materially
+# inserted a new row (count went up).  Edits to existing rows therefore
+# do NOT re-fire the upsert, even though the underlying store now
+# allows overwrite — that's what keeps Refresh-iteration safe (the
+# operator can tweak the last row's $/lbs cells without polluting the
+# cumulative audit history).
 _SS_NMT_LAST_PUBLISHED_ROW_COUNT     = f"{_SS_PREFIX}_nmt_last_published_row_count"
 
 
-def _maybe_rewrite_resin_cost_tracker_existing_months(
-    outputs: dict,
-) -> None:
-    """Refresh-driven rewrite of every (Month, Side) row already in the file.
+def _maybe_upsert_resin_cost_tracker(outputs: dict) -> None:
+    """Refresh-driven upsert of every (Month, Side) row from the NMT payload.
 
-    May-2026 contract (resin):
+    May-2026-late contract (resin):
 
-        "Existing data should be updated entirely once user hit refresh.
-         The append of the new month data should be only generated when
-         user hit Confirm and new month > existing month in the file."
+        "user clicks Refresh → calculate Resin Cost ($/Gal) for both
+         sides over every NMT month → either overwrite or append into
+         Resin_Cost_Tracker.csv"
 
-    The Refresh-side payload was pre-partitioned in
-    :func:`_compute_all_outputs` and lives at
-    ``outputs["resin_tracker_rewrite_payload"]``.  It contains rows ONLY
-    for months that already exist in the persisted Resin_Cost_Tracker —
-    months in the NMT but not yet in the file (e.g. today + 1) are held
-    back for the Confirm-side append path.  Months in the file but not
-    in the NMT (e.g. Sep–Nov 2025) are excluded by construction and
-    therefore pass through untouched.
+    The payload comes from :func:`_build_tracker_rows_for_nmt` and
+    covers every NMT row that carries at least one numeric ``$/lbs``
+    cell.  :func:`resin_cost_tracker_store.upsert_for_sides` then
+    drops the matching ``(Month, Side)`` rows from the persisted file
+    and concats the payload onto the survivors — overwriting existing
+    months AND appending new months in a single ETag-guarded write.
 
-    The underlying :func:`resin_cost_tracker_store.rewrite_existing_months_for_sides`
-    drops every persisted ``(Month, Side)`` row whose key is in the
-    payload and concats the payload onto the survivors — the spec's
-    "updated entirely" semantics.
+    Rows in the persisted file whose ``(Month, Side)`` key is NOT in
+    the payload are PRESERVED verbatim — the "Sep–Nov 2025 stay as-is"
+    invariant survives every Refresh.
+
+    The split between overwrite-count and append-count is computed
+    here purely for the caption — the store does not need it.
 
     Failures surface as a small caption — they NEVER raise, so a
     transient Fabric outage cannot break the rest of the Refresh
@@ -3901,98 +4113,36 @@ def _maybe_rewrite_resin_cost_tracker_existing_months(
     if outputs is None:
         return
 
-    payload = outputs.get("resin_tracker_rewrite_payload")
+    payload = outputs.get("resin_tracker_upsert_payload")
     if payload is None or payload.empty:
         st.caption(
-            "ℹ️ Resin_Cost_Tracker unchanged — no Movers Non-Milk Tracker "
-            "months match months already in the lakehouse file."
+            "ℹ️ Resin_Cost_Tracker unchanged — the Movers Non-Milk "
+            "Tracker has no rows with numeric ``$/lbs`` values for "
+            "Rest or TOPCO."
         )
         return
 
     try:
-        rows_inserted, rows_deleted = (
-            _resin_store.rewrite_existing_months_for_sides(payload)
-        )
+        rows_written, rows_replaced = _resin_store.upsert_for_sides(payload)
     except _resin_store.ResinCostTrackerStoreError as exc:
-        st.caption(f"⚠️ Could not rewrite Resin_Cost_Tracker: {exc}")
+        st.caption(f"⚠️ Could not update Resin_Cost_Tracker: {exc}")
         return
 
-    if rows_inserted == 0 and rows_deleted == 0:
+    if rows_written == 0:
         return
 
-    months_in_payload = (
-        sorted({_parse_month(m).strftime("%b %Y")
-                for m in payload[_COL_MONTH]
-                if _parse_month(m) is not None})
-    )
+    rows_appended = max(rows_written - rows_replaced, 0)
+    months_in_payload = sorted({
+        _parse_month(m).strftime("%b %Y")
+        for m in payload[_COL_MONTH]
+        if _parse_month(m) is not None
+    })
     months_caption = ", ".join(months_in_payload) if months_in_payload else "n/a"
     st.caption(
-        f"✅ Resin_Cost_Tracker rewrite: replaced {rows_deleted} row(s) with "
-        f"{rows_inserted} freshly-computed row(s) across "
-        f"{len(months_in_payload)} month(s) "
-        f"({months_caption})."
+        f"✅ Resin_Cost_Tracker upsert: overwrote {rows_replaced} row(s), "
+        f"appended {rows_appended} row(s) across "
+        f"{len(months_in_payload)} month(s) ({months_caption})."
     )
-
-
-def _maybe_append_resin_cost_tracker_new_month(
-    outputs: dict,
-) -> None:
-    """Confirm-driven append of the new-month rows to Resin_Cost_Tracker.csv.
-
-    May-2026 contract (resin):
-
-        "The append of the new month data should be only generated when
-         user hit Confirm and new month > existing month in the file."
-
-    The Confirm-side payload was pre-partitioned in
-    :func:`_compute_all_outputs` and lives at
-    ``outputs["resin_tracker_new_month_payload"]``.  It is empty when
-    the operator has not yet added a NMT row for the new month
-    (= today + 1 calendar month) — surfaces a clear "add the row first"
-    caption in that case.
-
-    The underlying
-    :func:`resin_cost_tracker_store.append_new_month_if_after_latest`
-    enforces the strict ``new_month > max(persisted months)`` gate and
-    no-ops (with an explanatory ``skip_reason``) when the gate fails.
-
-    Failures surface as a small caption — they NEVER raise.
-    """
-    if outputs is None:
-        return
-
-    new_month = _today_new_month()
-
-    payload = outputs.get("resin_tracker_new_month_payload")
-    if payload is None or payload.empty:
-        # Spec: refuse to append when the operator has not yet added the
-        # new-month row to the editable NMT.  Friendly nudge so they
-        # know exactly what to do.
-        st.caption(
-            f"ℹ️ Resin_Cost_Tracker append skipped: add a row for "
-            f"{new_month:%b %Y} to the Movers Non-Milk Tracker above "
-            f"with **{_NMT_COL_REST_RESIN}** and **{_NMT_COL_TOPCO_RESIN}** "
-            f"filled in, then click Refresh + Confirm again."
-        )
-        return
-
-    try:
-        rows_appended, was_appended, skip_reason = (
-            _resin_store.append_new_month_if_after_latest(new_month, payload)
-        )
-    except _resin_store.ResinCostTrackerStoreError as exc:
-        st.caption(f"⚠️ Could not append to Resin_Cost_Tracker: {exc}")
-        return
-
-    if was_appended and rows_appended:
-        st.caption(
-            f"✅ Resin_Cost_Tracker append: {rows_appended} row(s) for "
-            f"{new_month:%b %Y} → {_resin_store.get_cost_tracker_label()}."
-        )
-    elif skip_reason:
-        st.caption(
-            f"ℹ️ Resin_Cost_Tracker append skipped — {skip_reason}."
-        )
 
 
 def _maybe_upsert_mover_details_table_for_month(
@@ -4002,27 +4152,29 @@ def _maybe_upsert_mover_details_table_for_month(
     new_row_inserted: bool,
     nmt_row_count: int,
 ) -> None:
-    """Confirm-driven upsert of mover_details_table rows for ``editing_month``.
+    """Refresh-driven upsert of mover_details_table rows for ``editing_month``.
 
-    May-2026 contract:
+    May-2026-late contract:
 
-        "mover_details_table.csv is updated when user hits Confirm AND
-         a new row was inserted into the Movers Non-Milk Tracker since
-         the last successful publish (row-count delta).  Existing month
-         data can be overwritten."
+        "mover_details_table.csv is updated on Refresh AND a new row
+         was inserted into the Movers Non-Milk Tracker since the last
+         successful publish (row-count delta).  Existing month data
+         can be overwritten."
 
     Gate conditions (both must hold):
 
       1. ``new_row_inserted=True`` — the editable Movers Non-Milk
          Tracker has grown by at least one row since the last
-         successful Confirm (detected via row-count delta against
+         successful publish (detected via row-count delta against
          ``_SS_NMT_LAST_PUBLISHED_ROW_COUNT``).  Edit-in-place on the
          existing last row does NOT qualify, even though the underlying
-         store now allows overwrite.
+         store now allows overwrite.  This is what keeps Refresh
+         iteration safe — the operator can repeatedly tweak the last
+         row without polluting the cumulative audit history.
       2. ``mover_details_table`` is non-empty.
 
     On success, ``_SS_NMT_LAST_PUBLISHED_ROW_COUNT`` is bumped to the
-    current count so the next Confirm starts measuring from the new
+    current count so the next Refresh starts measuring from the new
     baseline.  Failures surface as a small caption — never raised.
     """
     if mover_details_table is None or mover_details_table.empty or editing_month is None:
@@ -4031,12 +4183,12 @@ def _maybe_upsert_mover_details_table_for_month(
     em = pd.Timestamp(editing_month).normalize().replace(day=1)
 
     if not new_row_inserted:
-        # Confirm clicked without a new row in the editable tracker —
+        # Refresh clicked without a new row in the editable tracker —
         # strict trigger says we do NOT upsert here.  Render a small
         # informational caption so the operator understands why nothing
         # was pushed to the cumulative file.
         st.caption(
-            "ℹ️ mover_details_table not updated: Confirm publishes a new "
+            "ℹ️ mover_details_table not updated: Refresh publishes a new "
             "month only when a NEW row has been inserted into the Movers "
             "Non-Milk Tracker since the last successful publish.  "
             "Edit-in-place on the existing last row does not qualify."
@@ -4052,7 +4204,7 @@ def _maybe_upsert_mover_details_table_for_month(
         return
 
     if rows_written:
-        # Bump the published-row-count snapshot so the next Confirm
+        # Bump the published-row-count snapshot so the next Refresh
         # measures "new row inserted" from this baseline forward.
         st.session_state[_SS_NMT_LAST_PUBLISHED_ROW_COUNT] = int(nmt_row_count)
         verb = "Overwrote" if was_overwrite else "Appended"
@@ -4123,38 +4275,50 @@ def _editing_month_from_session() -> Optional[pd.Timestamp]:
 
     Returns ``None`` when the tracker is empty or its last-row Month is
     unparseable, so callers can short-circuit cleanly without raising.
-    Centralised here because both the Refresh and Confirm orchestrators
-    derive this value the same way.
+    Reads the editor's coerced edited view (or the seed on first
+    render) — never the stable seed slot directly, which is preserved
+    intact for the widget.
     """
-    nmt_df: Optional[pd.DataFrame] = st.session_state.get(_SS_NMT_DF)
+    nmt_df = _get_nmt_edited_view()
     if nmt_df is None or nmt_df.empty:
         return None
     return _parse_month(nmt_df.iloc[-1][_NMT_COL_MONTH])
 
 
-def _run_refresh_lakehouse_writes(outputs: dict, uploads: dict[str, _Uploaded]) -> None:
-    """Run every Refresh-time OneLake write (replace-style, no upserts).
+def _run_refresh_lakehouse_writes(
+    outputs: dict,
+    uploads: dict[str, _Uploaded],
+    edited_nmt: pd.DataFrame,
+) -> None:
+    """Run every Refresh-time OneLake write under the single-trigger contract.
 
-    Wired only from the Refresh button handler.  Three lakehouse writes
-    happen here, in dependency order:
+    Wired from the sole Refresh button handler.  Six dependent writes
+    fire here, each under its own gate:
 
-      1. **Resin_Cost_Tracker.csv** — rewrite every ``(Month, Side)``
-         row already in the file using the freshly-computed NMT ×
-         Resin_Calculator payload.  Months in the file but not in the
-         NMT (e.g. Sep–Nov 2025) pass through untouched.  New-month
-         rows are NOT written here — those land under the Confirm
-         trigger (see :func:`_run_confirm_lakehouse_writes`).
+      1. **Resin_Cost_Tracker.csv** — single ``upsert_for_sides`` over
+         every ``(Month, Side)`` key in the NMT × Resin_Calculator
+         payload.  Overwrites existing months AND appends new months
+         in one ETag-guarded write.  Months in the file but absent
+         from the NMT (e.g. Sep–Nov 2025) are PRESERVED.
       2. **Product_Milk Base Cost.csv** — overwrite
          ``Base Milk Cost per Gallon`` by Item match; gated on
-         ``End Month >= file's max Month + 1`` calendar month.  Refresh
-         is the sole writer.
+         ``End Month >= file's max Month + 1`` calendar month.
       3. **Monthly_Pricing_Execution/{rest, topco, milk, NMT}.csv** —
          authoritative replace on every Refresh (no month gate).
+      4. **mover_details_table.csv** — upsert the editing month;
+         gated on **the operator inserted a new row into the NMT
+         since the last successful publish** (row-count delta).
+         Existing month data is overwritten when the gate is open.
+         Edit-in-place on the existing last row does NOT qualify.
+      5. **base_milk_cost_monthly_tracker.csv** — upsert the slicer's
+         End Month; gated on ``End Month = Start Month + 1`` calendar
+         month.  Existing months are overwritten when the gate is
+         open.
 
-    The two cumulative *tracking* artefacts (``mover_details_table.csv``
-    and ``base_milk_cost_monthly_tracker.csv``) are intentionally NOT
-    written here — those live under the Confirm trigger so operators
-    can iterate Refresh without polluting the audit history.
+    Step 4's row-count gate preserves the spec invariant "Refresh
+    shows metric changes but iteration on the existing last row
+    never pollutes the cumulative audit history" — even though every
+    other write now also rides the Refresh click.
 
     Failures surface as small captions inside each helper — they NEVER
     raise into this orchestrator.
@@ -4162,6 +4326,13 @@ def _run_refresh_lakehouse_writes(outputs: dict, uploads: dict[str, _Uploaded]) 
     editing_month = _editing_month_from_session()
     if editing_month is None:
         return
+
+    # ── FG warnings ─────────────────────────────────────────────────────────
+    # Render BEFORE any write so operators see the actionable banner
+    # alongside the success caption.  Each side's missing Old-month
+    # warning is independent, so render them all.
+    for warning in outputs.get("resin_fg_warnings", ()):  # type: ignore[arg-type]
+        st.warning(f"⚠️ {warning}")
 
     rest_fg = outputs.get("rest_htst_resin_mover_fg", pd.DataFrame())
     topco_fg = outputs.get("topco_resin_mover_fg", pd.DataFrame())
@@ -4170,103 +4341,55 @@ def _run_refresh_lakehouse_writes(outputs: dict, uploads: dict[str, _Uploaded]) 
     # Mover Downloads + Product_Milk Base Cost see the freshest values
     # without requiring another Refresh after a slicer interaction.
     milk_usage_with_movers = _compute_milk_usage_for_render(uploads)
-    end_month_slicer = st.session_state.get(_SS_MILK_END)
-    nmt_df: pd.DataFrame = st.session_state.get(_SS_NMT_DF)
+    end_month_slicer   = st.session_state.get(_SS_MILK_END)
+    start_month_slicer = st.session_state.get(_SS_MILK_START)
+    # Read the edited view (not the stable seed) so the published
+    # Movers_Non_Milk_Tracker.csv reflects the operator's just-typed
+    # values.  See ``_render_movers_non_milk_editor`` for why
+    # ``_SS_NMT_DF`` is intentionally left untouched.
+    nmt_df: Optional[pd.DataFrame] = _get_nmt_edited_view()
 
-    _maybe_rewrite_resin_cost_tracker_existing_months(outputs)
+    # ── 1. Resin tracker — single upsert (overwrite + append) ───────────────
+    _maybe_upsert_resin_cost_tracker(outputs)
+
+    # ── 2. Product_Milk Base Cost — Refresh-gated overwrite ─────────────────
     _maybe_update_product_milk_base_cost(milk_usage_with_movers, end_month_slicer)
 
-    # Authoritative replace of the four Mover Downloads in a dedicated
-    # Monthly_Pricing_Execution OneLake folder.  Always fires on Refresh —
-    # there is no month gate because the canonical drop-zone always
-    # holds the latest run's outputs.  Includes the editable Movers
-    # Non-Milk Tracker as-of-Refresh so the published FG outputs are
-    # auditable against the exact mover inputs that produced them.
+    # ── 3. Mover Downloads — authoritative replace ──────────────────────────
     _publish_mover_downloads_to_lakehouse(
         rest_fg, topco_fg, milk_usage_with_movers, nmt_df,
     )
 
-
-def _run_confirm_lakehouse_writes(
-    outputs: dict,
-    uploads: dict[str, _Uploaded],
-    edited_nmt: pd.DataFrame,
-) -> None:
-    """Run every Confirm-time OneLake write (upsert-style, overwrite-allowed).
-
-    Wired only from the Confirm button handler.  Three cumulative
-    tracking writes are dispatched under their own gates:
-
-      1. **mover_details_table.csv** — strict "new row inserted into
-         Movers Non-Milk Tracker since last successful publish"
-         (row-count delta).  Existing month data is OVERWRITTEN by
-         design — the latest values for a given month always win.
-      2. **base_milk_cost_monthly_tracker.csv** — slicer's
-         ``End Month = Start Month + 1`` calendar month.  Existing
-         End Months are OVERWRITTEN by design.
-      3. **Resin_Cost_Tracker.csv** — append the new-month rows
-         (= today's calendar month + 1) IFF that month is present in
-         the NMT AND is strictly greater than the file's current max
-         month.  Refusal to append surfaces a friendly "add the row
-         first" caption.
-
-    Inputs
-    ------
-    ``outputs`` is the cached payload from the most-recent Refresh; the
-    base mover_details_table lives at ``outputs["mover_details_table_base"]``
-    and the per-side new-month resin payload at
-    ``outputs["resin_tracker_new_month_payload"]``.  ``edited_nmt`` is
-    the live editable Movers Non-Milk Tracker frame (used to compute
-    the row-count delta).
-
-    Failures surface as small captions inside each helper — they NEVER
-    raise into this orchestrator.
-    """
-    editing_month = _editing_month_from_session()
-    if editing_month is None:
-        st.caption(
-            "ℹ️ Nothing to publish — the editable Movers Non-Milk "
-            "Tracker is empty or its last-row Month is invalid."
-        )
-        return
-
-    # Strict "new row inserted into NMT" detector — used by the
-    # mover_details_table upsert below to decide whether the user
-    # genuinely added a new row (count up) vs. merely edited the
-    # existing last row.  Compared against the row-count snapshot
-    # taken at the last successful Confirm.
+    # ── 4. mover_details_table — gated by NMT row-count delta ───────────────
+    #
+    # The row-count gate is what makes Refresh-iteration safe: the
+    # operator can hit Refresh repeatedly while tweaking the LAST
+    # row's $/lbs cells and the cumulative audit history won't change.
+    # Inserting a brand-new row (the only act that means "publish this
+    # month") opens the gate exactly once until the next successful
+    # publish.
     nmt_row_count = int(len(edited_nmt)) if edited_nmt is not None else 0
     last_published_count = int(
         st.session_state.get(_SS_NMT_LAST_PUBLISHED_ROW_COUNT, 0)
     )
     new_row_inserted = nmt_row_count > last_published_count
 
-    base_table: pd.DataFrame = outputs.get("mover_details_table_base", pd.DataFrame())
-
-    # Re-layer milk reactively so the published mover_details_table
-    # carries the latest milk columns produced by the current slicer.
-    milk_usage_with_movers = _compute_milk_usage_for_render(uploads)
+    base_table: pd.DataFrame = outputs.get(
+        "mover_details_table_base", pd.DataFrame(),
+    )
     full_table, _ignored = _layer_milk_on_mover_details_table(
         base_table, milk_usage_with_movers,
     )
-
     _maybe_upsert_mover_details_table_for_month(
         full_table, editing_month,
         new_row_inserted=new_row_inserted,
         nmt_row_count=nmt_row_count,
     )
 
-    start_month_slicer = st.session_state.get(_SS_MILK_START)
-    end_month_slicer   = st.session_state.get(_SS_MILK_END)
+    # ── 5. base_milk_cost_monthly_tracker — gated on End=Start+1 ────────────
     _maybe_upsert_base_milk_cost_tracker(
         milk_usage_with_movers, start_month_slicer, end_month_slicer,
     )
-
-    # New-month resin append: gated on (a) the operator added the row
-    # in the editable Movers Non-Milk Tracker, and (b) the store-side
-    # strict ``new > max(file)`` check.  Independent of the two milk
-    # tracking writes above — they share only the Confirm trigger.
-    _maybe_append_resin_cost_tracker_new_month(outputs)
 
 
 def _compute_milk_usage_for_render(
@@ -4282,9 +4405,9 @@ def _compute_milk_usage_for_render(
     mover_details_table reacts to slicer changes without requiring another Refresh.
 
     Pure read-side computation — this function NEVER mutates OneLake.
-    All cumulative writes live under the Refresh / Confirm orchestrators
-    (``_run_refresh_lakehouse_writes`` / ``_run_confirm_lakehouse_writes``)
-    so OneLake state is tied to deliberate user action only.
+    Every dependent write lives under the single Refresh orchestrator
+    (:func:`_run_refresh_lakehouse_writes`) so OneLake state is tied
+    to deliberate user action only.
     """
     milk = uploads.get("milk_mover_tracker")
     usage = uploads.get("milk_usage_stable")
@@ -4525,17 +4648,20 @@ def _render_results() -> None:
 def _clear_upload_state() -> None:
     """Evict every cached artifact for this section from session_state.
 
-    Includes the editable Movers Non-Milk Tracker, the milk-chart time
-    slicer, the packaging slicer, and every Refresh/Confirm idempotency
-    flag so "Change files" returns the section to a fully pristine
-    state — uploads, edits, slicer selections, and computed outputs
-    all reset together.
+    Includes the editable Movers Non-Milk Tracker (seed + coerced view
+    + the widget's internal delta state), the milk-chart time slicer,
+    the packaging slicer, and every Refresh idempotency flag so
+    "Change files" returns the section to a fully pristine state —
+    uploads, edits, slicer selections, and computed outputs all reset
+    together.
     """
     for key in (
         f"{_SS_PREFIX}_uploads",
         f"{_SS_PREFIX}_sig",
         f"{_SS_PREFIX}_outputs",
         _SS_NMT_DF,
+        _SS_NMT_EDITED_VIEW,
+        _SS_NMT_EDITOR_KEY,
         _SS_MILK_START,
         _SS_MILK_END,
         _SS_MILK_CATEGORY,

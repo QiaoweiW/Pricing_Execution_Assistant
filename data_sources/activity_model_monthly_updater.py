@@ -1,7 +1,7 @@
 """
 Monthly auto-updater for files in the ``Activity_Model`` folder.
 
-Three rules fire once per calendar month, the first time the New Price
+Two rules fire once per calendar month, the first time the New Price
 Quote page renders on or after the 1st of a new month (vs. the cursor's
 last-handled value):
 
@@ -11,27 +11,32 @@ last-handled value):
    "non-applicable" / "n/a" Mileage Fee Tier row, which is set / kept
    at 0 forever.
 
-2. **PMBC rule** — left-merge ``base_milk_cost_monthly_tracker.csv``
-   onto ``Product_Milk Base Cost.csv`` by Item, overwriting
-   ``Base Milk Cost per Gallon`` and ``Month`` for matched rows;
-   stale-stamping unmatched rows the same way the legacy
-   :mod:`product_milk_base_cost_updater` did. This module supersedes
-   that legacy updater — its logic is folded in here.
-
-3. **PPPI rule** — left-merge ``rest_htst_resin_mover_fg.csv`` onto
+2. **PPPI rule** — left-merge ``rest_htst_resin_mover_fg.csv`` onto
    ``Product_Processing_Pkg_Ing.csv`` by Product ID / Item; ADD
    ``Resin Mover ($/Gal)`` to existing ``Packaging ($/Gal)`` for
    matched rows; leave unmatched rows untouched.
 
+PMBC rule retirement (May-2026)
+-------------------------------
+``Product_Milk Base Cost.csv`` is no longer updated by this monthly
+orchestrator. The Market Barometer's **Refresh** button is now the
+**sole writer** of that file — see
+``data_sources/product_milk_base_cost_store.py`` and
+``pages/monthly_resin_freight_mover_tracker._maybe_update_product_milk_base_cost``.
+The legacy ``_apply_pmbc_rule`` lives on in this file as **dead code**
+kept only for historical/audit reference; ``run_if_due`` never invokes
+it. Future maintenance can delete it once the operator confirms no
+external script depends on the symbol.
+
 All-or-nothing cursor semantics
 -------------------------------
-The three rules share ONE cursor (``activity_model_monthly_state.json``
+The two live rules share ONE cursor (``activity_model_monthly_state.json``
 → ``last_handled_month``). A render fires the rules only when:
 
 * Today's first-of-month > the cursor's value, AND
-* All three rules' upstream prerequisites are satisfied
-  (Movers_Non_Milk_Tracker has a row for the new month, the milk
-  tracker has rows, and rest_htst_resin_mover_fg is non-empty).
+* Both rules' upstream prerequisites are satisfied
+  (Movers_Non_Milk_Tracker has a row for the new month, and
+  rest_htst_resin_mover_fg is non-empty).
 
 If ANY prerequisite is missing the entire render is a no-op and the
 cursor stays put — the operator gets a yellow status caption naming
@@ -43,8 +48,7 @@ Archive
 Before mutation, the Delivery and PPPI files are snapshotted to
 ``Files/Activity_Model/archive/<basename>__<YYYY-MM>__pre__<YYYY-MM-DD>.csv``
 (date suffix ensures multiple snapshots in the same month never
-overwrite). PMBC is NOT archived here — its month-by-month history
-already lives in ``base_milk_cost_monthly_tracker.csv``.
+overwrite).
 
 Catch-up
 --------
@@ -151,29 +155,36 @@ class RuleResult:
 
 @dataclass
 class ActivityModelUpdateResult:
-    """Aggregate outcome of one orchestrator render."""
+    """Aggregate outcome of one orchestrator render.
+
+    The ``pmbc`` slot remains in the dataclass for backwards
+    compatibility with any external caller that reads it, but is left
+    unset by :func:`run_if_due` as of May-2026 — see the module
+    docstring's "PMBC rule retirement" section.
+    """
     checked_at:        datetime           = field(default_factory=datetime.now)
     fired:             bool               = False  # at least one rule mutated
     cursor_before:     Optional[pd.Timestamp] = None
     cursor_after:      Optional[pd.Timestamp] = None
     target_month:      Optional[pd.Timestamp] = None
     delivery:          Optional[RuleResult]   = None
-    pmbc:              Optional[RuleResult]   = None
+    pmbc:              Optional[RuleResult]   = None  # retired — always None
     pppi:              Optional[RuleResult]   = None
     skipped_reason:    Optional[str]      = None
     errors:            list[str]          = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        """All-or-nothing: True iff all three rules either succeeded or
-        the render was a clean no-op (cursor already current)."""
+        """All-or-nothing: True iff both live rules succeeded or the
+        render was a clean no-op (cursor already current). PMBC is
+        intentionally excluded — it is no longer fired here."""
         if self.errors:
             return False
         if not self.fired:
             return True
         return all(
             r is not None and r.ok
-            for r in (self.delivery, self.pmbc, self.pppi)
+            for r in (self.delivery, self.pppi)
         )
 
     def as_caption(self) -> str:
@@ -201,8 +212,6 @@ class ActivityModelUpdateResult:
         bits: list[str] = []
         if self.delivery and self.delivery.ok:
             bits.append(f"Delivery {self.delivery.rows_changed} row(s)")
-        if self.pmbc and self.pmbc.ok:
-            bits.append(f"PMBC {self.pmbc.rows_changed} row(s)")
         if self.pppi and self.pppi.ok:
             bits.append(f"PPPI {self.pppi.rows_changed} row(s)")
         joined = "; ".join(bits) if bits else "no row changes"
@@ -297,20 +306,22 @@ def _format_pmbc_month(ts: pd.Timestamp) -> str:
     return f"{ts.month}/{ts.day}/{ts.year}"
 
 
-# ── Pre-flight: read all three drivers ───────────────────────────────────────
+# ── Pre-flight: read the two live drivers ────────────────────────────────────
 
 @dataclass
 class _Preflight:
-    """Read-only snapshot of every input needed to fire the rules."""
+    """Read-only snapshot of every input needed to fire the live rules.
+
+    The PMBC-specific slots (``pmbc_df``, ``pmbc_etag``, ``pmbc_target``,
+    ``pmbc_lookup``) are intentionally absent — PMBC is no longer fired
+    by this orchestrator (May-2026 retirement; the Market Barometer
+    Refresh handler is the sole writer).
+    """
     delivery_df:    pd.DataFrame
     delivery_etag:  Optional[str]
-    pmbc_df:        pd.DataFrame
-    pmbc_etag:      Optional[str]
     pppi_df:        pd.DataFrame
     pppi_etag:      Optional[str]
     rest_freight:   Optional[float]   # the new-month NMT lookup
-    pmbc_target:    Optional[pd.Timestamp]
-    pmbc_lookup:    dict[str, float]   # Item → cost
     fg_df:          pd.DataFrame      # rest_htst_resin_mover_fg
     missing:        list[str]          # human-readable list of prereqs that failed
 
@@ -329,16 +340,7 @@ def _preflight(target_month: pd.Timestamp) -> _Preflight:
         delivery_df, delivery_etag = pd.DataFrame(), None
         missing.append(f"could not read {_DELIVERY_FILENAME}: {exc}")
 
-    # 2. PMBC.
-    try:
-        pmbc_df, pmbc_etag = _io.read_csv(
-            _ACTIVITY_SECRETS, _activity_blob_path(_PMBC_FILENAME),
-        )
-    except _io.LakehouseIOError as exc:
-        pmbc_df, pmbc_etag = pd.DataFrame(), None
-        missing.append(f"could not read {_PMBC_FILENAME}: {exc}")
-
-    # 3. PPPI.
+    # 2. PPPI.
     try:
         pppi_df, pppi_etag = _io.read_csv(
             _ACTIVITY_SECRETS, _activity_blob_path(_PPPI_FILENAME),
@@ -347,7 +349,7 @@ def _preflight(target_month: pd.Timestamp) -> _Preflight:
         pppi_df, pppi_etag = pd.DataFrame(), None
         missing.append(f"could not read {_PPPI_FILENAME}: {exc}")
 
-    # 4. Movers_Non_Milk_Tracker → Rest HTST Freight Mover for target_month.
+    # 3. Movers_Non_Milk_Tracker → Rest HTST Freight Mover for target_month.
     rest_freight = _lookup_rest_freight_mover(target_month)
     if rest_freight is None:
         missing.append(
@@ -356,25 +358,7 @@ def _preflight(target_month: pd.Timestamp) -> _Preflight:
             f"run a Market-Barometer Refresh for {target_month:%B %Y} first"
         )
 
-    # 5. Tracker target + lookup.
-    pmbc_target = None
-    pmbc_lookup: dict[str, float] = {}
-    try:
-        pmbc_target = _tracker_store.latest_month()
-    except _tracker_store.BaseMilkCostTrackerError as exc:
-        missing.append(f"could not read base_milk_cost_monthly_tracker: {exc}")
-    if pmbc_target is None:
-        missing.append(
-            "base_milk_cost_monthly_tracker is empty — run a Market-Barometer "
-            "Refresh to populate it before the monthly update can fire"
-        )
-    else:
-        try:
-            pmbc_lookup = _tracker_store.lookup_for_end_month(pmbc_target)
-        except _tracker_store.BaseMilkCostTrackerError as exc:
-            missing.append(f"could not read base_milk_cost_monthly_tracker lookup: {exc}")
-
-    # 6. rest_htst_resin_mover_fg (FG file for the PPPI rule).
+    # 4. rest_htst_resin_mover_fg (FG file for the PPPI rule).
     try:
         fg_df, _fg_etag = _io.read_csv(
             _MPE_SECRETS, _mpe_store.REST_FG_BLOB_PATH,
@@ -391,13 +375,9 @@ def _preflight(target_month: pd.Timestamp) -> _Preflight:
     return _Preflight(
         delivery_df=delivery_df,
         delivery_etag=delivery_etag,
-        pmbc_df=pmbc_df,
-        pmbc_etag=pmbc_etag,
         pppi_df=pppi_df,
         pppi_etag=pppi_etag,
         rest_freight=rest_freight,
-        pmbc_target=pmbc_target,
-        pmbc_lookup=pmbc_lookup,
         fg_df=fg_df,
         missing=missing,
     )
@@ -815,7 +795,10 @@ def run_if_due(
         return result
 
     # 4. Apply rules in fixed order. ``fired = True`` once we start
-    #    mutating; the cursor advances ONLY when all three succeed.
+    #    mutating; the cursor advances ONLY when both live rules
+    #    (Delivery + PPPI) succeed. PMBC is intentionally NOT invoked
+    #    here — see the module docstring's "PMBC rule retirement"
+    #    section.
     result.fired = True
 
     # Delivery
@@ -826,15 +809,6 @@ def run_if_due(
         rest_freight=preflight.rest_freight,  # type: ignore[arg-type]
     )
 
-    # PMBC
-    result.pmbc = _apply_pmbc_rule(
-        preflight.pmbc_df,
-        etag=preflight.pmbc_etag,
-        target_month=today_first,
-        tracker_target=preflight.pmbc_target,  # type: ignore[arg-type]
-        lookup=preflight.pmbc_lookup,
-    )
-
     # PPPI
     result.pppi = _apply_pppi_rule(
         preflight.pppi_df,
@@ -843,18 +817,18 @@ def run_if_due(
         fg_df=preflight.fg_df,
     )
 
-    # 5. All three must report ok before we advance the cursor.
-    if all(r.ok for r in (result.delivery, result.pmbc, result.pppi)):
+    # 5. Both live rules must report ok before we advance the cursor.
+    if all(r.ok for r in (result.delivery, result.pppi)):
         try:
             _write_cursor(today_first)
             result.cursor_after = today_first
         except ActivityModelMonthlyUpdaterError as exc:
             # The mutations succeeded but the cursor failed to advance —
             # very unusual. Log and surface; next render will see the
-            # mutations succeed again (PMBC will be a no-op,
-            # Delivery / PPPI would double-apply — which is why we
-            # ALWAYS try to write the cursor immediately and surface
-            # this error so the operator manually inspects).
+            # mutations succeed again (Delivery / PPPI would double-
+            # apply — which is why we ALWAYS try to write the cursor
+            # immediately and surface this error so the operator
+            # manually inspects).
             result.errors.append(
                 f"All rules succeeded but the cursor failed to advance: {exc}. "
                 "DO NOT re-run the monthly update — Delivery/PPPI would "
@@ -864,7 +838,7 @@ def run_if_due(
         # Mixed result. Cursor stays put — next render retries. The
         # mutations that DID succeed are visible in the archive folder
         # and in the live CSVs; the operator must inspect.
-        failing = [r.rule for r in (result.delivery, result.pmbc, result.pppi) if not r.ok]
+        failing = [r.rule for r in (result.delivery, result.pppi) if not r.ok]
         result.errors.append(
             "One or more rules failed: " + ", ".join(failing) +
             ". Cursor NOT advanced. Inspect the per-rule messages."

@@ -143,6 +143,7 @@ from data_sources import resin_cost_tracker_store as _resin_store
 from data_sources import mover_details_table_store as _mover_details_store
 from data_sources import monthly_pricing_execution_store as _mpe_store
 from data_sources import cola_program_tracker_store as _cola_store
+from data_sources import product_milk_base_cost_store as _pmbc_store
 
 
 # ── 1. Constants ──────────────────────────────────────────────────────────────
@@ -702,12 +703,32 @@ def _render_resin_store_status() -> None:
 
 # ── 4. Chart builder ──────────────────────────────────────────────────────────
 
-def _build_packaging_index_chart(pkg_df: pd.DataFrame) -> go.Figure:
+def _build_packaging_index_chart(
+    pkg_df: pd.DataFrame,
+    *,
+    start_time: Optional[pd.Timestamp] = None,
+    end_time: Optional[pd.Timestamp] = None,
+    selected_indices: Optional[list[str]] = None,
+) -> go.Figure:
     """Multi-series time-series chart of the Packaging Index.
 
     Resin price series (HDPE, LDPE, PET, PP) plot on the primary y-axis in
     $/lb; Linerboard (if present) plots on a secondary y-axis in $/ton because
     it lives on a different scale.
+
+    Parameters
+    ----------
+    pkg_df
+        Raw packaging-index DataFrame; must contain a ``Time`` column.
+    start_time, end_time
+        Optional inclusive bounds on the ``Time`` axis. ``None`` means
+        "no bound on that side" so the chart defaults to "all data".
+    selected_indices
+        Optional whitelist of column names to plot. ``None`` (or the
+        empty list, after the caller normalises "All" to every column)
+        means "plot every non-Time column". Unknown column names in the
+        whitelist are silently skipped so a stale filter state never
+        blanks the chart.
     """
     df = pkg_df.copy()
     if "Time" not in df.columns:
@@ -716,8 +737,32 @@ def _build_packaging_index_chart(pkg_df: pd.DataFrame) -> go.Figure:
     df["Time"] = pd.to_datetime(df["Time"], errors="coerce")
     df = df.dropna(subset=["Time"]).sort_values("Time")
 
-    resin_cols = [c for c in df.columns if c != "Time" and "linerboard" not in c.lower()]
-    board_cols = [c for c in df.columns if "linerboard" in c.lower()]
+    # Apply the time-slicer bounds BEFORE the column split so every
+    # downstream trace automatically respects the operator's selection.
+    if start_time is not None:
+        df = df[df["Time"] >= pd.Timestamp(start_time)]
+    if end_time is not None:
+        df = df[df["Time"] <= pd.Timestamp(end_time)]
+    if df.empty:
+        return go.Figure()
+
+    all_non_time = [c for c in df.columns if c != "Time"]
+    # Normalise the whitelist. None / empty list → every column.
+    if selected_indices:
+        whitelist = {c for c in selected_indices if c in all_non_time}
+        if not whitelist:
+            return go.Figure()  # user deselected every index
+    else:
+        whitelist = set(all_non_time)
+
+    resin_cols = [
+        c for c in all_non_time
+        if c in whitelist and "linerboard" not in c.lower()
+    ]
+    board_cols = [
+        c for c in all_non_time
+        if c in whitelist and "linerboard" in c.lower()
+    ]
 
     palette = ["#1f77b4", "#2ca02c", "#d62728", "#9467bd", "#ff7f0e", "#17becf"]
 
@@ -795,6 +840,74 @@ _MILK_COLOR_MAP: dict[tuple[str, str], str] = {
 }
 
 
+def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
+    """Patch Cottage Cheese II rows so Skim/Butterfat mirror ESL II.
+
+    Operates on the chart's working DataFrame (NOT the lakehouse) — for
+    every CC II row whose Skim or Butterfat cell is null, we copy in
+    the corresponding ESL II value for the same Month. Bfat-only or
+    skim-only rows are repaired field-by-field so a row already half-
+    populated still benefits.
+
+    Pure function on a DataFrame copy — never mutates the input.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+    skim_col = next(
+        (c for c in out.columns if "skim" in c.lower() and "nonfat" not in c.lower()),
+        None,
+    )
+    bf_col = next((c for c in out.columns if "butter" in c.lower()), None)
+    if skim_col is None and bf_col is None:
+        return out
+    if "Category" not in out.columns or "Class" not in out.columns or "Month" not in out.columns:
+        return out
+
+    cat = out["Category"].astype(str).str.strip().str.upper()
+    cls = out["Class"].astype(str).str.strip().str.upper()
+
+    esl_mask = (cat == "ESL") & (cls.isin({"II", "CLASS II", "2", "CLASS 2"}))
+    cc_mask  = (cat == "COTTAGE CHEESE") & cls.isin({"II", "CLASS II", "2", "CLASS 2"})
+    if not esl_mask.any() or not cc_mask.any():
+        return out
+
+    esl_by_month: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]] = {}
+    esl_subset = out[esl_mask]
+    for _, row in esl_subset.iterrows():
+        try:
+            month_key = pd.Timestamp(row["Month"]).normalize().replace(day=1)
+        except Exception:  # noqa: BLE001 — defensive
+            continue
+        skim_val = pd.to_numeric(row[skim_col], errors="coerce") if skim_col else None
+        bf_val   = pd.to_numeric(row[bf_col],   errors="coerce") if bf_col   else None
+        esl_by_month[month_key] = (
+            None if (skim_val is None or pd.isna(skim_val)) else float(skim_val),
+            None if (bf_val   is None or pd.isna(bf_val))   else float(bf_val),
+        )
+
+    for idx in out[cc_mask].index:
+        try:
+            month_key = pd.Timestamp(out.at[idx, "Month"]).normalize().replace(day=1)
+        except Exception:  # noqa: BLE001
+            continue
+        ref = esl_by_month.get(month_key)
+        if ref is None:
+            continue
+        ref_skim, ref_bf = ref
+        if skim_col is not None and ref_skim is not None:
+            cur = pd.to_numeric(out.at[idx, skim_col], errors="coerce")
+            if pd.isna(cur):
+                out.at[idx, skim_col] = ref_skim
+        if bf_col is not None and ref_bf is not None:
+            cur = pd.to_numeric(out.at[idx, bf_col], errors="coerce")
+            if pd.isna(cur):
+                out.at[idx, bf_col] = ref_bf
+
+    return out
+
+
 def _build_milk_commodity_chart(
     milk_df: pd.DataFrame,
     start_month: Optional[pd.Timestamp] = None,
@@ -850,6 +963,15 @@ def _build_milk_commodity_chart(
         df = df[df["Month"] <= pd.Timestamp(end_month)]
     if df.empty:
         return go.Figure()
+
+    # Cottage Cheese II skim/bfat mirror ESL II for the same month
+    # (May-2026 contract).  The auto-updater write-side now sets these
+    # values explicitly AND the orchestrator runs a one-shot in-place
+    # repair pass on legacy rows — but a brief window can exist between
+    # a deploy and the first repair tick, so we mirror at chart-display
+    # time too as defence in depth.  Cheap: one indexed merge per
+    # chart render.
+    df = _mirror_cc_ii_skim_bfat_from_esl_ii(df)
 
     # Tolerant column resolution — header drift like "Skim Rate " or
     # "Butterfat Rate $" still resolves to the expected metric. "Other
@@ -1637,21 +1759,43 @@ def _patch_cottage_cheese_bfat_from_esl_class_ii(
     rate_tuples: list[_MilkRateTuple],
     month_lookup: dict[tuple[str, str], _MilkRateTuple],
 ) -> list[_MilkRateTuple]:
-    """Force Cottage Cheese butterfat to match ESL Class II for this month-side.
+    """Force Cottage Cheese **skim AND butterfat** to mirror ESL Class II.
 
-    Business rule (May-2026 milk pipeline): Cottage Cheese uses the Class II
-    butterfat pricing factor published for ESL Class II—the same skim/butterfat
-    pair as ``("ESL", "II")`` in the mover table after class normalisation.
+    Business rule (May-2026 milk pipeline): Cottage Cheese II shares the
+    same skim/butterfat rates as ESL Class II for the same month — these
+    two fields are NEVER scraped independently for Cottage Cheese.  Only
+    Protein Rate and Other Solids Rate are taken from the CC tracker row.
 
-    We still take Protein / Other Solids from the Cottage Cheese tracker row,
-    only the butterfat slot is authoritative-copied so a stale or partial
-    cottage row cannot drift from ESL Class II.
+    The function is the runtime safety net layered ON TOP OF the
+    write-side enforcement in ``milk_mover_autoupdate._derive_rows`` and
+    the one-shot in-place repair pass in
+    ``milk_mover_store.patch_cottage_cheese_rates``: even if a CC row
+    in the lakehouse still carries a stale or null skim/bfat (e.g.
+    written before the contract was tightened), the cost pipeline below
+    will see the canonical ESL II values.
+
+    Naming is preserved (``..._bfat_from_esl_class_ii``) only to avoid a
+    cross-cutting rename of every call-site; behaviour now covers both
+    rate slots as described above.
     """
-    esl_bf = month_lookup.get(("ESL", "II"), _MILK_RATES_NONE)[1]
+    esl_tuple = month_lookup.get(("ESL", "II"), _MILK_RATES_NONE)
+    esl_skim = esl_tuple[0]
+    esl_bf   = esl_tuple[1]
     patched: list[_MilkRateTuple] = []
     for key, tup in zip(keys, rate_tuples):
         if key[0] == "COTTAGE CHEESE":
-            patched.append((tup[0], esl_bf, tup[2], tup[3]))
+            # Mirror skim/bfat field-by-field — never overwrite a
+            # numeric ESL value with None, never overwrite a present CC
+            # value with None either (so a future divergence wins gracefully).
+            cc_skim = tup[0] if tup[0] is not None else esl_skim
+            cc_bf   = tup[1] if tup[1] is not None else esl_bf
+            # When ESL II carries a value, we PREFER it as the source of
+            # truth for CC II to match the May-2026 contract verbatim.
+            if esl_skim is not None:
+                cc_skim = esl_skim
+            if esl_bf is not None:
+                cc_bf = esl_bf
+            patched.append((cc_skim, cc_bf, tup[2], tup[3]))
         else:
             patched.append(tup)
     return patched
@@ -2386,10 +2530,16 @@ the Pricing Lakehouse — no upload needed.  When you click **Refresh**:
    duplicated, the Month is restamped to the new month, and
    `Resin Cost ($/Gal)` is overwritten by the FG outputs joined on
    `Product ID`.  The new rows are then appended back to Fabric.
-3. The fully-built `mover_details_table` (with the new `Month` column) is
-   appended to `Files/Monthly_Mover_Reporting/mover_details_table.csv`
-   in the Pricing Lakehouse — but only when the editing month isn't
-   already present, so re-clicking Refresh for the same month is safe.
+3. The fully-built `mover_details_table` (with the new `Month` column)
+   is appended to `Files/Monthly_Mover_Reporting/mover_details_table.csv`
+   in the Pricing Lakehouse, but ONLY when **two strict gates** both
+   hold:
+   - a **new row was inserted** into the Movers Non-Milk Tracker since
+     the last successful publish (row-count delta), AND
+   - the editing month is not already present in the lakehouse file.
+   Editing the existing last row's Month therefore does NOT re-fire
+   this append, and re-clicking Refresh for the same already-published
+   month is always safe.
 4. The four Mover Downloads (`rest_htst_resin_mover_fg.csv`,
    `topco_resin_mover_fg.csv`, `milk_mover.csv`,
    `Movers_Non_Milk_Tracker.csv`) are published to
@@ -2402,26 +2552,44 @@ the Pricing Lakehouse — no upload needed.  When you click **Refresh**:
     with st.expander("ℹ️ Automatic milk-cost workflow", expanded=False):
         st.markdown(
             """
-The milk pipeline is fully automated end-to-end — no manual file upload
-required for any milk artefact:
+The milk pipeline is fully automated end-to-end — no manual file
+upload required for any milk artefact. The matrix below names every
+lakehouse file the workflow touches, the exact trigger that fires the
+write, and the gate conditions that must hold before the write lands.
 
-1. **USDA publishes** a new
-   [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf)
-   → the page detects the change on next render (or click **🔄 USDA refresh**
-   to bypass the 1-hour cooldown) and appends the four FMMO rows
-   (HTST/ESL × Class I/II) to `fmmo_tracker.json` in Fabric.
-2. **Select a new End Month** in the Milk Commodity Cost slicer and click
-   **Refresh** → the `milk_mover` CSV becomes available in **Mover Downloads**
-   and the per-item end-month cost is appended to
-   `base_milk_cost_monthly_tracker.csv` in Fabric (append-only — existing
-   months are never overwritten).
-3. **HTST pricing unlocks** in the **New Price Quote** view: the Product
-   Milk Base Cost auto-update reads the latest end-month from
-   `base_milk_cost_monthly_tracker.csv` and refreshes downstream cost
-   inputs so a new HTST quote can be generated immediately.
+#### Per-file trigger / condition matrix
 
-All three artefacts live together in `Files/Milk_cost_tracker/` in the
-Pricing Lakehouse for auditability.
+| # | Lakehouse file | Trigger | Conditions that must hold |
+|---|---|---|---|
+| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf) (detected on next render, or click **🔄 USDA refresh** to bypass the 1-hour cooldown) | New month is **not** already present in `fmmo_tracker.json`. Cottage Cheese rows always carry **Class II** with **Skim Rate & Butterfat Rate identical to ESL Class II** for the same month — only **Protein Rate** and **Other Solids Rate** are scraped (both equal Class II Nonfat Solids Price). A new month must NOT appear in this file until the PDF has actually published — selecting a future month in the slicer is not possible until then. |
+| 2 | `Files/Monthly_Pricing_Execution/milk_mover.csv` | User clicks **Refresh** next to the Movers Non-Milk Tracker | Authoritative replace on every Refresh — no month gate. When the slicer's End Month has no rows in `fmmo_tracker.json`, rates collapse to zero (silent `$0` cost) so the published file structure stays stable. |
+| 3 | `Files/Activity_Model/Product_Milk Base Cost.csv` (column `Base Milk Cost per Gallon`) | User clicks **Refresh** | **Refresh is the sole writer.** Slicer's **End Month ≥ file's max Month + 1 calendar month**. Update is by Item match (left-merge); unmatched rows are stale-stamped. |
+| 4 | `Files/Monthly_Mover_Reporting/mover_details_table.csv` | User clicks **Refresh** | A **new row was inserted** into the Movers Non-Milk Tracker since the last successful publish (row-count delta) AND its Month is not already in the lakehouse file. Editing-in-place on the existing last row does NOT qualify. |
+| 5 | `Files/Milk_cost_tracker/base_milk_cost_monthly_tracker.csv` | User clicks **Refresh** | Slicer's **End Month = Start Month + 1 calendar month** AND End Month is **not** already in the file. Append-only — existing months are never overwritten. |
+
+#### Operator-facing checklist
+
+1. **Wait for USDA**: if the End Month you need isn't in the Milk
+   Commodity slicer, the advanced-prices PDF hasn't been published
+   yet. Click **🔄 USDA refresh** to force a check.
+2. **Pick `(Start Month, End Month)` in the slicer**. For the
+   `base_milk_cost_monthly_tracker` append to fire, the pair must be
+   exactly one calendar month apart.
+3. **Edit the Movers Non-Milk Tracker** below. To trigger the
+   `mover_details_table` append you must **insert a new row** for the
+   new month — editing the existing last row is not enough.
+4. **Click Refresh**. All five lakehouse writes fire idempotently in
+   the dependency order above. Each write that runs / skips / fails
+   surfaces a small caption beneath the table.
+5. **HTST pricing unlocks**: the New Price Quote view reads
+   `Product_Milk Base Cost.csv` directly, so the new $/gal flows
+   through immediately — no calendar-rollover wait required.
+
+All three milk artefacts (`fmmo_tracker.json`,
+`base_milk_cost_monthly_tracker.csv`, and the canonical drop-zone
+`milk_mover.csv`) live together in `Files/Milk_cost_tracker/` and
+`Files/Monthly_Pricing_Execution/` in the Pricing Lakehouse for
+auditability.
             """.strip()
         )
 
@@ -2694,8 +2862,144 @@ def _render_milk_commodity(
     st.plotly_chart(fig, use_container_width=True, key=f"{_SS_PREFIX}_milk_chart")
 
 
+# Session-state keys for the Packaging Index time slicer + index filter.
+# Both default to "All" / full range on first render and persist across
+# reruns so the operator's selection survives slicer interactions on
+# adjacent panels.
+_SS_PKG_START   = f"{_SS_PREFIX}_pkg_start"
+_SS_PKG_END     = f"{_SS_PREFIX}_pkg_end"
+_SS_PKG_INDICES = f"{_SS_PREFIX}_pkg_indices"
+
+# Sentinel label used in the index multiselect's "Select All / clear"
+# helper button.  Centralised so the label and the button text can never
+# drift apart.
+_PKG_INDEX_ALL_LABEL = "All indices"
+
+
+def _packaging_index_columns(pkg_df: pd.DataFrame) -> list[str]:
+    """Return every plottable column from the packaging index DataFrame.
+
+    Every non-``Time`` column (HDPE / LDPE / PET / PP / Linerboard …)
+    is a candidate index — the filter exposes the full set so the
+    operator can drill into any subset.
+    """
+    if pkg_df is None or pkg_df.empty or "Time" not in pkg_df.columns:
+        return []
+    return [c for c in pkg_df.columns if c != "Time"]
+
+
+def _render_packaging_slicer(
+    pkg_df: pd.DataFrame,
+) -> tuple[Optional[pd.Timestamp], Optional[pd.Timestamp], list[str]]:
+    """Render the time slicer + index multiselect above the Packaging chart.
+
+    Behaviour
+    ---------
+    * Time slicer defaults to **(earliest, latest)** of the ``Time``
+      column — i.e. all data — on first render. Subsequent renders read
+      the persisted ``_SS_PKG_START`` / ``_SS_PKG_END`` so the operator's
+      selection survives reruns.
+    * Index filter is a multiselect over every non-``Time`` column,
+      defaulting to every index ("All"). A one-click **"All indices"**
+      button restores the default.
+
+    Returns
+    -------
+    (start_ts, end_ts, selected_indices)
+        Live values bound to the widgets in this render — pass them
+        straight to :func:`_build_packaging_index_chart`.
+    """
+    if pkg_df is None or pkg_df.empty or "Time" not in pkg_df.columns:
+        return None, None, []
+
+    times = pd.to_datetime(pkg_df["Time"], errors="coerce").dropna()
+    if times.empty:
+        return None, None, _packaging_index_columns(pkg_df)
+
+    min_t = times.min().to_pydatetime().date()
+    max_t = times.max().to_pydatetime().date()
+    all_indices = _packaging_index_columns(pkg_df)
+
+    # Seed (or repair stale) session-state values BEFORE rendering the
+    # widgets so the date_input picks them up via its ``key`` argument.
+    saved_start = st.session_state.get(_SS_PKG_START)
+    saved_end   = st.session_state.get(_SS_PKG_END)
+    if not isinstance(saved_start, date) or saved_start < min_t or saved_start > max_t:
+        st.session_state[_SS_PKG_START] = min_t
+    if not isinstance(saved_end, date) or saved_end < min_t or saved_end > max_t:
+        st.session_state[_SS_PKG_END] = max_t
+
+    saved_indices = st.session_state.get(_SS_PKG_INDICES)
+    if not isinstance(saved_indices, list):
+        st.session_state[_SS_PKG_INDICES] = list(all_indices)
+    else:
+        # Repair: drop selections that no longer exist in the upload
+        # (e.g. column renamed); fall back to "All" if the repair
+        # leaves the selection empty.
+        repaired = [c for c in saved_indices if c in all_indices]
+        st.session_state[_SS_PKG_INDICES] = repaired or list(all_indices)
+
+    # Two-row layout keeps everything legible inside the 1/3-width
+    # Packaging column.
+    col_s, col_e = st.columns(2)
+    with col_s:
+        st.date_input(
+            "Start Time",
+            min_value=min_t,
+            max_value=max_t,
+            key=_SS_PKG_START,
+            help="Lower bound of the Packaging Index chart (defaults to earliest data).",
+        )
+    with col_e:
+        st.date_input(
+            "End Time",
+            min_value=min_t,
+            max_value=max_t,
+            key=_SS_PKG_END,
+            help="Upper bound of the Packaging Index chart (defaults to latest data).",
+        )
+
+    st.multiselect(
+        "Indices",
+        options=all_indices,
+        key=_SS_PKG_INDICES,
+        help=(
+            "Filter which packaging-index columns are drawn. Default is "
+            f"**{_PKG_INDEX_ALL_LABEL}** — clear the selection or click "
+            f"the **{_PKG_INDEX_ALL_LABEL}** button below to restore."
+        ),
+    )
+    if st.button(
+        _PKG_INDEX_ALL_LABEL,
+        key=f"{_SS_PREFIX}_pkg_indices_all",
+        help="Re-select every available index in one click.",
+    ):
+        st.session_state[_SS_PKG_INDICES] = list(all_indices)
+        st.rerun()
+
+    start_date = st.session_state.get(_SS_PKG_START)
+    end_date   = st.session_state.get(_SS_PKG_END)
+    start_ts = pd.Timestamp(start_date) if start_date else None
+    end_ts   = pd.Timestamp(end_date)   if end_date   else None
+
+    # Defensive swap: if the operator inverts the slider somehow,
+    # quietly fix the bounds rather than blanking the chart.
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        start_ts, end_ts = end_ts, start_ts
+
+    selected = list(st.session_state.get(_SS_PKG_INDICES) or all_indices)
+    return start_ts, end_ts, selected
+
+
 def _render_chart(uploads: dict[str, _Uploaded], current_month: pd.Timestamp) -> None:
-    """Render the Packaging Index Outlook section (header → metric → chart)."""
+    """Render the Packaging Index Outlook section (slicer → header → metric → chart).
+
+    Slicer/filter additions (May-2026): a time-range picker and an
+    index multiselect now sit ABOVE the metric, mirroring the
+    Milk-Commodity section's UX. Defaults are "all data" / "all
+    indices" so the visual on first render is the same as before the
+    slicer was added.
+    """
     st.markdown("#### 📈 Packaging Index Outlook (from Procurement)")
 
     pkg = uploads.get("packaging_index") or uploads.get("pkg_index")
@@ -2706,6 +3010,8 @@ def _render_chart(uploads: dict[str, _Uploaded], current_month: pd.Timestamp) ->
         )
         return
 
+    start_ts, end_ts, selected_indices = _render_packaging_slicer(pkg.df)
+
     hdpe_value = _current_month_hdpe(pkg.df, current_month)
     metric_col, _spacer = st.columns([1, 1])
     with metric_col:
@@ -2715,7 +3021,12 @@ def _render_chart(uploads: dict[str, _Uploaded], current_month: pd.Timestamp) ->
             help="HDPE price from the uploaded Packaging Index for the current month.",
         )
 
-    fig = _build_packaging_index_chart(pkg.df)
+    fig = _build_packaging_index_chart(
+        pkg.df,
+        start_time=start_ts,
+        end_time=end_ts,
+        selected_indices=selected_indices,
+    )
     st.plotly_chart(fig, use_container_width=True, key=f"{_SS_PREFIX}_pkg_chart")
 
 
@@ -2891,37 +3202,79 @@ def _render_table_and_refresh(
 _SS_BASE_MILK_TRACKER_LAST_END = "monthly_movers_base_milk_tracker_last_end"
 
 
+def _is_calendar_month_plus_one(
+    start_month: pd.Timestamp,
+    end_month: pd.Timestamp,
+) -> bool:
+    """Return True when ``end_month`` is exactly one calendar month after ``start_month``.
+
+    Used by the May-2026 Base Milk Cost Monthly Tracker append gate:
+
+        "end month = start month + 1, end not in file, user hit refresh"
+
+    The comparison is normalised to first-of-month so ``2026-05-15`` /
+    ``2026-06-01`` still counts as adjacent — but ``2026-04-01`` /
+    ``2026-06-01`` (a 2-month jump) is rejected.
+    """
+    s = pd.Timestamp(start_month).normalize().replace(day=1)
+    e = pd.Timestamp(end_month).normalize().replace(day=1)
+    return e == s + pd.DateOffset(months=1)
+
+
 def _maybe_append_to_base_milk_cost_tracker(
     milk_usage_with_movers: pd.DataFrame,
+    start_month: Optional[pd.Timestamp],
     end_month: Optional[pd.Timestamp],
 ) -> None:
-    """Append [Item, Item Description, End Month Milk Cost, End Month] to Fabric.
+    """Refresh-driven append to ``base_milk_cost_monthly_tracker.csv``.
 
-    Honours the contract from the migration plan:
+    Honours the strict May-2026 trigger:
 
-        "whenever both a new milk_mover CSV is generated AND a new end
-         month is selected that doesn't exist in this file yet, append
-         the new rows to the Base Milk Cost Monthly Tracker."
+        "base_milk_cost_monthly_tracker.csv is updated only when
+         End Month = Start Month + 1, the End Month is NOT already
+         present in the lakehouse file, AND the user clicked Refresh."
 
-    "New milk_mover CSV is generated" = ``milk_usage_with_movers`` is a
-    non-empty frame (i.e. the milk pipeline successfully ran for the
-    current slicer selection). "New end month" = the End Month selected
-    by the slicer is not already present in the OneLake tracker.
+    Three conditions must hold (all enforced here):
 
-    Idempotent: the underlying ``append_rows_for_end_month`` no-ops when
-    the month is already there, so re-calling on a slicer toggle is safe.
-    A session-state cache short-circuits the Fabric round-trip when we
-    just confirmed the same End Month milliseconds ago.
+      1. ``end_month`` is exactly one calendar month after
+         ``start_month`` — see :func:`_is_calendar_month_plus_one`.
+         A jump of 2+ months is rejected so historical / out-of-band
+         milk runs cannot leak into the tracker.
+      2. ``end_month`` is not already present in the OneLake tracker
+         (the underlying store also enforces this via
+         ``append_rows_for_end_month`` — defence in depth).
+      3. ``milk_usage_with_movers`` is non-empty (the milk pipeline
+         actually produced a per-item payload).
 
-    Failures are swallowed (logged + a non-fatal info badge); never
-    breaks the page render.
+    Failures are swallowed (logged + a non-fatal caption); never breaks
+    the page render. Idempotent on every layer (this wrapper, the
+    in-session short-circuit, and the underlying ETag-based write).
+
+    NOTE: This function is now wired ONLY from the Refresh button
+    handler (see :func:`_run_refresh_lakehouse_appends`). The old
+    reactive call from :func:`_compute_milk_usage_for_render` was
+    removed so slicer interactions no longer mutate OneLake — the
+    explicit Refresh click is the sole trigger.
     """
     if (milk_usage_with_movers is None
             or milk_usage_with_movers.empty
-            or end_month is None):
+            or end_month is None
+            or start_month is None):
         return
 
     em = pd.Timestamp(end_month).normalize().replace(day=1)
+    sm = pd.Timestamp(start_month).normalize().replace(day=1)
+
+    # Gate 1: End Month must be exactly +1 calendar month from Start.
+    if not _is_calendar_month_plus_one(sm, em):
+        st.caption(
+            f"ℹ️ base_milk_cost_monthly_tracker not updated: End Month "
+            f"({em:%Y-%m}) must be exactly one calendar month after "
+            f"Start Month ({sm:%Y-%m}). Adjust the slicer and click "
+            f"Refresh again."
+        )
+        return
+
     if st.session_state.get(_SS_BASE_MILK_TRACKER_LAST_END) == em:
         return  # already handled this end_month in this session
 
@@ -2959,6 +3312,89 @@ def _maybe_append_to_base_milk_cost_tracker(
             f"✅ Appended {rows_appended} row(s) for {em:%Y-%m} to "
             f"{_base_milk_cost_tracker.get_store_label()}."
         )
+    elif not was_new:
+        st.caption(
+            f"ℹ️ base_milk_cost_monthly_tracker already has rows for "
+            f"{em:%Y-%m}; no append performed."
+        )
+
+
+def _maybe_update_product_milk_base_cost(
+    milk_usage_with_movers: pd.DataFrame,
+    end_month: Optional[pd.Timestamp],
+) -> None:
+    """Refresh-driven rewrite of ``Files/Activity_Model/Product_Milk Base Cost.csv``.
+
+    Honours the May-2026 contract verbatim:
+
+        "the 'end month milk cost on $/gal' will be moved to
+         Product_Milk Base Cost.csv to rewrite the 'Base Milk Cost per
+         Gallon' only when through query based on item match, only when
+         the 'End Month' is a month ahead of the existing month in the
+         lakehouse file, … Refresh is the sole writer."
+
+    Implementation lives in ``data_sources.product_milk_base_cost_store``
+    so the gate logic + left-merge live next to the file, not inside
+    the page renderer.  This wrapper handles the page-side concerns
+    only: build the ``{Item → End Month Milk Cost}`` payload, dedupe
+    duplicate Refresh clicks on the same End Month in-session, surface
+    the result as a small caption, and short-circuit cleanly on any
+    missing precondition.
+
+    Idempotent on every layer: this wrapper, the store's End-Month gate,
+    and the underlying ETag-based write.
+    """
+    if (milk_usage_with_movers is None
+            or milk_usage_with_movers.empty
+            or end_month is None):
+        return
+
+    em = pd.Timestamp(end_month).normalize().replace(day=1)
+    # Short-circuit duplicate clicks for the same End Month — the
+    # underlying store already no-ops, but skipping the lakehouse read
+    # is still worth doing for snappy slicer interactions.
+    if st.session_state.get(_SS_PMBC_LAST_END) == em:
+        return
+
+    needed = (_MUM_COL_END_COST, "Item")
+    if not all(c in milk_usage_with_movers.columns for c in needed):
+        return  # graceful-degrade: required columns missing
+
+    payload_df = milk_usage_with_movers[list(needed)].dropna(subset=[_MUM_COL_END_COST])
+    payload_df = payload_df[payload_df["Item"].astype(str).str.strip() != ""]
+    if payload_df.empty:
+        return
+
+    item_to_end_cost: dict[str, float] = {
+        str(item).strip(): float(cost)
+        for item, cost in zip(
+            payload_df["Item"],
+            pd.to_numeric(payload_df[_MUM_COL_END_COST], errors="coerce"),
+        )
+        if pd.notna(cost)
+    }
+    if not item_to_end_cost:
+        return
+
+    try:
+        result = _pmbc_store.maybe_update_for_end_month(item_to_end_cost, em)
+    except _pmbc_store.ProductMilkBaseCostStoreError as exc:
+        st.caption(f"⚠️ Could not update Product_Milk Base Cost: {exc}")
+        return
+
+    st.session_state[_SS_PMBC_LAST_END] = em
+    # Render a small caption either way — the store distinguishes
+    # "wrote N rows" / "End Month not newer" / "no matches" / "error"
+    # in a single string we can surface unchanged.
+    if result.ok and result.rows_changed:
+        st.caption(result.as_caption())
+    elif result.ok and result.skipped_reason:
+        # Skipped reasons are informational, not warnings — keep the
+        # UI footprint small but visible so the operator knows the
+        # rewrite was considered and gated cleanly.
+        st.caption(result.as_caption())
+    elif not result.ok:
+        st.caption(result.as_caption())
 
 
 # ── Refresh-time Lakehouse appends ────────────────────────────────────────────
@@ -2978,6 +3414,21 @@ def _maybe_append_to_base_milk_cost_tracker(
 # user clicks Refresh repeatedly for the same editing month within a session.
 _SS_RESIN_TRACKER_LAST_MONTH         = f"{_SS_PREFIX}_resin_tracker_last_month"
 _SS_MOVER_DETAILS_TABLE_LAST_MONTH   = f"{_SS_PREFIX}_mover_details_table_last_month"
+
+# Session-state slot used to short-circuit the Product_Milk Base Cost
+# rewrite when Refresh is clicked repeatedly for the same End Month.
+# The underlying store is already idempotent (it gates on
+# ``end_month >= file_max + 1 month``), but keeping the round-trip out
+# of the hot path is still worthwhile during rapid slicer toggling.
+_SS_PMBC_LAST_END                    = f"{_SS_PREFIX}_pmbc_last_end"
+
+# Session-state slot for the strict mover_details_table trigger.  We
+# track the row count of the editable Movers Non-Milk Tracker at the
+# moment of the most-recent successful append so a later Refresh fires
+# the append ONLY when the user has materially inserted a new row
+# (count went up) AND the editing month is new in the lakehouse.  Edits
+# to existing rows therefore do NOT re-fire the append.
+_SS_NMT_LAST_PUBLISHED_ROW_COUNT     = f"{_SS_PREFIX}_nmt_last_published_row_count"
 
 
 def _combine_fg_new_resin_lookups(
@@ -3076,19 +3527,33 @@ def _maybe_append_resin_cost_tracker_for_month(
 def _maybe_append_mover_details_table_for_month(
     mover_details_table: pd.DataFrame,
     editing_month: pd.Timestamp,
+    *,
+    new_row_inserted: bool,
+    nmt_row_count: int,
 ) -> None:
     """Append the freshly-built mover_details_table rows to the cumulative file.
 
-    Implements the May-2026 contract verbatim:
+    Strict May-2026 trigger:
 
-        "include a new column 'Month' and put value as the last month of
-         the 'Movers Non-Milk Tracker', and append the rows into the
-         [pricing lakehouse mover_details_table.csv] only when user hit
-         'refresh' and when a new month in the generated mover_details_table
-         csv does not exist in the one in the pricing lakehouse."
+        "mover_details_table.csv gets updated only when a new row of
+         'Movers Non-Milk Tracker — fully editable' gets inserted with
+         a new 'month' and user hits refresh."
 
-    No-op when ``editing_month`` is already present in the lakehouse copy.
-    Failures surface as a small caption — never raised.
+    Two conditions must BOTH hold:
+
+      1. ``new_row_inserted=True`` — the editable Movers Non-Milk
+         Tracker has grown by at least one row since the last
+         successful append (detected via row-count delta against
+         ``_SS_NMT_LAST_PUBLISHED_ROW_COUNT``).  This rules out
+         "edit the existing last row's Month and Refresh" from
+         falsely re-triggering an append.
+      2. ``editing_month`` is not already present in the lakehouse
+         copy (the underlying store handles this dedup).
+
+    On a successful append, ``_SS_NMT_LAST_PUBLISHED_ROW_COUNT`` is
+    bumped to the current count so the next Refresh starts measuring
+    from the new baseline.  Failures surface as a small caption —
+    never raised.
     """
     if mover_details_table is None or mover_details_table.empty or editing_month is None:
         return
@@ -3096,6 +3561,19 @@ def _maybe_append_mover_details_table_for_month(
     em = pd.Timestamp(editing_month).normalize().replace(day=1)
     if st.session_state.get(_SS_MOVER_DETAILS_TABLE_LAST_MONTH) == em:
         return  # already handled this editing month in this session
+
+    if not new_row_inserted:
+        # Refresh clicked without a new row in the editable tracker —
+        # strict trigger says we do NOT append here.  Render a small
+        # informational caption so the operator understands why nothing
+        # was pushed to the cumulative file.
+        st.caption(
+            "ℹ️ mover_details_table not updated: Refresh fires the "
+            "append only when a NEW row was inserted into the Movers "
+            "Non-Milk Tracker. Edit-in-place on the last row does not "
+            "qualify."
+        )
+        return
 
     try:
         rows_appended, was_new = _mover_details_store.append_for_month_if_new(
@@ -3107,6 +3585,9 @@ def _maybe_append_mover_details_table_for_month(
 
     st.session_state[_SS_MOVER_DETAILS_TABLE_LAST_MONTH] = em
     if was_new and rows_appended:
+        # Bump the published-row-count snapshot so a subsequent Refresh
+        # measures "new row inserted" from this baseline forward.
+        st.session_state[_SS_NMT_LAST_PUBLISHED_ROW_COUNT] = int(nmt_row_count)
         st.caption(
             f"✅ Appended {rows_appended} row(s) for {em:%Y-%m} to "
             f"{_mover_details_store.get_store_label()}."
@@ -3178,13 +3659,20 @@ def _run_refresh_lakehouse_appends(outputs: dict, uploads: dict[str, _Uploaded])
     tracker; falls back silently when the tracker is empty so a transient
     state never raises here.
 
-    Three lakehouse writes happen here, in dependency order:
+    Four lakehouse writes happen here, in dependency order:
 
       1. **Resin_Cost_Tracker.csv** — append-only, idempotent on
          already-tracked months.
-      2. **mover_details_table.csv** — append-only, idempotent on
-         already-tracked months.
-      3. **Monthly_Pricing_Execution/{rest, topco, milk}.csv** —
+      2. **mover_details_table.csv** — append-only; ALSO gated on a
+         strict "new row inserted into NMT" test (row count went up
+         since the last successful publish) so editing the existing
+         last row's Month never silently re-fires the append.
+      3. **Product_Milk Base Cost.csv** — overwrite ``Base Milk Cost
+         per Gallon`` by Item match; gated on ``End Month >= file's
+         max Month + 1``.  Refresh is the sole writer (the legacy
+         monthly-cursor path in ``activity_model_monthly_updater``
+         has been retired).
+      4. **Monthly_Pricing_Execution/{rest, topco, milk, NMT}.csv** —
          authoritative replace on every Refresh (no month gate).
     """
     nmt_df: pd.DataFrame = st.session_state.get(_SS_NMT_DF)
@@ -3193,6 +3681,17 @@ def _run_refresh_lakehouse_appends(outputs: dict, uploads: dict[str, _Uploaded])
     editing_month = _parse_month(nmt_df.iloc[-1][_NMT_COL_MONTH])
     if editing_month is None:
         return
+
+    # Strict "new row inserted into NMT" detector — used by the
+    # mover_details_table append below to decide whether the user
+    # genuinely added a new row (count up) vs. merely edited the
+    # existing last row's Month.  Compared against the row-count
+    # snapshot taken at the last successful append.
+    nmt_row_count = int(len(nmt_df))
+    last_published_count = int(
+        st.session_state.get(_SS_NMT_LAST_PUBLISHED_ROW_COUNT, 0)
+    )
+    new_row_inserted = nmt_row_count > last_published_count
 
     rest_fg = outputs.get("rest_htst_resin_mover_fg", pd.DataFrame())
     topco_fg = outputs.get("topco_resin_mover_fg", pd.DataFrame())
@@ -3208,7 +3707,22 @@ def _run_refresh_lakehouse_appends(outputs: dict, uploads: dict[str, _Uploaded])
     )
 
     _maybe_append_resin_cost_tracker_for_month(rest_fg, topco_fg, editing_month)
-    _maybe_append_mover_details_table_for_month(full_table, editing_month)
+    _maybe_append_mover_details_table_for_month(
+        full_table, editing_month,
+        new_row_inserted=new_row_inserted,
+        nmt_row_count=nmt_row_count,
+    )
+
+    # Refresh-driven Milk lakehouse writes — End/Start Months sourced
+    # from the slicer (NOT the NMT editing month) per the May-2026
+    # contract.  Both writes are idempotent and never raise; failures
+    # surface as small captions.
+    start_month_slicer = st.session_state.get(_SS_MILK_START)
+    end_month_slicer   = st.session_state.get(_SS_MILK_END)
+    _maybe_append_to_base_milk_cost_tracker(
+        milk_usage_with_movers, start_month_slicer, end_month_slicer,
+    )
+    _maybe_update_product_milk_base_cost(milk_usage_with_movers, end_month_slicer)
 
     # Authoritative replace of the four Mover Downloads in a dedicated
     # Monthly_Pricing_Execution OneLake folder.  Always fires on Refresh —
@@ -3233,10 +3747,12 @@ def _compute_milk_usage_for_render(
     Reads the slicer values from ``session_state`` so the entire downstream
     mover_details_table reacts to slicer changes without requiring another Refresh.
 
-    Side effect: when a fresh DataFrame comes back AND the selected End
-    Month isn't already in ``base_milk_cost_monthly_tracker.csv``, we
-    append the per-item ``End Month Milk Cost`` rows for that month.
-    See :func:`_maybe_append_to_base_milk_cost_tracker` for details.
+    NOTE (May-2026): The base_milk_cost_monthly_tracker.csv append is
+    no longer wired in here.  It used to fire reactively on every
+    render (including slicer toggles) which violated the May-2026
+    contract that requires an explicit Refresh click as the trigger.
+    The append now lives in :func:`_run_refresh_lakehouse_appends` so
+    OneLake mutations stay tied to deliberate user action.
     """
     milk = uploads.get("milk_mover_tracker")
     usage = uploads.get("milk_usage_stable")
@@ -3257,8 +3773,6 @@ def _compute_milk_usage_for_render(
         start_month=start_month,
         end_month=end_month,
     )
-
-    _maybe_append_to_base_milk_cost_tracker(milk_usage_with_movers, end_month)
 
     return milk_usage_with_movers
 
@@ -3490,6 +4004,13 @@ def _clear_upload_state() -> None:
         _SS_MILK_END,
         _SS_MILK_CATEGORY,
         _SS_MILK_CLASS,
+        _SS_NMT_LAST_PUBLISHED_ROW_COUNT,
+        _SS_PMBC_LAST_END,
+        _SS_RESIN_TRACKER_LAST_MONTH,
+        _SS_MOVER_DETAILS_TABLE_LAST_MONTH,
+        _SS_PKG_START,
+        _SS_PKG_END,
+        _SS_PKG_INDICES,
     ):
         st.session_state.pop(key, None)
 

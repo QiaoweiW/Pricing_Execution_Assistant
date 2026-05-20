@@ -301,6 +301,132 @@ def has_rows_for_month(target_month: pd.Timestamp) -> bool:
     return any(r.get(COL_MONTH) == target_str for r in _read_rows_cached())
 
 
+def esl_class_ii_rates_by_month() -> dict[pd.Timestamp, tuple[Optional[float], Optional[float]]]:
+    """Return ``{first-of-month → (Skim Rate, Butterfat Rate)}`` for ESL Class II.
+
+    Used by the Cottage Cheese historical backfill: CC II skim/bfat
+    always mirror ESL II for the same month per the May-2026 contract,
+    so the orchestrator builds this lookup once and copies the values
+    into every CC row it backfills. The lookup is read straight from
+    the cached row list — no extra OneLake round-trip — so calling this
+    on every auto-update tick is cheap.
+
+    Missing (Skim, Butterfat) cells round-trip as ``None`` so the
+    backfill can clearly distinguish "unknown" from "zero".
+    """
+    out: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]] = {}
+    for r in _read_rows_cached():
+        cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
+        cls = str(r.get(COL_CLASS, "")).strip().casefold()
+        if cat != "esl" or cls != "ii":
+            continue
+        month_raw = r.get(COL_MONTH)
+        if not month_raw:
+            continue
+        ts = pd.to_datetime(month_raw, errors="coerce")
+        if pd.isna(ts):
+            continue
+        key = pd.Timestamp(ts).normalize().replace(day=1)
+        skim = r.get(COL_SKIM)
+        bfat = r.get(COL_BUTTERFAT)
+        out[key] = (
+            float(skim) if skim is not None and not pd.isna(skim) else None,
+            float(bfat) if bfat is not None and not pd.isna(bfat) else None,
+        )
+    return out
+
+
+def cottage_cheese_months_with_null_skim() -> list[pd.Timestamp]:
+    """Return Cottage Cheese months whose Skim Rate is null in the store.
+
+    The May-2026 Cottage Cheese contract requires CC Skim Rate to equal
+    ESL Class II Skim for the same month. Rows written before that
+    contract carry ``null`` Skim — this helper enumerates them so a
+    one-shot repair pass can patch each row by copying the ESL II value.
+    """
+    out: list[pd.Timestamp] = []
+    seen: set[pd.Timestamp] = set()
+    for r in _read_rows_cached():
+        cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
+        if cat != "cottage cheese":
+            continue
+        skim = r.get(COL_SKIM)
+        if skim is not None and not pd.isna(skim):
+            continue
+        month_raw = r.get(COL_MONTH)
+        if not month_raw:
+            continue
+        ts = pd.to_datetime(month_raw, errors="coerce")
+        if pd.isna(ts):
+            continue
+        key = pd.Timestamp(ts).normalize().replace(day=1)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return sorted(out)
+
+
+def patch_cottage_cheese_rates(
+    patches: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]],
+) -> int:
+    """Overwrite Skim/Butterfat on existing Cottage Cheese rows in-place.
+
+    ``patches`` is ``{first-of-month → (skim, bfat)}``. For each matched
+    Cottage Cheese row whose ``Month`` equals a key in ``patches``, the
+    Skim and Butterfat values are replaced (Protein / Other Solids are
+    left untouched). Returns the number of rows actually modified.
+
+    Idempotent: a no-op when the existing cell already equals the
+    incoming value. Safe to re-run after a partial network failure.
+    """
+    if not patches:
+        return 0
+
+    # Normalise keys to ``YYYY-MM-DD`` strings to match the on-disk shape.
+    keyed: dict[str, tuple[Optional[float], Optional[float]]] = {}
+    for k, v in patches.items():
+        ts = pd.Timestamp(k).normalize().replace(day=1)
+        keyed[ts.strftime("%Y-%m-%d")] = v
+
+    rows_changed = 0
+
+    def _mutate(current: Optional[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+        nonlocal rows_changed
+        rows_now = list(current) if current else []
+        for r in rows_now:
+            cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
+            if cat != "cottage cheese":
+                continue
+            month_key = r.get(COL_MONTH)
+            if not isinstance(month_key, str) or month_key not in keyed:
+                continue
+            new_skim, new_bfat = keyed[month_key]
+            changed = False
+            if new_skim is not None:
+                cur_skim = r.get(COL_SKIM)
+                if cur_skim is None or pd.isna(cur_skim) or float(cur_skim) != float(new_skim):
+                    r[COL_SKIM] = float(new_skim)
+                    changed = True
+            if new_bfat is not None:
+                cur_bfat = r.get(COL_BUTTERFAT)
+                if cur_bfat is None or pd.isna(cur_bfat) or float(cur_bfat) != float(new_bfat):
+                    r[COL_BUTTERFAT] = float(new_bfat)
+                    changed = True
+            if changed:
+                rows_changed += 1
+        return rows_now
+
+    try:
+        _io.update_json(_SECRETS_SECTION, _TABLE_BLOB_PATH, _mutate, initial_default=[])
+    except _io.LakehouseIOError as exc:
+        raise MilkMoverStoreError(str(exc)) from exc
+
+    if rows_changed > 0:
+        _invalidate_read_cache()
+    return rows_changed
+
+
 def months_missing_category(category: str) -> list[pd.Timestamp]:
     """Return every distinct ``Month`` that lacks a row for ``category``.
 
@@ -496,6 +622,9 @@ __all__ = [
     "latest_month",
     "has_rows_for_month",
     "months_missing_category",
+    "esl_class_ii_rates_by_month",
+    "cottage_cheese_months_with_null_skim",
+    "patch_cottage_cheese_rates",
     "insert_rows",
     "seed_from_csv_if_empty",
     "get_pdf_state",

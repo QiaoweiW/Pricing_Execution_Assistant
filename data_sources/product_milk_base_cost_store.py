@@ -23,10 +23,10 @@ the Movers Non-Milk Tracker, this module:
 
 The "End Month newer than file" gate is what makes the write idempotent:
 clicking Refresh twice for the same End Month is a no-op on the second
-click.  The monthly-cursor path that used to live in
-``activity_model_monthly_updater._apply_pmbc_rule`` has been retired
-in favour of this Refresh-driven path so PMBC reflects the operator's
-explicit action, not an opaque calendar rollover.
+click.  The legacy monthly-cursor PMBC path in
+``activity_model_monthly_updater`` has been retired in favour of this
+Refresh-driven path so PMBC reflects the operator's explicit action,
+not an opaque calendar rollover.
 
 Storage layout
 --------------

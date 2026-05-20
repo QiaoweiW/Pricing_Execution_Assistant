@@ -16,17 +16,11 @@ last-handled value):
    ``Resin Mover ($/Gal)`` to existing ``Packaging ($/Gal)`` for
    matched rows; leave unmatched rows untouched.
 
-PMBC rule retirement (May-2026)
--------------------------------
-``Product_Milk Base Cost.csv`` is no longer updated by this monthly
-orchestrator. The Market Barometer's **Refresh** button is now the
-**sole writer** of that file — see
-``data_sources/product_milk_base_cost_store.py`` and
-``pages/monthly_resin_freight_mover_tracker._maybe_update_product_milk_base_cost``.
-The legacy ``_apply_pmbc_rule`` lives on in this file as **dead code**
-kept only for historical/audit reference; ``run_if_due`` never invokes
-it. Future maintenance can delete it once the operator confirms no
-external script depends on the symbol.
+The May-2026 PMBC rule that used to live here has been **retired**.
+``Product_Milk Base Cost.csv`` is now rewritten exclusively from the
+Market Barometer's **Refresh** handler via
+``data_sources/product_milk_base_cost_store.py``.  Nothing in this
+module touches that file any more.
 
 All-or-nothing cursor semantics
 -------------------------------
@@ -64,11 +58,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import pandas as pd
 
-from data_sources import base_milk_cost_tracker_store as _tracker_store
 from data_sources import fabric_lakehouse_io as _io
 from data_sources import htst_activity_store as _activity_store
 from data_sources import monthly_pricing_execution_store as _mpe_store
@@ -89,22 +82,14 @@ _MPE_SECRETS:       str = "fabric_monthly_pricing_execution"
 # Source filenames (resolved through htst_activity_store so the registry
 # of Activity_Model files stays single-source-of-truth).
 _DELIVERY_FILENAME: str = "Delivery_Miles Tier_Drop Size Tier_Fee.csv"
-_PMBC_FILENAME:     str = "Product_Milk Base Cost.csv"
 _PPPI_FILENAME:     str = "Product_Processing_Pkg_Ing.csv"
 
 # Canonical column names (verbatim — every Activity_Model column is
 # "load-bearing" per htst_activity_store.EXPECTED_FILES; preserve the
-# leading/trailing spaces in " Delivery Charge ($/Gal) " and
-# " Base Milk Cost per Gallon ").
+# leading/trailing spaces in " Delivery Charge ($/Gal) ").
 _DELIVERY_COL_MILEAGE_TIER:  str = "Mileage Fee Tier (Mi)"
 _DELIVERY_COL_DROP_TIER:     str = "Drop Fee Tier (lbs/Drop Size)"
 _DELIVERY_COL_CHARGE:        str = " Delivery Charge ($/Gal) "
-
-_PMBC_COL_ITEM:      str = "Item"
-_PMBC_COL_ITEM_DESC: str = "Item Description"
-_PMBC_COL_BASE_COST: str = " Base Milk Cost per Gallon "
-_PMBC_COL_MONTH:     str = "Month"
-_PMBC_COL_SOURCE:    str = "Source"
 
 _PPPI_COL_ITEM:        str = "Item"
 _PPPI_COL_ITEM_DESC:   str = "Item Description"
@@ -117,13 +102,6 @@ _NMT_COL_MONTH:        str = "Month"
 _NMT_COL_REST_FREIGHT: str = "Rest HTST Freight Mover ($/Gal)"
 _FG_COL_PRODUCT_ID:    str = "Product ID"
 _FG_COL_MOVER:         str = "Resin Mover ($/Gal)"
-
-# Source-stamp labels (mirror legacy PMBC labels so any audit history
-# continues to read consistently).
-_AUTO_UPDATE_SOURCE_LABEL: str = (
-    "Auto-update from Base Milk Cost Monthly Tracker"
-)
-_STALE_SOURCE_TEMPLATE: str = "Stale — no tracker entry for {month}"
 
 # Case-insensitive substrings that mark the "delivery N/A" row. Anything
 # containing "applicable", "n/a", or "non" (with the literal applicable)
@@ -155,20 +133,13 @@ class RuleResult:
 
 @dataclass
 class ActivityModelUpdateResult:
-    """Aggregate outcome of one orchestrator render.
-
-    The ``pmbc`` slot remains in the dataclass for backwards
-    compatibility with any external caller that reads it, but is left
-    unset by :func:`run_if_due` as of May-2026 — see the module
-    docstring's "PMBC rule retirement" section.
-    """
+    """Aggregate outcome of one orchestrator render."""
     checked_at:        datetime           = field(default_factory=datetime.now)
     fired:             bool               = False  # at least one rule mutated
     cursor_before:     Optional[pd.Timestamp] = None
     cursor_after:      Optional[pd.Timestamp] = None
     target_month:      Optional[pd.Timestamp] = None
     delivery:          Optional[RuleResult]   = None
-    pmbc:              Optional[RuleResult]   = None  # retired — always None
     pppi:              Optional[RuleResult]   = None
     skipped_reason:    Optional[str]      = None
     errors:            list[str]          = field(default_factory=list)
@@ -176,8 +147,7 @@ class ActivityModelUpdateResult:
     @property
     def ok(self) -> bool:
         """All-or-nothing: True iff both live rules succeeded or the
-        render was a clean no-op (cursor already current). PMBC is
-        intentionally excluded — it is no longer fired here."""
+        render was a clean no-op (cursor already current)."""
         if self.errors:
             return False
         if not self.fired:
@@ -301,21 +271,14 @@ def _first_of_month(ts: pd.Timestamp) -> pd.Timestamp:
     return pd.Timestamp(ts).normalize().replace(day=1)
 
 
-def _format_pmbc_month(ts: pd.Timestamp) -> str:
-    """Render a first-of-month Timestamp in PMBC's native ``M/D/YYYY`` form."""
-    return f"{ts.month}/{ts.day}/{ts.year}"
-
-
 # ── Pre-flight: read the two live drivers ────────────────────────────────────
 
 @dataclass
 class _Preflight:
     """Read-only snapshot of every input needed to fire the live rules.
 
-    The PMBC-specific slots (``pmbc_df``, ``pmbc_etag``, ``pmbc_target``,
-    ``pmbc_lookup``) are intentionally absent — PMBC is no longer fired
-    by this orchestrator (May-2026 retirement; the Market Barometer
-    Refresh handler is the sole writer).
+    Holds only the live (Delivery + PPPI) inputs.  PMBC was retired in
+    May-2026 — the Market Barometer Refresh handler is the sole writer.
     """
     delivery_df:    pd.DataFrame
     delivery_etag:  Optional[str]
@@ -523,107 +486,6 @@ def _is_na_tier(label: object) -> bool:
     return bool(_NA_TIER_RE.search(s))
 
 
-def _apply_pmbc_rule(
-    df: pd.DataFrame, *,
-    etag: Optional[str],
-    target_month: pd.Timestamp,
-    tracker_target: pd.Timestamp,
-    lookup: dict[str, float],
-) -> RuleResult:
-    """Left-merge tracker rows for ``tracker_target`` onto PMBC.
-
-    Re-implements the original :mod:`product_milk_base_cost_updater`
-    semantics: matched rows get the new cost / month / auto-update
-    source; unmatched rows get the cost blanked + month set + a
-    "Stale" source label.
-    """
-    if df.empty:
-        return RuleResult(
-            rule="pmbc", ok=False,
-            message=f"{_PMBC_FILENAME} is empty.",
-        )
-    required = (_PMBC_COL_ITEM, _PMBC_COL_ITEM_DESC,
-                _PMBC_COL_BASE_COST, _PMBC_COL_MONTH, _PMBC_COL_SOURCE)
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        return RuleResult(
-            rule="pmbc", ok=False,
-            message=(
-                f"{_PMBC_FILENAME} missing required column(s) {missing!r}. "
-                f"Expected verbatim: {list(required)}."
-            ),
-        )
-    if not lookup:
-        return RuleResult(
-            rule="pmbc", ok=False,
-            message=(
-                f"base_milk_cost_monthly_tracker reported End Month "
-                f"{tracker_target:%Y-%m} but returned no rows for it."
-            ),
-        )
-
-    out = df.copy()
-    items = out[_PMBC_COL_ITEM].astype(str).str.strip()
-    new_costs = items.map(lookup)  # NaN where unmatched
-
-    matched_mask = new_costs.notna()
-    if not matched_mask.any():
-        return RuleResult(
-            rule="pmbc", ok=False,
-            message=(
-                f"Tracker has rows for {tracker_target:%Y-%m} but NONE match "
-                f"Items in {_PMBC_FILENAME}. Refusing to blank every row."
-            ),
-        )
-
-    existing_costs = pd.to_numeric(out[_PMBC_COL_BASE_COST], errors="coerce")
-    target_str = _format_pmbc_month(tracker_target)
-    stale_label = _STALE_SOURCE_TEMPLATE.format(month=target_str)
-
-    rows_changed = 0
-    for idx in out.index:
-        if matched_mask.loc[idx]:
-            new_val = float(new_costs.loc[idx])
-            existing = existing_costs.loc[idx]
-            if pd.isna(existing) or float(existing) != new_val:
-                rows_changed += 1
-            out.at[idx, _PMBC_COL_BASE_COST] = new_val
-            out.at[idx, _PMBC_COL_MONTH]     = target_str
-            out.at[idx, _PMBC_COL_SOURCE]    = _AUTO_UPDATE_SOURCE_LABEL
-        else:
-            existing = existing_costs.loc[idx]
-            if not pd.isna(existing):
-                rows_changed += 1
-            out.at[idx, _PMBC_COL_BASE_COST] = pd.NA
-            out.at[idx, _PMBC_COL_MONTH]     = target_str
-            out.at[idx, _PMBC_COL_SOURCE]    = stale_label
-
-    if df.equals(out):
-        return RuleResult(
-            rule="pmbc", ok=True, rows_changed=0,
-            skipped_reason="already-current",
-            message=f"PMBC already reflects End Month {tracker_target:%Y-%m}.",
-        )
-
-    try:
-        _io.write_csv(
-            _ACTIVITY_SECRETS, _activity_blob_path(_PMBC_FILENAME),
-            out, etag=etag,
-        )
-    except _io.LakehouseIOError as exc:
-        return RuleResult(
-            rule="pmbc", ok=False,
-            message=f"Wrote nothing (read OK, write failed): {exc}",
-        )
-
-    return RuleResult(
-        rule="pmbc", ok=True, rows_changed=rows_changed,
-        message=(
-            f"Updated {rows_changed} row(s) to End Month {tracker_target:%Y-%m}."
-        ),
-    )
-
-
 def _apply_pppi_rule(
     df: pd.DataFrame, *,
     etag: Optional[str],
@@ -796,9 +658,7 @@ def run_if_due(
 
     # 4. Apply rules in fixed order. ``fired = True`` once we start
     #    mutating; the cursor advances ONLY when both live rules
-    #    (Delivery + PPPI) succeed. PMBC is intentionally NOT invoked
-    #    here — see the module docstring's "PMBC rule retirement"
-    #    section.
+    #    (Delivery + PPPI) succeed.
     result.fired = True
 
     # Delivery

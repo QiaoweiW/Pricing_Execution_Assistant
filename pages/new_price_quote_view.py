@@ -396,7 +396,6 @@ def _run_activity_model_auto_update(*, force: bool = False) -> None:
             result.cursor_after.isoformat() if result.cursor_after is not None else None
         ),
         "delivery_rows":  (result.delivery.rows_changed if result.delivery else 0),
-        "pmbc_rows":      (result.pmbc.rows_changed     if result.pmbc     else 0),
         "pppi_rows":      (result.pppi.rows_changed     if result.pppi     else 0),
         "ran_at_epoch":   datetime.datetime.now().timestamp(),
     }
@@ -828,7 +827,7 @@ def render():
     #   * the download / upload-to-replace round-trip so RGM can change
     #     Fabric data without leaving the app, and
     #   * the manual Activity_Model monthly-update trigger + status caption
-    #     (Delivery + PMBC + PPPI rules — see activity_model_monthly_updater).
+    #     (Delivery + PPPI rules — see activity_model_monthly_updater).
     st.markdown("---")
     _render_fabric_data_panel()
     _render_am_manual_panel()

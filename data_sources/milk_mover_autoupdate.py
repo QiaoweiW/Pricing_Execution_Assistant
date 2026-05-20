@@ -40,10 +40,19 @@ Workflow on each invocation
     the same month (per the May-2026 contract: CC II Skim/Bfat mirror
     ESL II).
 3.  **TTL guard** — skip the rest when we checked the PDF within
-    ``_DEFAULT_CHECK_TTL`` AND there's nothing else to do.
+    ``_DEFAULT_CHECK_TTL`` AND there's nothing else to do.  Bypassed
+    when ``force=True`` (explicit "USDA refresh" click).
 4.  **Change detection** on the advanced-prices PDF (HEAD with ETag /
     Last-Modified; SHA-256 fallback).  Always persists the new
     fingerprint so the TTL math engages even on a "no change" tick.
+    The fingerprint is a ROUTINE-tick optimisation only — on
+    ``force=True`` we ALWAYS proceed to step 5 even when the
+    fingerprint says "unchanged", because the comparator (step 5) is
+    the authoritative gate.  This avoids the failure mode where a
+    prior tick persisted a new fingerprint but didn't actually land
+    the data (bfat lag, transient error, legacy-buggy write), which
+    used to leave the file stale forever even after the operator
+    explicitly clicked refresh.
 5.  **Compare scraped rates vs the latest stored month.**  Identical →
     no write, surface "rates unchanged" reason.  Differ on at least
     one of the seven canonical cells → proceed.  Class II Bfat lookup
@@ -623,8 +632,19 @@ def maybe_update_from_pdfs(
         result.errors.append(f"Could not update PDF state cache: {exc}")
         # Non-fatal — we still try to ingest if the PDF actually changed.
 
-    if not adv_changed and not backfill_needed:
-        result.skipped_reason = "advanced-prices PDF unchanged."
+    # The HTTP fingerprint (ETag/Last-Modified/sha) is a routine-tick
+    # optimisation, NOT a write-gating signal.  ``force=True`` is the
+    # operator's explicit "USDA refresh" click — they want a fresh
+    # answer from the comparator regardless of whatever fingerprint
+    # we cached on a prior tick.  Without this carve-out, a prior tick
+    # that persisted the new fingerprint but didn't land the new data
+    # (legacy buggy paths, transient errors, prior bfat lag) would
+    # leave the file stale FOREVER, because every subsequent
+    # fingerprint check returns "unchanged".
+    if not force and not adv_changed and not backfill_needed:
+        result.skipped_reason = (
+            "advanced-prices PDF unchanged (HTTP fingerprint cache hit)."
+        )
         return result
 
     # ── 3. Derive target_month from FILE STATE ──────────────────────────────

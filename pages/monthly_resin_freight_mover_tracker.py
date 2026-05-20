@@ -161,6 +161,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
@@ -168,6 +169,14 @@ from typing import Optional
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+
+# Module-level logger.  Used for low-volume diagnostic events that
+# should not surface in the UI but DO need to be discoverable in the
+# Streamlit Cloud / OneLake support logs.  Warnings here are NOT a
+# substitute for ``st.warning`` / ``st.caption`` — operator-facing
+# messages go through Streamlit; this is purely for engineers.
+logger = logging.getLogger(__name__)
 
 # OneLake-backed store + USDA-PDF auto-update workflow for Milk_Mover_Tracker.
 # These two modules replace the legacy ``Milk_Mover_Tracker.csv`` upload —
@@ -1294,18 +1303,80 @@ _MILK_CLASS_ALL: str = "All"
 _MILK_CLASS_OPTIONS: tuple[str, ...] = (_MILK_CLASS_ALL, "I", "II")
 
 
-def _seed_movers_non_milk_df() -> pd.DataFrame:
-    """Return a fresh DataFrame with the hard-coded schema and seeded rows.
+def _hardcoded_movers_non_milk_seed() -> pd.DataFrame:
+    """Return the historical hard-coded seed.
 
-    Every numeric column is forced to ``float64`` — mixing ``None`` with a
-    numeric in an editable column otherwise yields ``object`` dtype, which
-    Streamlit's NumberColumn refuses to edit cell-by-cell.
+    Used as a fall-back when the lakehouse copy is absent (cold-bootstrap
+    deployments) or unreadable for any reason — kept as a code-side
+    safety net so a brand-new tenant can still bring the editor up.
     """
     df = pd.DataFrame(_NMT_SEED_ROWS, columns=list(_NMT_ALL_COLUMNS))
+    return _coerce_nmt_seed_dtypes(df)
+
+
+def _coerce_nmt_seed_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Type-coerce a candidate seed frame to the editor's expected dtypes.
+
+    Month → ``datetime64[ns]`` (normalised to month-start);
+    every numeric column → ``float64``.
+
+    Centralised so the lakehouse-sourced seed and the hard-coded seed
+    go through the exact same coercion path — the data-editor refuses
+    to edit numeric columns whose dtype is ``object``, so this matters.
+    """
+    out = df.copy()
+    if _NMT_COL_MONTH in out.columns:
+        out[_NMT_COL_MONTH] = pd.to_datetime(out[_NMT_COL_MONTH], errors="coerce")
     for col in _NMT_NUMERIC_COLUMNS:
-        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float64")
-    df[_NMT_COL_MONTH] = pd.to_datetime(df[_NMT_COL_MONTH], errors="coerce")
-    return df
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+    return out
+
+
+def _seed_movers_non_milk_df() -> pd.DataFrame:
+    """Return a fresh seed DataFrame for the Movers Non-Milk Tracker.
+
+    Resolution order — operator-facing contract is "the UI reflects
+    the latest lakehouse copy on cold start":
+
+    1.  Read ``Files/Monthly_Pricing_Execution/Movers_Non_Milk_Tracker.csv``
+        from OneLake via :func:`_mpe_store.read_movers_non_milk_tracker_df`.
+        Apply the same header-migration + dtype-coercion pipeline used
+        on user-edited frames so legacy column names land on the
+        current canon.  Reindex to :data:`_NMT_ALL_COLUMNS` so extra
+        columns (e.g. transient publishing artefacts) are dropped and
+        missing columns are filled with NaN.
+    2.  Fall back to :func:`_hardcoded_movers_non_milk_seed` when the
+        lakehouse blob is absent, empty, or raises an unexpected error.
+        Hard-coded fallback keeps fresh-tenant onboarding alive and
+        provides a deterministic schema even with no Refresh history.
+
+    Every numeric column is forced to ``float64`` regardless of source —
+    mixing ``None`` with a numeric in an editable column otherwise
+    yields ``object`` dtype, which Streamlit's NumberColumn refuses to
+    edit cell-by-cell.
+    """
+    try:
+        lakehouse = _mpe_store.read_movers_non_milk_tracker_df()
+    except Exception as exc:
+        # Defensive — any unexpected error from the read path must not
+        # block the page from rendering.  Log + fall back so the
+        # editor still mounts with the hard-coded seed.
+        logger.warning(
+            "Failed to read Movers_Non_Milk_Tracker from lakehouse "
+            "(falling back to hard-coded seed): %s", exc,
+        )
+        lakehouse = None
+
+    if lakehouse is not None and not lakehouse.empty:
+        seeded = _migrate_nmt_headers(lakehouse)
+        # Drop any columns we don't render and add any required column
+        # that's absent in the lakehouse copy — keeps the editor schema
+        # stable across schema migrations in either direction.
+        seeded = seeded.reindex(columns=list(_NMT_ALL_COLUMNS))
+        return _coerce_nmt_seed_dtypes(seeded)
+
+    return _hardcoded_movers_non_milk_seed()
 
 
 # Legacy → canonical header migration map for the Movers Non-Milk Tracker.
@@ -1320,9 +1391,10 @@ _NMT_HEADER_MIGRATIONS: tuple[tuple[str, str], ...] = (
 def _migrate_nmt_headers(df: pd.DataFrame) -> pd.DataFrame:
     """Rename any legacy NMT columns to the current canonical names.
 
-    Called from :func:`_ensure_movers_non_milk_state` so sessions whose
-    ``_SS_NMT_DF`` was populated before a header rebrand land cleanly on
-    the new schema without losing any user edits.  Safe no-op when the
+    Called from :func:`_ensure_movers_non_milk_state` and from the
+    lakehouse-seeded code path in :func:`_seed_movers_non_milk_df`, so
+    both in-memory cached frames AND lakehouse-resident frames land on
+    the current schema without losing any data.  Safe no-op when the
     legacy column is absent or the canonical column already exists.
     """
     if df is None or df.empty:

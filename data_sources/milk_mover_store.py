@@ -25,11 +25,12 @@ Why two blobs and not one?
        bookkeeping without conflicting with a concurrent manual edit
        to the table.
 
-Public API (mirrors the legacy SQLite module so the autoupdate
-orchestrator and the view need only minimal changes):
+Public API (the autoupdate orchestrator and the view import these
+directly; new code should prefer ``upsert_rows`` over any historical
+append-only API):
     read_milk_mover_df()             -> pd.DataFrame
     latest_month()                   -> Optional[pd.Timestamp]
-    insert_rows(rows)                -> int  (number of rows actually added)
+    upsert_rows(rows)                -> tuple[int, int]  (inserted, updated)
     has_rows_for_month(target_month) -> bool
     seed_from_csv_if_empty(csv_path) -> int  (number of rows seeded; 0 if non-empty)
     get_pdf_state(url)               -> Optional[dict]
@@ -458,34 +459,84 @@ def months_missing_category(category: str) -> list[pd.Timestamp]:
             for ts in parsed if not pd.isna(ts)]
 
 
-def insert_rows(rows: Iterable[dict[str, Any]], *, source: str = "auto-update") -> int:
-    """Append rows to the table, skipping duplicates by ``(Category, Month, Class)``.
+def upsert_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    source: str = "auto-update",
+) -> tuple[int, int]:
+    """Insert new rows; overwrite rate cells on existing keys when they differ.
 
-    Returns the number of rows actually inserted. This is the OneLake
-    equivalent of SQLite's ``INSERT OR IGNORE`` — re-running the
-    auto-update pipeline is a safe no-op when the rows already exist.
+    The composite key is ``(Category, Month, Class)``.  For each incoming
+    row:
 
-    The ``source`` parameter is informational only (recorded as a
-    top-level field in each row so future tooling can distinguish
-    seed/auto-update/manual rows); it has no effect on dedup or read
-    behaviour.
+    * **No matching key in the store** → the row is appended (insert).
+    * **Matching key exists** → each of the four rate cells (``Skim Rate``,
+      ``Butterfat Rate``, ``Protein Rate``, ``Other Solids Rate``) is
+      overwritten *only when the incoming value is not ``None`` and
+      differs from the stored value*.
+
+    The ``None`` rule is what makes the parser composable with the page-1
+    advance-prices history: ESL Class I Skim is reconcilable only for the
+    announced month (the Class I ESL Adjustment is published only there),
+    so for every OTHER month the orchestrator passes ``Skim Rate=None``
+    and the existing (correctly written at announcement time) value is
+    preserved.
+
+    Bookkeeping fields ``_source`` and ``_updated_at`` are stamped on each
+    cell change so the JSON carries a small audit trail for the most-recent
+    writer.  ``_inserted_at`` is set only on a fresh insert.
+
+    Operates as a single ETag-guarded read-modify-write so a concurrent
+    auto-update or manual edit fails-and-retries cleanly inside
+    ``fabric_lakehouse_io.update_json``.
+
+    Returns
+    -------
+    ``(rows_inserted, rows_updated)`` — strictly disjoint counts.  Both
+    are ``0`` for a complete no-op, which is the steady-state when the
+    PDF is unchanged and the store is fully reconciled.
     """
     incoming = _normalise_rows(rows)
     if not incoming:
-        return 0
+        return 0, 0
 
     inserted_count = 0
+    updated_count  = 0
 
     def _mutate(current: Optional[list[dict[str, Any]]]) -> list[dict[str, Any]]:
-        nonlocal inserted_count
+        nonlocal inserted_count, updated_count
         rows_now = list(current) if current else []
-        existing_keys = {_row_key(r) for r in rows_now}
+        by_key: dict[tuple[str, str, str], dict[str, Any]] = {
+            _row_key(r): r for r in rows_now
+        }
         appended: list[dict[str, Any]] = []
         for r in incoming:
-            if _row_key(r) in existing_keys:
+            key = _row_key(r)
+            stored = by_key.get(key)
+            if stored is None:
+                appended.append({
+                    **r,
+                    "_source": source,
+                    "_inserted_at": datetime.utcnow().isoformat(),
+                })
                 continue
-            appended.append({**r, "_source": source, "_inserted_at": datetime.utcnow().isoformat()})
-            existing_keys.add(_row_key(r))
+            # In-place rate overwrite — None never overrides an existing
+            # numeric (see docstring for the rationale).
+            changed = False
+            for col in _RATE_COLUMNS:
+                new_val = r.get(col)
+                if new_val is None:
+                    continue
+                cur_val = stored.get(col)
+                if (cur_val is None
+                        or pd.isna(cur_val)
+                        or float(cur_val) != float(new_val)):
+                    stored[col] = float(new_val)
+                    changed = True
+            if changed:
+                stored["_source"]     = source
+                stored["_updated_at"] = datetime.utcnow().isoformat()
+                updated_count += 1
         inserted_count = len(appended)
         return rows_now + appended if appended else rows_now
 
@@ -494,9 +545,9 @@ def insert_rows(rows: Iterable[dict[str, Any]], *, source: str = "auto-update") 
     except _io.LakehouseIOError as exc:
         raise MilkMoverStoreError(str(exc)) from exc
 
-    if inserted_count > 0:
+    if inserted_count > 0 or updated_count > 0:
         _invalidate_read_cache()
-    return inserted_count
+    return inserted_count, updated_count
 
 
 def seed_from_csv_if_empty(csv_path: Optional[Path] = None) -> int:
@@ -625,7 +676,7 @@ __all__ = [
     "esl_class_ii_rates_by_month",
     "cottage_cheese_months_with_null_skim",
     "patch_cottage_cheese_rates",
-    "insert_rows",
+    "upsert_rows",
     "seed_from_csv_if_empty",
     "get_pdf_state",
     "upsert_pdf_state",

@@ -1,55 +1,86 @@
 """
 Auto-update orchestrator for the Milk Mover Tracker.
 
+Strategy
+--------
+The orchestrator runs a **reconciliation pass** against the page-1 history
+tables of ``dymadvancedprices.pdf`` (and the page-2 history of
+``dymclassprices.pdf``) on every detected change.  Each month present in
+the advance-prices history is re-derived from its own labelled row in the
+table — never from the page-1 headline — and the resulting five
+``(Category, Class)`` rows are upserted into the
+``fmmo_tracker.json`` blob.  ``store.upsert_rows`` overwrites existing
+rate cells when the incoming value differs, so any prior wrong-month
+write self-heals the moment USDA's PDF carries the corrected number.
+
+Why a reconciliation pass instead of "insert next month"?
+    The previous design assumed ``_next_month(latest_in_db)`` always
+    matched the month USDA had announced on page 1.  That invariant
+    broke whenever USDA edited the PDF for a non-data reason while the
+    headline still referenced the previous month — the orchestrator
+    then wrote stale headline values *under the wrong month* and the
+    append-only ``insert_rows`` API made the bad data permanent.  The
+    history table carries explicit ``(year, month)`` labels for every
+    row, eliminating the entire class of label-drift bugs by
+    construction.
+
 Workflow on each invocation
 ---------------------------
-1. Skip if the **advanced-prices** PDF has not changed since the last check
-   (HEAD with ETag / Last-Modified, falling back to body SHA-256). The
-   class-prices PDF is *only* fetched when an actual update is needed.
-2. Compute the target month: ``latest_month_in_db + 1 month``. If a row for
-   that month already exists for any (Category, Class) combination, exit
-   early — the auto-update is idempotent.
-3. Parse the five advanced-prices fields (the four legacy ones plus the
-   new ``Class II Nonfat Solids Price``) and the Class II Butterfat
-   figure for ``(today.year, today.month - 1)`` from page 2 of the
-   class-prices PDF.
-4. Derive the five (Category, Class) rows per the Skim/Butterfat/Protein
-   /Other-Solids formulas:
+1.  **Cottage Cheese backfill probe** (cheap, in-memory) — detect months
+    in the JSON that lack a CC row.  Bypasses the TTL guard when set so
+    a deploy-time schema bump is reflected on the next render.
+2.  **Cottage Cheese skim/bfat in-place repair** (cheap, no PDF) — fix
+    legacy CC rows whose Skim/Bfat are null by copying from ESL II for
+    the same month (per the May-2026 contract: CC II Skim/Bfat mirror
+    ESL II).
+3.  **TTL guard** — skip the rest when we checked the PDF within
+    ``_DEFAULT_CHECK_TTL`` AND there's nothing else to do.
+4.  **Change detection** on the advanced-prices PDF (HEAD with ETag /
+    Last-Modified; SHA-256 fallback).  Always persists the new
+    fingerprint so the TTL math engages even on a "no change" tick.
+5.  **Pull PDFs and parse** — both advance-prices and class-prices, all
+    history tables in one shot.
+6.  **Reconciliation upsert** — for every month in the advance-prices
+    history, build the canonical row set
+    (HTST I/II, ESL I/II, CC II) and upsert.  ``upsert_rows`` overwrites
+    rate cells in place when the incoming value differs; ``None``
+    incoming values preserve the stored value (so prior months' ESL I
+    Skim is never clobbered — the ESL Adjustment is announced only for
+    the upcoming month and only that month's ESL I Skim is reconcilable
+    here).
+7.  **Legacy Cottage Cheese backfill** — months in the JSON that
+    predate the PDF's history window (typically ≥ 24 months old) are
+    backfilled with CC II Skim/Bfat from the stored ESL II row and
+    ``null`` Protein/Other Solids (no NFS source available for that
+    vintage).  Months covered by step 6 are excluded by construction.
 
-   =============== ==== ============================ ============================ ============================ ============================
-   Category        Cl   Skim Rate                    Butterfat Rate               Protein Rate                 Other Solids Rate
-   =============== ==== ============================ ============================ ============================ ============================
-   HTST            I    Base Skim Class I / 100      Advanced Butterfat Factor    null                         null
-   HTST            II   Class II Skim Price / 100    Class II Butterfat (p.2)     null                         null
-   ESL             I    HTST Class I Skim            same as HTST Class I Bfat    null                         null
-                        + Class I ESL Adj / 100
-   ESL             II   same as HTST Class II Skim   same as HTST Class II Bfat   null                         null
-   Cottage Cheese  II   null                         Class II Butterfat (p.2)     Class II Nonfat Solids       Class II Nonfat Solids
-   =============== ==== ============================ ============================ ============================ ============================
+Row derivation matrix
+---------------------
 
-   Note that the Cottage Cheese row carries the SAME Class II Nonfat
-   Solids Price for both Protein Rate AND Other Solids Rate (per the
-   May-2026 spec). The page-1 headline value is used as-is — no
-   ``/100`` rescaling — because the source figure is already $/lb.
+==============  ====  ============================  =============================  ===================
+Category        Cl    Skim Rate                     Butterfat Rate                 Protein / Other
+==============  ====  ============================  =============================  ===================
+HTST            I     Base Skim Class I / 100        Advanced Butterfat Factor      null
+HTST            II    Class II Skim Price / 100      Class II Butterfat (p.2)       null
+ESL             I     HTST Class I Skim              same as HTST Class I Bfat      null
+                      + Class I ESL Adj / 100 ¹
+ESL             II    same as HTST Class II Skim     same as HTST Class II Bfat     null
+Cottage Cheese  II    same as ESL II Skim ²          same as ESL II Bfat ²          Class II Nonfat Solids
+==============  ====  ============================  =============================  ===================
 
-5. **One-shot Cottage Cheese backfill** — for every month already in
-   the JSON that lacks a Cottage Cheese row, look up the historical
-   Class II Butterfat (page 2 of ``dymclassprices.pdf``) and Class II
-   Nonfat Solids Price (page 1 monthly tables of
-   ``dymadvancedprices.pdf``). Months for which neither PDF exposes a
-   value get a Cottage Cheese row with ``null`` rates so the month
-   coverage of Cottage Cheese matches HTST/ESL exactly. Idempotent —
-   subsequent invocations are an in-memory no-op once every month is
-   filled in.
+¹ ESL Class I Skim is reconcilable ONLY for the announced month
+  (the headline ESL Adjustment is not republished for any other month).
+  For all other months the orchestrator emits ``Skim Rate=None`` so
+  ``upsert_rows`` preserves whatever was correctly written at
+  announcement time.
 
-6. Append to the ``milk_mover_tracker`` JSON blob in OneLake (the store
-   layer dedups by ``(Category, Month, Class)`` so re-runs are no-ops) and
-   persist the updated PDF fingerprint state to the companion state blob.
+² CC II Skim/Bfat NEVER drift from ESL II — by binding them to the same
+  derived values in one place, we make divergence structurally
+  impossible (May-2026 contract).
 
 The orchestrator is **safe to call on every page render** — the TTL guard
-(see ``maybe_update_from_pdfs``) plus the change-detection layer make
-repeated calls cheap (one in-memory check / no network) once we've checked
-within the cooldown window.
+plus the change-detection layer make repeated calls cheap (one HEAD or
+zero network at all) once we've checked within the cooldown window.
 """
 from __future__ import annotations
 
@@ -67,51 +98,63 @@ from data_sources import usda_milk_pdf as pdf
 logger = logging.getLogger(__name__)
 
 
-# Default minimum interval between PDF change-detection checks. The HEAD call
-# is cheap (~200 ms) but doing it on every Streamlit rerun would be wasteful;
-# 1 hour balances freshness against bandwidth.
+# Default minimum interval between PDF change-detection checks.  The HEAD
+# call is cheap (~200 ms) but doing it on every Streamlit rerun would be
+# wasteful; 1 hour balances freshness against bandwidth.
 _DEFAULT_CHECK_TTL = timedelta(hours=1)
+
+
+# Canonical Cottage Cheese category label.  Centralised so any future
+# rename only touches one place; downstream UI / chart code matches
+# case-insensitively but writes use this canonical spelling.
+_CATEGORY_COTTAGE_CHEESE: str = "Cottage Cheese"
 
 
 # ── Result type ──────────────────────────────────────────────────────────────
 
 @dataclass
 class AutoUpdateResult:
-    """Structured result the UI can render in a status caption."""
+    """Structured result the UI can render as a status caption.
+
+    All counts are mutually disjoint — a given row is counted in exactly
+    one of ``rows_inserted`` / ``rows_updated`` / ``backfill_inserted``
+    / ``cc_rows_repaired``.  ``as_caption`` composes a single-line
+    summary from whichever counters are non-zero.
+    """
     checked_at:        datetime
-    advanced_changed:  bool                = False
-    rows_inserted:     int                 = 0
-    # Number of Cottage Cheese rows inserted by the one-shot historical
-    # backfill. Tracked separately from ``rows_inserted`` (which counts
-    # the per-month new rows) so the status caption can call out a
-    # multi-month backfill distinctly from the routine monthly tick.
-    backfill_inserted: int                 = 0
-    # Number of historical Cottage Cheese rows patched in-place by the
-    # one-shot CC-skim/bfat repair pass (May-2026 contract: CC II
-    # skim/bfat mirror ESL II). Separate from ``backfill_inserted``
-    # which inserts whole missing CC rows.
-    cc_rows_repaired:  int                 = 0
+    advanced_changed:  bool                   = False
+    # Rows the reconciliation pass added — i.e. new ``(Category, Month,
+    # Class)`` keys that didn't exist in the JSON before this run.
+    rows_inserted:     int                    = 0
+    # Rows whose existing rate cells the reconciliation pass overwrote
+    # because USDA published a corrected value.  These would have been
+    # silently dropped by the old append-only ``insert_rows`` API.
+    rows_updated:      int                    = 0
+    # Cottage Cheese rows inserted by the legacy backfill (months older
+    # than the PDF's history window).  Disjoint from ``rows_inserted``.
+    backfill_inserted: int                    = 0
+    # Cottage Cheese rows patched in-place by the one-shot CC-skim/bfat
+    # repair pass (May-2026 contract: CC II skim/bfat mirror ESL II).
+    cc_rows_repaired:  int                    = 0
+    # The most-recent month USDA has announced on the advance-prices
+    # PDF.  Used by the caption and surfaced to the UI so the operator
+    # can sanity-check "the orchestrator saw USDA publish month X."
     target_month:      Optional[pd.Timestamp] = None
-    classii_bfat_lookup: Optional[pdf.ClassIIBfatLookup] = None
-    skipped_reason:    Optional[str]        = None
-    errors:            list[str]            = field(default_factory=list)
+    skipped_reason:    Optional[str]          = None
+    errors:            list[str]              = field(default_factory=list)
 
     def as_caption(self) -> str:
         """Compact one-liner suitable for ``st.caption``."""
         when = self.checked_at.strftime("%Y-%m-%d %H:%M")
         if self.errors:
             return f"⚠️ Auto-update at {when}: {self.errors[0]}"
-        # Build the success caption from up to three independent
-        # outcomes: monthly insert, backfill, and "no change". They're
-        # composed so a single render can convey both a new-month tick
-        # AND a same-call backfill (which is the expected experience on
-        # the FIRST page render after the May-2026 schema bump).
+
         parts: list[str] = []
+        tm = self.target_month.strftime("%b %Y") if self.target_month else "?"
         if self.rows_inserted:
-            tm = self.target_month.strftime("%b %Y") if self.target_month else "?"
-            parts.append(
-                f"inserted {self.rows_inserted} row(s) for {tm}"
-            )
+            parts.append(f"inserted {self.rows_inserted} row(s) up to {tm}")
+        if self.rows_updated:
+            parts.append(f"corrected {self.rows_updated} row(s)")
         if self.backfill_inserted:
             parts.append(
                 f"backfilled {self.backfill_inserted} Cottage Cheese row(s)"
@@ -127,32 +170,15 @@ class AutoUpdateResult:
         return f"✅ Auto-update at {when}: " + "; ".join(parts) + "."
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _next_month(ts: pd.Timestamp) -> pd.Timestamp:
-    """Return the first day of the month immediately after ``ts``."""
-    return (ts.normalize().replace(day=1) + pd.DateOffset(months=1))
-
-
-def _previous_calendar_month(today: datetime) -> tuple[int, int]:
-    """Return (year, month) for ``today`` minus one calendar month."""
-    if today.month == 1:
-        return (today.year - 1, 12)
-    return (today.year, today.month - 1)
-
-
-# Canonical Cottage Cheese category label. Centralised so any future
-# rename only touches one place; downstream UI / chart code matches
-# case-insensitively but writes use this canonical spelling.
-_CATEGORY_COTTAGE_CHEESE: str = "Cottage Cheese"
-
+# ── Pure helpers (no IO) ─────────────────────────────────────────────────────
 
 def _round_or_none(value: Optional[float], ndigits: int = 4) -> Optional[float]:
     """Round ``value`` when not None / NaN; otherwise propagate ``None``.
 
-    Used by the backfill helper so per-month rows with one resolvable
-    rate and one unresolvable rate produce ``{... : 0.5935, ... : None}``
-    rather than collapsing the row entirely.
+    Used so partial rows (e.g. a month where the class-prices PDF lags
+    and Class II Butterfat is unavailable) round-trip through
+    ``upsert_rows`` as ``{... : 0.5935, ... : None}`` rather than
+    collapsing the row to all-nulls.
     """
     if value is None:
         return None
@@ -164,81 +190,95 @@ def _round_or_none(value: Optional[float], ndigits: int = 4) -> Optional[float]:
     return round(float(value), ndigits)
 
 
-def _derive_rows(
+def _derive_rows_for_sample(
     *,
-    target_month:        pd.Timestamp,
-    advanced:            dict[str, float],
-    class_ii_butterfat:  float,
+    month:              pd.Timestamp,
+    sample:             pdf.AdvancedPriceSample,
+    class_ii_butterfat: Optional[float],
+    esl_adj_raw:        Optional[float],
 ) -> list[dict]:
-    """Compute the five (Category, Class) rows per the spec.
+    """Build the canonical five-row set for one month of the page-1 history.
 
-    All inputs are pre-validated by the parsers (they raise ``ValueError`` on
-    missing labels) so this is pure arithmetic — no IO, no error-handling
-    needed beyond the formulas themselves.
+    Parameters
+    ----------
+    month
+        First-of-month timestamp for the row group.
+    sample
+        Per-month sample from
+        :func:`pdf.parse_advanced_prices_history`.
+    class_ii_butterfat
+        Class II Butterfat from the page-2 history of
+        ``dymclassprices.pdf`` for the same month.  Pass ``None`` when
+        the class-prices PDF lags (USDA cadence: class-prices publishes
+        ~1 month behind advance-prices); HTST II / ESL II / CC II
+        Butterfat then defaults to ``None`` and the store preserves
+        whatever was previously written for those cells.
+    esl_adj_raw
+        Headline Class I ESL Adjustment ($/cwt, signed) from
+        ``parse_advanced_prices``.  Pass ``None`` for every month
+        OTHER than the announced month — USDA does not publish the
+        ESL Adjustment per-month in any history table, so for
+        non-announced months we propagate ``None`` for ESL Class I
+        Skim and the store preserves the value written when that
+        month was first announced.
 
-    Cottage Cheese (May-2026 contract): Class is always ``II``; **Skim Rate**
-    and **Butterfat Rate** are copied verbatim from the ESL Class II row
-    for the same month — they are NEVER scraped independently — and only
-    **Protein Rate** and **Other Solids Rate** carry distinct scraped
-    values (both equal the Class II Nonfat Solids Price from the
-    advanced-prices PDF). This guarantees CC II skim/bfat can never drift
-    from ESL II skim/bfat over time.
+    Returns
+    -------
+    Exactly five row dicts (HTST I, HTST II, ESL I, ESL II, CC II)
+    in the schema the store expects.  Skim/Butterfat are bound through
+    shared locals so ESL II and CC II can never drift from HTST II.
     """
-    htst_class_i_skim   = round(advanced["class_i_skim_raw"]    / 100, 4)
-    htst_class_ii_skim  = round(advanced["class_ii_skim_raw"]   / 100, 4)
-    htst_class_i_bfat   = round(advanced["advanced_butterfat"], 4)
-    htst_class_ii_bfat  = round(class_ii_butterfat,             4)
-    cc_nonfat_solids    = round(advanced["class_ii_nonfat_solids"], 4)
+    htst_class_i_skim   = round(sample.class_i_skim_raw    / 100, 4)
+    htst_class_ii_skim  = round(sample.class_ii_skim_raw   / 100, 4)
+    htst_class_i_bfat   = round(sample.advanced_butterfat,      4)
+    htst_class_ii_bfat  = _round_or_none(class_ii_butterfat)
+    cc_nonfat_solids    = round(sample.class_ii_nonfat_solids,  4)
 
-    # Per spec: ONLY the ESL Class I Skim differs from HTST — every other
-    # ESL field mirrors its HTST counterpart.
-    esl_class_i_skim = round(
-        htst_class_i_skim + advanced["class_i_esl_adj_raw"] / 100,
-        4,
-    )
-
-    # ESL Class II skim/bfat are the source of truth for Cottage Cheese
-    # Class II skim/bfat — bind them once so the two rows below can't
-    # accidentally diverge.
+    # ESL II / CC II skim/bfat mirror HTST II by spec — bind once.
     esl_class_ii_skim = htst_class_ii_skim
     esl_class_ii_bfat = htst_class_ii_bfat
+
+    # ESL Class I Skim — only derive when this is the announced month;
+    # otherwise propagate None so the upsert layer preserves the
+    # correct value already in storage.
+    esl_class_i_skim: Optional[float] = (
+        round(htst_class_i_skim + esl_adj_raw / 100, 4)
+        if esl_adj_raw is not None else None
+    )
 
     return [
         {
             store.COL_CATEGORY:     "HTST",
-            store.COL_MONTH:        target_month,
+            store.COL_MONTH:        month,
             store.COL_CLASS:        "I",
             store.COL_SKIM:         htst_class_i_skim,
             store.COL_BUTTERFAT:    htst_class_i_bfat,
         },
         {
             store.COL_CATEGORY:     "HTST",
-            store.COL_MONTH:        target_month,
+            store.COL_MONTH:        month,
             store.COL_CLASS:        "II",
             store.COL_SKIM:         htst_class_ii_skim,
             store.COL_BUTTERFAT:    htst_class_ii_bfat,
         },
         {
             store.COL_CATEGORY:     "ESL",
-            store.COL_MONTH:        target_month,
+            store.COL_MONTH:        month,
             store.COL_CLASS:        "I",
-            store.COL_SKIM:         esl_class_i_skim,
+            store.COL_SKIM:         esl_class_i_skim,   # None → preserve stored
             store.COL_BUTTERFAT:    htst_class_i_bfat,
         },
         {
             store.COL_CATEGORY:     "ESL",
-            store.COL_MONTH:        target_month,
+            store.COL_MONTH:        month,
             store.COL_CLASS:        "II",
             store.COL_SKIM:         esl_class_ii_skim,
             store.COL_BUTTERFAT:    esl_class_ii_bfat,
         },
         {
             store.COL_CATEGORY:     _CATEGORY_COTTAGE_CHEESE,
-            store.COL_MONTH:        target_month,
+            store.COL_MONTH:        month,
             store.COL_CLASS:        "II",
-            # Skim/Butterfat mirror ESL Class II so CC II skim/bfat can
-            # never drift from ESL II over time. Only Protein / Other
-            # Solids carry scraped values.
             store.COL_SKIM:         esl_class_ii_skim,
             store.COL_BUTTERFAT:    esl_class_ii_bfat,
             store.COL_PROTEIN:      cc_nonfat_solids,
@@ -247,133 +287,95 @@ def _derive_rows(
     ]
 
 
-def _derive_cottage_cheese_backfill_rows(
+def _derive_legacy_cottage_cheese_rows(
     *,
-    missing_months:    Iterable[pd.Timestamp],
-    nfs_history:       dict[tuple[int, int], float],
-    esl_ii_by_month:   dict[pd.Timestamp, tuple[Optional[float], Optional[float]]],
-) -> tuple[list[dict], list[tuple[pd.Timestamp, list[str]]]]:
-    """Derive a Cottage Cheese row for every historical month that lacks one.
+    legacy_months:   Iterable[pd.Timestamp],
+    esl_ii_by_month: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]],
+) -> list[dict]:
+    """Build CC rows for months OLDER than the page-1 history window.
 
-    Parameters
-    ----------
-    missing_months
-        Months already present in ``fmmo_tracker.json`` for some
-        (HTST/ESL) category but with no Cottage Cheese row yet. Sourced
-        from :func:`store.months_missing_category`.
-    nfs_history
-        Pre-parsed ``{(year, month) → Class II Nonfat Solids Price}``
-        from the page-1 monthly tables of ``dymadvancedprices.pdf``.
-    esl_ii_by_month
-        Pre-built ``{first-of-month → (ESL II Skim, ESL II Butterfat)}``
-        lookup. Cottage Cheese **always** inherits ESL II skim / bfat
-        for the same month — re-scraping the class-prices PDF for these
-        two fields is forbidden by the May-2026 contract.
+    The reconciliation pass (see :func:`_derive_rows_for_sample`) handles
+    every month USDA's current PDF exposes.  This helper handles the
+    long tail of pre-history months in ``fmmo_tracker.json`` (typically
+    from the seed CSV): CC II Skim/Bfat copy from the stored ESL II row
+    and Protein/Other Solids are left ``null`` because no NFS source
+    survives for that vintage.
 
-    Returns
-    -------
-    (rows, gaps)
-        ``rows`` is the list of normalised dicts (one per month, even
-        when one or more rates were unresolvable — ``None`` then
-        represents ``null`` in the JSON). ``gaps`` is a debug list of
-        ``(month, [missing_fields])`` tuples so the caller can emit a
-        single concise log line summarising backfill coverage.
+    Idempotent — months that already have a CC row are excluded by the
+    caller (see ``store.months_missing_category``).
     """
-    rows:   list[dict] = []
-    gaps:   list[tuple[pd.Timestamp, list[str]]] = []
-
-    for month in missing_months:
+    rows: list[dict] = []
+    for month in legacy_months:
         ts = pd.Timestamp(month).normalize().replace(day=1)
-
-        # CC II skim/bfat are NEVER scraped independently — they always
-        # mirror ESL II for the same month. When the ESL II row is
-        # absent from the tracker (shouldn't happen — every month with
-        # any FMMO data carries ESL II), we propagate None rather than
-        # synthesise a value out of thin air.
         skim_val, bfat_val = esl_ii_by_month.get(ts, (None, None))
-
-        nfs_val = nfs_history.get((ts.year, ts.month))
-
-        missing_fields: list[str] = []
-        if skim_val is None:
-            missing_fields.append("Skim Rate")
-        if bfat_val is None:
-            missing_fields.append("Butterfat Rate")
-        if nfs_val is None:
-            missing_fields.append("Protein/Other Solids Rate")
-        if missing_fields:
-            gaps.append((ts, missing_fields))
-
         rows.append({
             store.COL_CATEGORY:     _CATEGORY_COTTAGE_CHEESE,
             store.COL_MONTH:        ts,
             store.COL_CLASS:        "II",
             store.COL_SKIM:         _round_or_none(skim_val),
             store.COL_BUTTERFAT:    _round_or_none(bfat_val),
-            store.COL_PROTEIN:      _round_or_none(nfs_val),
-            store.COL_OTHER_SOLIDS: _round_or_none(nfs_val),
+            # NFS unavailable for legacy months — preserved as null so
+            # the row's coverage parity (every month has a CC row) is
+            # restored even when the source is incomplete.
+            store.COL_PROTEIN:      None,
+            store.COL_OTHER_SOLIDS: None,
         })
-
-    return rows, gaps
+    return rows
 
 
 # ── Public entry point ───────────────────────────────────────────────────────
 
 def maybe_update_from_pdfs(
     *,
-    force: bool                = False,
-    now:   Optional[datetime]  = None,
-    ttl:   timedelta           = _DEFAULT_CHECK_TTL,
+    force: bool               = False,
+    now:   Optional[datetime] = None,
+    ttl:   timedelta          = _DEFAULT_CHECK_TTL,
 ) -> AutoUpdateResult:
-    """Check the USDA PDFs and insert a new month's rows when warranted.
+    """Check the USDA PDFs and reconcile ``fmmo_tracker.json`` accordingly.
 
     Parameters
     ----------
     force
-        Skip the TTL guard and force a fresh PDF check, even if we checked
-        recently. Wired to the "Force refresh from USDA" button in the UI.
+        Skip the TTL guard and force a fresh PDF check, even if we
+        checked recently.  Wired to the "Force refresh from USDA" button
+        in the UI.
     now
-        Override the current time (test seam — defaults to ``datetime.now``).
+        Override the current time (test seam — defaults to
+        ``datetime.now(timezone.utc)``).
     ttl
         Minimum interval between PDF change-detection checks.
 
     Returns
     -------
     :class:`AutoUpdateResult`
-        Always-populated; the UI uses it for the status caption regardless
-        of whether anything was inserted.
+        Always populated; the UI uses it for the status caption
+        regardless of whether anything was inserted or updated.
     """
     now = now or datetime.now(timezone.utc)
-    # Make sure the store has a baseline before we attempt any inserts:
-    # without it the "next month" math has nothing to anchor on.
+    # Ensure the store has a baseline before we attempt any reconciliation:
+    # without a seed, the legacy backfill path has nothing to anchor on.
     store.seed_from_csv_if_empty()
 
     result = AutoUpdateResult(checked_at=now)
 
-    # ── 0a. Cottage Cheese backfill gate (cheap, in-memory) ─────────────────
+    # ── 0a. Cottage Cheese backfill probe (cheap, in-memory) ────────────────
     #
-    # The May-2026 schema bump introduced the Cottage Cheese category.
-    # Any month already in the JSON without a Cottage Cheese row must be
-    # backfilled — even when the PDFs haven't changed since the last
-    # check. Detecting this is free (it iterates the cached row list),
-    # so we evaluate it FIRST and use the result to decide whether to
-    # bypass the TTL / change-detection guards below.
+    # Any month already in the JSON without a Cottage Cheese row needs
+    # backfilling — even when the PDFs haven't changed since the last
+    # check.  Detecting this is free (iterates the cached row list).
     try:
         missing_cc_months = store.months_missing_category(_CATEGORY_COTTAGE_CHEESE)
     except store.MilkMoverStoreError as exc:
-        # Treat as no backfill needed — the normal new-month path below
-        # will surface any persistent storage problem.
+        # Treat as no backfill needed — the normal reconciliation path
+        # below will surface any persistent storage problem.
         logger.warning("Cottage Cheese backfill probe failed: %s", exc)
         missing_cc_months = []
     backfill_needed = bool(missing_cc_months)
 
-    # ── 0b. Cottage Cheese skim/bfat repair gate (cheap, in-memory) ─────────
+    # ── 0b. Cottage Cheese skim/bfat repair probe (cheap, in-memory) ────────
     #
-    # Same idea, narrower scope: CC rows written before the May-2026
-    # "CC II skim/bfat mirror ESL II" contract carry ``null`` Skim and
-    # need an in-place rewrite. Detecting this iterates the same cached
-    # row list. Evaluating here lets us short-circuit on a fully-healthy
-    # store without paying for any HTTPS work.
+    # CC rows written before the "CC II skim/bfat mirror ESL II"
+    # contract carry null Skim and need an in-place rewrite.
     try:
         cc_skim_repair_months = store.cottage_cheese_months_with_null_skim()
     except store.MilkMoverStoreError as exc:
@@ -383,11 +385,10 @@ def maybe_update_from_pdfs(
 
     # ── 0c. Cottage Cheese skim/bfat in-place repair (cheap, no PDF) ────────
     #
-    # Fire the repair pass BEFORE the TTL guard so a stale repair
-    # always closes before the next routine tick. The repair is
-    # idempotent — once every CC row has skim/bfat populated from ESL II,
-    # ``cc_skim_repair_months`` is empty here and this branch becomes
-    # a free in-memory probe on every subsequent invocation.
+    # Fire the repair pass BEFORE the TTL guard so a stale repair always
+    # closes before the next routine tick.  Idempotent — once every CC
+    # row has skim/bfat populated, this branch becomes a free in-memory
+    # probe on every subsequent invocation.
     if repair_needed:
         try:
             esl_lookup = store.esl_class_ii_rates_by_month()
@@ -413,7 +414,7 @@ def maybe_update_from_pdfs(
     #
     # Skip the TTL short-circuit when a backfill is pending — otherwise
     # the page would render with incomplete Cottage Cheese coverage for
-    # up to ``ttl`` after a deploy that introduced the schema. Once the
+    # up to ``ttl`` after a deploy that introduced the schema.  Once the
     # backfill completes, future renders see ``backfill_needed=False``
     # and the TTL guard resumes its normal role.
     state = store.get_pdf_state(pdf.ADVANCED_PRICES_URL)
@@ -441,8 +442,8 @@ def maybe_update_from_pdfs(
 
     result.advanced_changed = adv_changed
 
-    # Always update the "checked at" timestamp, even when nothing changed —
-    # otherwise the TTL guard never engages.
+    # Always update the "checked at" timestamp, even when nothing
+    # changed — otherwise the TTL guard never engages.
     try:
         store.upsert_pdf_state(
             pdf.ADVANCED_PRICES_URL,
@@ -460,165 +461,141 @@ def maybe_update_from_pdfs(
         result.skipped_reason = "advanced-prices PDF unchanged."
         return result
 
-    # ── 3. Determine target month & idempotency ─────────────────────────────
+    # ── 3. Pull PDFs ─────────────────────────────────────────────────────────
     #
-    # ``target_month`` is only populated when the advanced-prices PDF
-    # actually changed — i.e. a new month is being added. When we're in
-    # this branch purely for backfill, target_month stays ``None`` and
-    # the new-month derive/insert step below is skipped.
-    target_month: Optional[pd.Timestamp] = None
-    if adv_changed:
-        latest = store.latest_month()
-        if latest is None:
-            # Empty store and no seed CSV — nothing to anchor on. Surface
-            # a clear error rather than guessing.
-            result.errors.append(
-                "milk_mover_tracker is empty and no seed CSV is available; "
-                "cannot determine the next month to insert."
-            )
-            return result
-
-        candidate = _next_month(latest)
-        if store.has_rows_for_month(candidate):
-            # Idempotent — somebody else already inserted this month's
-            # rows. Fall through to (possibly) run backfill but skip the
-            # new-month derive step.
-            target_month = None
-        else:
-            target_month = candidate
-            result.target_month = candidate
-
-    # Short-circuit when there is nothing left to do. This guards the
-    # narrow case where ``adv_changed`` flipped True (so we passed the
-    # early-return on line above), but the target month is already
-    # populated AND no Cottage Cheese backfill is pending. Without this
-    # we'd waste two HTTPS GETs on the PDFs for no insert.
-    if target_month is None and not backfill_needed:
-        result.skipped_reason = (
-            f"row(s) for the next month already exist; "
-            "auto-update is idempotent — nothing to do."
-        )
-        return result
-
-    # ── 4. Pull PDFs and parse ─────────────────────────────────────────────
-    #
-    # Advanced-prices PDF is always needed past this point — either for
-    # a new-month derive (step 5a) or for the NFS history in backfill
-    # (step 5b). The class-prices PDF is only needed for the new-month
-    # Class II Butterfat lookup in step 5a; the CC backfill in step 5b
-    # now sources skim/bfat from the ESL II row in the store and never
-    # touches the class-prices PDF (May-2026 contract).
+    # Both PDFs are needed past this point.  The class-prices PDF lags
+    # ~1 month behind advance-prices (USDA cadence), so any month
+    # missing from the class-prices history is a tolerable gap — the
+    # reconciliation simply leaves Class II Butterfat as ``None`` for
+    # that month and the store preserves the previously-stored value.
     try:
-        adv_bytes, _adv_fp_full = pdf.fetch_pdf_bytes(pdf.ADVANCED_PRICES_URL)
-        advanced = pdf.parse_advanced_prices(adv_bytes)
+        adv_bytes, _ = pdf.fetch_pdf_bytes(pdf.ADVANCED_PRICES_URL)
     except Exception as exc:
-        result.errors.append(f"advanced-prices PDF parse failed: {exc}")
+        result.errors.append(f"advanced-prices PDF download failed: {exc}")
         return result
 
     cls_bytes: Optional[bytes] = None
-    if target_month is not None:
+    try:
+        cls_bytes, _ = pdf.fetch_pdf_bytes(pdf.CLASS_PRICES_URL)
+    except Exception as exc:
+        # Non-fatal: reconcile what we can from advance-prices alone.
+        logger.warning("class-prices PDF download failed: %s", exc)
+
+    # ── 4. Parse PDFs ────────────────────────────────────────────────────────
+    try:
+        advanced_history = pdf.parse_advanced_prices_history(adv_bytes)
+    except Exception as exc:
+        result.errors.append(f"advanced-prices history parse failed: {exc}")
+        return result
+
+    if not advanced_history:
+        # PDF layout drift or empty body — refuse to write anything
+        # rather than guess.  Surface so the UI banner is actionable.
+        result.errors.append(
+            "advanced-prices PDF history table is empty or unparseable; "
+            "skipping reconciliation."
+        )
+        return result
+
+    # Announced month = newest row of the page-1 history table.  This is
+    # the structural fix for the historical "label drift" bug.
+    announced_year_month = max(advanced_history.keys())
+    result.target_month = pd.Timestamp(
+        year=announced_year_month[0],
+        month=announced_year_month[1],
+        day=1,
+    )
+
+    # Headline values — used ONLY for the Class I ESL Adjustment of the
+    # announced month.  The other four headline fields are also in the
+    # history table (and we prefer that source) but we parse the
+    # headline anyway so a label-rename in a future USDA layout drift
+    # is surfaced as an error rather than silently producing a row
+    # without ESL adjustment.
+    try:
+        advanced_headline = pdf.parse_advanced_prices(adv_bytes)
+    except Exception as exc:
+        result.errors.append(f"advanced-prices headline parse failed: {exc}")
+        return result
+    headline_esl_adj_raw = advanced_headline.get("class_i_esl_adj_raw")
+
+    bfat_history: dict[tuple[int, int], float] = {}
+    if cls_bytes is not None:
         try:
-            cls_bytes, _cls_fp = pdf.fetch_pdf_bytes(pdf.CLASS_PRICES_URL)
+            bfat_history = pdf.parse_class_ii_butterfat_history(cls_bytes)
         except Exception as exc:
-            result.errors.append(f"class-prices PDF download failed: {exc}")
-            return result
+            # Non-fatal — reconciliation skips Class II Butterfat for
+            # any missing month.
+            logger.warning("class-prices history parse failed: %s", exc)
 
-    # ── 5a. New-month derive & insert ───────────────────────────────────────
-    if target_month is not None:
-        target_year, target_pdf_month = _previous_calendar_month(now)
-        try:
-            bfat_lookup = pdf.parse_class_ii_butterfat(
-                cls_bytes,
-                target_year=target_year,
-                target_month=target_pdf_month,
-            )
-        except ValueError as exc:
-            # Common case: the previous month's classprices hasn't been
-            # published yet (USDA cadence). Fall back to the most recent
-            # month available in the year-table so we don't block the
-            # auto-update.
-            bfat_lookup = _latest_available_class_ii_bfat(cls_bytes, target_year)
-            if bfat_lookup is None:
-                result.errors.append(f"Class II Butterfat lookup failed: {exc}")
-                return result
-
-        result.classii_bfat_lookup = bfat_lookup
-
-        try:
-            rows = _derive_rows(
-                target_month=target_month,
-                advanced=advanced,
-                class_ii_butterfat=bfat_lookup.value,
-            )
-            result.rows_inserted = store.insert_rows(rows, source="auto-update")
-        except Exception as exc:
-            result.errors.append(f"insert failed: {exc}")
-            return result
-
-    # ── 5b. Cottage Cheese backfill ─────────────────────────────────────────
+    # ── 5. Reconciliation upsert ─────────────────────────────────────────────
     #
-    # Idempotent and gated by the in-memory check at step 0a. Once every
-    # historical month has a Cottage Cheese row, ``missing_cc_months``
-    # is empty here and we skip the work entirely.
+    # Every month USDA exposes on page 1 gets re-derived from its own
+    # explicitly-labelled row and upserted.  Existing rows whose values
+    # match are no-ops; rows whose values differ are corrected in place;
+    # rows that don't exist yet are inserted.  This is the loop that
+    # heals the "June wrote May's value" bug on the next render after
+    # USDA publishes the corrected PDF.
+    reconciliation_rows: list[dict] = []
+    for (year, month), sample in sorted(advanced_history.items()):
+        month_ts    = pd.Timestamp(year=year, month=month, day=1)
+        bfat_value  = bfat_history.get((year, month))
+        is_announced = (year, month) == announced_year_month
+        # Only the announced month receives an ESL Adjustment from the
+        # headline; all other months propagate None and the upsert
+        # preserves the ESL Class I Skim already in the store.
+        esl_adj_for_month = headline_esl_adj_raw if is_announced else None
+        reconciliation_rows.extend(_derive_rows_for_sample(
+            month               = month_ts,
+            sample              = sample,
+            class_ii_butterfat  = bfat_value,
+            esl_adj_raw         = esl_adj_for_month,
+        ))
+
+    try:
+        inserted, updated = store.upsert_rows(
+            reconciliation_rows, source="auto-update"
+        )
+        result.rows_inserted = inserted
+        result.rows_updated  = updated
+    except Exception as exc:
+        result.errors.append(f"reconciliation upsert failed: {exc}")
+        return result
+
+    # ── 6. Legacy Cottage Cheese backfill ───────────────────────────────────
+    #
+    # The reconciliation pass above covers every month USDA's current
+    # PDF exposes.  This pass handles the long tail: months in the JSON
+    # that predate the page-1 history window.  Idempotent — once every
+    # legacy month has a CC row, this branch is a no-op.
     if backfill_needed:
-        try:
-            nfs_history = pdf.parse_class_ii_nonfat_solids_history(adv_bytes)
-        except Exception as exc:
-            # Never fatal — backfill operates on a best-effort basis.
-            logger.warning("Nonfat Solids history parse failed: %s", exc)
-            nfs_history = {}
-
-        # CC II skim/bfat mirror ESL II for the same month — sourced
-        # from the store (no PDF re-scrape) per the May-2026 contract.
-        try:
-            esl_ii_by_month = store.esl_class_ii_rates_by_month()
-        except store.MilkMoverStoreError as exc:
-            logger.warning("ESL II rate lookup failed: %s", exc)
-            esl_ii_by_month = {}
-
-        try:
-            cc_rows, gaps = _derive_cottage_cheese_backfill_rows(
-                missing_months=missing_cc_months,
-                nfs_history=nfs_history,
-                esl_ii_by_month=esl_ii_by_month,
+        history_months = {
+            pd.Timestamp(year=y, month=m, day=1)
+            for (y, m) in advanced_history.keys()
+        }
+        legacy_months = [
+            m for m in missing_cc_months if m not in history_months
+        ]
+        if legacy_months:
+            try:
+                esl_ii_by_month = store.esl_class_ii_rates_by_month()
+            except store.MilkMoverStoreError as exc:
+                logger.warning("ESL II rate lookup failed: %s", exc)
+                esl_ii_by_month = {}
+            cc_rows = _derive_legacy_cottage_cheese_rows(
+                legacy_months   = legacy_months,
+                esl_ii_by_month = esl_ii_by_month,
             )
             if cc_rows:
-                inserted = store.insert_rows(cc_rows, source="auto-update")
-                result.backfill_inserted = inserted
-                if gaps:
-                    logger.info(
-                        "Cottage Cheese backfill: %d row(s) inserted, "
-                        "%d month(s) had partial PDF coverage: %s",
-                        inserted,
-                        len(gaps),
-                        ", ".join(
-                            f"{m:%Y-%m} (missing {', '.join(fields)})"
-                            for m, fields in gaps[:5]
-                        ) + ("…" if len(gaps) > 5 else ""),
+                try:
+                    inserted, _ = store.upsert_rows(
+                        cc_rows, source="auto-update"
                     )
-        except Exception as exc:
-            # Surface but never raise — partial success is acceptable.
-            result.errors.append(f"Cottage Cheese backfill failed: {exc}")
+                    result.backfill_inserted = inserted
+                except Exception as exc:
+                    # Surface but never raise — partial success is acceptable.
+                    result.errors.append(
+                        f"Cottage Cheese backfill failed: {exc}"
+                    )
 
     return result
-
-
-def _latest_available_class_ii_bfat(
-    pdf_bytes: bytes,
-    target_year: int,
-) -> Optional[pdf.ClassIIBfatLookup]:
-    """Fall-back lookup: the most recent month present in the year-table.
-
-    USDA publishes class-prices around the 5th of the following month. If an
-    advance-prices update lands between roughly the 22nd and the 5th, the
-    "previous calendar month" row may not yet exist in class-prices — in
-    that window we accept the latest available month rather than failing.
-    """
-    for month in range(12, 0, -1):
-        try:
-            return pdf.parse_class_ii_butterfat(
-                pdf_bytes, target_year=target_year, target_month=month,
-            )
-        except ValueError:
-            continue
-    return None

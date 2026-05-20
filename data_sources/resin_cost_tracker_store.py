@@ -14,18 +14,41 @@ Storage layout
 ``Files/Resin_freight_cost_tracker/Resin_Calculator.csv``      — calculator inputs.
 ``Files/Resin_freight_cost_tracker/Resin_Cost_Tracker.csv``    — per-month baseline.
 
+Schema (cost tracker, May-2026 contract)
+----------------------------------------
+The tracker now carries a leading **"Rest Market vs TOPCO"** dimension
+so each month materialises **two** rows per Product ID — one for the
+Rest-of-Market HTST resin cost, one for the TOPCO HTST resin cost::
+
+    Rest Market vs TOPCO | Product ID | Product Description | Resin |
+    Resin Cost ($/Gal)   | Month      | Pricing Category    | ...
+
+The Side ("Rest" / "TOPCO") is the leftmost column by spec and is
+treated as part of the composite write key ``(Month, Side)``.  Legacy
+rows that pre-date this column are preserved verbatim on read and
+write — they simply lack a Side value and are invisible to the
+side-keyed Refresh rewrite.
+
 Public API
 ----------
 * :func:`read_resin_calculator_df`         — current calculator table.
 * :func:`read_resin_cost_tracker_df`       — current cost-tracker table.
 * :func:`latest_month`                     — newest Month present in the tracker.
 * :func:`has_month`                        — quick membership test.
-* :func:`append_new_month_from_latest`     — duplicate the latest-month rows,
-                                             re-stamp Month, and overwrite the
-                                             ``Resin Cost ($/Gal)`` column from
-                                             the two Resin Mover FGs (joined on
-                                             ``Product ID``).  Idempotent on
-                                             repeated calls for the same month.
+* :func:`rewrite_existing_months_for_sides` — Refresh-side writer.  For
+                                              every ``(Month, Side)`` key
+                                              present in the payload,
+                                              drops the persisted rows
+                                              and replaces with the
+                                              payload's rows.  Rows
+                                              outside the payload's
+                                              key set are untouched.
+* :func:`append_new_month_if_after_latest` — Confirm-side writer.  Only
+                                             appends ``target_month``
+                                             rows when ``target_month >
+                                             max(persisted months)``.
+                                             Idempotent on repeated
+                                             calls for the same month.
 * :func:`seed_from_local_if_empty`         — bootstrap helper for first-ever run.
 * :func:`get_calculator_label`             — UI caption helper.
 * :func:`get_cost_tracker_label`           — UI caption helper.
@@ -34,9 +57,9 @@ Concurrency
 -----------
 Writes go through :func:`fabric_lakehouse_io.update_csv`, which provides
 ETag-based optimistic concurrency with bounded retries.  Two simultaneous
-"Refresh" clicks for the same brand-new month therefore collapse into a
-single append (whichever lands first); the second sees the month already
-present and no-ops.
+"Refresh" clicks for the same set of months therefore collapse cleanly —
+both rewrites land on the same final state because each one drops the
+matching ``(Month, Side)`` rows before inserting.
 
 Configuration
 -------------
@@ -49,7 +72,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Iterable, Optional
 
 import pandas as pd
 import streamlit as st
@@ -86,6 +109,7 @@ COST_TRACKER_BLOB_PATH: str = f"{_FOLDER_PREFIX}/Resin_Cost_Tracker.csv"
 # Canonical column names — kept in lock-step with the consumer
 # ``pages/monthly_resin_freight_mover_tracker.py`` so renames need to be
 # done in exactly one place when the upstream schema evolves.
+COL_REST_VS_TOPCO: str = "Rest Market vs TOPCO"
 COL_PRODUCT_ID:   str = "Product ID"
 COL_PRODUCT_DESC: str = "Product Description"
 COL_RESIN:        str = "Resin"
@@ -95,8 +119,30 @@ COL_PRICING_CAT:  str = "Pricing Category"
 COL_USAGE_LBS:    str = "Usage (Lbs/Ea)"
 COL_GAL_EA:       str = "Gal/Ea"
 
+# Canonical Side values for the "Rest Market vs TOPCO" dimension.
+SIDE_REST:  str = "Rest"
+SIDE_TOPCO: str = "TOPCO"
+
+# Canonical column ordering for newly-written rows — keeps the
+# "Rest Market vs TOPCO" dimension flush-left per the May-2026 spec.
+# Any extra columns surviving from legacy rows are appended after.
+_CANONICAL_COLUMN_ORDER: tuple[str, ...] = (
+    COL_REST_VS_TOPCO,
+    COL_PRODUCT_ID,
+    COL_PRODUCT_DESC,
+    COL_RESIN,
+    COL_RESIN_GAL,
+    COL_MONTH,
+    COL_PRICING_CAT,
+    COL_USAGE_LBS,
+    COL_GAL_EA,
+)
+
 # The minimum column set we expect from the cost tracker.  Anything else
 # present in the file is preserved verbatim through reads and writes.
+# ``COL_REST_VS_TOPCO`` is INTENTIONALLY NOT in this set — legacy rows
+# that pre-date the new dimension are tolerated on read and pass through
+# write cycles untouched.
 _TRACKER_REQUIRED: tuple[str, ...] = (COL_PRODUCT_ID, COL_RESIN_GAL, COL_MONTH)
 
 # Calculator columns are looser — every consumer references the columns it
@@ -234,6 +280,45 @@ def _strip_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def normalise_side(value) -> Optional[str]:
+    """Coerce a raw Side cell to a canonical ``SIDE_REST`` / ``SIDE_TOPCO``.
+
+    Returns ``None`` for missing / unrecognised values — those rows fall
+    outside the new key space and are preserved as-is on rewrite.
+
+    Public so consumers (e.g. ``pages/monthly_resin_freight_mover_tracker``)
+    can normalise Side cells without reaching into private symbols.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    txt = str(value).strip()
+    if not txt:
+        return None
+    upper = txt.upper()
+    if upper.startswith("REST"):
+        return SIDE_REST
+    if upper.startswith("TOPCO"):
+        return SIDE_TOPCO
+    return None
+
+
+# Internal alias retained so existing module-private callers don't
+# need to be edited individually.  Public callers should use
+# :func:`normalise_side`.
+_normalise_side = normalise_side
+
+
+def _reorder_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
+    """Reorder columns so the canonical set comes first, extras trailing.
+
+    Missing canonical columns are skipped (not added) so this is a pure
+    reorder.  Used only on writes — reads preserve the source ordering.
+    """
+    present = [c for c in _CANONICAL_COLUMN_ORDER if c in df.columns]
+    trailing = [c for c in df.columns if c not in present]
+    return df[present + trailing]
+
+
 # ── Public API: reads ────────────────────────────────────────────────────────
 
 
@@ -290,107 +375,162 @@ def has_month(target_month) -> bool:
     return bool((_parsed_months(df) == em).any())
 
 
-# ── Public API: append-new-month workflow ────────────────────────────────────
+# ── Internal: payload validation + canonicalisation ──────────────────────────
 
 
-def append_new_month_from_latest(
-    target_month,
-    *,
-    new_resin_cost_lookup: Mapping[str, float],
-) -> tuple[int, bool]:
-    """Append a freshly-stamped copy of the latest month's rows for ``target_month``.
+def _validate_and_canonicalise_payload(rows: pd.DataFrame) -> pd.DataFrame:
+    """Validate ``rows`` and return a canonicalised copy ready for write.
 
-    Workflow (matches the May-2026 spec verbatim):
+    Enforces:
+      * Required columns present.
+      * ``Month`` parseable to first-of-month for every row.
+      * ``Rest Market vs TOPCO`` parseable to ``SIDE_REST`` / ``SIDE_TOPCO``
+        for every row (no NaN sides allowed in *new* writes — legacy
+        sideless rows can only enter the file via the bootstrap seed).
 
-    1. If ``target_month`` is already present in the cost tracker, no-op
-       (returns ``(0, False)``).
-    2. Otherwise duplicate the rows of the most-recent month, change every
-       row's :data:`COL_MONTH` to ``target_month``, and overwrite the
-       :data:`COL_RESIN_GAL` column using ``new_resin_cost_lookup`` keyed on
-       :data:`COL_PRODUCT_ID`.
-    3. The duplicated rows are then appended to the cost tracker via an
-       ETag-guarded read-modify-write cycle; cached reads are invalidated
-       so the very next ``read_resin_cost_tracker_df`` sees the new rows.
-
-    Parameters
-    ----------
-    target_month
-        Anything ``pd.to_datetime`` accepts; normalised to first-of-month.
-    new_resin_cost_lookup
-        ``{Product ID (str) → New Resin Cost ($/Gal) (float)}`` keyed on the
-        upstream FG output(s).  Caller is responsible for merging the Rest
-        HTST and TOPCO FGs into one combined lookup (see consumer code).
-
-    Returns
-    -------
-    (rows_appended, month_was_new)
-        ``rows_appended`` is the number of rows actually written;
-        ``month_was_new`` is True iff the call resulted in a new month
-        being appended.  When False we deliberately do nothing — the
-        existing rows for that month win.
+    Side-effects:
+      * ``Month`` is restamped to canonical ``M/D/YYYY`` string form.
+      * ``Rest Market vs TOPCO`` is restamped to the exact canonical
+        ``"Rest"`` / ``"TOPCO"`` casing.
+      * Column ordering is normalised via :func:`_reorder_to_canonical`.
     """
-    em = _normalise_month(target_month)
-    if em is None:
+    if rows is None or rows.empty:
+        return pd.DataFrame(columns=list(_CANONICAL_COLUMN_ORDER))
+
+    df = _strip_columns(rows)
+
+    missing = [c for c in _TRACKER_REQUIRED if c not in df.columns]
+    if missing:
         raise ResinCostTrackerStoreError(
-            f"target_month {target_month!r} is not parseable — "
-            "expected something pd.to_datetime accepts."
+            f"Payload is missing required columns {missing!r}.  "
+            f"Expected at least {list(_TRACKER_REQUIRED)}."
+        )
+    if COL_REST_VS_TOPCO not in df.columns:
+        raise ResinCostTrackerStoreError(
+            f"Payload is missing the {COL_REST_VS_TOPCO!r} column — every "
+            "new tracker row must carry a Rest/TOPCO side per the May-2026 "
+            "schema."
         )
 
-    rows_appended = 0
-    month_was_new = False
+    sides = df[COL_REST_VS_TOPCO].apply(_normalise_side)
+    if sides.isna().any():
+        bad = df.loc[sides.isna(), COL_REST_VS_TOPCO].astype(str).tolist()
+        raise ResinCostTrackerStoreError(
+            f"Payload has unrecognised Side values {bad!r}.  Expected "
+            f"{SIDE_REST!r} or {SIDE_TOPCO!r}."
+        )
+    df[COL_REST_VS_TOPCO] = sides
+
+    months = df[COL_MONTH].apply(_normalise_month)
+    if months.isna().any():
+        bad = df.loc[months.isna(), COL_MONTH].astype(str).tolist()
+        raise ResinCostTrackerStoreError(
+            f"Payload has unparseable Month values {bad!r}."
+        )
+    df[COL_MONTH] = months.apply(_stringify_month)
+
+    return _reorder_to_canonical(df)
+
+
+def _payload_key_pairs(payload: pd.DataFrame) -> set[tuple[pd.Timestamp, str]]:
+    """Return the set of ``(month_ts, side)`` pairs covered by ``payload``."""
+    if payload.empty:
+        return set()
+    months = payload[COL_MONTH].apply(_normalise_month)
+    sides  = payload[COL_REST_VS_TOPCO].apply(_normalise_side)
+    return {
+        (m, s) for m, s in zip(months, sides)
+        if m is not None and s is not None
+    }
+
+
+def _drop_rows_for_key_pairs(
+    existing: pd.DataFrame,
+    keys: Iterable[tuple[pd.Timestamp, str]],
+) -> tuple[pd.DataFrame, int]:
+    """Drop every row of ``existing`` whose ``(Month, Side)`` is in ``keys``.
+
+    Returns ``(filtered_df, rows_dropped)``.  Rows that lack either a
+    parseable Month or a parseable Side are PRESERVED verbatim — they
+    fall outside the key space and the caller's intent is to leave them
+    alone.
+    """
+    if existing.empty:
+        return existing, 0
+
+    keys_set = set(keys)
+    if not keys_set:
+        return existing, 0
+
+    months = existing[COL_MONTH].apply(_normalise_month) \
+        if COL_MONTH in existing.columns else pd.Series([None] * len(existing))
+    sides = existing[COL_REST_VS_TOPCO].apply(_normalise_side) \
+        if COL_REST_VS_TOPCO in existing.columns else pd.Series([None] * len(existing))
+
+    pairs = list(zip(months, sides))
+    drop_mask = pd.Series(
+        [(m, s) in keys_set for m, s in pairs],
+        index=existing.index,
+    )
+    rows_dropped = int(drop_mask.sum())
+    return existing.loc[~drop_mask].copy(), rows_dropped
+
+
+# ── Public API: Refresh writer (rewrite existing months × sides) ─────────────
+
+
+def rewrite_existing_months_for_sides(
+    rows: pd.DataFrame,
+) -> tuple[int, int]:
+    """Replace tracker rows whose ``(Month, Side)`` keys are in ``rows``.
+
+    Refresh-side writer (May-2026 contract):
+
+        "Existing data should be updated entirely once user hit refresh."
+
+    Algorithm:
+
+      1. Validate + canonicalise the payload via
+         :func:`_validate_and_canonicalise_payload`.
+      2. Compute the set of ``(Month, Side)`` keys covered by the payload.
+      3. Drop every persisted row whose key is in that set.
+      4. Concat the payload onto the survivors and write back.
+
+    Persisted rows whose ``(Month, Side)`` key is NOT in ``rows`` are
+    PRESERVED verbatim — this is how the spec's "Sep–Nov 2025 stay as-is"
+    invariant survives a Refresh that only covers Dec 2025 → May 2026.
+
+    Returns ``(rows_inserted, rows_deleted)``.
+    """
+    payload = _validate_and_canonicalise_payload(rows)
+    if payload.empty:
+        return 0, 0
+
+    key_pairs = _payload_key_pairs(payload)
+    if not key_pairs:
+        return 0, 0
+
+    rows_inserted = len(payload)
+    rows_deleted_total = 0
 
     def _mutate(current: Optional[pd.DataFrame]) -> pd.DataFrame:
-        nonlocal rows_appended, month_was_new
+        nonlocal rows_deleted_total
 
         existing = (
             pd.DataFrame() if current is None or current.empty
             else _strip_columns(current)
         )
+
+        # Even a brand-new tracker should land in canonical column order
+        # so downstream readers can rely on the leading Side column.
         if existing.empty:
-            # Nothing to duplicate from — bail out cleanly so we don't
-            # write a malformed empty frame.
-            return existing
+            rows_deleted_total = 0
+            return _reorder_to_canonical(payload)
 
-        missing = [c for c in _TRACKER_REQUIRED if c not in existing.columns]
-        if missing:
-            raise ResinCostTrackerStoreError(
-                f"Resin_Cost_Tracker is missing required columns "
-                f"{missing!r}.  Expected at least {list(_TRACKER_REQUIRED)}."
-            )
-
-        months = existing[COL_MONTH].apply(_normalise_month)
-        if (months == em).any():
-            # Already tracked — no-op return.
-            return existing
-
-        valid = months.dropna()
-        if valid.empty:
-            return existing
-
-        latest = pd.Timestamp(valid.max())
-        latest_rows = existing[months == latest].copy()
-        if latest_rows.empty:
-            return existing
-
-        # Stamp the new month and overwrite Resin Cost ($/Gal) when the
-        # FG lookup carries a value for that Product ID.  Rows whose
-        # Product ID is not in either FG keep the latest-month $/Gal
-        # value — that's a defensive default so partial FG outputs don't
-        # blow holes in the cost tracker.
-        latest_rows[COL_MONTH] = _stringify_month(em)
-        if new_resin_cost_lookup and COL_PRODUCT_ID in latest_rows.columns:
-            mapped = latest_rows[COL_PRODUCT_ID].astype(str).str.strip().map(
-                {str(k).strip(): v for k, v in new_resin_cost_lookup.items()}
-            )
-            mapped = pd.to_numeric(mapped, errors="coerce")
-            new_vals = mapped.where(mapped.notna(), latest_rows[COL_RESIN_GAL])
-            latest_rows[COL_RESIN_GAL] = pd.to_numeric(
-                new_vals, errors="coerce"
-            ).round(4)
-
-        rows_appended = len(latest_rows)
-        month_was_new = True
-        return pd.concat([existing, latest_rows], ignore_index=True)
+        survivors, dropped = _drop_rows_for_key_pairs(existing, key_pairs)
+        rows_deleted_total = dropped
+        out = pd.concat([survivors, payload], ignore_index=True)
+        return _reorder_to_canonical(out)
 
     try:
         _io.update_csv(
@@ -402,9 +542,104 @@ def append_new_month_from_latest(
     except _io.LakehouseIOError as exc:
         raise ResinCostTrackerStoreError(str(exc)) from exc
 
-    if month_was_new:
+    if rows_inserted or rows_deleted_total:
         _invalidate_read_cache()
-    return rows_appended, month_was_new
+    return rows_inserted, rows_deleted_total
+
+
+# ── Public API: Confirm writer (append strictly-newer month) ─────────────────
+
+
+def append_new_month_if_after_latest(
+    target_month,
+    rows: pd.DataFrame,
+) -> tuple[int, bool, str]:
+    """Append ``rows`` for ``target_month`` only when it is strictly newer.
+
+    Confirm-side writer (May-2026 contract):
+
+        "The append of the new month data should be only generated when
+         user hit Confirm and new month > existing month in the file."
+
+    Gates:
+      * ``target_month`` parses to a first-of-month timestamp.
+      * Every row in ``rows`` carries that same Month.
+      * ``target_month`` is strictly greater than the current max(Month)
+        of the persisted tracker.  An empty tracker passes this gate
+        vacuously.
+
+    Returns ``(rows_appended, was_appended, skip_reason)``.
+    ``skip_reason`` is non-empty when the call no-ops; it carries a
+    short, operator-readable explanation for the caller to surface as
+    a caption.
+    """
+    em = _normalise_month(target_month)
+    if em is None:
+        raise ResinCostTrackerStoreError(
+            f"target_month {target_month!r} is not parseable — "
+            "expected something pd.to_datetime accepts."
+        )
+
+    if rows is None or rows.empty:
+        return 0, False, "payload is empty"
+
+    payload = _validate_and_canonicalise_payload(rows)
+    if payload.empty:
+        return 0, False, "payload is empty"
+
+    # Reject mixed-month payloads — the Confirm writer is for a single
+    # new month only.  Catches programmer mistakes early.
+    payload_months = payload[COL_MONTH].apply(_normalise_month).dropna().unique()
+    if len(payload_months) != 1 or pd.Timestamp(payload_months[0]) != em:
+        raise ResinCostTrackerStoreError(
+            f"Confirm-append payload must carry exactly the target month "
+            f"{em.strftime('%Y-%m')}; saw {sorted(payload_months)}."
+        )
+
+    rows_appended = 0
+    was_appended = False
+    skip_reason = ""
+
+    def _mutate(current: Optional[pd.DataFrame]) -> pd.DataFrame:
+        nonlocal rows_appended, was_appended, skip_reason
+
+        existing = (
+            pd.DataFrame() if current is None or current.empty
+            else _strip_columns(current)
+        )
+
+        if not existing.empty:
+            persisted_months = _parsed_months(existing).dropna()
+            if not persisted_months.empty:
+                current_max = pd.Timestamp(persisted_months.max())
+                if em <= current_max:
+                    skip_reason = (
+                        f"target month {em.strftime('%b %Y')} is not "
+                        f"strictly newer than the file's latest month "
+                        f"({current_max.strftime('%b %Y')})"
+                    )
+                    return existing  # no-op write
+
+        rows_appended = len(payload)
+        was_appended = True
+        if existing.empty:
+            return _reorder_to_canonical(payload)
+        out = pd.concat([existing, payload], ignore_index=True)
+        return _reorder_to_canonical(out)
+
+    try:
+        _io.update_csv(
+            _SECRETS_SECTION,
+            COST_TRACKER_BLOB_PATH,
+            _mutate,
+            initial_default=pd.DataFrame(),
+        )
+    except _io.LakehouseIOError as exc:
+        raise ResinCostTrackerStoreError(str(exc)) from exc
+
+    if was_appended:
+        _invalidate_read_cache()
+    return rows_appended, was_appended, skip_reason
 
 
 # ── Public API: bootstrap ────────────────────────────────────────────────────
@@ -476,6 +711,7 @@ __all__ = [
     "ResinCostTrackerStoreError",
     "CALCULATOR_BLOB_PATH",
     "COST_TRACKER_BLOB_PATH",
+    "COL_REST_VS_TOPCO",
     "COL_PRODUCT_ID",
     "COL_PRODUCT_DESC",
     "COL_RESIN",
@@ -484,12 +720,16 @@ __all__ = [
     "COL_PRICING_CAT",
     "COL_USAGE_LBS",
     "COL_GAL_EA",
+    "SIDE_REST",
+    "SIDE_TOPCO",
+    "normalise_side",
     "read_resin_calculator_df",
     "read_resin_cost_tracker_df",
     "invalidate_read_cache",
     "latest_month",
     "has_month",
-    "append_new_month_from_latest",
+    "rewrite_existing_months_for_sides",
+    "append_new_month_if_after_latest",
     "seed_from_local_if_empty",
     "get_calculator_label",
     "get_cost_tracker_label",

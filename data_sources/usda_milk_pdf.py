@@ -9,25 +9,20 @@ HTTP I/O and ``pdfplumber`` text-extraction primitives:
    when the CDN provides them) and fall back to a content SHA-256 over a
    ``GET`` body when the headers are absent or inconclusive.
 
-2. **Parsing** — extract advance-price data from ``dymadvancedprices.pdf``
-   and Class II Butterfat figures from page 2 of ``dymclassprices.pdf``.
+2. **Parsing**
 
-   Two parser tiers are exposed:
-
-   * **Headline parsers** (``parse_advanced_prices``) — pull the small
-     "ADVANCED PRICES FOR <MONTH YYYY>" summary block at the top of
-     page 1.  Used for the Class I ESL Adjustment, which is announced
-     only for the upcoming month and is *not* republished in the
-     per-year history.
-   * **History parsers** (``parse_advanced_prices_history``,
-     ``parse_class_ii_butterfat_history``, ``parse_announced_month``) —
-     parse the per-year monthly tables.  These are the AUTHORITATIVE
-     source for any monthly reconciliation: the headline is just the
-     newest row of the table, rendered for emphasis, while the table
-     itself carries the explicit ``(year, month)`` label and every
-     value USDA has ever published.  Driving the orchestrator off the
-     history table eliminates the entire class of "PDF page-1 lags the
-     candidate month" mis-labelling bugs.
+   * :func:`parse_advanced_prices` — pull the five headline values
+     ("ADVANCED PRICES FOR <MONTH YYYY>" summary at the top of page 1
+     of ``dymadvancedprices.pdf``).  All five values describe the SAME
+     upcoming month — the orchestrator labels the resulting row with
+     ``store.latest_month() + 1`` rather than mining the headline text
+     for a month name, so a USDA layout shift cannot mis-label a row.
+   * :func:`parse_class_ii_butterfat_history` — page-2 per-year monthly
+     tables of ``dymclassprices.pdf``, returned as a dict keyed by
+     ``(year, month)``.  Class II Butterfat is published in the table
+     only (no headline block on the class-prices PDF), so the
+     orchestrator looks up its single ``target_month`` here and falls
+     back to ``None`` on a miss.
 
 Why pdfplumber and not pypdf2/pdfminer/AI?
     The USDA PDFs are text-native (verified empirically — see the parse
@@ -244,140 +239,6 @@ def parse_advanced_prices(pdf_bytes: bytes) -> dict[str, float]:
             + ". The USDA PDF layout may have changed."
         )
     return out
-
-
-# ── Advanced Prices page-1 monthly history (per-year tables) ────────────────
-#
-# The page-1 monthly tables on ``dymadvancedprices.pdf`` are titled
-# "Federal Milk Order Class I and Class II Advanced Prices and Pricing
-# Factors, <year>" — one per year (current + prior calendar year). Each
-# data row follows the same fixed column layout:
-#
-#     <MonAbbr> <Class I Base> <Base Skim Class I> <Adv Class III Skim>
-#               <Adv Class IV Skim> <Adv Butterfat> <Class II Skim>
-#               <Class II Nonfat Solids>
-#
-# pdfplumber's text extraction collapses each row into a single line with
-# the 7 numbers in column order. We anchor on the year header (so unrelated
-# numeric tables on the page can't false-match) and capture every value we
-# need from each month row. The "Avg" row is intentionally NOT included
-# because it doesn't map onto a (year, month) key.
-
-_ADV_HISTORY_ROW_RE = re.compile(
-    r"^\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+"
-    r"(-?\d+\.\d+)\s+"   # group 2: Class I Base Price ($/cwt) — unused (derived)
-    r"(-?\d+\.\d+)\s+"   # group 3: Base Skim Milk Price for Class I ($/cwt)
-    r"(-?\d+\.\d+)\s+"   # group 4: Advanced Class III Skim Milk Pricing Factor — unused
-    r"(-?\d+\.\d+)\s+"   # group 5: Advanced Class IV  Skim Milk Pricing Factor — unused
-    r"(-?\d+\.\d+)\s+"   # group 6: Advanced Butterfat Pricing Factor ($/lb)
-    r"(-?\d+\.\d+)\s+"   # group 7: Class II Skim Milk Price ($/cwt)
-    r"(-?\d+\.\d+)\s*$", # group 8: Class II Nonfat Solids Price ($/lb)
-    re.MULTILINE,
-)
-
-# Header anchor for the per-year Advanced-Prices table. The wording is
-# "Federal Milk Order Class I and Class II Advanced Prices and Pricing
-# Factors, <year>". We accept any 4-digit year and segment the page-1
-# text into per-year blocks using the next-header position as a bound.
-_ADV_YEAR_HEADER_RE = re.compile(
-    r"Federal Milk Order Class I[^,]*and\s*Class II[^,]*Advanced Prices "
-    r"and Pricing Factors[^,]*,\s*(\d{4})"
-)
-
-
-@dataclass(frozen=True)
-class AdvancedPriceSample:
-    """One month's reconcilable advance-price values from the page-1 history.
-
-    Carries the four advance-price values USDA publishes per month, in the
-    raw form that appears on the PDF (no rescaling).  Callers that need
-    Skim-per-pound divide ``class_*_skim_raw`` by 100 explicitly — that
-    rescaling is left to the orchestrator so the parser stays a pure
-    extraction layer with no derived semantics.
-    """
-    year:                   int
-    month:                  int
-    class_i_skim_raw:       float  # Base Skim Milk Price for Class I  ($/cwt)
-    advanced_butterfat:     float  # Advanced Butterfat Pricing Factor ($/lb)
-    class_ii_skim_raw:      float  # Class II Skim Milk Price          ($/cwt)
-    class_ii_nonfat_solids: float  # Class II Nonfat Solids Price      ($/lb)
-
-
-def parse_advanced_prices_history(
-    pdf_bytes: bytes,
-) -> dict[tuple[int, int], AdvancedPriceSample]:
-    """Return ``{(year, month) → AdvancedPriceSample}`` from page-1 history.
-
-    The per-year monthly tables on page 1 of ``dymadvancedprices.pdf`` are
-    the AUTHORITATIVE source for any monthly reconciliation.  Each row is
-    explicitly labelled with its month so the orchestrator can never
-    mis-label a value (unlike the page-1 headline, which references only
-    the upcoming month).
-
-    Coverage is the current calendar year (months published so far) and
-    the previous full calendar year — typically ~24 rows.  Months older
-    than the PDF's history window are simply absent from the returned
-    dict; callers handle the missing-key case themselves.
-
-    Never raises on layout drift — returns whatever rows it could parse.
-    The orchestrator's "skip when empty" guard then falls back to the
-    last good state in the store.
-    """
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # Year tables live on page 1; reading all pages is cheap and
-        # keeps us resilient against future paginations of the same
-        # report layout.
-        text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-
-    headers = list(_ADV_YEAR_HEADER_RE.finditer(text))
-    if not headers:
-        return {}
-
-    out: dict[tuple[int, int], AdvancedPriceSample] = {}
-    for i, m in enumerate(headers):
-        block_year = int(m.group(1))
-        start = m.end()
-        end   = headers[i + 1].start() if i + 1 < len(headers) else len(text)
-        block = text[start:end]
-        for row in _ADV_HISTORY_ROW_RE.finditer(block):
-            month_int = _MONTH_NAME_TO_INT.get(row.group(1))
-            if month_int is None:
-                continue
-            try:
-                out[(block_year, month_int)] = AdvancedPriceSample(
-                    year=block_year,
-                    month=month_int,
-                    class_i_skim_raw       = float(row.group(3)),
-                    advanced_butterfat     = float(row.group(6)),
-                    class_ii_skim_raw      = float(row.group(7)),
-                    class_ii_nonfat_solids = float(row.group(8)),
-                )
-            except (TypeError, ValueError):
-                # Unparseable cell — silently skip rather than poison
-                # the dict; the caller handles missing keys.
-                continue
-    return out
-
-
-def parse_announced_month(pdf_bytes: bytes) -> Optional[tuple[int, int]]:
-    """Return ``(year, month)`` of the upcoming-month advance USDA just published.
-
-    Derived from the LATEST row present in the page-1 history table —
-    that row IS the announcement.  This is more reliable than text-mining
-    the "ADVANCED PRICES FOR …" headline, which has variable casing and
-    occasional layout drift across revisions and would silently mis-match
-    on a single PDF re-issue.
-
-    Returns ``None`` when the page-1 history table is empty or
-    unparseable — at which point the orchestrator skips any new write
-    rather than guessing a candidate month.  This is the structural fix
-    for the historical "PDF page-1 lags ``_next_month(latest)``" bug
-    where stale headline values were written under the wrong month.
-    """
-    history = parse_advanced_prices_history(pdf_bytes)
-    if not history:
-        return None
-    return max(history.keys())
 
 
 # ── Class Prices parser (dymclassprices.pdf, page 2) ────────────────────────

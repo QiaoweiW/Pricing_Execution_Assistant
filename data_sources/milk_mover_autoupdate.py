@@ -3,26 +3,21 @@ Auto-update orchestrator for the Milk Mover Tracker.
 
 Strategy
 --------
-The orchestrator runs a **reconciliation pass** against the page-1 history
-tables of ``dymadvancedprices.pdf`` (and the page-2 history of
-``dymclassprices.pdf``) on every detected change.  Each month present in
-the advance-prices history is re-derived from its own labelled row in the
-table — never from the page-1 headline — and the resulting five
-``(Category, Class)`` rows are upserted into the
-``fmmo_tracker.json`` blob.  ``store.upsert_rows`` overwrites existing
-rate cells when the incoming value differs, so any prior wrong-month
-write self-heals the moment USDA's PDF carries the corrected number.
+When the advance-prices PDF changes, scrape the headline values once and
+write them under a **single new month** whose label is derived purely
+from the persisted file's state:
 
-Why a reconciliation pass instead of "insert next month"?
-    The previous design assumed ``_next_month(latest_in_db)`` always
-    matched the month USDA had announced on page 1.  That invariant
-    broke whenever USDA edited the PDF for a non-data reason while the
-    headline still referenced the previous month — the orchestrator
-    then wrote stale headline values *under the wrong month* and the
-    append-only ``insert_rows`` API made the bad data permanent.  The
-    history table carries explicit ``(year, month)`` labels for every
-    row, eliminating the entire class of label-drift bugs by
-    construction.
+    target_month = store.latest_month() + 1 calendar month
+
+This is the operator-facing contract — "Once the pdf is updated, the
+system scrapes data from that pdf and labels the month = existing month
+in the file + 1, always first-of-month."  The labeling is intentionally
+decoupled from any text-mined month-name on the PDF so a USDA layout
+shift (e.g. footnote re-numbering, year-header rephrasing) cannot
+mis-label a row.  ``store.upsert_rows`` keeps the write idempotent — a
+duplicate Refresh-tick for the same already-published month is a no-op,
+and a corrected re-publish of the headline for the same month lands in
+the same row.
 
 Workflow on each invocation
 ---------------------------
@@ -38,21 +33,16 @@ Workflow on each invocation
 4.  **Change detection** on the advanced-prices PDF (HEAD with ETag /
     Last-Modified; SHA-256 fallback).  Always persists the new
     fingerprint so the TTL math engages even on a "no change" tick.
-5.  **Pull PDFs and parse** — both advance-prices and class-prices, all
-    history tables in one shot.
-6.  **Reconciliation upsert** — for every month in the advance-prices
-    history, build the canonical row set
-    (HTST I/II, ESL I/II, CC II) and upsert.  ``upsert_rows`` overwrites
-    rate cells in place when the incoming value differs; ``None``
-    incoming values preserve the stored value (so prior months' ESL I
-    Skim is never clobbered — the ESL Adjustment is announced only for
-    the upcoming month and only that month's ESL I Skim is reconcilable
-    here).
-7.  **Legacy Cottage Cheese backfill** — months in the JSON that
-    predate the PDF's history window (typically ≥ 24 months old) are
-    backfilled with CC II Skim/Bfat from the stored ESL II row and
-    ``null`` Protein/Other Solids (no NFS source available for that
-    vintage).  Months covered by step 6 are excluded by construction.
+5.  **Single-month ingest** — derive ``target_month`` from the file's
+    current max plus one calendar month, scrape the headline values
+    from advance-prices, look up Class II Butterfat for ``target_month``
+    in the page-2 class-prices history, build the canonical
+    ``(Category, Class)`` row set and upsert it.
+6.  **Legacy Cottage Cheese backfill** — months in the JSON without a
+    CC row are backfilled with CC II Skim/Bfat copied from the stored
+    ESL II row.  Protein/Other Solids fall back to ``null`` for the
+    pre-NFS vintage; the just-ingested ``target_month`` is excluded by
+    construction (it already carries a CC row from step 5).
 
 Row derivation matrix
 ---------------------
@@ -63,18 +53,12 @@ Category        Cl    Skim Rate                     Butterfat Rate              
 HTST            I     Base Skim Class I / 100        Advanced Butterfat Factor      null
 HTST            II    Class II Skim Price / 100      Class II Butterfat (p.2)       null
 ESL             I     HTST Class I Skim              same as HTST Class I Bfat      null
-                      + Class I ESL Adj / 100 ¹
+                      + Class I ESL Adj / 100
 ESL             II    same as HTST Class II Skim     same as HTST Class II Bfat     null
-Cottage Cheese  II    same as ESL II Skim ²          same as ESL II Bfat ²          Class II Nonfat Solids
+Cottage Cheese  II    same as ESL II Skim ¹          same as ESL II Bfat ¹          Class II Nonfat Solids
 ==============  ====  ============================  =============================  ===================
 
-¹ ESL Class I Skim is reconcilable ONLY for the announced month
-  (the headline ESL Adjustment is not republished for any other month).
-  For all other months the orchestrator emits ``Skim Rate=None`` so
-  ``upsert_rows`` preserves whatever was correctly written at
-  announcement time.
-
-² CC II Skim/Bfat NEVER drift from ESL II — by binding them to the same
+¹ CC II Skim/Bfat NEVER drift from ESL II — by binding them to the same
   derived values in one place, we make divergence structurally
   impossible (May-2026 contract).
 
@@ -123,22 +107,25 @@ class AutoUpdateResult:
     """
     checked_at:        datetime
     advanced_changed:  bool                   = False
-    # Rows the reconciliation pass added — i.e. new ``(Category, Month,
-    # Class)`` keys that didn't exist in the JSON before this run.
+    # Rows the ingest added — i.e. new ``(Category, Month, Class)``
+    # keys that didn't exist in the JSON before this run.  Under the
+    # ``max(file) + 1`` contract this is 5 on a clean tick (or 0 when
+    # the upsert is a no-op for a re-issued unchanged PDF).
     rows_inserted:     int                    = 0
-    # Rows whose existing rate cells the reconciliation pass overwrote
-    # because USDA published a corrected value.  These would have been
-    # silently dropped by the old append-only ``insert_rows`` API.
+    # Rows whose existing rate cells the upsert overwrote because USDA
+    # re-published the headline for ``target_month`` with a corrected
+    # number.  Idempotent on repeated unchanged ticks.
     rows_updated:      int                    = 0
-    # Cottage Cheese rows inserted by the legacy backfill (months older
-    # than the PDF's history window).  Disjoint from ``rows_inserted``.
+    # Cottage Cheese rows inserted by the legacy backfill (months that
+    # predate the NFS-publication window).  Disjoint from
+    # ``rows_inserted``.
     backfill_inserted: int                    = 0
     # Cottage Cheese rows patched in-place by the one-shot CC-skim/bfat
     # repair pass (May-2026 contract: CC II skim/bfat mirror ESL II).
     cc_rows_repaired:  int                    = 0
-    # The most-recent month USDA has announced on the advance-prices
-    # PDF.  Used by the caption and surfaced to the UI so the operator
-    # can sanity-check "the orchestrator saw USDA publish month X."
+    # The month label the orchestrator chose for this tick, derived as
+    # ``store.latest_month() + 1`` per the operator-facing contract.
+    # Surfaced to the UI so the operator can sanity-check the labelling.
     target_month:      Optional[pd.Timestamp] = None
     skipped_reason:    Optional[str]          = None
     errors:            list[str]              = field(default_factory=list)
@@ -190,60 +177,58 @@ def _round_or_none(value: Optional[float], ndigits: int = 4) -> Optional[float]:
     return round(float(value), ndigits)
 
 
-def _derive_rows_for_sample(
+def _derive_rows_for_target(
     *,
     month:              pd.Timestamp,
-    sample:             pdf.AdvancedPriceSample,
+    headline:           dict[str, float],
     class_ii_butterfat: Optional[float],
-    esl_adj_raw:        Optional[float],
 ) -> list[dict]:
-    """Build the canonical five-row set for one month of the page-1 history.
+    """Build the canonical five-row set for ``month`` from headline values.
+
+    All five rows share the same first-of-month ``month`` label; the
+    label is supplied by the caller (typically ``store.latest_month() +
+    1 calendar month``) and is INTENTIONALLY decoupled from any
+    text-mined month name on the PDF.
 
     Parameters
     ----------
     month
-        First-of-month timestamp for the row group.
-    sample
-        Per-month sample from
-        :func:`pdf.parse_advanced_prices_history`.
+        First-of-month timestamp the row set should carry.  All five
+        rows are written under this exact label.
+    headline
+        The dict returned by :func:`pdf.parse_advanced_prices`.  Must
+        contain every key the function documents — KeyError if any
+        is missing, which surfaces cleanly to the orchestrator.
     class_ii_butterfat
-        Class II Butterfat from the page-2 history of
-        ``dymclassprices.pdf`` for the same month.  Pass ``None`` when
-        the class-prices PDF lags (USDA cadence: class-prices publishes
-        ~1 month behind advance-prices); HTST II / ESL II / CC II
-        Butterfat then defaults to ``None`` and the store preserves
-        whatever was previously written for those cells.
-    esl_adj_raw
-        Headline Class I ESL Adjustment ($/cwt, signed) from
-        ``parse_advanced_prices``.  Pass ``None`` for every month
-        OTHER than the announced month — USDA does not publish the
-        ESL Adjustment per-month in any history table, so for
-        non-announced months we propagate ``None`` for ESL Class I
-        Skim and the store preserves the value written when that
-        month was first announced.
+        Class II Butterfat for ``month``, looked up from page-2 of
+        ``dymclassprices.pdf``.  Pass ``None`` when the class-prices
+        PDF lags (USDA cadence: class-prices publishes ~1 month behind
+        advance-prices); HTST II / ESL II / CC II Butterfat then write
+        as ``None`` and the store preserves whatever was previously
+        written for those cells on a re-tick.
 
     Returns
     -------
     Exactly five row dicts (HTST I, HTST II, ESL I, ESL II, CC II)
-    in the schema the store expects.  Skim/Butterfat are bound through
-    shared locals so ESL II and CC II can never drift from HTST II.
+    in the schema :func:`store.upsert_rows` expects.  Skim/Butterfat
+    are bound through shared locals so ESL II and CC II can never
+    drift from HTST II.
     """
-    htst_class_i_skim   = round(sample.class_i_skim_raw    / 100, 4)
-    htst_class_ii_skim  = round(sample.class_ii_skim_raw   / 100, 4)
-    htst_class_i_bfat   = round(sample.advanced_butterfat,      4)
+    htst_class_i_skim   = round(headline["class_i_skim_raw"]    / 100, 4)
+    htst_class_ii_skim  = round(headline["class_ii_skim_raw"]   / 100, 4)
+    htst_class_i_bfat   = round(headline["advanced_butterfat"],       4)
     htst_class_ii_bfat  = _round_or_none(class_ii_butterfat)
-    cc_nonfat_solids    = round(sample.class_ii_nonfat_solids,  4)
+    cc_nonfat_solids    = round(headline["class_ii_nonfat_solids"],   4)
 
     # ESL II / CC II skim/bfat mirror HTST II by spec — bind once.
     esl_class_ii_skim = htst_class_ii_skim
     esl_class_ii_bfat = htst_class_ii_bfat
 
-    # ESL Class I Skim — only derive when this is the announced month;
-    # otherwise propagate None so the upsert layer preserves the
-    # correct value already in storage.
-    esl_class_i_skim: Optional[float] = (
-        round(htst_class_i_skim + esl_adj_raw / 100, 4)
-        if esl_adj_raw is not None else None
+    # ESL Class I Skim = HTST I Skim + ESL Adjustment ($/cwt → $/lb).
+    # The headline parser raises if the label is missing, so by the
+    # time we get here the adjustment is guaranteed to be present.
+    esl_class_i_skim = round(
+        htst_class_i_skim + headline["class_i_esl_adj_raw"] / 100, 4
     )
 
     return [
@@ -265,7 +250,7 @@ def _derive_rows_for_sample(
             store.COL_CATEGORY:     "ESL",
             store.COL_MONTH:        month,
             store.COL_CLASS:        "I",
-            store.COL_SKIM:         esl_class_i_skim,   # None → preserve stored
+            store.COL_SKIM:         esl_class_i_skim,
             store.COL_BUTTERFAT:    htst_class_i_bfat,
         },
         {
@@ -285,6 +270,18 @@ def _derive_rows_for_sample(
             store.COL_OTHER_SOLIDS: cc_nonfat_solids,
         },
     ]
+
+
+def _next_calendar_month(month: pd.Timestamp) -> pd.Timestamp:
+    """Return ``month + 1`` calendar month, normalised to first-of-month.
+
+    Pure helper so the "target_month = file_max + 1" derivation lives in
+    one place and the orchestrator stays declarative.
+    """
+    return (
+        pd.Timestamp(month).normalize().replace(day=1)
+        + pd.DateOffset(months=1)
+    )
 
 
 def _derive_legacy_cottage_cheese_rows(
@@ -331,7 +328,12 @@ def maybe_update_from_pdfs(
     now:   Optional[datetime] = None,
     ttl:   timedelta          = _DEFAULT_CHECK_TTL,
 ) -> AutoUpdateResult:
-    """Check the USDA PDFs and reconcile ``fmmo_tracker.json`` accordingly.
+    """Check the USDA PDFs and ingest one new month into ``fmmo_tracker.json``.
+
+    On every detected advance-prices PDF change the orchestrator picks
+    ``target_month = store.latest_month() + 1 calendar month`` (the
+    operator-facing labelling contract), scrapes the headline values
+    once, and upserts the canonical five-row set under that label.
 
     Parameters
     ----------
@@ -352,8 +354,9 @@ def maybe_update_from_pdfs(
         regardless of whether anything was inserted or updated.
     """
     now = now or datetime.now(timezone.utc)
-    # Ensure the store has a baseline before we attempt any reconciliation:
-    # without a seed, the legacy backfill path has nothing to anchor on.
+    # Ensure the store has a baseline before we attempt to ingest:
+    # without a seed, ``store.latest_month()`` would be None and we'd
+    # fall back to today's calendar month + 1 (defensive only).
     store.seed_from_csv_if_empty()
 
     result = AutoUpdateResult(checked_at=now)
@@ -366,8 +369,8 @@ def maybe_update_from_pdfs(
     try:
         missing_cc_months = store.months_missing_category(_CATEGORY_COTTAGE_CHEESE)
     except store.MilkMoverStoreError as exc:
-        # Treat as no backfill needed — the normal reconciliation path
-        # below will surface any persistent storage problem.
+        # Treat as no backfill needed — the main ingest below will
+        # surface any persistent storage problem.
         logger.warning("Cottage Cheese backfill probe failed: %s", exc)
         missing_cc_months = []
     backfill_needed = bool(missing_cc_months)
@@ -461,13 +464,32 @@ def maybe_update_from_pdfs(
         result.skipped_reason = "advanced-prices PDF unchanged."
         return result
 
-    # ── 3. Pull PDFs ─────────────────────────────────────────────────────────
+    # ── 3. Derive target_month from FILE STATE ──────────────────────────────
+    #
+    # Operator-facing contract: "label the month = existing month in the
+    # file + 1".  We read the persisted max BEFORE any write so a
+    # re-tick on the same PDF doesn't drift the target forward.
+    file_max = store.latest_month()
+    if file_max is None:
+        # Defensive fallback — should be unreachable after
+        # ``store.seed_from_csv_if_empty()`` above.  Anchor on today's
+        # calendar month + 1 so the orchestrator can still make
+        # forward progress without a seed.
+        from datetime import date as _date
+        target_month = _next_calendar_month(
+            pd.Timestamp(_date.today().replace(day=1))
+        )
+    else:
+        target_month = _next_calendar_month(file_max)
+    result.target_month = target_month
+
+    # ── 4. Pull PDFs ─────────────────────────────────────────────────────────
     #
     # Both PDFs are needed past this point.  The class-prices PDF lags
-    # ~1 month behind advance-prices (USDA cadence), so any month
-    # missing from the class-prices history is a tolerable gap — the
-    # reconciliation simply leaves Class II Butterfat as ``None`` for
-    # that month and the store preserves the previously-stored value.
+    # ~1 month behind advance-prices (USDA cadence), so a missing
+    # ``target_month`` lookup is a tolerable gap — Class II Butterfat
+    # falls back to ``None`` and the store preserves whatever was
+    # previously written for that cell on a re-tick.
     try:
         adv_bytes, _ = pdf.fetch_pdf_bytes(pdf.ADVANCED_PRICES_URL)
     except Exception as exc:
@@ -478,103 +500,73 @@ def maybe_update_from_pdfs(
     try:
         cls_bytes, _ = pdf.fetch_pdf_bytes(pdf.CLASS_PRICES_URL)
     except Exception as exc:
-        # Non-fatal: reconcile what we can from advance-prices alone.
+        # Non-fatal: ingest what we can from advance-prices alone.
         logger.warning("class-prices PDF download failed: %s", exc)
 
-    # ── 4. Parse PDFs ────────────────────────────────────────────────────────
-    try:
-        advanced_history = pdf.parse_advanced_prices_history(adv_bytes)
-    except Exception as exc:
-        result.errors.append(f"advanced-prices history parse failed: {exc}")
-        return result
-
-    if not advanced_history:
-        # PDF layout drift or empty body — refuse to write anything
-        # rather than guess.  Surface so the UI banner is actionable.
-        result.errors.append(
-            "advanced-prices PDF history table is empty or unparseable; "
-            "skipping reconciliation."
-        )
-        return result
-
-    # Announced month = newest row of the page-1 history table.  This is
-    # the structural fix for the historical "label drift" bug.
-    announced_year_month = max(advanced_history.keys())
-    result.target_month = pd.Timestamp(
-        year=announced_year_month[0],
-        month=announced_year_month[1],
-        day=1,
-    )
-
-    # Headline values — used ONLY for the Class I ESL Adjustment of the
-    # announced month.  The other four headline fields are also in the
-    # history table (and we prefer that source) but we parse the
-    # headline anyway so a label-rename in a future USDA layout drift
-    # is surfaced as an error rather than silently producing a row
-    # without ESL adjustment.
+    # ── 5. Parse headline values ────────────────────────────────────────────
     try:
         advanced_headline = pdf.parse_advanced_prices(adv_bytes)
     except Exception as exc:
         result.errors.append(f"advanced-prices headline parse failed: {exc}")
         return result
-    headline_esl_adj_raw = advanced_headline.get("class_i_esl_adj_raw")
 
-    bfat_history: dict[tuple[int, int], float] = {}
+    # Class II Butterfat is a page-2 lookup on the class-prices PDF.
+    # The lookup key is structural ``(year, month)`` of ``target_month``;
+    # USDA's table-row month label is the authoritative source for THIS
+    # one field — without it we have no way to associate Bfat with a
+    # specific month, since the class-prices PDF has no headline block
+    # the way advance-prices does.
+    class_ii_butterfat: Optional[float] = None
     if cls_bytes is not None:
         try:
             bfat_history = pdf.parse_class_ii_butterfat_history(cls_bytes)
+            class_ii_butterfat = bfat_history.get(
+                (target_month.year, target_month.month)
+            )
         except Exception as exc:
-            # Non-fatal — reconciliation skips Class II Butterfat for
-            # any missing month.
+            # Non-fatal — preserve any value the store already holds.
             logger.warning("class-prices history parse failed: %s", exc)
 
-    # ── 5. Reconciliation upsert ─────────────────────────────────────────────
+    # ── 6. Build the canonical row set and upsert ───────────────────────────
     #
-    # Every month USDA exposes on page 1 gets re-derived from its own
-    # explicitly-labelled row and upserted.  Existing rows whose values
-    # match are no-ops; rows whose values differ are corrected in place;
-    # rows that don't exist yet are inserted.  This is the loop that
-    # heals the "June wrote May's value" bug on the next render after
-    # USDA publishes the corrected PDF.
-    reconciliation_rows: list[dict] = []
-    for (year, month), sample in sorted(advanced_history.items()):
-        month_ts    = pd.Timestamp(year=year, month=month, day=1)
-        bfat_value  = bfat_history.get((year, month))
-        is_announced = (year, month) == announced_year_month
-        # Only the announced month receives an ESL Adjustment from the
-        # headline; all other months propagate None and the upsert
-        # preserves the ESL Class I Skim already in the store.
-        esl_adj_for_month = headline_esl_adj_raw if is_announced else None
-        reconciliation_rows.extend(_derive_rows_for_sample(
-            month               = month_ts,
-            sample              = sample,
-            class_ii_butterfat  = bfat_value,
-            esl_adj_raw         = esl_adj_for_month,
-        ))
+    # The upsert is idempotent: a re-tick on the same PDF that doesn't
+    # mutate any cell is a clean no-op (zero inserts, zero updates),
+    # and a corrected re-publish of the headline for ``target_month``
+    # lands in the SAME row by ``(Category, Month, Class)`` key.
+    try:
+        target_rows = _derive_rows_for_target(
+            month               = target_month,
+            headline            = advanced_headline,
+            class_ii_butterfat  = class_ii_butterfat,
+        )
+    except KeyError as exc:
+        result.errors.append(
+            f"advanced-prices headline is missing required label {exc!s}; "
+            "skipping write."
+        )
+        return result
 
     try:
         inserted, updated = store.upsert_rows(
-            reconciliation_rows, source="auto-update"
+            target_rows, source="auto-update",
         )
         result.rows_inserted = inserted
         result.rows_updated  = updated
     except Exception as exc:
-        result.errors.append(f"reconciliation upsert failed: {exc}")
+        result.errors.append(f"target-month upsert failed: {exc}")
         return result
 
-    # ── 6. Legacy Cottage Cheese backfill ───────────────────────────────────
+    # ── 7. Legacy Cottage Cheese backfill ───────────────────────────────────
     #
-    # The reconciliation pass above covers every month USDA's current
-    # PDF exposes.  This pass handles the long tail: months in the JSON
-    # that predate the page-1 history window.  Idempotent — once every
-    # legacy month has a CC row, this branch is a no-op.
+    # Months in the JSON without a CC row are backfilled from the
+    # stored ESL II row (CC II skim/bfat mirror ESL II by spec).
+    # ``target_month`` already carries a CC row from step 6 so it is
+    # excluded by construction.  Idempotent — once every legacy month
+    # has a CC row, this branch is a no-op.
     if backfill_needed:
-        history_months = {
-            pd.Timestamp(year=y, month=m, day=1)
-            for (y, m) in advanced_history.keys()
-        }
         legacy_months = [
-            m for m in missing_cc_months if m not in history_months
+            m for m in missing_cc_months
+            if pd.Timestamp(m).normalize().replace(day=1) != target_month
         ]
         if legacy_months:
             try:
@@ -589,7 +581,7 @@ def maybe_update_from_pdfs(
             if cc_rows:
                 try:
                     inserted, _ = store.upsert_rows(
-                        cc_rows, source="auto-update"
+                        cc_rows, source="auto-update",
                     )
                     result.backfill_inserted = inserted
                 except Exception as exc:

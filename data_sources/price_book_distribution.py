@@ -111,11 +111,16 @@ _PARQUET_READ_TTL_SECONDS: int = 300
 
 PARQUET_COL_ITEM:           str = "Item"
 PARQUET_COL_ITEM_DESC:      str = "Item Description"
-PARQUET_COL_SHIP_TO:        str = "Ship to Site Name"
+PARQUET_COL_SHIP_TO:        str = "Ship To Site Name"
 PARQUET_COL_UOM:            str = "Pricing UOM"
-PARQUET_COL_OLD_PRICE:      str = "Total Price per Pricing UOM"
-PARQUET_COL_START_DATE:     str = "Pricing Adjustment Start Date"
-PARQUET_COL_END_DATE:       str = "Pricing Adjustment End Date"
+PARQUET_COL_OLD_PRICE:      str = "Total Price Per Pricing UOM"
+# Note: the parquet uses "Price Adjustment …" (NOT "Pricing Adjustment …")
+# for the date columns, even though the UOM column is "Pricing UOM".
+# Confirmed against the actual B2C_Pricing_History.parquet schema —
+# diverging from this spelling here will break the date filter and the
+# topmost-start-date → +1-month lookup gate.
+PARQUET_COL_START_DATE:     str = "Price Adjustment Start Date"
+PARQUET_COL_END_DATE:       str = "Price Adjustment End Date"
 PARQUET_COL_ITEM_CATEGORY:  str = "Item Category"
 PARQUET_COL_CUSTOMER:       str = "Customer"
 

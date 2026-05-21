@@ -3449,7 +3449,16 @@ def _render_milk_autoupdate_status() -> None:
             # ``st.warning`` so the operator sees them as an amber banner
             # instead of buried small grey caption text.  Successful
             # ticks remain as quiet captions to keep the page calm.
-            if result.is_warning:
+            #
+            # ``getattr`` with a default guards the common Streamlit
+            # post-deploy case where ``session_state`` still holds an
+            # ``AutoUpdateResult`` built by the previous module version —
+            # any property added in a later release would otherwise
+            # ``AttributeError`` on the stale instance until the user
+            # restarts the session.  Falling back to ``False`` means a
+            # stale instance simply renders as a quiet caption (the
+            # pre-escalation behaviour) instead of crashing the page.
+            if getattr(result, "is_warning", False):
                 st.warning(result.as_caption())
             else:
                 st.caption(result.as_caption())

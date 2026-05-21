@@ -128,27 +128,45 @@ COL_GAL_EA:       str = "Gal/Ea"
 SIDE_REST:  str = "Rest"
 SIDE_TOPCO: str = "TOPCO"
 
-# Canonical column ordering for newly-written rows — keeps the
-# "Rest Market vs TOPCO" dimension flush-left per the May-2026 spec.
-# Any extra columns surviving from legacy rows are appended after.
+# Canonical column ordering for newly-written rows.
+#
+# The May-2026-late lakehouse schema for ``Resin_Calculator.csv`` uses
+# ``Pricing Category`` as the natural row identifier — e.g.
+# ``"Alb - GAL Conventional - 62 grams"``.  ``Product ID`` /
+# ``Product Description`` / ``Resin`` are NOT present in the calculator
+# file and therefore not produced by the NMT-driven payload builder
+# either; they remain in the constants list purely as forward-compat
+# placeholders so any legacy tracker rows that DO carry them survive
+# rewrites untouched (`upsert_for_sides` preserves trailing columns
+# verbatim).
+#
+# Schema order: Side dimension first, then identity, then computed cost,
+# then month, then calculator-derived inputs.  Optional/legacy columns
+# (Product ID / Description / Resin) sit between identity and cost so
+# downstream readers that DO carry them keep their existing positions.
 _CANONICAL_COLUMN_ORDER: tuple[str, ...] = (
     COL_REST_VS_TOPCO,
+    COL_PRICING_CAT,
     COL_PRODUCT_ID,
     COL_PRODUCT_DESC,
     COL_RESIN,
     COL_RESIN_GAL,
     COL_MONTH,
-    COL_PRICING_CAT,
     COL_USAGE_LBS,
     COL_GAL_EA,
 )
 
-# The minimum column set we expect from the cost tracker.  Anything else
-# present in the file is preserved verbatim through reads and writes.
+# The minimum column set we expect on every payload row.  Pricing
+# Category is the natural row identifier in the lakehouse calculator
+# file, NOT Product ID — historical schema assumptions about a Product
+# ID column were wrong (the file has no such column).  Anything else
+# present in a payload is preserved verbatim through writes.
+#
 # ``COL_REST_VS_TOPCO`` is INTENTIONALLY NOT in this set — legacy rows
 # that pre-date the new dimension are tolerated on read and pass through
-# write cycles untouched.
-_TRACKER_REQUIRED: tuple[str, ...] = (COL_PRODUCT_ID, COL_RESIN_GAL, COL_MONTH)
+# write cycles untouched.  ``upsert_for_sides`` validates it separately
+# for *new* payloads (which must always carry a Side).
+_TRACKER_REQUIRED: tuple[str, ...] = (COL_PRICING_CAT, COL_RESIN_GAL, COL_MONTH)
 
 # Calculator columns are looser — every consumer references the columns it
 # needs by literal string and tolerates extras, so we don't enforce a strict

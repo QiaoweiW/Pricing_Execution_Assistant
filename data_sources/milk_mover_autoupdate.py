@@ -55,18 +55,31 @@ Workflow on each invocation
     explicitly clicked refresh.
 5.  **Compare scraped rates vs the latest stored month.**  Identical →
     no write, surface "rates unchanged" reason.  Differ on at least
-    one of the seven canonical cells → proceed.  Class II Bfat lookup
-    missing for ``target_month`` → surface
-    ``class_ii_bfat_lag_target`` so the page renders an actionable
-    warning; no write.
-6.  **Insert** one new five-row month at ``target_month`` using
+    one of the **six advance-prices-driven cells** (HTST I Skim/Bfat,
+    HTST II Skim, ESL I Skim, CC II Protein, CC II Other Solids) →
+    proceed.  The Class II Butterfat cell (HTST II Bfat / ESL II Bfat
+    / CC II Bfat) is INTENTIONALLY EXCLUDED from the gate per
+    operator contract: "only the advance-prices PDF publish should
+    trigger a new month write — Class II Butterfat is always the
+    latest available row from page 2 of dymclassprices.pdf".  See
+    :data:`_RECONCILABLE_FIELDS`.
+6.  **Source Class II Butterfat** by taking the LATEST published row
+    from :func:`pdf.parse_class_ii_butterfat_history` regardless of
+    target month — the operator-facing contract is "Class II
+    butterfat is always the last row value on page 2 of
+    dymclassprices.pdf".  Decouples the orchestrator from the
+    class-prices cadence lag entirely.  Defensive fallback: when the
+    class-prices PDF is unreachable or unparseable the bfat cell
+    writes as ``None`` and a warning is surfaced so the operator
+    can fill it in manually.
+7.  **Insert** one new five-row month at ``target_month`` using
     :func:`store.insert_rows` — append-only by construction; existing
     rows are not touched.
-7.  **Legacy Cottage Cheese backfill** — months in the JSON without a
+8.  **Legacy Cottage Cheese backfill** — months in the JSON without a
     CC row are backfilled with CC II Skim/Bfat copied from the stored
     ESL II row.  Protein/Other Solids fall back to ``null`` for the
     pre-NFS vintage; the just-ingested ``target_month`` is excluded by
-    construction (it already carries a CC row from step 6).
+    construction (it already carries a CC row from step 7).
 
 Row derivation matrix
 ---------------------
@@ -148,32 +161,29 @@ class AutoUpdateResult:
     # ``store.latest_month() + 1`` per the operator-facing contract.
     # Surfaced to the UI so the operator can sanity-check the labelling.
     target_month:      Optional[pd.Timestamp] = None
-    # Non-empty when the Class II Butterfat lookup for ``target_month``
-    # came back missing (page-2 of ``dymclassprices.pdf`` lags advance-
-    # prices by ~1 month at the USDA cadence).  When set, the
-    # orchestrator REFUSES to insert the new month — the page surfaces
-    # the warning so the operator can fill the missing cell into the
-    # lakehouse manually, then re-Refresh.  The string is the
-    # already-formatted "Month YYYY" label of ``target_month``.
+    # Non-empty when the class-prices PDF was unreachable or unparseable,
+    # so the Class II Butterfat cell on the new month landed as ``None``.
+    # The orchestrator STILL inserts the new-month row (per the
+    # May-2026-late contract: "only the advance-prices PDF publish
+    # should trigger / block new-month writes"); the warning is surfaced
+    # so the operator knows to fill the missing Bfat cell into the
+    # lakehouse manually.  The string is the already-formatted
+    # "Month YYYY" label of ``target_month``.
     class_ii_bfat_lag_target: Optional[str]   = None
     skipped_reason:    Optional[str]          = None
     errors:            list[str]              = field(default_factory=list)
 
     def as_caption(self) -> str:
-        """Compact one-liner suitable for ``st.caption``."""
+        """Compact one-liner suitable for ``st.caption``.
+
+        See also :attr:`is_warning` — pages should escalate the
+        caption to ``st.warning`` when that returns True so the
+        operator sees the missing-bfat call-out as a banner instead
+        of small grey text.
+        """
         when = self.checked_at.strftime("%Y-%m-%d %H:%M")
         if self.errors:
             return f"⚠️ Auto-update at {when}: {self.errors[0]}"
-
-        # Class II Bfat lag is a hard-stop warning that supersedes the
-        # normal status line — the operator has to act on it.
-        if self.class_ii_bfat_lag_target:
-            return (
-                f"⚠️ Auto-update at {when}: USDA Class II Butterfat for "
-                f"{self.class_ii_bfat_lag_target} is not yet published "
-                "on dymclassprices.pdf — fill the row into "
-                "`fmmo_tracker.json` manually, then click USDA refresh."
-            )
 
         parts: list[str] = []
         tm = self.target_month.strftime("%b %Y") if self.target_month else "?"
@@ -187,11 +197,34 @@ class AutoUpdateResult:
             parts.append(
                 f"repaired {self.cc_rows_repaired} Cottage Cheese skim/bfat row(s)"
             )
+
+        # Class II Bfat lag is now a SOFT warning — the new-month row
+        # is still written with Bfat=None, the operator just needs to
+        # fill in the cell when class-prices catches up.  Append the
+        # call-out to the normal status line so the operator sees
+        # both "what we wrote" and "what still needs filling".
+        if self.class_ii_bfat_lag_target:
+            parts.append(
+                f"⚠️ Class II Butterfat for {self.class_ii_bfat_lag_target} "
+                "wrote as NULL — fill the cell into `fmmo_tracker.json` "
+                "manually when class-prices PDF publishes"
+            )
+
         if self.skipped_reason and not parts:
             return f"✅ Auto-update at {when}: {self.skipped_reason}"
         if not parts:
             return f"✅ Auto-update at {when}: no change."
-        return f"✅ Auto-update at {when}: " + "; ".join(parts) + "."
+        prefix = "⚠️" if self.is_warning else "✅"
+        return f"{prefix} Auto-update at {when}: " + "; ".join(parts) + "."
+
+    @property
+    def is_warning(self) -> bool:
+        """True when callers should render the caption as ``st.warning``.
+
+        Used by the page so the bfat-lag soft warning gets the amber
+        banner treatment instead of being buried in a small caption.
+        """
+        return bool(self.errors) or bool(self.class_ii_bfat_lag_target)
 
 
 # ── Pure helpers (no IO) ─────────────────────────────────────────────────────
@@ -323,14 +356,24 @@ def _next_calendar_month(month: pd.Timestamp) -> pd.Timestamp:
 
 # ── Compare-vs-latest gate ───────────────────────────────────────────────────
 #
-# The seven reconcilable cells the comparator looks at.  Every other
-# cell of a 5-row month group is derived from these by spec:
+# The SIX reconcilable cells the comparator looks at — all sourced
+# directly from the advance-prices PDF.  Every other cell of a 5-row
+# month group is derived from these by spec:
 #
 #   * ESL II Skim/Bfat       = HTST II Skim/Bfat
 #   * CC II  Skim/Bfat       = ESL II Skim/Bfat (= HTST II)
 #   * ESL I  Bfat            = HTST I  Bfat
 #
-# So "any of the seven differ" is necessary AND sufficient to conclude
+# **HTST II Butterfat is INTENTIONALLY EXCLUDED** from the gate.  Per
+# the May-2026-late operator contract: "Only the publish of
+# dymadvancedprices.pdf matters; Class II butterfat is always the last
+# row value on page 2 of dymclassprices.pdf".  In other words: the
+# class-prices PDF is treated purely as a cell-source for HTST II Bfat,
+# never as a trigger for new-month writes.  Letting Class II Butterfat
+# gate the comparator would cause spurious new-month writes any time
+# class-prices publishes ahead of advance-prices.
+#
+# So "any of the six differ" is necessary AND sufficient to conclude
 # that USDA has published new rates for the announced month.  Adding
 # the derived cells would just be redundant comparisons.
 @dataclass(frozen=True)
@@ -345,7 +388,6 @@ _RECONCILABLE_FIELDS: tuple[_CellSpec, ...] = (
     _CellSpec("HTST",                   "I",  store.COL_SKIM),
     _CellSpec("HTST",                   "I",  store.COL_BUTTERFAT),
     _CellSpec("HTST",                   "II", store.COL_SKIM),
-    _CellSpec("HTST",                   "II", store.COL_BUTTERFAT),
     _CellSpec("ESL",                    "I",  store.COL_SKIM),
     _CellSpec(_CATEGORY_COTTAGE_CHEESE, "II", store.COL_PROTEIN),
     _CellSpec(_CATEGORY_COTTAGE_CHEESE, "II", store.COL_OTHER_SOLIDS),
@@ -693,28 +735,43 @@ def maybe_update_from_pdfs(
         result.errors.append(f"advanced-prices headline parse failed: {exc}")
         return result
 
-    # Class II Butterfat is a page-2 lookup on the class-prices PDF.
-    # The lookup key is structural ``(year, month)`` of ``target_month``;
-    # USDA's table-row month label is the authoritative source for THIS
-    # one field — without it we have no way to associate Bfat with a
-    # specific month, since the class-prices PDF has no headline block
-    # the way advance-prices does.  A miss surfaces the bfat-lag warning
-    # and stops the new-month insert dead — we refuse to write a row
-    # with null Bfat by spec.
+    # Class II Butterfat sourcing — per operator contract: "Class II
+    # butterfat is always the last row value on page 2 of
+    # dymclassprices.pdf".  We take the LATEST published row from the
+    # parsed history regardless of which month it carries.  This
+    # decouples the orchestrator from the class-prices cadence lag
+    # entirely: even when the new-target month hasn't been published
+    # yet on the class-prices PDF, we still emit a row carrying the
+    # most-recent published Bfat — which is exactly what the operator
+    # wants since Class II Bfat does NOT trigger new-month writes
+    # (it's excluded from :data:`_RECONCILABLE_FIELDS`).
+    #
+    # Defensive fallback: if the class-prices PDF is unreachable or
+    # unparseable we land here with ``class_ii_butterfat = None``.  The
+    # candidate row writes with Bfat = None and the page surfaces a
+    # warning so the operator can fill the cell into the lakehouse
+    # manually.  This path is rare (class-prices is a stable USDA
+    # publication) but matters for resilience.
     class_ii_butterfat: Optional[float] = None
     if cls_bytes is not None:
         try:
             bfat_history = pdf.parse_class_ii_butterfat_history(cls_bytes)
-            class_ii_butterfat = bfat_history.get(
-                (target_month.year, target_month.month)
-            )
         except Exception as exc:
-            # Non-fatal parse error — fall through to the lag handler.
+            # Non-fatal parse error — fall through to the None
+            # fallback below, which surfaces the warning to the page.
             logger.warning("class-prices history parse failed: %s", exc)
+            bfat_history = {}
+        if bfat_history:
+            latest_key = max(bfat_history.keys())
+            class_ii_butterfat = bfat_history.get(latest_key)
 
+    # When the class-prices PDF wasn't reachable / parseable we still
+    # proceed with bfat=None.  The cell will land as ``None`` in the
+    # JSON; surface the actionable warning so the operator knows to
+    # fill it in.  The label points at ``target_month`` so the operator
+    # knows exactly which row needs the manual fill.
     if class_ii_butterfat is None:
         result.class_ii_bfat_lag_target = target_month.strftime("%b %Y")
-        return result
 
     # ── 6. Compare scraped rates vs the latest stored month ─────────────────
     #

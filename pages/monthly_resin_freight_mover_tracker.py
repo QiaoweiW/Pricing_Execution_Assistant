@@ -1647,9 +1647,16 @@ def _build_tracker_rows_for_nmt(
 
     Returned schema (canonical order)::
 
-        Rest Market vs TOPCO | Product ID | Product Description |
-        Resin | Resin Cost ($/Gal) | Month |
-        Pricing Category | Usage (Lbs/Ea) | Gal/Ea
+        Rest Market vs TOPCO | Pricing Category | Resin Cost ($/Gal) |
+        Month | Usage (Lbs/Ea) | Gal/Ea | <calculator extras…>
+
+    ``Pricing Category`` is the natural row identifier per the
+    lakehouse ``Resin_Calculator.csv`` schema (e.g. ``"Alb - GAL
+    Conventional - 62 grams"``).  ``Product ID`` / ``Product
+    Description`` / ``Resin`` are NOT present in the calculator file
+    and therefore not in this payload either — they're carried in the
+    canonical column list only as forward-compat placeholders for any
+    legacy tracker rows that already have them.
 
     Used by:
 
@@ -1698,10 +1705,16 @@ def _build_tracker_rows_for_nmt(
 
     out = pd.concat(blocks, ignore_index=True)
 
-    # Canonical column ordering: Side first, then identity, then $/Gal,
-    # then Month, then auxiliary calculator columns trailing.
+    # Canonical column ordering: Side first, then natural identity
+    # (Pricing Category — the lakehouse calculator's row identifier),
+    # then any forward-compat legacy identity columns if they happen to
+    # be present, then computed $/Gal, then Month, then auxiliary
+    # calculator columns trailing.  Columns not in the leading list
+    # pass through in their original order so any extra calculator
+    # fields (Grams/ea, Lbs/gram, etc.) survive the round-trip.
     leading = [
-        _TRACKER_COL_SIDE, _COL_PRODUCT_ID, _COL_PRODUCT_DESC, _COL_RESIN,
+        _TRACKER_COL_SIDE, _COL_PRICING_CAT,
+        _COL_PRODUCT_ID, _COL_PRODUCT_DESC, _COL_RESIN,
         _COL_RESIN_GAL, _COL_MONTH,
     ]
     leading_present = [c for c in leading if c in out.columns]
@@ -3229,7 +3242,7 @@ Two buttons partition the work:
 
 | # | Lakehouse file | Trigger | Conditions that must hold |
 |---|---|---|---|
-| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System scrapes all rates from the PDF and compares them against the matching cells of the latest month already in `fmmo_tracker.json`.**  A new month row is appended (labelled `max(file) + 1 calendar month`, always first-of-month) ONLY when at least one of the **seven canonical reconcilable cells** differs — HTST I Skim & Bfat, HTST II Skim & Bfat, ESL I Skim, CC II Protein, CC II Other Solids.  All other cells are derived from these seven by spec (ESL II / CC II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the USDA Class II Butterfat for the target month is missing (USDA cadence lag), the orchestrator REFUSES the write and surfaces a warning so the operator can fill the cell into the lakehouse manually. |
+| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System scrapes all rates from the advance-prices PDF and compares them against the matching cells of the latest month already in `fmmo_tracker.json`.**  A new month row is appended (labelled `max(file) + 1 calendar month`, always first-of-month) ONLY when at least one of the **six canonical advance-prices-driven cells** differs — HTST I Skim & Bfat, HTST II Skim, ESL I Skim, CC II Protein, CC II Other Solids.  HTST II / ESL II / CC II Butterfat are sourced from [dymclassprices.pdf](https://www.ams.usda.gov/mnreports/dymclassprices.pdf) (always the latest published row on page 2) but do NOT gate writes — only the advance-prices PDF triggers a new month.  All other cells are derived by spec (ESL II / CC II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the class-prices PDF is unreachable / unparseable the new row still writes with Class II Bfat = NULL and a warning banner asks the operator to fill the cell into the lakehouse manually. |
 | 2 | `Files/Monthly_Pricing_Execution/milk_mover.csv` | User clicks **🔄 Refresh** | Authoritative replace on every Refresh — no month gate.  When the slicer's End Month has no rows in `fmmo_tracker.json`, rates collapse to zero (silent `$0` cost) so the published file structure stays stable. |
 | 3 | `Files/Activity_Model/Product_Milk Base Cost.csv` (column `Base Milk Cost per Gallon`) | User clicks **🔄 Refresh** | Slicer's **End Month ≥ file's max Month + 1 calendar month**.  Update is by Item match (left-merge); unmatched rows are stale-stamped. |
 | 4 | `Files/Monthly_Mover_Reporting/mover_details_table.csv` | User clicks **🔄 Refresh** | A **new row was inserted** into the Movers Non-Milk Tracker since the last successful publish (row-count delta).  Edit-in-place on the existing last row does NOT qualify.  **Existing months may be overwritten** when the gate is open — the upsert wins for the current editing month. |
@@ -3240,10 +3253,11 @@ Two buttons partition the work:
 1. **Wait for USDA**: if the End Month you need isn't in the Milk
    Commodity slicer, the advanced-prices PDF hasn't yet published
    different rates than the latest month on file.  Click **🔄 USDA
-   refresh** to re-check.  When USDA's Class II Butterfat lags
-   advance-prices, you'll see a yellow warning naming the missing
-   month — fill it into the lakehouse, then click USDA refresh
-   again.
+   refresh** to re-check.  Class II Butterfat is sourced from
+   page 2 of the class-prices PDF (always the latest row) and does
+   NOT gate writes — if the class-prices PDF is unreachable the
+   new month still lands with Class II Bfat = NULL and an amber
+   warning will point you at the cell to fill in manually.
 2. **Pick `(Start Month, End Month)` in the slicer**.  For the
    `base_milk_cost_monthly_tracker` upsert to fire, the pair must be
    exactly one calendar month apart.
@@ -3431,7 +3445,14 @@ def _render_milk_autoupdate_status() -> None:
     col_status, col_btn = st.columns([4, 1])
     with col_status:
         if result is not None:
-            st.caption(result.as_caption())
+            # Escalate warnings (errors OR bfat-lag fill-in callouts) to
+            # ``st.warning`` so the operator sees them as an amber banner
+            # instead of buried small grey caption text.  Successful
+            # ticks remain as quiet captions to keep the page calm.
+            if result.is_warning:
+                st.warning(result.as_caption())
+            else:
+                st.caption(result.as_caption())
         else:
             st.caption(
                 "🥛 Milk Mover data sourced from the Fabric Lakehouse "

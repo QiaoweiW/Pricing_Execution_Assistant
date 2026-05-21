@@ -1074,6 +1074,30 @@ def run_variable_pricing(data_files):
     _render_distribute_price_book()
 
 
+# UI-only display label overrides for the cascading filters.  The
+# underlying parquet column name is kept in the data layer (so a column
+# rename upstream only needs one constant update there) — the
+# operator-facing string is rendered through this map so we can call
+# the start-date filter "Old Price Start Date" without losing the link
+# to the parquet schema.
+_FILTER_DISPLAY_LABEL_OVERRIDES: dict[str, str] = {
+    # Parquet column "Price Adjustment Start Date" → renders as
+    # "Old Price Start Date" because in the Price Book workflow that
+    # value represents the OLD price's effective start (the NEW
+    # effective window is sourced from the matched VBCS row).
+    "Price Adjustment Start Date": "Old Price Start Date",
+}
+
+
+def _filter_display_label(logical_col: str) -> str:
+    """Return the operator-facing label for a cascading filter column.
+
+    Looks up the column in :data:`_FILTER_DISPLAY_LABEL_OVERRIDES`
+    first; falls back to the raw column name when there's no override.
+    """
+    return _FILTER_DISPLAY_LABEL_OVERRIDES.get(logical_col, logical_col)
+
+
 def _render_distribute_price_book() -> None:
     """Render the Distribute Price Book section under Variable Pricing.
 
@@ -1081,12 +1105,12 @@ def _render_distribute_price_book() -> None:
     --------
     1.  Load ``Files/FG_Pricing_History/B2C_Pricing_History.parquet``.
     2.  Five cascading multi-selects: Item Category → Customer →
-        Ship to Site → Price Adjustment Start Date → Pricing UOM.
+        Ship to Site → Old Price Start Date → Pricing UOM.
         Each downstream dropdown only exposes values still present in
         the upstream-narrowed slice.
     3.  Compute the price book via
         :func:`price_book_distribution.build_price_book` using the
-        ``topmost`` (earliest) selected Price Adjustment Start Date as
+        ``topmost`` (earliest) selected Old Price Start Date as
         the +1-calendar-month reference for the New Price lookup.
     4.  Preview the resulting frame, then expose Download / Send.
 
@@ -1137,6 +1161,10 @@ def _render_distribute_price_book() -> None:
         for i, logical in enumerate(_price_book.CASCADING_FILTERS):
             options = _price_book.distinct_options(narrowing, logical, column_map)
             with cols[i]:
+                # Operator-facing label honours the override map so the
+                # date filter can read "Old Price Start Date" while the
+                # underlying data path still keys on the parquet column.
+                display_label = _filter_display_label(logical)
                 if logical == _price_book.PARQUET_COL_START_DATE:
                     # Date options: show YYYY-MM-DD strings so the
                     # multiselect popover stays compact and sortable.
@@ -1148,7 +1176,7 @@ def _render_distribute_price_book() -> None:
                     for disp, orig in zip(display_options, options):
                         date_display_to_value[disp] = pd.Timestamp(orig)
                     picked_display = st.multiselect(
-                        logical,
+                        display_label,
                         options=display_options,
                         default=[],
                         key=f"price_book_filter_{logical}",
@@ -1157,7 +1185,7 @@ def _render_distribute_price_book() -> None:
                     picked = [date_display_to_value[d] for d in picked_display]
                 else:
                     picked = st.multiselect(
-                        logical,
+                        display_label,
                         options=options,
                         default=[],
                         key=f"price_book_filter_{logical}",
@@ -1173,12 +1201,12 @@ def _render_distribute_price_book() -> None:
             st.info("No rows match — adjust your filters above.")
             return
 
-        # ── 3. Resolve the topmost (earliest) selected Price Start Date ─────
+        # ── 3. Resolve the topmost (earliest) selected Old Price Start Date ─
         start_picks = selections.get(_price_book.PARQUET_COL_START_DATE) or []
         if not start_picks:
             st.warning(
-                "⚠️ Select at least one **Price Adjustment Start Date** so "
-                "the system knows which calendar month to look up New Prices "
+                "⚠️ Select at least one **Old Price Start Date** so the "
+                "system knows which calendar month to look up New Prices "
                 "for (lookup month = topmost selected date + 1 calendar "
                 "month)."
             )
@@ -1191,7 +1219,7 @@ def _render_distribute_price_book() -> None:
             f"🎯 New Price lookup will scan VBCS files in "
             f"{_vbcs_store.get_folder_label()} for `Adjustmentstartdate` "
             f"in **{target_month.strftime('%B %Y')}** "
-            f"(topmost selected Price Start Date "
+            f"(topmost selected Old Price Start Date "
             f"{topmost.strftime('%Y-%m-%d')} + 1 calendar month)."
         )
 
@@ -1258,6 +1286,30 @@ def _render_distribute_price_book() -> None:
             )
         with col_send:
             st.markdown("**📧 Send Price Book by email**")
+            # Up-front SMTP configuration probe: lets us surface the
+            # copy-pasteable secrets template BEFORE the operator has
+            # typed an email address + clicked send, instead of after.
+            smtp_ready = _price_book.is_smtp_configured()
+            if not smtp_ready:
+                st.warning(
+                    "⚠️ Email sender is not configured yet — the "
+                    "**Send** button is disabled until SMTP credentials "
+                    "are present in `.streamlit/secrets.toml`.  "
+                    "Downloading the CSV (left) still works."
+                )
+                with st.expander(
+                    "Show secrets.toml template", expanded=False
+                ):
+                    st.caption(
+                        "Paste ONE of these blocks into "
+                        "`.streamlit/secrets.toml` (local) or the "
+                        "Streamlit Cloud secrets editor, then reload "
+                        "the app."
+                    )
+                    st.code(
+                        _price_book.smtp_template_for_ui(),
+                        language="toml",
+                    )
             raw_emails = st.text_area(
                 "Recipient email addresses (one or more, separated by "
                 "comma, semicolon, or newline)",
@@ -1267,11 +1319,13 @@ def _render_distribute_price_book() -> None:
                     "carol@darigold.com"
                 ),
                 height=80,
+                disabled=not smtp_ready,
             )
             if st.button(
                 "📤 Send Price Book",
                 type="primary",
                 key="price_book_send",
+                disabled=not smtp_ready,
             ):
                 tokens = _price_book.parse_recipients(raw_emails)
                 valid, invalid = _price_book.validate_recipients(tokens)
@@ -1297,7 +1351,11 @@ def _render_distribute_price_book() -> None:
                             summary_lines=summary_lines,
                         )
                     except _price_book.PriceBookError as exc:
-                        st.error(f"❌ SMTP config error: {exc}")
+                        # The error already carries the full template;
+                        # surface it as a plain code block so toml
+                        # formatting is preserved.
+                        st.error("❌ SMTP config error — see template below.")
+                        st.code(str(exc), language="toml")
                         return
                 successes = [d for d in delivery if d.success]
                 failures  = [d for d in delivery if not d.success]

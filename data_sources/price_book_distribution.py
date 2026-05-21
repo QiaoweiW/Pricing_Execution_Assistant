@@ -138,12 +138,22 @@ CASCADING_FILTERS: tuple[str, ...] = (
 
 
 # ── VBCS schema constants ────────────────────────────────────────────────────
+#
+# The VBCS files are the source of truth for *both* the New Price AND
+# the Price Start / End dates that appear in the output Price Book.
+# This contract is intentional: the dates in the output represent when
+# the **new** price takes effect (post-execution), not when the old
+# price was last adjusted (which is what the parquet records).  Pulling
+# all three from the same VBCS row guarantees they line up — a row with
+# a New Price will always have matching Start / End dates, and a row
+# with no VBCS match will have all three blank.
 
 VBCS_COL_ITEM:        str = "item_name"
 VBCS_COL_UOM:         str = "pricinguom"
 VBCS_COL_SHIP_TO:     str = "Shiptoname"
 VBCS_COL_AMOUNT:      str = "Adjustmentamount"
 VBCS_COL_START_DATE:  str = "Adjustmentstartdate"
+VBCS_COL_END_DATE:    str = "Adjustmentenddate"
 
 
 # ── Output schema constants ──────────────────────────────────────────────────
@@ -241,6 +251,13 @@ def validate_parquet_schema(df: pd.DataFrame) -> dict[str, str]:
     on every row).  Raises a single aggregated error when any column
     is missing.
     """
+    # NB: ``PARQUET_COL_END_DATE`` is deliberately NOT required —
+    # since the May-2026-late update Price End Date in the output comes
+    # from the matched VBCS row, not the parquet, so the parquet only
+    # needs the *start* date (for the cascading filter and the
+    # +1-calendar-month lookup gate).  Operators with a parquet that
+    # lacks Price Adjustment End Date should still be able to
+    # distribute price books.
     required_logical = (
         PARQUET_COL_ITEM,
         PARQUET_COL_ITEM_DESC,
@@ -248,7 +265,6 @@ def validate_parquet_schema(df: pd.DataFrame) -> dict[str, str]:
         PARQUET_COL_UOM,
         PARQUET_COL_OLD_PRICE,
         PARQUET_COL_START_DATE,
-        PARQUET_COL_END_DATE,
         PARQUET_COL_ITEM_CATEGORY,
         PARQUET_COL_CUSTOMER,
     )
@@ -366,10 +382,21 @@ class _VbcsLookupKey:
 
 @dataclass(frozen=True)
 class _VbcsLookupHit:
-    """One match returned by the VBCS scan."""
+    """One match returned by the VBCS scan.
+
+    Carries the VBCS row's ``Adjustmentstartdate`` and
+    ``Adjustmentenddate`` (already normalised to first-of-day
+    ``pd.Timestamp``) in addition to the dollar amount so the Price
+    Book output can populate Price Start / End directly from the same
+    matched VBCS row.  Dates may be ``None`` when the source row was
+    missing a parseable end date (start date is required by the
+    target-month filter, so it is always present on a hit).
+    """
 
     amount: float
     source_file: str
+    start_date: Optional[pd.Timestamp]
+    end_date:   Optional[pd.Timestamp]
 
 
 @dataclass
@@ -426,6 +453,10 @@ def build_vbcs_lookup(
     for source_file, df in vbcs_files:
         if df is None or df.empty:
             continue
+        # Start date is REQUIRED (drives the target-month filter); end
+        # date is best-effort because a tiny number of historical VBCS
+        # rows have shipped without it — we still want the row to land
+        # in the Price Book, just with a blank Price End Date.
         required = (VBCS_COL_ITEM, VBCS_COL_UOM, VBCS_COL_SHIP_TO, VBCS_COL_AMOUNT, VBCS_COL_START_DATE)
         norm_cols = {c.strip().casefold(): c for c in df.columns}
         col_map: dict[str, Optional[str]] = {
@@ -438,10 +469,17 @@ def build_vbcs_lookup(
                 source_file, list(required), list(df.columns),
             )
             continue
+        end_col = norm_cols.get(VBCS_COL_END_DATE.strip().casefold())
 
         # Date-coerce once per file (vectorised) so the per-row month
         # comparison below is a cheap int compare.
         starts = pd.to_datetime(df[col_map[VBCS_COL_START_DATE]], errors="coerce")
+        if end_col is not None:
+            ends = pd.to_datetime(df[end_col], errors="coerce")
+        else:
+            # Same length, all-NaT series so the per-row ``.at`` access
+            # below stays uniform regardless of file shape.
+            ends = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
         amounts = pd.to_numeric(df[col_map[VBCS_COL_AMOUNT]], errors="coerce")
         items = df[col_map[VBCS_COL_ITEM]].astype(str).str.strip()
         uoms  = df[col_map[VBCS_COL_UOM]].astype(str).str.strip()
@@ -464,9 +502,17 @@ def build_vbcs_lookup(
                 site=sites.at[idx],
             )
             amount = float(amounts.at[idx])
+            start_ts = starts.at[idx]
+            end_ts   = ends.at[idx]
+            hit = _VbcsLookupHit(
+                amount=amount,
+                source_file=source_file,
+                start_date=None if pd.isna(start_ts) else pd.Timestamp(start_ts).normalize(),
+                end_date=  None if pd.isna(end_ts)   else pd.Timestamp(end_ts).normalize(),
+            )
             existing = lookup.get(key)
             if existing is None:
-                lookup[key] = _VbcsLookupHit(amount=amount, source_file=source_file)
+                lookup[key] = hit
                 continue
             # Same key already seen — only escalate to a conflict when
             # the amounts actually differ (a duplicate-but-identical
@@ -525,11 +571,14 @@ def build_price_book(
     -----
     1.  Filter ``parquet_df`` by every non-empty selection.
     2.  Project the surviving rows into the canonical output schema
-        (``OUTPUT_COLUMNS``) — Item, Description, UOM, Old Price,
-        Start / End dates carry over directly.
+        (``OUTPUT_COLUMNS``) — Item, Description, UOM and Old Price
+        carry over from the parquet.
     3.  Compute ``target_month = topmost_start_date + 1 calendar month``
         and look up ``New Price`` for every row from
-        :func:`build_vbcs_lookup`.
+        :func:`build_vbcs_lookup`.  The same lookup also supplies
+        Price Start Date and Price End Date (i.e. the date window the
+        NEW price takes effect for) — when no VBCS row matches, both
+        dates land blank to keep the row internally consistent.
     4.  Compute ``Price Change = New − Old`` (blank when New is blank).
 
     Parameters
@@ -564,19 +613,22 @@ def build_price_book(
     col_desc   = column_map[PARQUET_COL_ITEM_DESC]
     col_uom    = column_map[PARQUET_COL_UOM]
     col_old    = column_map[PARQUET_COL_OLD_PRICE]
-    col_start  = column_map[PARQUET_COL_START_DATE]
-    col_end    = column_map[PARQUET_COL_END_DATE]
     col_site   = column_map[PARQUET_COL_SHIP_TO]
+    # NB: ``PARQUET_COL_START_DATE`` is still required for the
+    # cascading filter UI and for the topmost-date lookup-month gate,
+    # but it is intentionally NOT projected into the output — Price
+    # Start / End in the Price Book represent the NEW price's effective
+    # window and come from the matched VBCS row instead.
 
     item_series  = filtered[col_item].astype(str).str.strip()
     desc_series  = filtered[col_desc].astype(str).str.strip()
     uom_series   = filtered[col_uom].astype(str).str.strip()
     site_series  = filtered[col_site].astype(str).str.strip()
     old_series   = pd.to_numeric(filtered[col_old], errors="coerce")
-    start_series = pd.to_datetime(filtered[col_start], errors="coerce")
-    end_series   = pd.to_datetime(filtered[col_end], errors="coerce")
 
     new_prices: list[Optional[float]] = []
+    start_dates: list[str] = []
+    end_dates:   list[str] = []
     for idx in filtered.index:
         key = _VbcsLookupKey(
             item=item_series.at[idx],
@@ -584,7 +636,22 @@ def build_price_book(
             site=site_series.at[idx],
         )
         hit = lookup.get(key)
-        new_prices.append(round(hit.amount, 4) if hit is not None else None)
+        if hit is None:
+            # No VBCS row ⇒ no new price ⇒ blank effective window.
+            # Keeping all three blank avoids the trap of an operator
+            # eyeballing a date but no New Price and assuming silent
+            # data loss.
+            new_prices.append(None)
+            start_dates.append("")
+            end_dates.append("")
+        else:
+            new_prices.append(round(hit.amount, 4))
+            start_dates.append(
+                "" if hit.start_date is None else hit.start_date.strftime("%Y-%m-%d")
+            )
+            end_dates.append(
+                "" if hit.end_date is None else hit.end_date.strftime("%Y-%m-%d")
+            )
 
     old_rounded = old_series.round(4)
     # Build Price Change as None when New is None — otherwise the
@@ -604,8 +671,8 @@ def build_price_book(
         OUT_COL_OLD:    old_rounded.values,
         OUT_COL_NEW:    new_prices,
         OUT_COL_CHANGE: changes,
-        OUT_COL_START:  start_series.dt.strftime("%Y-%m-%d").where(start_series.notna(), ""),
-        OUT_COL_END:    end_series.dt.strftime("%Y-%m-%d").where(end_series.notna(), ""),
+        OUT_COL_START:  start_dates,
+        OUT_COL_END:    end_dates,
     })
     out = out[list(OUTPUT_COLUMNS)].reset_index(drop=True)
 
@@ -690,29 +757,107 @@ def validate_recipients(addresses: list[str]) -> tuple[list[str], list[str]]:
     return valid, invalid
 
 
-def _read_smtp_config() -> dict[str, Any]:
-    """Read the shared ``[task_manager_email]`` SMTP config from secrets.
+# Section name probe order: a dedicated ``[price_book_email]`` block
+# takes precedence so an operator can route price-book emails through
+# a different sender than the task-reminder daemon if they ever need
+# to (e.g. a "Pricing Operations" inbox vs. the shared notifications
+# account).  Falling back to ``[task_manager_email]`` keeps the
+# zero-extra-config path working for the common case where there's
+# only one SMTP identity for the whole app.
+_SMTP_SECTION_PROBE_ORDER: tuple[str, ...] = (
+    "price_book_email",
+    "task_manager_email",
+)
 
-    Mirrors ``utils.notification_helpers._read_email_config`` exactly
-    so a missing-key error message reads the same in both flows.
+_SMTP_REQUIRED_KEYS: tuple[str, ...] = (
+    "smtp_host", "smtp_port", "smtp_username", "smtp_password", "from_email",
+)
+
+
+def _format_secrets_toml_template() -> str:
+    """Return a ready-to-paste secrets.toml snippet for the missing block.
+
+    Surfaced verbatim in the UI when SMTP isn't configured so operators
+    don't have to context-switch to documentation — they can copy this
+    into ``.streamlit/secrets.toml`` (or the Streamlit Cloud secrets
+    editor) and reload.
     """
-    section = "task_manager_email"
-    if section not in st.secrets:
+    return (
+        "# .streamlit/secrets.toml\n"
+        "[price_book_email]\n"
+        '# Or use [task_manager_email] if you want to share the same\n'
+        '# SMTP identity that drives task reminder emails.\n'
+        'smtp_host = "smtp.office365.com"        # your SMTP host\n'
+        "smtp_port = 587                          # 587 for STARTTLS, 465 for SSL\n"
+        'smtp_username = "user@yourcompany.com"\n'
+        'smtp_password = "<app-password-or-secret>"\n'
+        'from_email = "user@yourcompany.com"\n'
+        "use_tls = true                           # optional, defaults to true\n"
+    )
+
+
+def _read_smtp_config() -> dict[str, Any]:
+    """Read SMTP config from secrets, preferring a dedicated section.
+
+    Probe order: ``[price_book_email]`` → ``[task_manager_email]``.
+    The first present section wins; if both are present, the dedicated
+    block takes precedence.  Raises :class:`PriceBookError` with a
+    copy-pasteable template when none of the candidate sections are
+    configured.
+    """
+    found_section: Optional[str] = None
+    cfg: Optional[dict[str, Any]] = None
+    # ``st.secrets`` is a dict-like that exposes ``__contains__``.  Iterate
+    # explicitly so a future probe-order extension only needs an entry in
+    # ``_SMTP_SECTION_PROBE_ORDER``.
+    for section in _SMTP_SECTION_PROBE_ORDER:
+        try:
+            present = section in st.secrets
+        except Exception:  # noqa: BLE001 — st.secrets can throw before init
+            present = False
+        if present:
+            found_section = section
+            cfg = dict(st.secrets[section])
+            break
+
+    if cfg is None or found_section is None:
         raise PriceBookError(
-            "Missing [task_manager_email] in .streamlit/secrets.toml — "
-            "the same SMTP credentials used for task reminders are reused "
-            "here.  Add the section with smtp_host, smtp_port, "
-            "smtp_username, smtp_password, from_email."
+            "Email sender is not configured — none of the candidate "
+            f"sections {list(_SMTP_SECTION_PROBE_ORDER)!r} were found in "
+            ".streamlit/secrets.toml.\n\n"
+            "Add ONE of them, for example:\n\n"
+            f"{_format_secrets_toml_template()}"
         )
-    cfg = dict(st.secrets[section])
-    required = ("smtp_host", "smtp_port", "smtp_username", "smtp_password", "from_email")
-    missing = [k for k in required if not cfg.get(k)]
+
+    missing = [k for k in _SMTP_REQUIRED_KEYS if not cfg.get(k)]
     if missing:
         raise PriceBookError(
-            f"[task_manager_email] missing required keys: {', '.join(missing)}"
+            f"[{found_section}] is missing required key(s): "
+            f"{', '.join(missing)}.  Expected: {', '.join(_SMTP_REQUIRED_KEYS)}.\n\n"
+            "Reference template:\n\n"
+            f"{_format_secrets_toml_template()}"
         )
     cfg.setdefault("use_tls", True)
     return cfg
+
+
+def is_smtp_configured() -> bool:
+    """Return ``True`` when at least one SMTP section is present + complete.
+
+    Cheap probe used by the UI to grey out / hide the "Send Price
+    Book" button before the operator clicks it.  Swallows every
+    exception (the goal is a boolean for UI gating, not diagnostics).
+    """
+    try:
+        _read_smtp_config()
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def smtp_template_for_ui() -> str:
+    """Public accessor for the UI to show the copy-paste template."""
+    return _format_secrets_toml_template()
 
 
 def send_price_book(
@@ -823,4 +968,6 @@ __all__ = [
     "parse_recipients",
     "validate_recipients",
     "send_price_book",
+    "is_smtp_configured",
+    "smtp_template_for_ui",
 ]

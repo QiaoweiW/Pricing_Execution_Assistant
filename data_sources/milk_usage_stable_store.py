@@ -18,7 +18,7 @@ Co-located with ``fmmo_tracker.json`` and
 place a user can open in OneLake explorer.
 
 ``Protein Usage`` and ``Other Solids Usage`` were introduced for the
-Culture category (formerly "Cottage Cheese", renamed May-2026-late).
+Culture category (May-2026-late).
 HTST/ESL items carry ``0`` for both so the additive cost formula in
 ``_build_milk_usage_with_movers`` collapses back to the legacy
 Skim+Butterfat behaviour for non-Culture items — the new schema is
@@ -92,9 +92,8 @@ _READ_CACHE_TTL_SECONDS: int = 300
 # string, so a silent column-drift bug is much worse than a loud
 # "missing column" error at read time. ``Protein Usage`` and
 # ``Other Solids Usage`` were added in May-2026 for the Culture
-# category (formerly "Cottage Cheese", renamed May-2026-late);
-# legacy HTST/ESL items must carry ``0`` for both to preserve
-# their existing cost.
+# category; legacy HTST/ESL items must carry ``0`` for both to
+# preserve their existing cost.
 _REQUIRED_COLUMNS: tuple[str, ...] = (
     "Item",
     "Item Description",

@@ -208,9 +208,8 @@ def parse_advanced_prices(pdf_bytes: bytes) -> dict[str, float]:
     * ``class_ii_skim_raw``      — "Class II Skim Milk Price" ($/cwt)
     * ``class_i_esl_adj_raw``    — "Class I ESL Adjustment" ($/cwt, signed)
     * ``class_ii_nonfat_solids`` — "Class II Nonfat Solids Price" ($/lb).
-                                    Doubles as the Culture (formerly
-                                    "Cottage Cheese") Protein Rate AND
-                                    Other Solids Rate.
+                                    Doubles as the Culture Protein
+                                    Rate AND Other Solids Rate.
 
     Raises ``ValueError`` listing every missing label so the orchestrator can
     surface a single actionable error message instead of failing silently.

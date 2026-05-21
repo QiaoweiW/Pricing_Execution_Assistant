@@ -615,6 +615,53 @@ def update_csv(
     )
 
 
+# ── Parquet-shaped helpers ──────────────────────────────────────────────────
+#
+# Parquet is read-only here: we only need it for upstream feeds the
+# pricing app consumes (e.g. the B2C Pricing History snapshot the
+# Distribute Price Book workflow filters on).  Add a write/update pair
+# the day we actually need to publish parquet — there's no production
+# code path doing that yet, and keeping this read-only avoids accidental
+# round-trip type drift (pandas → pyarrow → pandas can rewrite null
+# typing in ways consumers don't expect).
+
+def read_parquet(
+    secrets_section: str,
+    blob_path: str,
+    *,
+    read_parquet_kwargs: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(DataFrame, etag)`` for a Parquet blob, or ``(None, None)`` when absent.
+
+    Mirrors :func:`read_csv` semantics for ``.parquet`` blobs:
+
+    * Missing blob → ``(None, None)`` (a recoverable cold-bootstrap state).
+    * Empty body  → ``(empty DataFrame, etag)`` so callers can still
+      branch on ``df.empty`` without a separate sentinel.
+    * Parse failure raises :class:`LakehouseIOError` rather than silently
+      ingesting a malformed file — see the same rationale in
+      :func:`read_csv`.
+
+    ``pd.read_parquet`` will pick the first installed engine (``pyarrow``
+    preferred, falling back to ``fastparquet``).  Callers that need a
+    specific engine can pass ``read_parquet_kwargs={'engine': 'pyarrow'}``.
+    """
+    raw, etag = read_bytes(secrets_section, blob_path)
+    if raw is None:
+        return None, None
+    if not raw:
+        return pd.DataFrame(), etag
+    try:
+        df = pd.read_parquet(io.BytesIO(raw), **(read_parquet_kwargs or {}))
+    except Exception as exc:  # noqa: BLE001
+        raise LakehouseIOError(
+            f"Could not parse OneLake blob 'Files/{blob_path}' as Parquet: {exc}. "
+            "Inspect the file in OneLake; if corrupt, re-upload the latest "
+            "snapshot from the upstream pipeline."
+        ) from exc
+    return df, etag
+
+
 # ── JSON-shaped helpers ──────────────────────────────────────────────────────
 
 def read_json(
@@ -755,6 +802,7 @@ __all__ = [
     "read_csv",
     "write_csv",
     "update_csv",
+    "read_parquet",
     "read_json",
     "write_json",
     "update_json",

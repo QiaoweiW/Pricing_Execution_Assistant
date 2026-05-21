@@ -141,7 +141,7 @@ Calculation contract (matches the May-2026 product spec)
          End Month Milk Cost   = same formula with End-month rates.
          Milk Cost Mover $/Gal = End Month Milk Cost − Start Month Milk Cost.
 
-     The two new terms drive the Cottage Cheese category (added May-2026).
+     The two new terms drive the Culture category (added May-2026).
      HTST/ESL items carry ``0`` for Protein Usage / Other Solids Usage in
      ``Milk_Usage_Stable``, so the formula collapses back to the legacy
      Skim+Butterfat shape for them — backward-compatible by construction.
@@ -762,9 +762,11 @@ def _build_packaging_index_chart(
 ) -> go.Figure:
     """Multi-series time-series chart of the Packaging Index.
 
-    Resin price series (HDPE, LDPE, PET, PP) plot on the primary y-axis in
-    $/lb; Linerboard (if present) plots on a secondary y-axis in $/ton because
-    it lives on a different scale.
+    Resin price series (HDPE, LDPE, PET, PP) plot on the primary y-axis
+    labelled ``rate ($/lbs)``; Linerboard (if present) plots on a
+    secondary y-axis labelled ``$/ton`` because it lives on a
+    different scale and collapsing both onto one axis would visually
+    flatten the resin series.
 
     Parameters
     ----------
@@ -842,7 +844,7 @@ def _build_packaging_index_chart(
 
     layout_kwargs = dict(
         xaxis=dict(title="", showgrid=False, showline=True, linecolor="#e0e0e0"),
-        yaxis=dict(title="Resin ($/lb)", showgrid=True, gridcolor="#f0f0f0",
+        yaxis=dict(title="rate ($/lbs)", showgrid=True, gridcolor="#f0f0f0",
                    showline=True, linecolor="#e0e0e0", rangemode="tozero"),
         plot_bgcolor="white",
         paper_bgcolor="white",
@@ -858,7 +860,7 @@ def _build_packaging_index_chart(
     )
     if board_cols:
         layout_kwargs["yaxis2"] = dict(
-            title="Linerboard ($/ton)", overlaying="y", side="right",
+            title="$/ton", overlaying="y", side="right",
             showgrid=False, showline=True, linecolor="#e0e0e0",
             rangemode="tozero",
         )
@@ -867,26 +869,21 @@ def _build_packaging_index_chart(
 
 
 # Color map for the milk-commodity chart. Each (Category, Class) pair
-# gets its own colour. The line style encodes the metric:
+# gets its own colour.  All four metrics share a single y-axis
+# (``rate ($/lbs)``); line styles encode the metric so series of the
+# same colour can still be told apart:
 #
-#   Skim         → solid line on the PRIMARY (left) $/cwt-scaled axis
-#                  (Skim ≈ 0.08–0.15)
-#   Butterfat    → dashed line on the SECONDARY (right) $/lb-scaled axis
-#                  (Butterfat ≈ 1.4–3.0)
-#   Protein      → dotted line on the SECONDARY axis (Cottage Cheese only)
-#   Other Solids → dash-dot line on the SECONDARY axis (Cottage Cheese only)
+#   Skim         → solid line     (HTST / ESL only)
+#   Butterfat    → dashed line    (all categories that publish it)
+#   Protein      → dotted line    (Culture only — Class II Nonfat Solids)
+#   Other Solids → dash-dot line  (Culture only — Class II Nonfat Solids)
 #
-# Cottage Cheese has no Skim component; its three metrics all sit on the
-# secondary $/lb axis. Since Protein Rate and Other Solids Rate carry the
-# SAME value for Cottage Cheese (both equal the Class II Nonfat Solids
-# Price), those two lines overlap visually — both still appear in the
-# legend so the user can confirm both are populated.
+# Culture has no Skim component.  Protein Rate and Other Solids Rate
+# both equal the Class II Nonfat Solids Price for Culture, so those
+# two lines overlap visually — both still appear in the legend so the
+# user can confirm both are populated.
 # Keys are uppercased Category labels.  ``CULTURE`` is the canonical
-# May-2026-late spelling (renamed from "Cottage Cheese" when the
-# milk usage + FMMO files were both relabeled).  Chart data is
-# normalised to the canonical form by
-# :func:`_mirror_cc_ii_skim_bfat_from_esl_ii` so we never need a
-# second legacy-alias entry here.
+# May-2026-late spelling.
 _MILK_COLOR_MAP: dict[tuple[str, str], str] = {
     ("HTST",    "I"):  "#1f77b4",
     ("HTST",    "II"): "#aec7e8",
@@ -896,22 +893,23 @@ _MILK_COLOR_MAP: dict[tuple[str, str], str] = {
 }
 
 
-def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
+def _mirror_culture_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
     """Patch Culture II rows so Skim/Butterfat mirror ESL II.
 
     Operates on the chart's working DataFrame (NOT the lakehouse) — for
-    every Culture II row whose Skim or Butterfat cell is null, we copy in
-    the corresponding ESL II value for the same Month. Bfat-only or
+    every Culture II row whose Skim or Butterfat cell is null, we copy
+    in the corresponding ESL II value for the same Month.  Bfat-only or
     skim-only rows are repaired field-by-field so a row already half-
     populated still benefits.
 
-    Also normalises legacy ``"Cottage Cheese"`` Category values to
-    ``"Culture"`` (the May-2026-late canonical spelling) in the output —
-    so every downstream chart consumer only ever sees the canonical
-    spelling and we don't need duplicate ``("COTTAGE CHEESE", …)``
-    entries in :data:`_MILK_COLOR_MAP` or anywhere else.
-
     Pure function on a DataFrame copy — never mutates the input.
+
+    Note on naming: the lakehouse JSON has been fully migrated to the
+    canonical ``"Culture"`` label (the legacy label rows
+    were rewritten in the May-2026-late lakehouse pass).  This helper
+    therefore matches only ``"CULTURE"`` here — adding the legacy alias
+    would just paper over a regression in the upstream rename rather
+    than offer real value.
     """
     if df is None or df.empty:
         return df
@@ -923,21 +921,17 @@ def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
     )
     bf_col = next((c for c in out.columns if "butter" in c.lower()), None)
     if skim_col is None and bf_col is None:
-        return _coerce_culture_category(out)
+        return out
     if "Category" not in out.columns or "Class" not in out.columns or "Month" not in out.columns:
-        return _coerce_culture_category(out)
+        return out
 
     cat = out["Category"].astype(str).str.strip().str.upper()
     cls = out["Class"].astype(str).str.strip().str.upper()
 
-    esl_mask = (cat == "ESL") & (cls.isin({"II", "CLASS II", "2", "CLASS 2"}))
-    # Accept BOTH the canonical ``CULTURE`` label and the legacy
-    # ``COTTAGE CHEESE`` label so historical lakehouse rows still get
-    # their ESL-II mirror repair until the operator drops every
-    # legacy row from the file.
-    cc_mask  = cat.isin({"CULTURE", "COTTAGE CHEESE"}) & cls.isin({"II", "CLASS II", "2", "CLASS 2"})
-    if not esl_mask.any() or not cc_mask.any():
-        return _coerce_culture_category(out)
+    esl_mask     = (cat == "ESL")     & (cls.isin({"II", "CLASS II", "2", "CLASS 2"}))
+    culture_mask = (cat == "CULTURE") & (cls.isin({"II", "CLASS II", "2", "CLASS 2"}))
+    if not esl_mask.any() or not culture_mask.any():
+        return out
 
     esl_by_month: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]] = {}
     esl_subset = out[esl_mask]
@@ -953,7 +947,7 @@ def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
             None if (bf_val   is None or pd.isna(bf_val))   else float(bf_val),
         )
 
-    for idx in out[cc_mask].index:
+    for idx in out[culture_mask].index:
         try:
             month_key = pd.Timestamp(out.at[idx, "Month"]).normalize().replace(day=1)
         except Exception:  # noqa: BLE001
@@ -971,25 +965,6 @@ def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(cur):
                 out.at[idx, bf_col] = ref_bf
 
-    return _coerce_culture_category(out)
-
-
-def _coerce_culture_category(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename any legacy ``"Cottage Cheese"`` Category values to ``"Culture"``.
-
-    Pure on a DataFrame copy — never mutates the input.  Used at the
-    end of :func:`_mirror_cc_ii_skim_bfat_from_esl_ii` so every chart
-    consumer downstream sees the canonical May-2026-late spelling.
-    Tolerant of mixed-case input (``"COTTAGE CHEESE"``, ``"cottage
-    cheese"``, etc.) — strips, compares case-insensitively, writes
-    the canonical ``"Culture"`` back.
-    """
-    if df is None or df.empty or "Category" not in df.columns:
-        return df
-    out = df.copy()
-    legacy_mask = out["Category"].astype(str).str.strip().str.upper() == "COTTAGE CHEESE"
-    if legacy_mask.any():
-        out.loc[legacy_mask, "Category"] = "Culture"
     return out
 
 
@@ -1004,7 +979,7 @@ def _milk_commodity_visible_slice(
     """Return the FMMO rows the Milk Commodity Cost chart actually plots.
 
     The chart applies a fixed sequence of filters before drawing — slicer
-    bounds, the CC II → ESL II Skim/Bfat mirror, and the chart-only
+    bounds, the Culture II → ESL II Skim/Bfat mirror, and the chart-only
     Category / Class knobs.  This helper applies the SAME transformations
     so an "Export visible series" download surfaces exactly the data the
     operator sees on screen.
@@ -1035,18 +1010,18 @@ def _milk_commodity_visible_slice(
     if df.empty:
         return pd.DataFrame()
 
-    # ── Mirror Cottage Cheese II Skim/Bfat from ESL II ───────────────────
-    # Same defence-in-depth as the chart builder — legacy rows with null
-    # CC II skim/bfat get their values from the matching ESL II row.
-    df = _mirror_cc_ii_skim_bfat_from_esl_ii(df)
+    # ── Mirror Culture II Skim/Bfat from ESL II ──────────────────────────
+    # Same defence-in-depth as the chart builder — any Culture rows still
+    # carrying null skim/bfat (from the legacy backfill path) get their
+    # values from the matching ESL II row at chart-display time.
+    df = _mirror_culture_ii_skim_bfat_from_esl_ii(df)
 
     # ── Chart-only Category + Class knobs ────────────────────────────────
-    # ``COTTAGE CHEESE`` retained as an accepted synonym alongside the
-    # current canonical ``CULTURE`` so any legacy session-state or
-    # external caller that still passes the old label keeps working
-    # through the rename window.  Downstream comparison is uppercased
-    # both sides so source-data casing variations don't matter.
-    _VALID_CAT = {"HTST", "ESL", "CULTURE", "COTTAGE CHEESE"}
+    # Comparison is uppercased both sides so source-data casing variations
+    # don't matter.  ``CULTURE`` is the canonical May-2026-late label
+    # (single label; the legacy ``"COTTAGE CHEESE"`` alias was retired in
+    # the follow-on cleanup once the lakehouse JSON was confirmed clean).
+    _VALID_CAT = {"HTST", "ESL", "CULTURE"}
     cat_filter = (category_filter or "").strip().upper()
     if cat_filter and cat_filter in _VALID_CAT:
         df = df[df["Category"].astype(str).str.upper() == cat_filter]
@@ -1081,13 +1056,21 @@ def _build_milk_commodity_chart(
     and Other Solids rates.
 
     The chart visualises every (Category, Class) combination that
-    exists in ``Milk_Mover_Tracker``. Skim Rate plots on the primary
-    y-axis (solid); Butterfat / Protein / Other Solids plot on the
-    secondary y-axis (dashed, dotted, dash-dot respectively). The two
-    Cottage Cheese-only metrics (Protein, Other Solids) auto-suppress
-    for HTST/ESL series since those rows carry ``null`` rates for them.
-    Missing-column / all-null traces are skipped silently — the chart
-    degrades gracefully rather than raising.
+    exists in ``Milk_Mover_Tracker``.  All four metrics share a single
+    y-axis labelled ``rate ($/lbs)``: Skim is solid, Butterfat dashed,
+    Protein dotted, Other Solids dash-dot.  The two Culture-only
+    metrics (Protein, Other Solids) auto-suppress for HTST/ESL series
+    since those rows carry ``null`` rates for them.  Missing-column /
+    all-null traces are skipped silently — the chart degrades
+    gracefully rather than raising.
+
+    Single-axis rationale (May-2026-late operator update): the previous
+    secondary axis carrying Butterfat/Protein/Other-Solids made the
+    Butterfat scale visually dominate.  Collapsing onto one
+    ``rate ($/lbs)`` axis keeps comparisons honest at the cost of
+    sacrificing the artificial Butterfat zoom — Plotly's autoscale
+    handles the residual scale spread fine because Skim and the NFS
+    fields all live in the same $/lb range.
 
     The optional ``start_month`` / ``end_month`` arguments restrict the
     plotted x-range so the chart reacts to the time slicer rendered
@@ -1126,14 +1109,14 @@ def _build_milk_commodity_chart(
     if df.empty:
         return go.Figure()
 
-    # Cottage Cheese II skim/bfat mirror ESL II for the same month
-    # (May-2026 contract).  The auto-updater write-side now sets these
-    # values explicitly AND the orchestrator runs a one-shot in-place
-    # repair pass on legacy rows — but a brief window can exist between
-    # a deploy and the first repair tick, so we mirror at chart-display
-    # time too as defence in depth.  Cheap: one indexed merge per
-    # chart render.
-    df = _mirror_cc_ii_skim_bfat_from_esl_ii(df)
+    # Culture II skim/bfat mirror ESL II for the same month (May-2026
+    # contract).  The auto-updater write-side sets these values
+    # explicitly AND the orchestrator runs a one-shot in-place repair
+    # pass on legacy rows — but a brief window can exist between a
+    # deploy and the first repair tick, so we mirror at chart-display
+    # time too as defence in depth.  Cheap: one indexed merge per chart
+    # render.
+    df = _mirror_culture_ii_skim_bfat_from_esl_ii(df)
 
     # Tolerant column resolution — header drift like "Skim Rate " or
     # "Butterfat Rate $" still resolves to the expected metric. "Other
@@ -1155,10 +1138,9 @@ def _build_milk_commodity_chart(
     # Normalise the chart-only category filter once. Anything outside
     # the known set falls back to "show everything" so unexpected values
     # can never silently blank out the chart.  ``CULTURE`` is the
-    # canonical May-2026-late label (renamed from "Cottage Cheese");
-    # the old label is retained as an accepted synonym so legacy
-    # session-state still resolves cleanly.
-    _VALID_CAT_FILTERS = {"HTST", "ESL", "CULTURE", "COTTAGE CHEESE"}
+    # canonical May-2026-late label (single label; the legacy
+    # ``"COTTAGE CHEESE"`` alias was retired in the follow-on cleanup).
+    _VALID_CAT_FILTERS = {"HTST", "ESL", "CULTURE"}
     cat_filter = (category_filter or "").strip().upper()
     if cat_filter not in _VALID_CAT_FILTERS:
         cat_filter = ""
@@ -1183,15 +1165,15 @@ def _build_milk_commodity_chart(
             continue
 
         # Display label uses the canonical mixed-case spelling so the
-        # legend reads "Cottage Cheese Class II Butterfat" rather than
-        # "COTTAGE CHEESE Class II Butterfat".
-        display_cat = cat.title() if cat == "COTTAGE CHEESE" else cat
+        # legend reads "Culture Class II Butterfat" rather than
+        # "CULTURE Class II Butterfat".
+        display_cat = cat.title() if cat == "CULTURE" else cat
 
-        # ── Skim — primary axis (only relevant for HTST / ESL) ─────────
+        # ── Skim — only relevant for HTST / ESL ────────────────────────
         if skim_col is not None:
             skim_y = pd.to_numeric(sub[skim_col], errors="coerce")
-            # Skip drawing when every value is null (e.g. Cottage Cheese
-            # rows have null Skim Rate by design — no point in adding an
+            # Skip drawing when every value is null (e.g. Culture rows
+            # have null Skim Rate by design — no point in adding an
             # empty trace and cluttering the legend).
             if skim_y.notna().any():
                 fig.add_trace(go.Scatter(
@@ -1207,7 +1189,7 @@ def _build_milk_commodity_chart(
                     ),
                 ))
 
-        # ── Butterfat — secondary axis ────────────────────────────────
+        # ── Butterfat ─────────────────────────────────────────────────
         if bf_col is not None:
             bf_y = pd.to_numeric(sub[bf_col], errors="coerce")
             if bf_y.notna().any():
@@ -1218,14 +1200,13 @@ def _build_milk_commodity_chart(
                     name=f"{display_cat} Class {cls} Butterfat",
                     line=dict(color=color, width=2, dash="dash"),
                     marker=dict(size=4, symbol="diamond"),
-                    yaxis="y2",
                     hovertemplate=(
                         f"<b>{display_cat} Class {cls} Butterfat</b><br>"
                         "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
                     ),
                 ))
 
-        # ── Protein — secondary axis (Cottage Cheese only by data) ────
+        # ── Protein (Culture only by data) ────────────────────────────
         if protein_col is not None:
             protein_y = pd.to_numeric(sub[protein_col], errors="coerce")
             if protein_y.notna().any():
@@ -1236,14 +1217,13 @@ def _build_milk_commodity_chart(
                     name=f"{display_cat} Class {cls} Protein",
                     line=dict(color=color, width=2, dash="dot"),
                     marker=dict(size=4, symbol="square"),
-                    yaxis="y2",
                     hovertemplate=(
                         f"<b>{display_cat} Class {cls} Protein</b><br>"
                         "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
                     ),
                 ))
 
-        # ── Other Solids — secondary axis (Cottage Cheese only by data)
+        # ── Other Solids (Culture only by data) ───────────────────────
         if other_col is not None:
             other_y = pd.to_numeric(sub[other_col], errors="coerce")
             if other_y.notna().any():
@@ -1254,23 +1234,21 @@ def _build_milk_commodity_chart(
                     name=f"{display_cat} Class {cls} Other Solids",
                     line=dict(color=color, width=2, dash="dashdot"),
                     marker=dict(size=4, symbol="triangle-up"),
-                    yaxis="y2",
                     hovertemplate=(
                         f"<b>{display_cat} Class {cls} Other Solids</b><br>"
                         "%{x|%b %Y}<br>$%{y:.4f}<extra></extra>"
                     ),
                 ))
 
+    # Single y-axis carries every metric (Skim, Butterfat, Protein,
+    # Other Solids).  ``rangemode="tozero"`` keeps the visual baseline
+    # honest for $/lb readings; Plotly autoscales the upper bound to
+    # accommodate the Butterfat range (~$1.5–3.0) and the lower-scale
+    # Skim/NFS series (~$0.08–0.35) on the same axis.
     fig.update_layout(
         xaxis=dict(title="", showgrid=False, showline=True, linecolor="#e0e0e0"),
-        yaxis=dict(title="Skim Rate ($)", showgrid=True, gridcolor="#f0f0f0",
+        yaxis=dict(title="rate ($/lbs)", showgrid=True, gridcolor="#f0f0f0",
                    showline=True, linecolor="#e0e0e0", rangemode="tozero"),
-        # The right axis carries Butterfat, Protein, and Other Solids
-        # rates — all three quoted in $/lb so they share a scale.
-        yaxis2=dict(title="Butterfat / Protein / Other Solids Rate ($/lb)",
-                    overlaying="y", side="right",
-                    showgrid=False, showline=True, linecolor="#e0e0e0",
-                    rangemode="tozero"),
         plot_bgcolor="white",
         paper_bgcolor="white",
         margin=dict(l=50, r=50, t=30, b=80),
@@ -1327,8 +1305,7 @@ _SS_MILK_CLASS    = f"{_SS_PREFIX}_milk_class_filter"
 # Filter options for the chart-only category selector. ``"All"`` is the
 # default and preserves the legacy multi-line view; ``"HTST"`` / ``"ESL"``
 # isolate the two pasteurisation methods so users can compare classes
-# within a single family without legend clutter.  ``"Culture"`` (formerly
-# "Cottage Cheese", renamed in the May-2026-late lakehouse update) was
+# within a single family without legend clutter.  ``"Culture"`` was
 # added in May-2026 alongside the Class II Nonfat Solids ingestion —
 # selecting it isolates Culture's three $/lb rate series (Butterfat,
 # Protein, Other Solids).
@@ -2654,10 +2631,10 @@ def _normalise_milk_usage_class(raw: object) -> str:
     ``Milk_Usage_Stable`` historically spells milk class as full phrases
     (e.g. ``"Class II"``) while ``fmmo_tracker`` rows carry the terse
     token ``"II"``.  Without this shim, lookups build keys like
-    ``("COTTAGE CHEESE", "CLASS II")`` which never match
-    ``("COTTAGE CHEESE", "II")``, so Start/End butterfat columns for
-    Cottage Cheese silently read as blank and ``fillna(0)`` washes
-    the milk mover arithmetic.
+    ``("CULTURE", "CLASS II")`` which never match
+    ``("CULTURE", "II")``, so Start/End butterfat columns for Culture
+    silently read as blank and ``fillna(0)`` washes the milk mover
+    arithmetic.
     """
     s = str(raw).strip().upper()
     if s in {"I", "1", "CLASS I", "CLASS 1"}:
@@ -2667,48 +2644,46 @@ def _normalise_milk_usage_class(raw: object) -> str:
     return s
 
 
-def _patch_cottage_cheese_bfat_from_esl_class_ii(
+def _patch_culture_bfat_from_esl_class_ii(
     keys: list[tuple[str, str]],
     rate_tuples: list[_MilkRateTuple],
     month_lookup: dict[tuple[str, str], _MilkRateTuple],
 ) -> list[_MilkRateTuple]:
-    """Force Cottage Cheese **skim AND butterfat** to mirror ESL Class II.
+    """Force Culture **skim AND butterfat** to mirror ESL Class II.
 
-    Business rule (May-2026 milk pipeline): Cottage Cheese II shares the
-    same skim/butterfat rates as ESL Class II for the same month — these
-    two fields are NEVER scraped independently for Cottage Cheese.  Only
-    Protein Rate and Other Solids Rate are taken from the CC tracker row.
+    Business rule (May-2026 milk pipeline): Culture II shares the same
+    skim/butterfat rates as ESL Class II for the same month — these
+    two fields are NEVER scraped independently for Culture.  Only
+    Protein Rate and Other Solids Rate are taken from the Culture
+    tracker row.
 
     The function is the runtime safety net layered ON TOP OF the
-    write-side enforcement in ``milk_mover_autoupdate._derive_rows`` and
-    the one-shot in-place repair pass in
-    ``milk_mover_store.patch_cottage_cheese_rates``: even if a CC row
-    in the lakehouse still carries a stale or null skim/bfat (e.g.
-    written before the contract was tightened), the cost pipeline below
-    will see the canonical ESL II values.
-
-    Naming is preserved (``..._bfat_from_esl_class_ii``) only to avoid a
-    cross-cutting rename of every call-site; behaviour now covers both
-    rate slots as described above.
+    write-side enforcement in ``milk_mover_autoupdate._derive_rows_for_target``
+    and the one-shot in-place repair pass in
+    ``milk_mover_store.patch_culture_rates``: even if a Culture row in
+    the lakehouse still carries a stale or null skim/bfat (e.g.
+    written before the contract was tightened), the cost pipeline
+    below will see the canonical ESL II values.
     """
     esl_tuple = month_lookup.get(("ESL", "II"), _MILK_RATES_NONE)
     esl_skim = esl_tuple[0]
     esl_bf   = esl_tuple[1]
     patched: list[_MilkRateTuple] = []
     for key, tup in zip(keys, rate_tuples):
-        if key[0] == "COTTAGE CHEESE":
+        if key[0] == "CULTURE":
             # Mirror skim/bfat field-by-field — never overwrite a
-            # numeric ESL value with None, never overwrite a present CC
-            # value with None either (so a future divergence wins gracefully).
-            cc_skim = tup[0] if tup[0] is not None else esl_skim
-            cc_bf   = tup[1] if tup[1] is not None else esl_bf
+            # numeric ESL value with None, never overwrite a present
+            # Culture value with None either (so a future divergence
+            # wins gracefully).
+            culture_skim = tup[0] if tup[0] is not None else esl_skim
+            culture_bf   = tup[1] if tup[1] is not None else esl_bf
             # When ESL II carries a value, we PREFER it as the source of
-            # truth for CC II to match the May-2026 contract verbatim.
+            # truth for Culture II to match the May-2026 contract verbatim.
             if esl_skim is not None:
-                cc_skim = esl_skim
+                culture_skim = esl_skim
             if esl_bf is not None:
-                cc_bf = esl_bf
-            patched.append((cc_skim, cc_bf, tup[2], tup[3]))
+                culture_bf = esl_bf
+            patched.append((culture_skim, culture_bf, tup[2], tup[3]))
         else:
             patched.append(tup)
     return patched
@@ -2843,14 +2818,14 @@ def _build_milk_usage_with_movers(
 
     Class labels on ``Milk_Usage_Stable`` rows are passed through
     :func:`_normalise_milk_usage_class` before joining so ``"Class II"``
-    lines match tracker keys that use ``"II"``.  For **Cottage Cheese**
+    lines match tracker keys that use ``"II"``.  For **Culture**
     category rows, Start and End Month **Butterfat** rates always mirror
     the ESL Class II butterfat pulled from the same month’s lookup—even
-    if a tracker row drifted—see :func:`_patch_cottage_cheese_bfat_from_esl_class_ii`.
+    if a tracker row drifted—see :func:`_patch_culture_bfat_from_esl_class_ii`.
 
     Why ``fillna(0)`` on every multiplicative input?
         Either a missing rate (legacy row in fmmo_tracker.json that
-        predates the May-2026 schema) or a missing usage (Cottage Cheese
+        predates the May-2026 schema) or a missing usage (Culture
         items have ``Skim Usage=0`` literally; future-added items might
         miss other columns) would otherwise produce ``NaN × 0 = NaN``
         which poisons the sum and blanks the whole cost. Coercing to
@@ -2885,10 +2860,10 @@ def _build_milk_usage_with_movers(
     # per row on large frames.
     start_tuples = [start_lookup.get(k, _MILK_RATES_NONE) for k in keys]
     end_tuples   = [end_lookup.get(k,   _MILK_RATES_NONE) for k in keys]
-    start_tuples = _patch_cottage_cheese_bfat_from_esl_class_ii(
+    start_tuples = _patch_culture_bfat_from_esl_class_ii(
         keys, start_tuples, start_lookup,
     )
-    end_tuples = _patch_cottage_cheese_bfat_from_esl_class_ii(
+    end_tuples = _patch_culture_bfat_from_esl_class_ii(
         keys, end_tuples, end_lookup,
     )
 
@@ -3604,7 +3579,7 @@ Two buttons partition the work:
 
 | # | Lakehouse file | Trigger | Conditions that must hold |
 |---|---|---|---|
-| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System scrapes all rates from the advance-prices PDF and compares them against the matching cells of the latest month already in `fmmo_tracker.json`.**  A new month row is appended (labelled `max(file) + 1 calendar month`, always first-of-month) ONLY when at least one of the **six canonical advance-prices-driven cells** differs — HTST I Skim & Bfat, HTST II Skim, ESL I Skim, CC II Protein, CC II Other Solids.  HTST II / ESL II / CC II Butterfat are sourced from [dymclassprices.pdf](https://www.ams.usda.gov/mnreports/dymclassprices.pdf) (always the latest published row on page 2) but do NOT gate writes — only the advance-prices PDF triggers a new month.  All other cells are derived by spec (ESL II / CC II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the class-prices PDF is unreachable / unparseable the new row still writes with Class II Bfat = NULL and a warning banner asks the operator to fill the cell into the lakehouse manually. |
+| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System scrapes all rates from the advance-prices PDF and compares them against the matching cells of the latest month already in `fmmo_tracker.json`.**  A new month row is appended (labelled `max(file) + 1 calendar month`, always first-of-month) ONLY when at least one of the **six canonical advance-prices-driven cells** differs — HTST I Skim & Bfat, HTST II Skim, ESL I Skim, Culture II Protein, Culture II Other Solids.  HTST II / ESL II / Culture II Butterfat are sourced from [dymclassprices.pdf](https://www.ams.usda.gov/mnreports/dymclassprices.pdf) (always the latest published row on page 2) but do NOT gate writes — only the advance-prices PDF triggers a new month.  All other cells are derived by spec (ESL II / Culture II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the class-prices PDF is unreachable / unparseable the new row still writes with Class II Bfat = NULL and a warning banner asks the operator to fill the cell into the lakehouse manually. |
 | 2 | `Files/Monthly_Pricing_Execution/milk_mover.csv` | User clicks **🔄 Refresh** | Authoritative replace on every Refresh — no month gate.  When the slicer's End Month has no rows in `fmmo_tracker.json`, rates collapse to zero (silent `$0` cost) so the published file structure stays stable. |
 | 3 | `Files/Activity_Model/Product_Milk Base Cost.csv` (column `Base Milk Cost per Gallon`) | User clicks **🔄 Refresh** | Slicer's **End Month ≥ file's max Month + 1 calendar month**.  Update is by Item match (left-merge); unmatched rows are stale-stamped. |
 | 4 | `Files/Monthly_Mover_Reporting/mover_details_table.csv` | User clicks **🔄 Refresh** | A **new row was inserted** into the Movers Non-Milk Tracker since the last successful publish (row-count delta).  Edit-in-place on the existing last row does NOT qualify.  **Existing months may be overwritten** when the gate is open — the upsert wins for the current editing month. |
@@ -3933,7 +3908,7 @@ def _render_milk_commodity(
 
     # ── Download: the EXACT slice rendered on the chart ─────────────────────
     # Pulled through the same filter pipeline as the chart (slicer bounds,
-    # CC II → ESL II mirror, Category / Class knobs) so the CSV always
+    # Culture II → ESL II mirror, Category / Class knobs) so the CSV always
     # matches what the operator sees on screen.  Hidden silently when the
     # slice would be empty (no need for an "empty CSV" download button).
     visible_slice = _milk_commodity_visible_slice(

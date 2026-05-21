@@ -14,9 +14,9 @@ the operator contract.  Existing rows are NEVER mutated by this path
 
 The seven canonical cells live in
 :data:`_RECONCILABLE_FIELDS` and cover HTST I Skim/Bfat, HTST II
-Skim/Bfat, ESL I Skim, CC II Protein, CC II Other Solids.  Every other
+Skim/Bfat, ESL I Skim, Culture II Protein, Culture II Other Solids.  Every other
 cell of the 5-row month group is *derived* from those seven by spec
-(ESL II / CC II Skim+Bfat mirror HTST II, etc.), so "any of the seven
+(ESL II / Culture II Skim+Bfat mirror HTST II, etc.), so "any of the seven
 differ" is the necessary and sufficient signal that USDA actually
 published new rates.
 
@@ -26,18 +26,18 @@ cadence.  When the lookup for ``target_month`` misses, we treat that
 as a hard stop and surface an operator-actionable warning rather than
 papering over the gap — the warning tells the user exactly where to
 drop the value into the lakehouse manually.  This is intentional:
-without Class II Bfat, the HTST II / ESL II / CC II rows would land
-with null Butterfat and corrupt the downstream HTST II / ESL II / CC
-II calculations silently.
+without Class II Bfat, the HTST II / ESL II / Culture II rows would
+land with null Butterfat and corrupt the downstream HTST II / ESL II
+/ Culture II calculations silently.
 
 Workflow on each invocation
 ---------------------------
-1.  **Cottage Cheese backfill probe** (cheap, in-memory) — detect months
-    in the JSON that lack a CC row.  Bypasses the TTL guard when set so
-    a deploy-time schema bump is reflected on the next render.
-2.  **Cottage Cheese skim/bfat in-place repair** (cheap, no PDF) — fix
-    legacy CC rows whose Skim/Bfat are null by copying from ESL II for
-    the same month (per the May-2026 contract: CC II Skim/Bfat mirror
+1.  **Culture backfill probe** (cheap, in-memory) — detect months in the
+    JSON that lack a Culture row.  Bypasses the TTL guard when set so a
+    deploy-time schema bump is reflected on the next render.
+2.  **Culture skim/bfat in-place repair** (cheap, no PDF) — fix legacy
+    Culture rows whose Skim/Bfat are null by copying from ESL II for the
+    same month (per the May-2026 contract: Culture II Skim/Bfat mirror
     ESL II).
 3.  **TTL guard** — skip the rest when we checked the PDF within
     ``_DEFAULT_CHECK_TTL`` AND there's nothing else to do.  Bypassed
@@ -56,12 +56,12 @@ Workflow on each invocation
 5.  **Compare scraped rates vs the latest stored month.**  Identical →
     no write, surface "rates unchanged" reason.  Differ on at least
     one of the **six advance-prices-driven cells** (HTST I Skim/Bfat,
-    HTST II Skim, ESL I Skim, CC II Protein, CC II Other Solids) →
-    proceed.  The Class II Butterfat cell (HTST II Bfat / ESL II Bfat
-    / CC II Bfat) is INTENTIONALLY EXCLUDED from the gate per
-    operator contract: "only the advance-prices PDF publish should
-    trigger a new month write — Class II Butterfat is always the
-    latest available row from page 2 of dymclassprices.pdf".  See
+    HTST II Skim, ESL I Skim, Culture II Protein, Culture II Other
+    Solids) → proceed.  The Class II Butterfat cell (HTST II Bfat /
+    ESL II Bfat / Culture II Bfat) is INTENTIONALLY EXCLUDED from the
+    gate per operator contract: "only the advance-prices PDF publish
+    should trigger a new month write — Class II Butterfat is always
+    the latest available row from page 2 of dymclassprices.pdf".  See
     :data:`_RECONCILABLE_FIELDS`.
 6.  **Source Class II Butterfat** by taking the LATEST published row
     from :func:`pdf.parse_class_ii_butterfat_history` regardless of
@@ -75,11 +75,12 @@ Workflow on each invocation
 7.  **Insert** one new five-row month at ``target_month`` using
     :func:`store.insert_rows` — append-only by construction; existing
     rows are not touched.
-8.  **Legacy Cottage Cheese backfill** — months in the JSON without a
-    CC row are backfilled with CC II Skim/Bfat copied from the stored
-    ESL II row.  Protein/Other Solids fall back to ``null`` for the
-    pre-NFS vintage; the just-ingested ``target_month`` is excluded by
-    construction (it already carries a CC row from step 7).
+8.  **Legacy Culture backfill** — months in the JSON without a Culture
+    row are backfilled with Culture II Skim/Bfat copied from the
+    stored ESL II row.  Protein/Other Solids fall back to ``null`` for
+    the pre-NFS vintage; the just-ingested ``target_month`` is
+    excluded by construction (it already carries a Culture row from
+    step 7).
 
 Row derivation matrix
 ---------------------
@@ -92,12 +93,12 @@ HTST            II    Class II Skim Price / 100      Class II Butterfat (p.2)   
 ESL             I     HTST Class I Skim              same as HTST Class I Bfat      null
                       + Class I ESL Adj / 100
 ESL             II    same as HTST Class II Skim     same as HTST Class II Bfat     null
-Cottage Cheese  II    same as ESL II Skim ¹          same as ESL II Bfat ¹          Class II Nonfat Solids
+Culture         II    same as ESL II Skim ¹          same as ESL II Bfat ¹          Class II Nonfat Solids
 ==============  ====  ============================  =============================  ===================
 
-¹ CC II Skim/Bfat NEVER drift from ESL II — by binding them to the same
-  derived values in one place, we make divergence structurally
-  impossible (May-2026 contract).
+¹ Culture II Skim/Bfat NEVER drift from ESL II — by binding them to
+  the same derived values in one place, we make divergence
+  structurally impossible (May-2026 contract).
 
 The orchestrator is **safe to call on every page render** — the TTL guard
 plus the change-detection layer make repeated calls cheap (one HEAD or
@@ -125,17 +126,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CHECK_TTL = timedelta(hours=1)
 
 
-# Canonical "Culture" (formerly "Cottage Cheese") category label.
-# Centralised so any future rename only touches one place; downstream
-# UI / chart code matches case-insensitively but writes use this
-# canonical spelling.  May-2026-late operator update: the milk usage
-# stable file and ``fmmo_tracker.json`` both adopted the shorter
-# "Culture" label and we now follow.  The Python identifier
-# (``_CATEGORY_COTTAGE_CHEESE``) is INTENTIONALLY left unchanged
-# because every cross-module reference would otherwise need to
-# migrate in the same commit — keeping the symbol stable preserves
-# git-blame and all import sites.
-_CATEGORY_COTTAGE_CHEESE: str = "Culture"
+# Canonical "Culture" category label.  Centralised so any future rename
+# only touches one place; downstream UI / chart code matches
+# case-insensitively but writes use this canonical spelling.  The
+# May-2026-late operator update renamed the legacy "Cottage Cheese"
+# label across the milk usage stable file and ``fmmo_tracker.json``,
+# and the symbol was renamed to match in the follow-on cleanup once
+# the lakehouse JSON was confirmed clean.
+_CATEGORY_CULTURE: str = "Culture"
 
 
 # ── Result type ──────────────────────────────────────────────────────────────
@@ -146,7 +144,7 @@ class AutoUpdateResult:
 
     All counts are mutually disjoint — a given row is counted in exactly
     one of ``rows_inserted`` / ``rows_updated`` / ``backfill_inserted``
-    / ``cc_rows_repaired``.  ``as_caption`` composes a single-line
+    / ``culture_rows_repaired``.  ``as_caption`` composes a single-line
     summary from whichever counters are non-zero.
     """
     checked_at:        datetime
@@ -157,13 +155,13 @@ class AutoUpdateResult:
     # on a successful new-month tick and 0 on every other path
     # (rates unchanged, bfat lag, error).
     rows_inserted:     int                    = 0
-    # Cottage Cheese rows inserted by the legacy backfill (months that
-    # predate the NFS-publication window).  Disjoint from
-    # ``rows_inserted``.
+    # Culture rows inserted by the legacy backfill (months that predate
+    # the NFS-publication window).  Disjoint from ``rows_inserted``.
     backfill_inserted: int                    = 0
-    # Cottage Cheese rows patched in-place by the one-shot CC-skim/bfat
-    # repair pass (May-2026 contract: CC II skim/bfat mirror ESL II).
-    cc_rows_repaired:  int                    = 0
+    # Culture rows patched in-place by the one-shot Culture-skim/bfat
+    # repair pass (May-2026 contract: Culture II skim/bfat mirror ESL
+    # II).
+    culture_rows_repaired:  int               = 0
     # The month label the orchestrator chose for this tick, derived as
     # ``store.latest_month() + 1`` per the operator-facing contract.
     # Surfaced to the UI so the operator can sanity-check the labelling.
@@ -200,9 +198,9 @@ class AutoUpdateResult:
             parts.append(
                 f"backfilled {self.backfill_inserted} Culture row(s)"
             )
-        if self.cc_rows_repaired:
+        if self.culture_rows_repaired:
             parts.append(
-                f"repaired {self.cc_rows_repaired} Culture skim/bfat row(s)"
+                f"repaired {self.culture_rows_repaired} Culture skim/bfat row(s)"
             )
 
         # Class II Bfat lag is now a SOFT warning — the new-month row
@@ -280,15 +278,15 @@ def _derive_rows_for_target(
         Class II Butterfat for ``month``, looked up from page-2 of
         ``dymclassprices.pdf``.  Pass ``None`` when the class-prices
         PDF lags (USDA cadence: class-prices publishes ~1 month behind
-        advance-prices); HTST II / ESL II / CC II Butterfat then write
+        advance-prices); HTST II / ESL II / Culture II Butterfat then write
         as ``None`` and the store preserves whatever was previously
         written for those cells on a re-tick.
 
     Returns
     -------
-    Exactly five row dicts (HTST I, HTST II, ESL I, ESL II, CC II)
+    Exactly five row dicts (HTST I, HTST II, ESL I, ESL II, Culture II)
     in the schema :func:`store.upsert_rows` expects.  Skim/Butterfat
-    are bound through shared locals so ESL II and CC II can never
+    are bound through shared locals so ESL II and Culture II can never
     drift from HTST II.
     """
     htst_class_i_skim   = round(headline["class_i_skim_raw"]    / 100, 4)
@@ -297,7 +295,7 @@ def _derive_rows_for_target(
     htst_class_ii_bfat  = _round_or_none(class_ii_butterfat)
     cc_nonfat_solids    = round(headline["class_ii_nonfat_solids"],   4)
 
-    # ESL II / CC II skim/bfat mirror HTST II by spec — bind once.
+    # ESL II / Culture II skim/bfat mirror HTST II by spec — bind once.
     esl_class_ii_skim = htst_class_ii_skim
     esl_class_ii_bfat = htst_class_ii_bfat
 
@@ -338,7 +336,7 @@ def _derive_rows_for_target(
             store.COL_BUTTERFAT:    esl_class_ii_bfat,
         },
         {
-            store.COL_CATEGORY:     _CATEGORY_COTTAGE_CHEESE,
+            store.COL_CATEGORY:     _CATEGORY_CULTURE,
             store.COL_MONTH:        month,
             store.COL_CLASS:        "II",
             store.COL_SKIM:         esl_class_ii_skim,
@@ -368,7 +366,7 @@ def _next_calendar_month(month: pd.Timestamp) -> pd.Timestamp:
 # month group is derived from these by spec:
 #
 #   * ESL II Skim/Bfat       = HTST II Skim/Bfat
-#   * CC II  Skim/Bfat       = ESL II Skim/Bfat (= HTST II)
+#   * Culture II Skim/Bfat   = ESL II Skim/Bfat (= HTST II)
 #   * ESL I  Bfat            = HTST I  Bfat
 #
 # **HTST II Butterfat is INTENTIONALLY EXCLUDED** from the gate.  Per
@@ -396,8 +394,8 @@ _RECONCILABLE_FIELDS: tuple[_CellSpec, ...] = (
     _CellSpec("HTST",                   "I",  store.COL_BUTTERFAT),
     _CellSpec("HTST",                   "II", store.COL_SKIM),
     _CellSpec("ESL",                    "I",  store.COL_SKIM),
-    _CellSpec(_CATEGORY_COTTAGE_CHEESE, "II", store.COL_PROTEIN),
-    _CellSpec(_CATEGORY_COTTAGE_CHEESE, "II", store.COL_OTHER_SOLIDS),
+    _CellSpec(_CATEGORY_CULTURE, "II", store.COL_PROTEIN),
+    _CellSpec(_CATEGORY_CULTURE, "II", store.COL_OTHER_SOLIDS),
 )
 
 
@@ -505,36 +503,36 @@ def _latest_month_row_group(latest_month: pd.Timestamp) -> list[dict]:
     return df.loc[mask].to_dict(orient="records")
 
 
-def _derive_legacy_cottage_cheese_rows(
+def _derive_legacy_culture_rows(
     *,
     legacy_months:   Iterable[pd.Timestamp],
     esl_ii_by_month: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]],
 ) -> list[dict]:
-    """Build CC rows for months OLDER than the page-1 history window.
+    """Build Culture rows for months OLDER than the page-1 history window.
 
-    The reconciliation pass (see :func:`_derive_rows_for_sample`) handles
+    The reconciliation pass (see :func:`_derive_rows_for_target`) handles
     every month USDA's current PDF exposes.  This helper handles the
     long tail of pre-history months in ``fmmo_tracker.json`` (typically
-    from the seed CSV): CC II Skim/Bfat copy from the stored ESL II row
-    and Protein/Other Solids are left ``null`` because no NFS source
+    from the seed CSV): Culture II Skim/Bfat copy from the stored ESL II
+    row and Protein/Other Solids are left ``null`` because no NFS source
     survives for that vintage.
 
-    Idempotent — months that already have a CC row are excluded by the
-    caller (see ``store.months_missing_category``).
+    Idempotent — months that already have a Culture row are excluded by
+    the caller (see ``store.months_missing_category``).
     """
     rows: list[dict] = []
     for month in legacy_months:
         ts = pd.Timestamp(month).normalize().replace(day=1)
         skim_val, bfat_val = esl_ii_by_month.get(ts, (None, None))
         rows.append({
-            store.COL_CATEGORY:     _CATEGORY_COTTAGE_CHEESE,
+            store.COL_CATEGORY:     _CATEGORY_CULTURE,
             store.COL_MONTH:        ts,
             store.COL_CLASS:        "II",
             store.COL_SKIM:         _round_or_none(skim_val),
             store.COL_BUTTERFAT:    _round_or_none(bfat_val),
             # NFS unavailable for legacy months — preserved as null so
-            # the row's coverage parity (every month has a CC row) is
-            # restored even when the source is incomplete.
+            # the row's coverage parity (every month has a Culture
+            # row) is restored even when the source is incomplete.
             store.COL_PROTEIN:      None,
             store.COL_OTHER_SOLIDS: None,
         })
@@ -582,43 +580,43 @@ def maybe_update_from_pdfs(
 
     result = AutoUpdateResult(checked_at=now)
 
-    # ── 0a. Cottage Cheese backfill probe (cheap, in-memory) ────────────────
+    # ── 0a. Culture backfill probe (cheap, in-memory) ───────────────────────
     #
-    # Any month already in the JSON without a Cottage Cheese row needs
+    # Any month already in the JSON without a Culture row needs
     # backfilling — even when the PDFs haven't changed since the last
     # check.  Detecting this is free (iterates the cached row list).
     try:
-        missing_cc_months = store.months_missing_category(_CATEGORY_COTTAGE_CHEESE)
+        missing_culture_months = store.months_missing_category(_CATEGORY_CULTURE)
     except store.MilkMoverStoreError as exc:
         # Treat as no backfill needed — the main ingest below will
         # surface any persistent storage problem.
         logger.warning("Culture backfill probe failed: %s", exc)
-        missing_cc_months = []
-    backfill_needed = bool(missing_cc_months)
+        missing_culture_months = []
+    backfill_needed = bool(missing_culture_months)
 
-    # ── 0b. Cottage Cheese skim/bfat repair probe (cheap, in-memory) ────────
+    # ── 0b. Culture skim/bfat repair probe (cheap, in-memory) ───────────────
     #
-    # CC rows written before the "CC II skim/bfat mirror ESL II"
-    # contract carry null Skim and need an in-place rewrite.
+    # Culture rows written before the "Culture II skim/bfat mirror ESL
+    # II" contract carry null Skim and need an in-place rewrite.
     try:
-        cc_skim_repair_months = store.cottage_cheese_months_with_null_skim()
+        culture_skim_repair_months = store.culture_months_with_null_skim()
     except store.MilkMoverStoreError as exc:
         logger.warning("Culture skim-repair probe failed: %s", exc)
-        cc_skim_repair_months = []
-    repair_needed = bool(cc_skim_repair_months)
+        culture_skim_repair_months = []
+    repair_needed = bool(culture_skim_repair_months)
 
-    # ── 0c. Cottage Cheese skim/bfat in-place repair (cheap, no PDF) ────────
+    # ── 0c. Culture skim/bfat in-place repair (cheap, no PDF) ───────────────
     #
     # Fire the repair pass BEFORE the TTL guard so a stale repair always
-    # closes before the next routine tick.  Idempotent — once every CC
-    # row has skim/bfat populated, this branch becomes a free in-memory
-    # probe on every subsequent invocation.
+    # closes before the next routine tick.  Idempotent — once every
+    # Culture row has skim/bfat populated, this branch becomes a free
+    # in-memory probe on every subsequent invocation.
     if repair_needed:
         try:
             esl_lookup = store.esl_class_ii_rates_by_month()
             patches: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]] = {
                 m: esl_lookup.get(m, (None, None))
-                for m in cc_skim_repair_months
+                for m in culture_skim_repair_months
                 if esl_lookup.get(m) is not None
             }
             # Only patch rows whose ESL II row exists with at least one
@@ -629,7 +627,7 @@ def maybe_update_from_pdfs(
                 if skim is not None or bfat is not None
             }
             if patches:
-                result.cc_rows_repaired = store.patch_cottage_cheese_rates(patches)
+                result.culture_rows_repaired = store.patch_culture_rates(patches)
         except store.MilkMoverStoreError as exc:
             # Non-fatal — surface and continue with the rest of the pipeline.
             result.errors.append(f"Culture skim/bfat repair failed: {exc}")
@@ -637,8 +635,8 @@ def maybe_update_from_pdfs(
     # ── 1. TTL guard ────────────────────────────────────────────────────────
     #
     # Skip the TTL short-circuit when a backfill is pending — otherwise
-    # the page would render with incomplete Cottage Cheese coverage for
-    # up to ``ttl`` after a deploy that introduced the schema.  Once the
+    # the page would render with incomplete Culture coverage for up to
+    # ``ttl`` after a deploy that introduced the schema.  Once the
     # backfill completes, future renders see ``backfill_needed=False``
     # and the TTL guard resumes its normal role.
     state = store.get_pdf_state(pdf.ADVANCED_PRICES_URL)
@@ -809,8 +807,8 @@ def maybe_update_from_pdfs(
                 f"USDA rates unchanged vs {file_max.strftime('%b %Y')} — "
                 "no new month written."
             )
-            # Fall through to the legacy CC backfill below; we still want
-            # to close gaps in the existing data even on a no-op tick.
+            # Fall through to the legacy Culture backfill below; we still
+            # want to close gaps in the existing data even on a no-op tick.
             target_rows_to_insert: list[dict] = []
         else:
             target_rows_to_insert = candidate_rows
@@ -836,16 +834,16 @@ def maybe_update_from_pdfs(
             result.errors.append(f"target-month insert failed: {exc}")
             return result
 
-    # ── 8. Legacy Cottage Cheese backfill ───────────────────────────────────
+    # ── 8. Legacy Culture backfill ──────────────────────────────────────────
     #
-    # Months in the JSON without a CC row are backfilled from the
-    # stored ESL II row (CC II skim/bfat mirror ESL II by spec).
-    # ``target_month`` already carries a CC row from step 6 so it is
+    # Months in the JSON without a Culture row are backfilled from the
+    # stored ESL II row (Culture II skim/bfat mirror ESL II by spec).
+    # ``target_month`` already carries a Culture row from step 6 so it is
     # excluded by construction.  Idempotent — once every legacy month
-    # has a CC row, this branch is a no-op.
+    # has a Culture row, this branch is a no-op.
     if backfill_needed:
         legacy_months = [
-            m for m in missing_cc_months
+            m for m in missing_culture_months
             if pd.Timestamp(m).normalize().replace(day=1) != target_month
         ]
         if legacy_months:
@@ -854,14 +852,14 @@ def maybe_update_from_pdfs(
             except store.MilkMoverStoreError as exc:
                 logger.warning("ESL II rate lookup failed: %s", exc)
                 esl_ii_by_month = {}
-            cc_rows = _derive_legacy_cottage_cheese_rows(
+            culture_rows = _derive_legacy_culture_rows(
                 legacy_months   = legacy_months,
                 esl_ii_by_month = esl_ii_by_month,
             )
-            if cc_rows:
+            if culture_rows:
                 try:
                     inserted, _ = store.upsert_rows(
-                        cc_rows, source="auto-update",
+                        culture_rows, source="auto-update",
                     )
                     result.backfill_inserted = inserted
                 except Exception as exc:

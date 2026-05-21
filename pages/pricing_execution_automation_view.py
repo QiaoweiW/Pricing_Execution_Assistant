@@ -33,9 +33,12 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from data_sources import bid_asset_store as _bid_store
+from data_sources import price_book_distribution as _price_book
 from data_sources import task_manager_store as _task_store
+from data_sources import vbcs_refrehable_store as _vbcs_store
 from data_sources.bid_asset_store import BidAssetStoreError
 from data_sources.task_manager_store import TaskManagerStoreError
+from data_sources.vbcs_refrehable_store import VbcsRefrehableStoreError
 from utils import notification_helpers as _notify
 from utils.notification_helpers import NotificationError
 from utils.ui_helpers import apply_custom_css, create_metric_box, safe_error_message
@@ -133,6 +136,47 @@ def _cleanup_vbcs_cache():
                 del st.session_state.vbcs_cache[filename]
             if filename in st.session_state.vbcs_cache_timestamps:
                 del st.session_state.vbcs_cache_timestamps[filename]
+
+
+def _publish_outputs_to_lakehouse(outputs: dict[str, pd.DataFrame]) -> None:
+    """Mirror every generated VBCS CSV to OneLake ``VBCS_refrehable/``.
+
+    Called from each of the four VBCS tools (Fixed, KS, Variable,
+    Combine) immediately after a successful generation.  The user's
+    operating contract is "always overwrite the old copy", so we never
+    version-stamp filenames — the latest publish wins.
+
+    Lakehouse failure is treated as non-fatal: the local download
+    experience is preserved (the session-state cache is independent),
+    but we surface an amber warning so the operator knows the
+    downstream Price Book lookup might be reading stale bytes.
+    """
+    if not outputs:
+        return
+
+    publishable = {name: df for name, df in outputs.items() if df is not None and not df.empty}
+    if not publishable:
+        return
+
+    try:
+        result = _vbcs_store.publish_many(publishable)
+    except VbcsRefrehableStoreError as exc:
+        st.warning(
+            f"⚠️ Could not publish VBCS files to lakehouse "
+            f"({_vbcs_store.get_folder_label()}): {exc}.  The local "
+            "download(s) below still reflect the freshly-generated "
+            "data — but the Distribute Price Book lookup may be stale "
+            "until the next successful publish."
+        )
+        return
+
+    written = [name for name, ok in result.items() if ok]
+    if written:
+        st.caption(
+            f"📤 Published {len(written)} VBCS file(s) to "
+            f"{_vbcs_store.get_folder_label()}: "
+            + ", ".join(f"`{n}`" for n in written)
+        )
 
 
 def _load_latest_bid_df_for_rules():
@@ -583,6 +627,10 @@ def run_fixed_pricing(data_files):
                     for filename, df in output_dataframes.items():
                         st.session_state.vbcs_cache[filename] = df
                         st.session_state.vbcs_cache_timestamps[filename] = current_time
+                    # Mirror every generated CSV to OneLake so the
+                    # Distribute Price Book lookup always reads the
+                    # latest published rates.
+                    _publish_outputs_to_lakehouse(output_dataframes)
                 
                 if success:
                     st.success(f"Success: {message}")
@@ -705,6 +753,9 @@ def run_ks_pricing(data_files):
                     for filename, df in output_dataframes.items():
                         st.session_state.vbcs_cache[filename] = df
                         st.session_state.vbcs_cache_timestamps[filename] = current_time
+                    # Mirror every generated CSV to OneLake (see
+                    # _publish_outputs_to_lakehouse for the rationale).
+                    _publish_outputs_to_lakehouse(output_dataframes)
                 
                 if success:
                     st.success(f"Success: {message}")
@@ -828,6 +879,11 @@ def run_variable_pricing(data_files):
                     if output_dataframes:
                         _store_vbcs_in_cache(output_dataframes)
                         _cleanup_vbcs_cache()
+                        # Mirror every generated CSV to OneLake's
+                        # VBCS_refrehable folder so the Distribute Price
+                        # Book lookup always reads the latest published
+                        # rates (see _publish_outputs_to_lakehouse).
+                        _publish_outputs_to_lakehouse(output_dataframes)
                     
                     # Check for Excel automation errors in the message (from stdout/stderr)
                     has_excel_error = ("ERROR: Failed to process URM custom sheet" in message or 
@@ -1008,6 +1064,290 @@ def run_variable_pricing(data_files):
     else:
         st.info("No data available for download. Please run the generation first.")
 
+    # ── Distribute Price Book ────────────────────────────────────────────────
+    #
+    # Always render — the lookup pulls from the lakehouse (parquet +
+    # VBCS_refrehable folder), so it works even on a fresh session with
+    # no in-memory cache.  Kept INSIDE the Variable Pricing tool per
+    # operator spec ("under Variable Pricing > Download Output") so the
+    # price book lives next to the rates that drive it.
+    _render_distribute_price_book()
+
+
+def _render_distribute_price_book() -> None:
+    """Render the Distribute Price Book section under Variable Pricing.
+
+    Workflow
+    --------
+    1.  Load ``Files/FG_Pricing_History/B2C_Pricing_History.parquet``.
+    2.  Five cascading multi-selects: Item Category → Customer →
+        Ship to Site → Price Adjustment Start Date → Pricing UOM.
+        Each downstream dropdown only exposes values still present in
+        the upstream-narrowed slice.
+    3.  Compute the price book via
+        :func:`price_book_distribution.build_price_book` using the
+        ``topmost`` (earliest) selected Price Adjustment Start Date as
+        the +1-calendar-month reference for the New Price lookup.
+    4.  Preview the resulting frame, then expose Download / Send.
+
+    Failure modes are LOCALISED here — a parquet read failure renders
+    a single ``st.error`` and returns; an SMTP send failure renders a
+    per-recipient error list.  None of this can break the Variable
+    Pricing generation pipeline that lives above it.
+    """
+    st.markdown("---")
+    st.markdown("### 📦 Distribute Price Book")
+    st.caption(
+        "Filter B2C Pricing History → look up New Prices from the latest "
+        "VBCS files → download or email the resulting Price Book CSV."
+    )
+
+    with st.expander("Open the Price Book builder", expanded=False):
+        # ── 1. Load parquet + resolve schema ────────────────────────────────
+        try:
+            parquet_df = _price_book.load_b2c_pricing_history()
+        except _price_book.PriceBookError as exc:
+            st.error(f"❌ Could not load B2C Pricing History parquet: {exc}")
+            return
+        if parquet_df.empty:
+            st.warning(
+                "⚠️ B2C Pricing History parquet is empty — verify the upstream "
+                "pipeline has published rows to "
+                "`Files/FG_Pricing_History/B2C_Pricing_History.parquet`."
+            )
+            return
+        try:
+            column_map = _price_book.validate_parquet_schema(parquet_df)
+        except _price_book.PriceBookError as exc:
+            st.error(f"❌ Parquet schema error: {exc}")
+            return
+
+        # ── 2. Cascading multi-selects ──────────────────────────────────────
+        #
+        # Each filter narrows the parquet to the rows surviving the
+        # upstream selections, then the next filter's options are
+        # computed from that narrowed slice.  This is the natural
+        # cascading-multiselect semantics every BI tool uses.
+        selections: dict[str, list] = {}
+        narrowing = parquet_df
+        date_display_to_value: dict[str, pd.Timestamp] = {}
+
+        st.markdown("**Cascading filters** (each one narrows the next)")
+        cols = st.columns(5)
+        for i, logical in enumerate(_price_book.CASCADING_FILTERS):
+            options = _price_book.distinct_options(narrowing, logical, column_map)
+            with cols[i]:
+                if logical == _price_book.PARQUET_COL_START_DATE:
+                    # Date options: show YYYY-MM-DD strings so the
+                    # multiselect popover stays compact and sortable.
+                    display_options = [
+                        pd.Timestamp(o).strftime("%Y-%m-%d") for o in options
+                    ]
+                    # Remember the mapping so we can recover the
+                    # original Timestamp when building the filter.
+                    for disp, orig in zip(display_options, options):
+                        date_display_to_value[disp] = pd.Timestamp(orig)
+                    picked_display = st.multiselect(
+                        logical,
+                        options=display_options,
+                        default=[],
+                        key=f"price_book_filter_{logical}",
+                        placeholder="(any)",
+                    )
+                    picked = [date_display_to_value[d] for d in picked_display]
+                else:
+                    picked = st.multiselect(
+                        logical,
+                        options=options,
+                        default=[],
+                        key=f"price_book_filter_{logical}",
+                        placeholder="(any)",
+                    )
+            selections[logical] = picked
+            narrowing = _price_book.apply_filters(narrowing, selections, column_map)
+
+        row_count = len(narrowing)
+        st.caption(f"📋 {row_count:,} parquet row(s) match your filters")
+
+        if row_count == 0:
+            st.info("No rows match — adjust your filters above.")
+            return
+
+        # ── 3. Resolve the topmost (earliest) selected Price Start Date ─────
+        start_picks = selections.get(_price_book.PARQUET_COL_START_DATE) or []
+        if not start_picks:
+            st.warning(
+                "⚠️ Select at least one **Price Adjustment Start Date** so "
+                "the system knows which calendar month to look up New Prices "
+                "for (lookup month = topmost selected date + 1 calendar "
+                "month)."
+            )
+            return
+        topmost = min(pd.Timestamp(p) for p in start_picks)
+        target_month = (
+            topmost.normalize().replace(day=1) + pd.DateOffset(months=1)
+        ).normalize()
+        st.caption(
+            f"🎯 New Price lookup will scan VBCS files in "
+            f"{_vbcs_store.get_folder_label()} for `Adjustmentstartdate` "
+            f"in **{target_month.strftime('%B %Y')}** "
+            f"(topmost selected Price Start Date "
+            f"{topmost.strftime('%Y-%m-%d')} + 1 calendar month)."
+        )
+
+        # ── 4. Generate button — builds the Price Book DataFrame ────────────
+        if st.button("📝 Generate Price Book", type="primary", key="price_book_generate"):
+            with st.spinner("Building Price Book…"):
+                try:
+                    vbcs_files = _price_book.read_all_vbcs_files()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"❌ Could not enumerate VBCS files: {exc}")
+                    return
+                try:
+                    result = _price_book.build_price_book(
+                        parquet_df,
+                        selections,
+                        column_map,
+                        topmost_start_date=topmost,
+                        vbcs_files=vbcs_files,
+                    )
+                except _price_book.PriceBookError as exc:
+                    st.error(f"❌ Could not build Price Book: {exc}")
+                    return
+            st.session_state["price_book_result"] = result
+            st.session_state["price_book_selections_snapshot"] = {
+                k: list(v) for k, v in selections.items()
+            }
+
+        # ── 5. Render the saved result (across reruns) ──────────────────────
+        result = st.session_state.get("price_book_result")
+        if result is None:
+            return
+
+        st.success(
+            f"✅ Built Price Book with {len(result.df):,} row(s) "
+            f"({result.matched_rows:,} matched a VBCS row, "
+            f"{result.unmatched_rows:,} unmatched ⇒ blank New Price)."
+        )
+
+        if result.conflicts:
+            with st.expander(
+                f"⚠️ {len(result.conflicts)} VBCS conflict(s) detected — "
+                "those rows have blank New Price",
+                expanded=False,
+            ):
+                for c in result.conflicts:
+                    pairs = ", ".join(f"`{f}` → {a}" for f, a in c.values)
+                    st.write(
+                        f"- **{c.item}** | site `{c.site}` | UOM `{c.uom}` — {pairs}"
+                    )
+
+        st.dataframe(result.df, use_container_width=True, height=320)
+
+        # ── 6. Download + email controls ────────────────────────────────────
+        file_name = f"price_book_{pd.Timestamp.now():%Y%m%d-%H%M}.csv"
+        csv_bytes = result.df.to_csv(index=False).encode("utf-8")
+        col_dl, col_send = st.columns([1, 2])
+        with col_dl:
+            st.download_button(
+                label="⬇️ Download Price Book (CSV)",
+                data=csv_bytes,
+                file_name=file_name,
+                mime="text/csv",
+                key="price_book_download",
+            )
+        with col_send:
+            st.markdown("**📧 Send Price Book by email**")
+            raw_emails = st.text_area(
+                "Recipient email addresses (one or more, separated by "
+                "comma, semicolon, or newline)",
+                key="price_book_recipients",
+                placeholder=(
+                    "alice@darigold.com, bob@partner.com\n"
+                    "carol@darigold.com"
+                ),
+                height=80,
+            )
+            if st.button(
+                "📤 Send Price Book",
+                type="primary",
+                key="price_book_send",
+            ):
+                tokens = _price_book.parse_recipients(raw_emails)
+                valid, invalid = _price_book.validate_recipients(tokens)
+                if invalid:
+                    st.error(
+                        f"❌ Invalid email address(es) (will not be "
+                        f"contacted): {invalid}"
+                    )
+                if not valid:
+                    st.warning("⚠️ Enter at least one valid email address.")
+                    return
+                summary_lines = _summarise_price_book_for_email(
+                    result, selections,
+                )
+                with st.spinner(
+                    f"Sending Price Book to {len(valid)} recipient(s)…"
+                ):
+                    try:
+                        delivery = _price_book.send_price_book(
+                            recipients=valid,
+                            csv_bytes=csv_bytes,
+                            file_name=file_name,
+                            summary_lines=summary_lines,
+                        )
+                    except _price_book.PriceBookError as exc:
+                        st.error(f"❌ SMTP config error: {exc}")
+                        return
+                successes = [d for d in delivery if d.success]
+                failures  = [d for d in delivery if not d.success]
+                if successes:
+                    st.success(
+                        f"✅ Delivered to {len(successes)} recipient(s): "
+                        + ", ".join(f"`{d.recipient}`" for d in successes)
+                    )
+                if failures:
+                    st.error(
+                        f"❌ Failed to deliver to {len(failures)} "
+                        "recipient(s):"
+                    )
+                    for d in failures:
+                        st.write(f"- `{d.recipient}` — {d.error}")
+
+
+def _summarise_price_book_for_email(
+    result, selections: dict[str, list],
+) -> list[str]:
+    """Build the per-send email-body summary lines.
+
+    Kept narrow on purpose — the body lists the filter selections used
+    and the matched / unmatched row counts so the recipient can sanity-
+    check the attachment without opening it.  Anything fancier
+    belongs in the CSV, not the email body.
+    """
+    lines: list[str] = []
+    selection_blurb = ", ".join(
+        f"{k}={v}" for k, v in selections.items() if v
+    )
+    if selection_blurb:
+        lines.append(f"Filters: {selection_blurb}")
+    if result.target_month is not None:
+        lines.append(
+            f"Lookup month for New Price: "
+            f"{result.target_month.strftime('%B %Y')}"
+        )
+    lines.append(f"Total rows: {len(result.df):,}")
+    lines.append(f"Matched VBCS rows: {result.matched_rows:,}")
+    lines.append(
+        f"Unmatched rows (blank New Price): {result.unmatched_rows:,}"
+    )
+    if result.conflicts:
+        lines.append(
+            f"VBCS conflicts blanked: {len(result.conflicts)} "
+            "(see Distribute Price Book screen for details)"
+        )
+    return lines
+
 
 def run_combine_vbcs(data_files):
     """Run VBCS File Combination"""
@@ -1075,7 +1415,11 @@ def run_combine_vbcs(data_files):
                         # Save to data directory
                         output_path = output_dir / "combined_all_vbcs.csv"
                         combined_df.to_csv(output_path, index=False)
-                        
+
+                        # Mirror the combined CSV to OneLake so the
+                        # Distribute Price Book lookup can see it.
+                        _publish_outputs_to_lakehouse({"combined_all_vbcs.csv": combined_df})
+
                         # Verify the file was saved
                         if output_path.exists():
                             file_size = output_path.stat().st_size

@@ -99,7 +99,7 @@ _STATE_BLOB_PATH: str = f"{_FOLDER_PREFIX}/milk_mover_state.json"
 # Canonical column names — the original five preserve the legacy CSV /
 # SQLite schema so every downstream consumer of ``read_milk_mover_df()``
 # keeps working unchanged. ``Protein Rate`` and ``Other Solids Rate``
-# were introduced for the Cottage Cheese category (May-2026); they are
+# were introduced for the Culture category (May-2026); they are
 # additive — legacy rows simply have ``null`` for these two fields and
 # round-trip back to ``NaN`` when read into pandas.
 COL_CATEGORY     = "Category"
@@ -263,7 +263,7 @@ def read_milk_mover_df() -> pd.DataFrame:
     Output columns (in order): ``Category, Month, Class, Skim Rate,
     Butterfat Rate, Protein Rate, Other Solids Rate``. The first five
     preserve the legacy CSV shape; the trailing two were introduced for
-    the Cottage Cheese category (May-2026) and read back as ``NaN`` for
+    the Culture category (May-2026) and read back as ``NaN`` for
     every legacy row that predates the schema change.
 
     Months are returned as ``M/D/YYYY`` strings (no zero-padding) — the
@@ -305,7 +305,7 @@ def has_rows_for_month(target_month: pd.Timestamp) -> bool:
 def esl_class_ii_rates_by_month() -> dict[pd.Timestamp, tuple[Optional[float], Optional[float]]]:
     """Return ``{first-of-month → (Skim Rate, Butterfat Rate)}`` for ESL Class II.
 
-    Used by the Cottage Cheese historical backfill: CC II skim/bfat
+    Used by the Culture historical backfill: Culture II skim/bfat
     always mirror ESL II for the same month per the May-2026 contract,
     so the orchestrator builds this lookup once and copies the values
     into every CC row it backfills. The lookup is read straight from
@@ -338,28 +338,28 @@ def esl_class_ii_rates_by_month() -> dict[pd.Timestamp, tuple[Optional[float], O
 
 
 # Set of casefolded Category labels that the historical-repair helpers
-# treat as the "Culture" category.  The May-2026-late lakehouse rename
-# replaced ``"Cottage Cheese"`` with ``"Culture"``; the legacy label is
-# retained as an accepted synonym so any rows written before the rename
-# still get repaired by these helpers.
-_CULTURE_CATEGORY_LABELS: frozenset[str] = frozenset({"culture", "cottage cheese"})
+# treat as the "Culture" category.  Lakehouse rows are fully migrated to
+# the canonical ``"Culture"`` label as of the May-2026-late rename — the
+# legacy ``"Cottage Cheese"`` synonym was retired in the follow-on
+# cleanup once the lakehouse JSON was confirmed clean.  Keeping this as
+# a frozenset (rather than a single literal) lets the comparison sites
+# read uniformly and lets us re-add a synonym for any future renames
+# without churning every callsite.
+_CULTURE_CATEGORY_LABELS: frozenset[str] = frozenset({"culture"})
 
 
-def cottage_cheese_months_with_null_skim() -> list[pd.Timestamp]:
+def culture_months_with_null_skim() -> list[pd.Timestamp]:
     """Return Culture months whose Skim Rate is null in the store.
 
-    The May-2026 Culture contract (formerly "Cottage Cheese") requires
-    Culture Skim Rate to equal ESL Class II Skim for the same month.
-    Rows written before that contract carry ``null`` Skim — this helper
-    enumerates them so a one-shot repair pass can patch each row by
-    copying the ESL II value.
+    The May-2026 Culture contract requires Culture Skim Rate to equal
+    ESL Class II Skim for the same month.  Rows written before that
+    contract carry ``null`` Skim — this helper enumerates them so a
+    one-shot repair pass can patch each row by copying the ESL II
+    value.
 
-    The Python function name is kept as ``cottage_cheese_months_with_null_skim``
-    on purpose: every cross-module import site would otherwise need to
-    migrate in the same commit, and the function-name churn brings no
-    operator-visible benefit.  Internal logic accepts BOTH the canonical
-    ``"Culture"`` label and the legacy ``"Cottage Cheese"`` label via
-    :data:`_CULTURE_CATEGORY_LABELS`.
+    Comparison uses :data:`_CULTURE_CATEGORY_LABELS` so any future
+    re-introduction of a legacy synonym (e.g. during a partial
+    migration) only needs to update that one constant.
     """
     out: list[pd.Timestamp] = []
     seen: set[pd.Timestamp] = set()
@@ -384,7 +384,7 @@ def cottage_cheese_months_with_null_skim() -> list[pd.Timestamp]:
     return sorted(out)
 
 
-def patch_cottage_cheese_rates(
+def patch_culture_rates(
     patches: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]],
 ) -> int:
     """Overwrite Skim/Butterfat on existing Culture rows in-place.
@@ -397,10 +397,8 @@ def patch_cottage_cheese_rates(
     Idempotent: a no-op when the existing cell already equals the
     incoming value. Safe to re-run after a partial network failure.
 
-    The Python function name is kept as ``patch_cottage_cheese_rates``
-    on purpose (same rationale as :func:`cottage_cheese_months_with_null_skim`).
-    Internal logic accepts both ``"Culture"`` and the legacy
-    ``"Cottage Cheese"`` label via :data:`_CULTURE_CATEGORY_LABELS`.
+    Internal Category comparison uses :data:`_CULTURE_CATEGORY_LABELS`
+    (one canonical label today; trivially extensible).
     """
     if not patches:
         return 0
@@ -452,21 +450,19 @@ def patch_cottage_cheese_rates(
 def months_missing_category(category: str) -> list[pd.Timestamp]:
     """Return every distinct ``Month`` that lacks a row for ``category``.
 
-    Used by the one-shot Culture (formerly "Cottage Cheese") backfill so
-    the auto-update orchestrator can decide cheaply (in-memory, no HTTPS
-    round-trip) whether any historical months still need to be filled in.
-    Returns an empty list once every month already has a row for
-    ``category``.
+    Used by the one-shot Culture backfill so the auto-update
+    orchestrator can decide cheaply (in-memory, no HTTPS round-trip)
+    whether any historical months still need to be filled in.  Returns
+    an empty list once every month already has a row for ``category``.
 
     Comparison is case-insensitive and whitespace-tolerant so a stray
-    ``"COTTAGE CHEESE "`` row still counts as present.
+    ``"CULTURE "`` row still counts as present.
 
-    Synonym handling: when ``category`` is in the Culture family
-    (``"Culture"`` or its legacy alias ``"Cottage Cheese"``), every row
-    whose Category falls anywhere in :data:`_CULTURE_CATEGORY_LABELS`
-    counts as a present row.  This prevents the orchestrator from
-    re-backfilling Culture rows for months that still carry the legacy
-    label — a common mid-migration scenario.
+    Synonym handling: when ``category`` casefolds to a Culture label
+    (see :data:`_CULTURE_CATEGORY_LABELS`), every row whose Category
+    falls anywhere in that set counts as a present row.  Today the set
+    contains just ``"culture"``; the indirection lets us re-introduce a
+    synonym during any future rename without touching this function.
     """
     target = category.strip().casefold()
     accepted_labels: set[str] = {target}
@@ -707,8 +703,8 @@ __all__ = [
     "has_rows_for_month",
     "months_missing_category",
     "esl_class_ii_rates_by_month",
-    "cottage_cheese_months_with_null_skim",
-    "patch_cottage_cheese_rates",
+    "culture_months_with_null_skim",
+    "patch_culture_rates",
     "upsert_rows",
     "seed_from_csv_if_empty",
     "get_pdf_state",

@@ -881,23 +881,35 @@ def _build_packaging_index_chart(
 # SAME value for Cottage Cheese (both equal the Class II Nonfat Solids
 # Price), those two lines overlap visually — both still appear in the
 # legend so the user can confirm both are populated.
+# Keys are uppercased Category labels.  ``CULTURE`` is the canonical
+# May-2026-late spelling (renamed from "Cottage Cheese" when the
+# milk usage + FMMO files were both relabeled).  Chart data is
+# normalised to the canonical form by
+# :func:`_mirror_cc_ii_skim_bfat_from_esl_ii` so we never need a
+# second legacy-alias entry here.
 _MILK_COLOR_MAP: dict[tuple[str, str], str] = {
-    ("HTST",           "I"):  "#1f77b4",
-    ("HTST",           "II"): "#aec7e8",
-    ("ESL",            "I"):  "#d62728",
-    ("ESL",            "II"): "#ff9896",
-    ("COTTAGE CHEESE", "II"): "#2ca02c",
+    ("HTST",    "I"):  "#1f77b4",
+    ("HTST",    "II"): "#aec7e8",
+    ("ESL",     "I"):  "#d62728",
+    ("ESL",     "II"): "#ff9896",
+    ("CULTURE", "II"): "#2ca02c",
 }
 
 
 def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
-    """Patch Cottage Cheese II rows so Skim/Butterfat mirror ESL II.
+    """Patch Culture II rows so Skim/Butterfat mirror ESL II.
 
     Operates on the chart's working DataFrame (NOT the lakehouse) — for
-    every CC II row whose Skim or Butterfat cell is null, we copy in
+    every Culture II row whose Skim or Butterfat cell is null, we copy in
     the corresponding ESL II value for the same Month. Bfat-only or
     skim-only rows are repaired field-by-field so a row already half-
     populated still benefits.
+
+    Also normalises legacy ``"Cottage Cheese"`` Category values to
+    ``"Culture"`` (the May-2026-late canonical spelling) in the output —
+    so every downstream chart consumer only ever sees the canonical
+    spelling and we don't need duplicate ``("COTTAGE CHEESE", …)``
+    entries in :data:`_MILK_COLOR_MAP` or anywhere else.
 
     Pure function on a DataFrame copy — never mutates the input.
     """
@@ -911,17 +923,21 @@ def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
     )
     bf_col = next((c for c in out.columns if "butter" in c.lower()), None)
     if skim_col is None and bf_col is None:
-        return out
+        return _coerce_culture_category(out)
     if "Category" not in out.columns or "Class" not in out.columns or "Month" not in out.columns:
-        return out
+        return _coerce_culture_category(out)
 
     cat = out["Category"].astype(str).str.strip().str.upper()
     cls = out["Class"].astype(str).str.strip().str.upper()
 
     esl_mask = (cat == "ESL") & (cls.isin({"II", "CLASS II", "2", "CLASS 2"}))
-    cc_mask  = (cat == "COTTAGE CHEESE") & cls.isin({"II", "CLASS II", "2", "CLASS 2"})
+    # Accept BOTH the canonical ``CULTURE`` label and the legacy
+    # ``COTTAGE CHEESE`` label so historical lakehouse rows still get
+    # their ESL-II mirror repair until the operator drops every
+    # legacy row from the file.
+    cc_mask  = cat.isin({"CULTURE", "COTTAGE CHEESE"}) & cls.isin({"II", "CLASS II", "2", "CLASS 2"})
     if not esl_mask.any() or not cc_mask.any():
-        return out
+        return _coerce_culture_category(out)
 
     esl_by_month: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]] = {}
     esl_subset = out[esl_mask]
@@ -955,6 +971,25 @@ def _mirror_cc_ii_skim_bfat_from_esl_ii(df: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(cur):
                 out.at[idx, bf_col] = ref_bf
 
+    return _coerce_culture_category(out)
+
+
+def _coerce_culture_category(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename any legacy ``"Cottage Cheese"`` Category values to ``"Culture"``.
+
+    Pure on a DataFrame copy — never mutates the input.  Used at the
+    end of :func:`_mirror_cc_ii_skim_bfat_from_esl_ii` so every chart
+    consumer downstream sees the canonical May-2026-late spelling.
+    Tolerant of mixed-case input (``"COTTAGE CHEESE"``, ``"cottage
+    cheese"``, etc.) — strips, compares case-insensitively, writes
+    the canonical ``"Culture"`` back.
+    """
+    if df is None or df.empty or "Category" not in df.columns:
+        return df
+    out = df.copy()
+    legacy_mask = out["Category"].astype(str).str.strip().str.upper() == "COTTAGE CHEESE"
+    if legacy_mask.any():
+        out.loc[legacy_mask, "Category"] = "Culture"
     return out
 
 
@@ -1006,7 +1041,12 @@ def _milk_commodity_visible_slice(
     df = _mirror_cc_ii_skim_bfat_from_esl_ii(df)
 
     # ── Chart-only Category + Class knobs ────────────────────────────────
-    _VALID_CAT = {"HTST", "ESL", "COTTAGE CHEESE"}
+    # ``COTTAGE CHEESE`` retained as an accepted synonym alongside the
+    # current canonical ``CULTURE`` so any legacy session-state or
+    # external caller that still passes the old label keeps working
+    # through the rename window.  Downstream comparison is uppercased
+    # both sides so source-data casing variations don't matter.
+    _VALID_CAT = {"HTST", "ESL", "CULTURE", "COTTAGE CHEESE"}
     cat_filter = (category_filter or "").strip().upper()
     if cat_filter and cat_filter in _VALID_CAT:
         df = df[df["Category"].astype(str).str.upper() == cat_filter]
@@ -1056,7 +1096,7 @@ def _build_milk_commodity_chart(
 
     ``category_filter`` is a chart-only knob that restricts which
     Category families are drawn — accepts ``"HTST"`` / ``"ESL"`` /
-    ``"Cottage Cheese"`` (case-insensitive) to isolate one family, or
+    ``"Culture"`` (case-insensitive) to isolate one family, or
     ``None`` / ``"All"`` to draw every series.
 
     ``class_filter`` is the parallel chart-only knob for Class —
@@ -1114,10 +1154,11 @@ def _build_milk_commodity_chart(
 
     # Normalise the chart-only category filter once. Anything outside
     # the known set falls back to "show everything" so unexpected values
-    # can never silently blank out the chart. Cottage Cheese was added
-    # in May-2026; the comparison set is uppercased once so the chart's
-    # case-insensitive matching stays consistent below.
-    _VALID_CAT_FILTERS = {"HTST", "ESL", "COTTAGE CHEESE"}
+    # can never silently blank out the chart.  ``CULTURE`` is the
+    # canonical May-2026-late label (renamed from "Cottage Cheese");
+    # the old label is retained as an accepted synonym so legacy
+    # session-state still resolves cleanly.
+    _VALID_CAT_FILTERS = {"HTST", "ESL", "CULTURE", "COTTAGE CHEESE"}
     cat_filter = (category_filter or "").strip().upper()
     if cat_filter not in _VALID_CAT_FILTERS:
         cat_filter = ""
@@ -1286,13 +1327,14 @@ _SS_MILK_CLASS    = f"{_SS_PREFIX}_milk_class_filter"
 # Filter options for the chart-only category selector. ``"All"`` is the
 # default and preserves the legacy multi-line view; ``"HTST"`` / ``"ESL"``
 # isolate the two pasteurisation methods so users can compare classes
-# within a single family without legend clutter. ``"Cottage Cheese"``
-# was added in May-2026 alongside the Class II Nonfat Solids ingestion
-# — selecting it isolates Cottage Cheese's three $/lb rate series
-# (Butterfat, Protein, Other Solids).
+# within a single family without legend clutter.  ``"Culture"`` (formerly
+# "Cottage Cheese", renamed in the May-2026-late lakehouse update) was
+# added in May-2026 alongside the Class II Nonfat Solids ingestion —
+# selecting it isolates Culture's three $/lb rate series (Butterfat,
+# Protein, Other Solids).
 _MILK_CATEGORY_ALL: str = "All"
 _MILK_CATEGORY_OPTIONS: tuple[str, ...] = (
-    _MILK_CATEGORY_ALL, "HTST", "ESL", "Cottage Cheese",
+    _MILK_CATEGORY_ALL, "HTST", "ESL", "Culture",
 )
 
 # Filter options for the chart-only class selector. ``"All"`` preserves the
@@ -1552,32 +1594,9 @@ def _latest_scrape_fraction(scrape_tracker_df: pd.DataFrame) -> float:
     return float(pct) if pct is not None else 0.0
 
 
-def _build_resincalculate(
-    resin_calculator_df: pd.DataFrame,
-    resin_cost_per_lb: float,
-    scrape_fraction: float,
-) -> pd.DataFrame:
-    """Build the ``resincalculate`` DataFrame.
-
-    Formula::
-
-        Resin Cost ($/Gal) = resin_cost_per_lb
-                           × Usage (Lbs/Ea)
-                           × (1 + scrape_fraction)
-                           ÷ Gal/Ea
-    """
-    df = resin_calculator_df.copy()
-    usage  = pd.to_numeric(df.get(_COL_USAGE_LBS), errors="coerce")
-    gal_ea = pd.to_numeric(df.get(_COL_GAL_EA),   errors="coerce")
-    df[_COL_RESIN_GAL] = (
-        resin_cost_per_lb * usage * (1.0 + scrape_fraction) / gal_ea
-    ).round(4)
-    return df
-
-
 # Output column names for the resin-mover FG. Defined once at module scope so
-# the builder, downstream consumers (resin-mover_details_table fallback, example-prices
-# enrichment) and tests can reference a single source of truth.
+# the builder, downstream consumers (resin-mover_details_table fallback,
+# example-prices enrichment) and tests can reference a single source of truth.
 _FG_COL_OLD       = "Old Resin Cost ($/Gal)"
 _FG_COL_NEW       = "New Resin Cost ($/Gal)"
 _FG_COL_MOVER     = "Resin Mover ($/Gal)"
@@ -1590,24 +1609,52 @@ _FG_OUTPUT_COLUMNS: tuple[str, ...] = (
 # ── Resin_Cost_Tracker payload builders (NMT + Resin_Calculator → tracker rows) ─
 
 
+def _compute_resin_cost_per_gal(
+    rate_per_lb: float,
+    usage_lbs_per_ea: float,
+    gal_per_ea: float,
+    scrape_fraction: float,
+) -> Optional[float]:
+    """Pure cost formula — Resin Cost ($/Gal) for one (rate, Resin) pair.
+
+    Single source of truth for the cost arithmetic shared by every
+    consumer (NMT-driven tracker rewrite, FG builder).  Returns
+    ``None`` when ``gal_per_ea`` is zero / missing so callers can
+    decide how to surface the lookup-miss without crashing.
+    """
+    try:
+        gal = float(gal_per_ea)
+    except (TypeError, ValueError):
+        return None
+    if gal == 0.0 or pd.isna(gal):
+        return None
+    try:
+        usage = float(usage_lbs_per_ea)
+        rate  = float(rate_per_lb)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(usage) or pd.isna(rate):
+        return None
+    return round(rate * usage * (1.0 + scrape_fraction) / gal, 4)
+
+
 def _build_resincalculate(
     resin_calculator_df: pd.DataFrame,
     resin_cost_per_lb: float,
     scrape_fraction: float,
 ) -> pd.DataFrame:
-    """Build the per-Product-ID ``Resin Cost ($/Gal)`` table for one $/lbs driver.
+    """Build the per-Pricing-Category ``Resin Cost ($/Gal)`` table.
 
-    Formula::
+    Applies :func:`_compute_resin_cost_per_gal` row-wise to the
+    calculator file for one $/lbs driver.  Preserves every original
+    calculator column and overwrites only ``Resin Cost ($/Gal)``.
 
-        Resin Cost ($/Gal) = resin_cost_per_lb
-                           × Usage (Lbs/Ea)
-                           × (1 + scrape_fraction)
-                           ÷ Gal/Ea
-
-    The output preserves every Resin_Calculator column verbatim and
-    overwrites only ``Resin Cost ($/Gal)``.  Defined at module scope so
-    both the FG-from-tracker path and the tracker-rewrite payload
-    builder share a single cost formula.
+    Retained because legacy in-app consumers (the freight-side
+    enrichment and the per-side mover_details fallback) still call
+    it directly with the calculator's full row schema; the new
+    :func:`_build_tracker_rows_for_nmt` does NOT use this helper —
+    it joins the Resin → (Usage, Gal/Ea) lookup against the persisted
+    tracker's Product IDs instead.
     """
     df = resin_calculator_df.copy()
     usage  = pd.to_numeric(df.get(_COL_USAGE_LBS), errors="coerce")
@@ -1618,67 +1665,235 @@ def _build_resincalculate(
     return df
 
 
-# Side label used in the Resin_Cost_Tracker schema (the May-2026
-# "Rest Market vs TOPCO" dimension).  Re-exported from the store so
-# the page never disagrees with the file on canonical Side spelling.
+# Side dimension used in the Resin_Cost_Tracker schema (the
+# May-2026-late "Rest vs TOPCO" header, lowercase values).
+# Re-exported from the store so the page never disagrees with the
+# file on canonical Side spelling.
 _TRACKER_COL_SIDE  = _resin_store.COL_REST_VS_TOPCO
 _TRACKER_SIDE_REST  = _resin_store.SIDE_REST
 _TRACKER_SIDE_TOPCO = _resin_store.SIDE_TOPCO
 
 
+def _build_resin_usage_lookup(
+    resin_calculator_df: pd.DataFrame,
+) -> dict[str, tuple[float, float]]:
+    """Return ``{Pricing Category → (Usage Lbs/Ea, Gal/Ea)}``.
+
+    The producer joins the persisted tracker's ``Resin`` column against
+    this lookup to derive per-row Usage / Gal-Ea — the operator-curated
+    tracker uses ``Resin`` as the join key, whereas the calculator file
+    spells the same identifier as ``Pricing Category``.  Rows with a
+    non-numeric / zero ``Gal/Ea`` are dropped so the math helper can
+    treat a missing key as "no usable lookup".
+    """
+    out: dict[str, tuple[float, float]] = {}
+    if resin_calculator_df is None or resin_calculator_df.empty:
+        return out
+    df = resin_calculator_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if _COL_PRICING_CAT not in df.columns:
+        return out
+    for _, r in df.iterrows():
+        key = str(r.get(_COL_PRICING_CAT, "")).strip()
+        if not key:
+            continue
+        usage  = pd.to_numeric(r.get(_COL_USAGE_LBS), errors="coerce")
+        gal_ea = pd.to_numeric(r.get(_COL_GAL_EA),    errors="coerce")
+        if pd.isna(usage) or pd.isna(gal_ea) or float(gal_ea) == 0.0:
+            continue
+        out[key] = (float(usage), float(gal_ea))
+    return out
+
+
+def _extract_template_products(
+    persisted_tracker_df: pd.DataFrame,
+) -> list[dict]:
+    """Return the (Product ID, Description, Resin) template product set.
+
+    Definition: the deduplicated set of triples from the rows where
+    ``Side == 'rest'`` AND ``Month == max(Month where Side == 'rest')``
+    in the persisted ``Resin_Cost_Tracker.csv``.
+
+    Per the May-2026-late operator contract: this set seeds every
+    *new* ``(Month, Side)`` pair (both ``rest`` and ``topco`` use the
+    same rest-derived template).  Existing ``(Month, Side)`` pairs in
+    the tracker retain their own per-month product set — they only get
+    their ``$/Gal`` recomputed, not their Product IDs replaced.
+
+    Returns an empty list when the tracker has no rest rows at all —
+    the caller must surface a warning and skip the resin update in
+    that case (we can't bootstrap product coverage without a template).
+    """
+    if persisted_tracker_df is None or persisted_tracker_df.empty:
+        return []
+    df = persisted_tracker_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if _COL_MONTH not in df.columns or _TRACKER_COL_SIDE not in df.columns:
+        return []
+
+    sides_norm  = df[_TRACKER_COL_SIDE].apply(_resin_store.normalise_side)
+    months_norm = df[_COL_MONTH].apply(_parse_month)
+    rest_mask = (sides_norm == _TRACKER_SIDE_REST) & months_norm.notna()
+    if not rest_mask.any():
+        return []
+    latest_rest_month = months_norm[rest_mask].max()
+
+    template_mask = rest_mask & (months_norm == latest_rest_month)
+    template_rows = df.loc[template_mask]
+
+    seen: set[tuple[str, str, str]] = set()
+    out: list[dict] = []
+    for _, r in template_rows.iterrows():
+        pid_raw   = r.get(_COL_PRODUCT_ID, "")
+        desc_raw  = r.get(_COL_PRODUCT_DESC, "")
+        resin_raw = r.get(_COL_RESIN, "")
+        # Normalise to plain strings (the Product ID column can carry
+        # floats like ``341656.0`` after a CSV round-trip — preserve
+        # that representation so downstream FG joins line up exactly
+        # with the persisted file).
+        pid_norm   = pid_raw   if not (isinstance(pid_raw,  float) and pd.isna(pid_raw))  else None
+        desc_norm  = desc_raw  if not (isinstance(desc_raw, float) and pd.isna(desc_raw)) else None
+        resin_norm = "" if (resin_raw is None or (isinstance(resin_raw, float) and pd.isna(resin_raw))) \
+                     else str(resin_raw).strip()
+
+        dedupe_key = (str(pid_norm), str(desc_norm), resin_norm)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        out.append({
+            "product_id":   pid_norm,
+            "product_desc": desc_norm,
+            "resin":        resin_norm,
+        })
+    return out
+
+
+def _index_persisted_by_month_side(
+    persisted_tracker_df: pd.DataFrame,
+) -> dict[tuple[pd.Timestamp, str], list[dict]]:
+    """Index persisted tracker rows by ``(Month, Side)`` for recompute lookups.
+
+    Used by :func:`_build_tracker_rows_for_nmt` to drive the
+    "recompute-only" branch — when an NMT month already has rows in
+    the persisted tracker for a given side, those rows' Product IDs
+    are kept and only their ``$/Gal`` is recomputed.  We pre-index
+    here once so the per-row recompute loop is O(1) instead of O(n)
+    per lookup.
+    """
+    out: dict[tuple[pd.Timestamp, str], list[dict]] = {}
+    if persisted_tracker_df is None or persisted_tracker_df.empty:
+        return out
+    df = persisted_tracker_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if _COL_MONTH not in df.columns or _TRACKER_COL_SIDE not in df.columns:
+        return out
+
+    sides_norm  = df[_TRACKER_COL_SIDE].apply(_resin_store.normalise_side)
+    months_norm = df[_COL_MONTH].apply(_parse_month)
+    for idx in df.index:
+        m = months_norm.at[idx]
+        s = sides_norm.at[idx]
+        if m is None or s is None:
+            continue
+        out.setdefault((m, s), []).append({
+            _COL_PRODUCT_ID:   df.at[idx, _COL_PRODUCT_ID]   if _COL_PRODUCT_ID   in df.columns else None,
+            _COL_PRODUCT_DESC: df.at[idx, _COL_PRODUCT_DESC] if _COL_PRODUCT_DESC in df.columns else None,
+            _COL_RESIN:        df.at[idx, _COL_RESIN]        if _COL_RESIN        in df.columns else None,
+            _COL_RESIN_GAL:    pd.to_numeric(df.at[idx, _COL_RESIN_GAL], errors="coerce")
+                               if _COL_RESIN_GAL in df.columns else pd.NA,
+        })
+    return out
+
+
 def _build_tracker_rows_for_nmt(
     movers_non_milk_df: pd.DataFrame,
     resin_calculator_df: pd.DataFrame,
+    persisted_tracker_df: pd.DataFrame,
     scrape_fraction: float,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, list[str]]:
     """Materialise the per-(Month × Side) rows of ``Resin_Cost_Tracker``.
 
-    For every row of the Movers Non-Milk Tracker we emit two blocks of
-    Resin_Calculator rows — one for ``Rest`` (``Rest HTST Resin Cost
-    ($/lbs)``) and one for ``TOPCO`` (``TOPCO HTST Resin Cost ($/lbs)``).
-    Each block applies the per-side $/lbs cost through the
-    :func:`_build_resincalculate` formula and tags the resulting rows
-    with ``Rest Market vs TOPCO`` plus the canonical first-of-month
-    ``Month``.
+    May-2026-late operator contract — strict 6-column output schema::
 
-    NMT rows whose Month is unparseable, or whose corresponding $/lbs
-    cell is missing for a given side, are silently skipped on that side
-    — the per-side payload simply lacks that month.
+        Product ID | Product Description | Resin | Resin Cost ($/Gal) |
+        Month      | Rest vs TOPCO
 
-    Returned schema (canonical order)::
+    Algorithm — three independent paths, one per ``(NMT Month × side)`` pair:
 
-        Rest Market vs TOPCO | Pricing Category | Resin Cost ($/Gal) |
-        Month | Usage (Lbs/Ea) | Gal/Ea | <calculator extras…>
+      1. **Recompute-only** (the ``(Month, Side)`` already exists in the
+         persisted tracker): every existing row keeps its Product ID /
+         Description / Resin; the ``$/Gal`` is recomputed from the
+         current NMT ``$/lbs`` rate × Resin's Usage / Gal-Ea.  Operators
+         control product coverage per-month by editing the tracker
+         directly — Refresh never adds or removes rows on this branch.
+      2. **Fan-out** (the ``(Month, Side)`` does NOT exist in the
+         persisted tracker): pull the *template product set* from the
+         latest-``rest``-month rows of the persisted tracker
+         (:func:`_extract_template_products`), and emit one row per
+         template Product ID with computed ``$/Gal``.  This is how new
+         months get bootstrapped — both ``rest`` and ``topco`` sides
+         use the same rest-derived template per the operator's
+         explicit preference.
+      3. **NMT $/lbs blank**: skip the side entirely for that month —
+         the per-side payload simply lacks that ``(Month, Side)``.
 
-    ``Pricing Category`` is the natural row identifier per the
-    lakehouse ``Resin_Calculator.csv`` schema (e.g. ``"Alb - GAL
-    Conventional - 62 grams"``).  ``Product ID`` / ``Product
-    Description`` / ``Resin`` are NOT present in the calculator file
-    and therefore not in this payload either — they're carried in the
-    canonical column list only as forward-compat placeholders for any
-    legacy tracker rows that already have them.
+    Resin → (Usage, Gal/Ea) lookup uses ``Resin_Calculator.csv`` joined
+    on ``Pricing Category``.  Unresolved Resins are collected into a
+    single end-of-call warning so the operator sees one actionable
+    list rather than one banner per missing row.
 
-    Used by:
+    Returns ``(payload_df, warnings)``:
 
-    * The single Refresh writer (passes the entire payload through
-      :func:`resin_cost_tracker_store.upsert_for_sides` — that one
-      call performs both overwrite-existing and append-new in a
-      single ETag-guarded write).
-    * The in-memory FG builder (merged with the persisted tracker into
-      an "effective tracker" so Refresh-time FG metrics reflect the
-      operator's just-edited NMT before the lakehouse write lands).
+      * ``payload_df`` — strict 6-column DataFrame ready for
+        :func:`_resin_store.upsert_for_sides`.  Empty when the NMT is
+        empty, the calculator is empty, or the persisted tracker has
+        no ``rest`` rows to seed the template.
+      * ``warnings`` — list of operator-actionable strings rendered by
+        the Refresh orchestrator as ``st.warning`` banners.
     """
+    warnings: list[str] = []
+
     if movers_non_milk_df is None or movers_non_milk_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), warnings
     if resin_calculator_df is None or resin_calculator_df.empty:
-        return pd.DataFrame()
+        warnings.append(
+            "Resin_Calculator is empty — Resin_Cost_Tracker rewrite skipped "
+            "because there is no Usage / Gal-Ea lookup available."
+        )
+        return pd.DataFrame(), warnings
 
-    blocks: list[pd.DataFrame] = []
+    template = _extract_template_products(persisted_tracker_df)
+    persisted_index = _index_persisted_by_month_side(persisted_tracker_df)
 
-    # Iterate every NMT row to capture every month the operator has
-    # entered, not just the latest.  The per-side branches are
-    # independent so a row with only Rest filled in still contributes a
-    # Rest block.
+    if not template and not persisted_index:
+        warnings.append(
+            "Resin_Cost_Tracker has no rows yet — add at least one row "
+            "with Side='rest' at any Month to bootstrap the product "
+            "template, then click Refresh again."
+        )
+        return pd.DataFrame(), warnings
+    if not template:
+        # The file has rows but none on the rest side — we can still
+        # recompute existing (Month, Side) pairs but can't fan out
+        # new ones.  Surface the limitation; carry on with recompute.
+        warnings.append(
+            "Resin_Cost_Tracker has no 'rest' rows — new (Month, Side) "
+            "pairs in NMT cannot be bootstrapped.  Add at least one "
+            "rest row at the desired template month to enable fan-out."
+        )
+
+    usage_lookup = _build_resin_usage_lookup(resin_calculator_df)
+    if not usage_lookup:
+        warnings.append(
+            "Resin_Calculator has no usable rows (every row has a "
+            "blank/zero Gal/Ea or no Pricing Category) — "
+            "Resin_Cost_Tracker rewrite skipped."
+        )
+        return pd.DataFrame(), warnings
+
+    out_rows: list[dict] = []
+    unresolved_resins: set[str] = set()
+
     for _, nmt_row in movers_non_milk_df.iterrows():
         month_ts = _parse_month(nmt_row.get(_NMT_COL_MONTH))
         if month_ts is None:
@@ -1691,35 +1906,171 @@ def _build_tracker_rows_for_nmt(
             lbs_value = pd.to_numeric(nmt_row.get(lbs_col), errors="coerce")
             if pd.isna(lbs_value):
                 continue
+            rate = float(lbs_value)
 
-            block = _build_resincalculate(
-                resin_calculator_df, float(lbs_value), scrape_fraction,
-            )
-            block = block.copy()
-            block[_TRACKER_COL_SIDE] = side_label
-            block[_COL_MONTH] = month_ts
-            blocks.append(block)
+            key = (month_ts, side_label)
+            existing = persisted_index.get(key)
+            if existing:
+                # ── Path 1: recompute-only ───────────────────────────
+                out_rows.extend(_recompute_rows(
+                    existing, rate, scrape_fraction,
+                    month_ts, side_label,
+                    usage_lookup, unresolved_resins,
+                ))
+            elif template:
+                # ── Path 2: fan-out from rest-derived template ──────
+                out_rows.extend(_fanout_rows(
+                    template, rate, scrape_fraction,
+                    month_ts, side_label,
+                    usage_lookup, unresolved_resins,
+                ))
+            # else: no template AND no existing rows — caller already
+            # surfaced the "no rest rows" warning; skip silently.
 
-    if not blocks:
-        return pd.DataFrame()
+    if unresolved_resins:
+        warnings.append(
+            "Resin lookup miss in Resin_Calculator for: "
+            f"{sorted(unresolved_resins)!r}.  Affected rows on the "
+            "recompute-only path keep their previously-stored $/Gal; "
+            "fan-out rows are skipped entirely.  Add a matching "
+            "Pricing Category row to Resin_Calculator.csv to "
+            "enable Refresh-driven recompute for those Resins."
+        )
 
-    out = pd.concat(blocks, ignore_index=True)
+    if not out_rows:
+        return pd.DataFrame(), warnings
 
-    # Canonical column ordering: Side first, then natural identity
-    # (Pricing Category — the lakehouse calculator's row identifier),
-    # then any forward-compat legacy identity columns if they happen to
-    # be present, then computed $/Gal, then Month, then auxiliary
-    # calculator columns trailing.  Columns not in the leading list
-    # pass through in their original order so any extra calculator
-    # fields (Grams/ea, Lbs/gram, etc.) survive the round-trip.
-    leading = [
-        _TRACKER_COL_SIDE, _COL_PRICING_CAT,
+    payload = pd.DataFrame(out_rows)
+    # Column projection: the writer's strict canonicaliser drops any
+    # surplus columns, but we project explicitly here too so the
+    # in-memory ``effective tracker`` (built before the write) is also
+    # in canonical 6-column shape and the FG builder sees a clean
+    # frame.
+    canonical_cols = [
         _COL_PRODUCT_ID, _COL_PRODUCT_DESC, _COL_RESIN,
-        _COL_RESIN_GAL, _COL_MONTH,
+        _COL_RESIN_GAL, _COL_MONTH, _TRACKER_COL_SIDE,
     ]
-    leading_present = [c for c in leading if c in out.columns]
-    trailing = [c for c in out.columns if c not in leading_present]
-    return out[leading_present + trailing]
+    for col in canonical_cols:
+        if col not in payload.columns:
+            payload[col] = pd.NA
+    return payload[canonical_cols], warnings
+
+
+def _recompute_rows(
+    existing_rows: list[dict],
+    rate_per_lb: float,
+    scrape_fraction: float,
+    month_ts: pd.Timestamp,
+    side_label: str,
+    usage_lookup: dict[str, tuple[float, float]],
+    unresolved_resins: set[str],
+) -> list[dict]:
+    """Emit per-existing-row recomputes for one ``(Month, Side)`` pair.
+
+    For every existing row at ``(month_ts, side_label)`` in the
+    persisted tracker, recompute its ``$/Gal`` from ``rate_per_lb``
+    and the Resin's looked-up (Usage, Gal/Ea).  When a Resin doesn't
+    resolve in the calculator, the row is emitted with its previously
+    stored ``$/Gal`` (i.e. unchanged) and the Resin is added to
+    ``unresolved_resins`` for a single end-of-call warning.
+
+    The Product ID / Description / Resin trio is preserved verbatim —
+    Refresh never adds or removes rows on this branch.
+    """
+    rows: list[dict] = []
+    for existing in existing_rows:
+        pid    = existing.get(_COL_PRODUCT_ID)
+        desc   = existing.get(_COL_PRODUCT_DESC)
+        resin  = existing.get(_COL_RESIN)
+        prev_g = existing.get(_COL_RESIN_GAL)
+
+        resin_key = "" if (resin is None or (isinstance(resin, float) and pd.isna(resin))) \
+                   else str(resin).strip()
+        if not resin_key:
+            # No Resin key on the existing row — keep the existing
+            # $/Gal verbatim (the row is operator-curated; respect it).
+            rows.append({
+                _COL_PRODUCT_ID: pid, _COL_PRODUCT_DESC: desc,
+                _COL_RESIN:      resin_key,
+                _COL_RESIN_GAL:  prev_g,
+                _COL_MONTH:      month_ts,
+                _TRACKER_COL_SIDE: side_label,
+            })
+            continue
+
+        lookup = usage_lookup.get(resin_key)
+        if lookup is None:
+            unresolved_resins.add(resin_key)
+            # Recompute-only-path lookup miss: keep the existing $/Gal
+            # so we don't silently nuke a hand-tuned value.
+            rows.append({
+                _COL_PRODUCT_ID: pid, _COL_PRODUCT_DESC: desc,
+                _COL_RESIN:      resin_key,
+                _COL_RESIN_GAL:  prev_g,
+                _COL_MONTH:      month_ts,
+                _TRACKER_COL_SIDE: side_label,
+            })
+            continue
+
+        usage, gal_ea = lookup
+        new_gal = _compute_resin_cost_per_gal(
+            rate_per_lb, usage, gal_ea, scrape_fraction,
+        )
+        rows.append({
+            _COL_PRODUCT_ID: pid, _COL_PRODUCT_DESC: desc,
+            _COL_RESIN:      resin_key,
+            _COL_RESIN_GAL:  new_gal if new_gal is not None else prev_g,
+            _COL_MONTH:      month_ts,
+            _TRACKER_COL_SIDE: side_label,
+        })
+    return rows
+
+
+def _fanout_rows(
+    template_products: list[dict],
+    rate_per_lb: float,
+    scrape_fraction: float,
+    month_ts: pd.Timestamp,
+    side_label: str,
+    usage_lookup: dict[str, tuple[float, float]],
+    unresolved_resins: set[str],
+) -> list[dict]:
+    """Emit per-template-product rows for one new ``(Month, Side)`` pair.
+
+    Used when the NMT introduces a ``(Month, Side)`` pair that doesn't
+    yet exist in the persisted tracker.  Template products come from
+    the latest ``rest`` month per the May-2026-late operator contract
+    (the same template seeds both ``rest`` and ``topco`` sides).
+
+    Unresolved Resins are collected for a single end-of-call warning;
+    rows whose Resin can't be looked up are **skipped** here — a
+    brand-new row with a ``NaN`` $/Gal would be misleading.
+    """
+    rows: list[dict] = []
+    for tmpl in template_products:
+        resin_key = tmpl.get("resin", "")
+        if not resin_key:
+            continue
+        lookup = usage_lookup.get(resin_key)
+        if lookup is None:
+            unresolved_resins.add(resin_key)
+            continue
+        usage, gal_ea = lookup
+        new_gal = _compute_resin_cost_per_gal(
+            rate_per_lb, usage, gal_ea, scrape_fraction,
+        )
+        if new_gal is None:
+            unresolved_resins.add(resin_key)
+            continue
+        rows.append({
+            _COL_PRODUCT_ID:   tmpl.get("product_id"),
+            _COL_PRODUCT_DESC: tmpl.get("product_desc"),
+            _COL_RESIN:        resin_key,
+            _COL_RESIN_GAL:    new_gal,
+            _COL_MONTH:        month_ts,
+            _TRACKER_COL_SIDE: side_label,
+        })
+    return rows
 
 
 def _build_effective_resin_cost_tracker(
@@ -2883,11 +3234,17 @@ def _compute_all_outputs(
     scrape_fraction = _latest_scrape_fraction(uploads["scrape_tracker"].df)
 
     # ── 1. Build the per-(Month × Side) Resin_Cost_Tracker payload from
-    #       the editable NMT × Resin_Calculator.  Covers every NMT row
-    #       that carries at least one numeric $/lbs cell.
-    full_payload = _build_tracker_rows_for_nmt(
+    #       the editable NMT × Resin_Calculator × the persisted tracker.
+    #       Covers every NMT row that carries at least one numeric
+    #       $/lbs cell.  ``persisted_tracker`` is the source of the
+    #       "template product set" (latest rest month) and of the
+    #       per-(Month, Side) existing rows used by the recompute-only
+    #       branch — see :func:`_build_tracker_rows_for_nmt`.
+    persisted_tracker = uploads["resin_cost_tracker"].df
+    full_payload, resin_payload_warnings = _build_tracker_rows_for_nmt(
         movers_non_milk_df,
         uploads["resin_calculator"].df,
+        persisted_tracker,
         scrape_fraction,
     )
 
@@ -2895,7 +3252,6 @@ def _compute_all_outputs(
     #       Side) pair present in the payload REPLACED by the payload's
     #       freshly-computed rows.  Sep–Nov 2025 (and any other months
     #       in the file but absent from NMT) pass through untouched.
-    persisted_tracker = uploads["resin_cost_tracker"].df
     effective_tracker = _build_effective_resin_cost_tracker(
         persisted_tracker, full_payload,
     )
@@ -2971,6 +3327,12 @@ def _compute_all_outputs(
         # Rendered as ``st.warning`` banners by the Refresh
         # orchestrator so operators know exactly which row to fill in.
         "resin_fg_warnings":                fg_warnings,
+        # Producer-side warnings from the NMT → Resin_Cost_Tracker
+        # rewrite path (unresolved Resin lookups, empty template
+        # product set, etc.).  Rendered as ``st.warning`` banners
+        # alongside ``resin_fg_warnings`` so the operator sees both
+        # FG-side and payload-side issues in one Refresh response.
+        "resin_payload_warnings":           tuple(resin_payload_warnings),
         "_meta": pd.DataFrame([{
             "scrape_fraction":      scrape_fraction,
             "rest_freight_$/gal":   rest_freight_gal,
@@ -3866,8 +4228,14 @@ def _render_table_and_refresh(
 
     Layout
     ------
-    The editable table sits on the left (~5/6 of the row); a vertical button
-    stack on the right holds two controls (top to bottom):
+    The whole section sits inside an ``st.expander`` so the operator can
+    fold the (visually busy) tracker away once they're done editing.
+    Defaults to ``expanded=True`` so first-load behaviour is identical
+    to the pre-foldable layout.
+
+    Inside the expander, the editable table sits on the left (~5/6 of
+    the row); a vertical button stack on the right holds two controls
+    (top to bottom):
 
       1. **🔄 Refresh** — single-trigger orchestrator that runs the
          impact pipeline AND every dependent OneLake write under that
@@ -3883,70 +4251,78 @@ def _render_table_and_refresh(
       2. **⬇️ Download CSV** — download the current state of the editable
          tracker (including unsaved edits and newly added rows).
     """
-    st.markdown("#### 📝 Movers Non-Milk Tracker — fully editable")
-    st.caption(
-        "Add, remove, or edit rows freely.  The **last row** drives the "
-        "Incremental Revenue vs. Last Month calculations.  Click "
-        "**Refresh** to recompute metrics and update every dependent "
-        "lakehouse file under its own gate."
-    )
-
-    col_table, col_btn = st.columns([5, 1])
-    with col_table:
-        edited = _render_movers_non_milk_editor()
-    with col_btn:
-        st.markdown("<div style='margin-top: 2.2rem'></div>", unsafe_allow_html=True)
-        refresh_clicked = st.button(
-            "🔄 Refresh",
-            type="primary",
-            use_container_width=True,
-            key=f"{_SS_PREFIX}_refresh",
-            help=(
-                "Recompute the Incremental Revenue vs. Last Month metrics "
-                "from the LAST row of this table.  Upserts Resin_Cost_Tracker "
-                "(both Rest + TOPCO sides, every NMT month), regenerates the "
-                "two Resin Mover FGs, rewrites Product_Milk Base Cost, and "
-                "publishes the four Mover Downloads.  Also upserts "
-                "mover_details_table.csv (when a NEW row has been inserted "
-                "into the tracker since the last successful publish) and "
-                "base_milk_cost_monthly_tracker.csv (when the slicer's End "
-                "Month = Start Month + 1 calendar month)."
-            ),
-        )
-        st.download_button(
-            label="⬇️ Download CSV",
-            data=_to_csv_bytes(edited),
-            file_name=f"Movers_Non_Milk_Tracker_{datetime.now():%Y%m%d}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key=f"{_SS_PREFIX}_download_nmt",
-            help="Download the current state of this editable table.",
+    # The expander's label replaces the previous ``#### …`` markdown
+    # heading.  Streamlit renders the label with a slightly smaller
+    # font than ``####`` would have, but the visual hierarchy still
+    # reads correctly inside the surrounding "Monthly Movers" block.
+    with st.expander(
+        "📝 Movers Non-Milk Tracker — fully editable",
+        expanded=True,
+    ):
+        st.caption(
+            "Add, remove, or edit rows freely.  The **last row** drives the "
+            "Incremental Revenue vs. Last Month calculations.  Click "
+            "**Refresh** to recompute metrics and update every dependent "
+            "lakehouse file under its own gate."
         )
 
-    if refresh_clicked:
-        # Drop the resin-store read cache before re-injecting.  The
-        # underlying ``@st.cache_data`` decorator otherwise pins a
-        # potentially-stale "absent" answer for up to 5 minutes — which
-        # surfaces as a misleading "resin_calculator is not available"
-        # banner when the operator has just dropped fresh files into
-        # OneLake.  This is cheap (one HTTPS round-trip per blob) and
-        # only fires on an explicit Refresh click, never on every
-        # rerun.
-        try:
-            _resin_store.invalidate_read_cache()
-        except Exception:  # noqa: BLE001 — non-fatal cache invalidation
-            pass
-        _inject_resin_inputs_from_store(uploads)
+        col_table, col_btn = st.columns([5, 1])
+        with col_table:
+            edited = _render_movers_non_milk_editor()
+        with col_btn:
+            st.markdown("<div style='margin-top: 2.2rem'></div>", unsafe_allow_html=True)
+            refresh_clicked = st.button(
+                "🔄 Refresh",
+                type="primary",
+                use_container_width=True,
+                key=f"{_SS_PREFIX}_refresh",
+                help=(
+                    "Recompute the Incremental Revenue vs. Last Month metrics "
+                    "from the LAST row of this table.  Upserts Resin_Cost_Tracker "
+                    "(both Rest + TOPCO sides, every NMT month), regenerates the "
+                    "two Resin Mover FGs, rewrites Product_Milk Base Cost, and "
+                    "publishes the four Mover Downloads.  Also upserts "
+                    "mover_details_table.csv (when a NEW row has been inserted "
+                    "into the tracker since the last successful publish) and "
+                    "base_milk_cost_monthly_tracker.csv (when the slicer's End "
+                    "Month = Start Month + 1 calendar month)."
+                ),
+            )
+            st.download_button(
+                label="⬇️ Download CSV",
+                data=_to_csv_bytes(edited),
+                file_name=f"Movers_Non_Milk_Tracker_{datetime.now():%Y%m%d}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=f"{_SS_PREFIX}_download_nmt",
+                help="Download the current state of this editable table.",
+            )
 
-        with st.spinner("Running Incremental Revenue calculations..."):
-            outputs = _compute_all_outputs(uploads, edited, current_month)
-        if outputs is not None:
-            st.session_state[f"{_SS_PREFIX}_outputs"] = outputs
-            # The single Refresh orchestrator runs every dependent
-            # OneLake write under its own gate.  Failures surface as
-            # small captions inside the helpers — they never raise.
-            _run_refresh_lakehouse_writes(outputs, uploads, edited)
-            st.success("✅ Calculations complete. Results below.")
+        if refresh_clicked:
+            # Drop the resin-store read cache before re-injecting.  The
+            # underlying ``@st.cache_data`` decorator otherwise pins a
+            # potentially-stale "absent" answer for up to 5 minutes —
+            # which surfaces as a misleading "resin_calculator is not
+            # available" banner when the operator has just dropped
+            # fresh files into OneLake.  This is cheap (one HTTPS
+            # round-trip per blob) and only fires on an explicit
+            # Refresh click, never on every rerun.
+            try:
+                _resin_store.invalidate_read_cache()
+            except Exception:  # noqa: BLE001 — non-fatal cache invalidation
+                pass
+            _inject_resin_inputs_from_store(uploads)
+
+            with st.spinner("Running Incremental Revenue calculations..."):
+                outputs = _compute_all_outputs(uploads, edited, current_month)
+            if outputs is not None:
+                st.session_state[f"{_SS_PREFIX}_outputs"] = outputs
+                # The single Refresh orchestrator runs every dependent
+                # OneLake write under its own gate.  Failures surface
+                # as small captions inside the helpers — they never
+                # raise.
+                _run_refresh_lakehouse_writes(outputs, uploads, edited)
+                st.success("✅ Calculations complete. Results below.")
 
 
 def _is_calendar_month_plus_one(
@@ -4429,11 +4805,15 @@ def _run_refresh_lakehouse_writes(
     if editing_month is None:
         return
 
-    # ── FG warnings ─────────────────────────────────────────────────────────
-    # Render BEFORE any write so operators see the actionable banner
+    # ── FG + payload warnings ───────────────────────────────────────────────
+    # Render BEFORE any write so operators see the actionable banners
     # alongside the success caption.  Each side's missing Old-month
-    # warning is independent, so render them all.
+    # warning is independent of the producer's unresolved-Resin
+    # warning; both render here so a single Refresh response carries
+    # every actionable issue.
     for warning in outputs.get("resin_fg_warnings", ()):  # type: ignore[arg-type]
+        st.warning(f"⚠️ {warning}")
+    for warning in outputs.get("resin_payload_warnings", ()):  # type: ignore[arg-type]
         st.warning(f"⚠️ {warning}")
 
     rest_fg = outputs.get("rest_htst_resin_mover_fg", pd.DataFrame())

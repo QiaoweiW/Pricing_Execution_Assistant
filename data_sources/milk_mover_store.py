@@ -337,19 +337,35 @@ def esl_class_ii_rates_by_month() -> dict[pd.Timestamp, tuple[Optional[float], O
     return out
 
 
-def cottage_cheese_months_with_null_skim() -> list[pd.Timestamp]:
-    """Return Cottage Cheese months whose Skim Rate is null in the store.
+# Set of casefolded Category labels that the historical-repair helpers
+# treat as the "Culture" category.  The May-2026-late lakehouse rename
+# replaced ``"Cottage Cheese"`` with ``"Culture"``; the legacy label is
+# retained as an accepted synonym so any rows written before the rename
+# still get repaired by these helpers.
+_CULTURE_CATEGORY_LABELS: frozenset[str] = frozenset({"culture", "cottage cheese"})
 
-    The May-2026 Cottage Cheese contract requires CC Skim Rate to equal
-    ESL Class II Skim for the same month. Rows written before that
-    contract carry ``null`` Skim — this helper enumerates them so a
-    one-shot repair pass can patch each row by copying the ESL II value.
+
+def cottage_cheese_months_with_null_skim() -> list[pd.Timestamp]:
+    """Return Culture months whose Skim Rate is null in the store.
+
+    The May-2026 Culture contract (formerly "Cottage Cheese") requires
+    Culture Skim Rate to equal ESL Class II Skim for the same month.
+    Rows written before that contract carry ``null`` Skim — this helper
+    enumerates them so a one-shot repair pass can patch each row by
+    copying the ESL II value.
+
+    The Python function name is kept as ``cottage_cheese_months_with_null_skim``
+    on purpose: every cross-module import site would otherwise need to
+    migrate in the same commit, and the function-name churn brings no
+    operator-visible benefit.  Internal logic accepts BOTH the canonical
+    ``"Culture"`` label and the legacy ``"Cottage Cheese"`` label via
+    :data:`_CULTURE_CATEGORY_LABELS`.
     """
     out: list[pd.Timestamp] = []
     seen: set[pd.Timestamp] = set()
     for r in _read_rows_cached():
         cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
-        if cat != "cottage cheese":
+        if cat not in _CULTURE_CATEGORY_LABELS:
             continue
         skim = r.get(COL_SKIM)
         if skim is not None and not pd.isna(skim):
@@ -371,15 +387,20 @@ def cottage_cheese_months_with_null_skim() -> list[pd.Timestamp]:
 def patch_cottage_cheese_rates(
     patches: dict[pd.Timestamp, tuple[Optional[float], Optional[float]]],
 ) -> int:
-    """Overwrite Skim/Butterfat on existing Cottage Cheese rows in-place.
+    """Overwrite Skim/Butterfat on existing Culture rows in-place.
 
     ``patches`` is ``{first-of-month → (skim, bfat)}``. For each matched
-    Cottage Cheese row whose ``Month`` equals a key in ``patches``, the
-    Skim and Butterfat values are replaced (Protein / Other Solids are
-    left untouched). Returns the number of rows actually modified.
+    Culture row whose ``Month`` equals a key in ``patches``, the Skim and
+    Butterfat values are replaced (Protein / Other Solids are left
+    untouched).  Returns the number of rows actually modified.
 
     Idempotent: a no-op when the existing cell already equals the
     incoming value. Safe to re-run after a partial network failure.
+
+    The Python function name is kept as ``patch_cottage_cheese_rates``
+    on purpose (same rationale as :func:`cottage_cheese_months_with_null_skim`).
+    Internal logic accepts both ``"Culture"`` and the legacy
+    ``"Cottage Cheese"`` label via :data:`_CULTURE_CATEGORY_LABELS`.
     """
     if not patches:
         return 0
@@ -397,7 +418,7 @@ def patch_cottage_cheese_rates(
         rows_now = list(current) if current else []
         for r in rows_now:
             cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
-            if cat != "cottage cheese":
+            if cat not in _CULTURE_CATEGORY_LABELS:
                 continue
             month_key = r.get(COL_MONTH)
             if not isinstance(month_key, str) or month_key not in keyed:
@@ -431,15 +452,27 @@ def patch_cottage_cheese_rates(
 def months_missing_category(category: str) -> list[pd.Timestamp]:
     """Return every distinct ``Month`` that lacks a row for ``category``.
 
-    Used by the one-shot Cottage Cheese backfill so the auto-update
-    orchestrator can decide cheaply (in-memory, no HTTPS round-trip)
-    whether any historical months still need to be filled in. Returns
-    an empty list once every month already has a row for ``category``.
+    Used by the one-shot Culture (formerly "Cottage Cheese") backfill so
+    the auto-update orchestrator can decide cheaply (in-memory, no HTTPS
+    round-trip) whether any historical months still need to be filled in.
+    Returns an empty list once every month already has a row for
+    ``category``.
 
     Comparison is case-insensitive and whitespace-tolerant so a stray
     ``"COTTAGE CHEESE "`` row still counts as present.
+
+    Synonym handling: when ``category`` is in the Culture family
+    (``"Culture"`` or its legacy alias ``"Cottage Cheese"``), every row
+    whose Category falls anywhere in :data:`_CULTURE_CATEGORY_LABELS`
+    counts as a present row.  This prevents the orchestrator from
+    re-backfilling Culture rows for months that still carry the legacy
+    label — a common mid-migration scenario.
     """
     target = category.strip().casefold()
+    accepted_labels: set[str] = {target}
+    if target in _CULTURE_CATEGORY_LABELS:
+        accepted_labels = set(_CULTURE_CATEGORY_LABELS)
+
     months_present: set[str] = set()
     months_with_category: set[str] = set()
     for r in _read_rows_cached():
@@ -448,7 +481,7 @@ def months_missing_category(category: str) -> list[pd.Timestamp]:
             continue
         months_present.add(month)
         row_cat = str(r.get(COL_CATEGORY, "")).strip().casefold()
-        if row_cat == target:
+        if row_cat in accepted_labels:
             months_with_category.add(month)
 
     missing = months_present - months_with_category

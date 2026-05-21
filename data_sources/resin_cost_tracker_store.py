@@ -14,20 +14,37 @@ Storage layout
 ``Files/Resin_freight_cost_tracker/Resin_Calculator.csv``      — calculator inputs.
 ``Files/Resin_freight_cost_tracker/Resin_Cost_Tracker.csv``    — per-month baseline.
 
-Schema (cost tracker, May-2026 contract)
-----------------------------------------
-The tracker now carries a leading **"Rest Market vs TOPCO"** dimension
-so each month materialises **two** rows per Product ID — one for the
-Rest-of-Market HTST resin cost, one for the TOPCO HTST resin cost::
+Schema (cost tracker, May-2026-late contract — strict 6-column)
+----------------------------------------------------------------
+Every write produces **exactly** these 6 columns in this exact order::
 
-    Rest Market vs TOPCO | Product ID | Product Description | Resin |
-    Resin Cost ($/Gal)   | Month      | Pricing Category    | ...
+    Product ID | Product Description | Resin | Resin Cost ($/Gal) |
+    Month      | Rest vs TOPCO
 
-The Side ("Rest" / "TOPCO") is the leftmost column by spec and is
-treated as part of the composite write key ``(Month, Side)``.  Legacy
-rows that pre-date this column are preserved verbatim on read and
-write — they simply lack a Side value and are invisible to the
-side-keyed Refresh rewrite.
+The Side dimension lives in the trailing column ``"Rest vs TOPCO"``
+(per the operator's lakehouse layout — note the absence of the word
+"Market" from the previous schema) and its values are lowercase
+``"rest"`` / ``"topco"``.  ``(Month, Side)`` is the composite write
+key; for every pair in the payload, the prior persisted rows for that
+pair are dropped and the new ones inserted.  Persisted rows whose
+``(Month, Side)`` is NOT in a given payload are PRESERVED verbatim
+so months in the file but absent from the NMT (e.g. Sep–Nov 2025) stay
+as-is.
+
+On read, the store is tolerant of two historical legacy artefacts:
+
+* The column header ``"Rest Market vs TOPCO"`` (pre-May-2026-late) is
+  renamed to ``"Rest vs TOPCO"`` automatically so downstream code only
+  sees the canonical name.
+* Side cell values in any casing (``"Rest"``, ``"rest"``, ``"REST"``,
+  ``"TOPCO"``, ``"Topco"``, etc.) are coerced to the canonical
+  lowercase form on write via :func:`normalise_side`.
+
+On write, the store strictly **projects** the output to the canonical
+6 columns — any legacy trailing columns surviving from prior writes
+(``Pricing Category``, ``Usage (Lbs/Ea)``, ``Gal/Ea``, ``Grams/ea``,
+``Lbs/gram``, the dead duplicate ``Rest Market vs TOPCO``, etc.) are
+dropped, so a single Refresh cleans the entire file to spec.
 
 Public API
 ----------
@@ -114,59 +131,67 @@ COST_TRACKER_BLOB_PATH: str = f"{_FOLDER_PREFIX}/Resin_Cost_Tracker.csv"
 # Canonical column names — kept in lock-step with the consumer
 # ``pages/monthly_resin_freight_mover_tracker.py`` so renames need to be
 # done in exactly one place when the upstream schema evolves.
-COL_REST_VS_TOPCO: str = "Rest Market vs TOPCO"
-COL_PRODUCT_ID:   str = "Product ID"
-COL_PRODUCT_DESC: str = "Product Description"
-COL_RESIN:        str = "Resin"
-COL_RESIN_GAL:    str = "Resin Cost ($/Gal)"
-COL_MONTH:        str = "Month"
+#
+# May-2026-late: the Side column was renamed from "Rest Market vs TOPCO"
+# (the original schema we wrote when the dimension was first introduced)
+# to "Rest vs TOPCO" (the operator's preferred header in the actual
+# lakehouse file).  ``LEGACY_COL_REST_VS_TOPCO`` retains the old name
+# so :func:`_canonicalise_legacy_columns` can rename it on read.
+COL_REST_VS_TOPCO:        str = "Rest vs TOPCO"
+LEGACY_COL_REST_VS_TOPCO: str = "Rest Market vs TOPCO"
+COL_PRODUCT_ID:           str = "Product ID"
+COL_PRODUCT_DESC:         str = "Product Description"
+COL_RESIN:                str = "Resin"
+COL_RESIN_GAL:            str = "Resin Cost ($/Gal)"
+COL_MONTH:                str = "Month"
+
+# Names retained purely so historical imports keep resolving — they're
+# not part of the strict 6-column tracker schema any more.  The
+# ``Resin_Calculator.csv`` file is queried for these columns by the
+# page when computing per-row Usage / Gal-Ea, but the tracker file
+# itself does NOT carry them post-May-2026-late.
 COL_PRICING_CAT:  str = "Pricing Category"
 COL_USAGE_LBS:    str = "Usage (Lbs/Ea)"
 COL_GAL_EA:       str = "Gal/Ea"
 
-# Canonical Side values for the "Rest Market vs TOPCO" dimension.
-SIDE_REST:  str = "Rest"
-SIDE_TOPCO: str = "TOPCO"
+# Canonical Side values for the "Rest vs TOPCO" dimension.
+# Lowercase per the operator's lakehouse layout.
+SIDE_REST:  str = "rest"
+SIDE_TOPCO: str = "topco"
 
-# Canonical column ordering for newly-written rows.
-#
-# The May-2026-late lakehouse schema for ``Resin_Calculator.csv`` uses
-# ``Pricing Category`` as the natural row identifier — e.g.
-# ``"Alb - GAL Conventional - 62 grams"``.  ``Product ID`` /
-# ``Product Description`` / ``Resin`` are NOT present in the calculator
-# file and therefore not produced by the NMT-driven payload builder
-# either; they remain in the constants list purely as forward-compat
-# placeholders so any legacy tracker rows that DO carry them survive
-# rewrites untouched (`upsert_for_sides` preserves trailing columns
-# verbatim).
-#
-# Schema order: Side dimension first, then identity, then computed cost,
-# then month, then calculator-derived inputs.  Optional/legacy columns
-# (Product ID / Description / Resin) sit between identity and cost so
-# downstream readers that DO carry them keep their existing positions.
+# Strict canonical column ordering for every newly-written tracker row.
+# Exactly 6 columns, in this exact order — the writer projects to this
+# tuple on every commit, dropping any legacy trailing columns surviving
+# from prior writes (``Pricing Category``, ``Usage (Lbs/Ea)``, ``Gal/Ea``,
+# ``Grams/ea``, ``Lbs/gram``, the dead duplicate ``Rest Market vs TOPCO``,
+# etc.).
 _CANONICAL_COLUMN_ORDER: tuple[str, ...] = (
-    COL_REST_VS_TOPCO,
-    COL_PRICING_CAT,
     COL_PRODUCT_ID,
     COL_PRODUCT_DESC,
     COL_RESIN,
     COL_RESIN_GAL,
     COL_MONTH,
-    COL_USAGE_LBS,
-    COL_GAL_EA,
+    COL_REST_VS_TOPCO,
 )
 
-# The minimum column set we expect on every payload row.  Pricing
-# Category is the natural row identifier in the lakehouse calculator
-# file, NOT Product ID — historical schema assumptions about a Product
-# ID column were wrong (the file has no such column).  Anything else
-# present in a payload is preserved verbatim through writes.
+# The minimum column set we expect on every payload row.
 #
-# ``COL_REST_VS_TOPCO`` is INTENTIONALLY NOT in this set — legacy rows
-# that pre-date the new dimension are tolerated on read and pass through
-# write cycles untouched.  ``upsert_for_sides`` validates it separately
-# for *new* payloads (which must always carry a Side).
-_TRACKER_REQUIRED: tuple[str, ...] = (COL_PRICING_CAT, COL_RESIN_GAL, COL_MONTH)
+# ``Product ID`` is the row identifier in the operator-curated tracker.
+# ``Resin`` is the secondary lookup key that the page joins against the
+# calculator file's ``Pricing Category`` to derive Usage / Gal-Ea.
+# ``Resin Cost ($/Gal)`` is the computed output, and ``Month`` is the
+# composite key half.  Side is validated separately (see below).
+#
+# ``COL_REST_VS_TOPCO`` is INTENTIONALLY NOT in this set — payload-side
+# validation enforces it independently in
+# :func:`_validate_and_canonicalise_payload`, raising a more actionable
+# error message when a row drifts in without a Side value.
+_TRACKER_REQUIRED: tuple[str, ...] = (
+    COL_PRODUCT_ID,
+    COL_RESIN,
+    COL_RESIN_GAL,
+    COL_MONTH,
+)
 
 # Calculator columns are looser — every consumer references the columns it
 # needs by literal string and tolerates extras, so we don't enforce a strict
@@ -296,10 +321,50 @@ def _stringify_month(ts: pd.Timestamp) -> str:
     return f"{ts.month}/{ts.day}/{ts.year}"
 
 
+def _canonicalise_legacy_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Coalesce the legacy ``Rest Market vs TOPCO`` header to ``Rest vs TOPCO``.
+
+    Renames the column in place (on a copy).  When BOTH headers exist
+    in the same file (the worst-case legacy artefact we've seen — a
+    duplicate column from a prior bad write), the values from the new
+    canonical column win; legacy values are only used to fill rows
+    where the new column is null.
+
+    Pure on a DataFrame copy — never mutates the input.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    has_legacy = LEGACY_COL_REST_VS_TOPCO in out.columns
+    has_new    = COL_REST_VS_TOPCO        in out.columns
+    if not has_legacy:
+        return out
+    if not has_new:
+        out = out.rename(columns={LEGACY_COL_REST_VS_TOPCO: COL_REST_VS_TOPCO})
+        return out
+    # Both columns present — fill nulls in the new column from the legacy
+    # column, then drop the legacy column.
+    legacy_series = out[LEGACY_COL_REST_VS_TOPCO]
+    new_series    = out[COL_REST_VS_TOPCO]
+    coalesced = new_series.where(
+        new_series.notna() & (new_series.astype(str).str.strip() != ""),
+        legacy_series,
+    )
+    out[COL_REST_VS_TOPCO] = coalesced
+    out = out.drop(columns=[LEGACY_COL_REST_VS_TOPCO])
+    return out
+
+
 def _strip_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy of ``df`` with header whitespace stripped."""
+    """Return a copy of ``df`` with header whitespace stripped + legacy renamed.
+
+    Single read-side normalisation pass so every downstream helper sees
+    the canonical column names, including the May-2026-late
+    ``Rest Market vs TOPCO`` → ``Rest vs TOPCO`` rename.
+    """
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
+    out = _canonicalise_legacy_columns(out)
     return out
 
 
@@ -308,6 +373,11 @@ def normalise_side(value) -> Optional[str]:
 
     Returns ``None`` for missing / unrecognised values — those rows fall
     outside the new key space and are preserved as-is on rewrite.
+
+    Accepts any casing on input (``"Rest"`` / ``"rest"`` / ``"REST"`` /
+    ``"Topco"`` / ``"TOPCO"`` / ``"topco"`` etc.) and always emits the
+    canonical lowercase form via the module-level :data:`SIDE_REST` /
+    :data:`SIDE_TOPCO` constants.
 
     Public so consumers (e.g. ``pages/monthly_resin_freight_mover_tracker``)
     can normalise Side cells without reaching into private symbols.
@@ -331,15 +401,21 @@ def normalise_side(value) -> Optional[str]:
 _normalise_side = normalise_side
 
 
-def _reorder_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
-    """Reorder columns so the canonical set comes first, extras trailing.
+def _project_to_canonical_strict(df: pd.DataFrame) -> pd.DataFrame:
+    """Project ``df`` to the strict 6-column canonical schema.
 
-    Missing canonical columns are skipped (not added) so this is a pure
-    reorder.  Used only on writes — reads preserve the source ordering.
+    Every column NOT in :data:`_CANONICAL_COLUMN_ORDER` is **dropped**;
+    missing canonical columns are added as empty (NaN) so the output
+    always has exactly the canonical column set in the canonical order.
+    This is the May-2026-late "clean rewrite" behaviour: a single
+    Refresh purges every legacy trailing column from the lakehouse
+    file in one shot.
     """
-    present = [c for c in _CANONICAL_COLUMN_ORDER if c in df.columns]
-    trailing = [c for c in df.columns if c not in present]
-    return df[present + trailing]
+    out = df.copy() if df is not None else pd.DataFrame()
+    for col in _CANONICAL_COLUMN_ORDER:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out[list(_CANONICAL_COLUMN_ORDER)]
 
 
 # ── Public API: reads ────────────────────────────────────────────────────────
@@ -426,20 +502,24 @@ def has_month(target_month) -> bool:
 
 
 def _validate_and_canonicalise_payload(rows: pd.DataFrame) -> pd.DataFrame:
-    """Validate ``rows`` and return a canonicalised copy ready for write.
+    """Validate ``rows`` and return a strictly-canonicalised copy ready for write.
 
     Enforces:
-      * Required columns present.
+      * Required columns present (``Product ID``, ``Resin``,
+        ``Resin Cost ($/Gal)``, ``Month``).
       * ``Month`` parseable to first-of-month for every row.
-      * ``Rest Market vs TOPCO`` parseable to ``SIDE_REST`` / ``SIDE_TOPCO``
+      * ``Rest vs TOPCO`` parseable to ``SIDE_REST`` / ``SIDE_TOPCO``
         for every row (no NaN sides allowed in *new* writes — legacy
         sideless rows can only enter the file via the bootstrap seed).
 
     Side-effects:
       * ``Month`` is restamped to canonical ``M/D/YYYY`` string form.
-      * ``Rest Market vs TOPCO`` is restamped to the exact canonical
-        ``"Rest"`` / ``"TOPCO"`` casing.
-      * Column ordering is normalised via :func:`_reorder_to_canonical`.
+      * ``Rest vs TOPCO`` is restamped to the exact canonical
+        lowercase ``"rest"`` / ``"topco"`` casing.
+      * Output is strictly projected to the 6-column canonical schema
+        via :func:`_project_to_canonical_strict` — any extra columns
+        (legacy ``Pricing Category``, ``Usage (Lbs/Ea)``, ``Gal/Ea``,
+        etc.) are dropped.
     """
     if rows is None or rows.empty:
         return pd.DataFrame(columns=list(_CANONICAL_COLUMN_ORDER))
@@ -455,8 +535,8 @@ def _validate_and_canonicalise_payload(rows: pd.DataFrame) -> pd.DataFrame:
     if COL_REST_VS_TOPCO not in df.columns:
         raise ResinCostTrackerStoreError(
             f"Payload is missing the {COL_REST_VS_TOPCO!r} column — every "
-            "new tracker row must carry a Rest/TOPCO side per the May-2026 "
-            "schema."
+            "new tracker row must carry a rest/topco side per the "
+            "May-2026-late schema."
         )
 
     sides = df[COL_REST_VS_TOPCO].apply(_normalise_side)
@@ -476,7 +556,7 @@ def _validate_and_canonicalise_payload(rows: pd.DataFrame) -> pd.DataFrame:
         )
     df[COL_MONTH] = months.apply(_stringify_month)
 
-    return _reorder_to_canonical(df)
+    return _project_to_canonical_strict(df)
 
 
 def _payload_key_pairs(payload: pd.DataFrame) -> set[tuple[pd.Timestamp, str]]:
@@ -533,8 +613,7 @@ def upsert_for_sides(
 
     Sole writer.  Performs both "overwrite existing months" and
     "append new months" in a single call — exactly what the
-    operator-facing Refresh contract demands now that the Confirm
-    button has been retired::
+    operator-facing Refresh contract demands::
 
         "user clicks Refresh → calculate Resin Cost ($/Gal) for both
          sides over every NMT month → either overwrite or append into
@@ -546,7 +625,9 @@ def upsert_for_sides(
          :func:`_validate_and_canonicalise_payload`.
       2. Compute the set of ``(Month, Side)`` keys covered by the payload.
       3. Drop every persisted row whose key is in that set.
-      4. Concat the payload onto the survivors and write back.
+      4. Concat the payload onto the survivors.
+      5. Strictly project to the 6-column canonical schema (drops every
+         legacy trailing column).
 
     Persisted rows whose ``(Month, Side)`` key is NOT in ``rows`` are
     PRESERVED verbatim — this is how the spec's "Sep–Nov 2025 stay
@@ -581,16 +662,21 @@ def upsert_for_sides(
             else _strip_columns(current)
         )
 
-        # Even a brand-new tracker should land in canonical column order
-        # so downstream readers can rely on the leading Side column.
+        # Even a brand-new tracker lands in the strict 6-column canonical
+        # schema so the file is always spec-clean from the first write.
         if existing.empty:
             rows_replaced_total = 0
-            return _reorder_to_canonical(payload)
+            return _project_to_canonical_strict(payload)
 
         survivors, dropped = _drop_rows_for_key_pairs(existing, key_pairs)
         rows_replaced_total = dropped
         out = pd.concat([survivors, payload], ignore_index=True)
-        return _reorder_to_canonical(out)
+        # Strict projection on the FINAL write — every legacy trailing
+        # column that survived from prior bad writes (``Pricing Category``,
+        # ``Usage (Lbs/Ea)``, ``Gal/Ea``, ``Grams/ea``, ``Lbs/gram``, the
+        # duplicate ``Rest Market vs TOPCO`` etc.) is dropped here so a
+        # single Refresh cleans the lakehouse file to spec.
+        return _project_to_canonical_strict(out)
 
     try:
         _io.update_csv(

@@ -125,10 +125,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CHECK_TTL = timedelta(hours=1)
 
 
-# Canonical Cottage Cheese category label.  Centralised so any future
-# rename only touches one place; downstream UI / chart code matches
-# case-insensitively but writes use this canonical spelling.
-_CATEGORY_COTTAGE_CHEESE: str = "Cottage Cheese"
+# Canonical "Culture" (formerly "Cottage Cheese") category label.
+# Centralised so any future rename only touches one place; downstream
+# UI / chart code matches case-insensitively but writes use this
+# canonical spelling.  May-2026-late operator update: the milk usage
+# stable file and ``fmmo_tracker.json`` both adopted the shorter
+# "Culture" label and we now follow.  The Python identifier
+# (``_CATEGORY_COTTAGE_CHEESE``) is INTENTIONALLY left unchanged
+# because every cross-module reference would otherwise need to
+# migrate in the same commit — keeping the symbol stable preserves
+# git-blame and all import sites.
+_CATEGORY_COTTAGE_CHEESE: str = "Culture"
 
 
 # ── Result type ──────────────────────────────────────────────────────────────
@@ -191,11 +198,11 @@ class AutoUpdateResult:
             parts.append(f"appended {self.rows_inserted} row(s) for {tm}")
         if self.backfill_inserted:
             parts.append(
-                f"backfilled {self.backfill_inserted} Cottage Cheese row(s)"
+                f"backfilled {self.backfill_inserted} Culture row(s)"
             )
         if self.cc_rows_repaired:
             parts.append(
-                f"repaired {self.cc_rows_repaired} Cottage Cheese skim/bfat row(s)"
+                f"repaired {self.cc_rows_repaired} Culture skim/bfat row(s)"
             )
 
         # Class II Bfat lag is now a SOFT warning — the new-month row
@@ -585,7 +592,7 @@ def maybe_update_from_pdfs(
     except store.MilkMoverStoreError as exc:
         # Treat as no backfill needed — the main ingest below will
         # surface any persistent storage problem.
-        logger.warning("Cottage Cheese backfill probe failed: %s", exc)
+        logger.warning("Culture backfill probe failed: %s", exc)
         missing_cc_months = []
     backfill_needed = bool(missing_cc_months)
 
@@ -596,7 +603,7 @@ def maybe_update_from_pdfs(
     try:
         cc_skim_repair_months = store.cottage_cheese_months_with_null_skim()
     except store.MilkMoverStoreError as exc:
-        logger.warning("Cottage Cheese skim-repair probe failed: %s", exc)
+        logger.warning("Culture skim-repair probe failed: %s", exc)
         cc_skim_repair_months = []
     repair_needed = bool(cc_skim_repair_months)
 
@@ -625,7 +632,7 @@ def maybe_update_from_pdfs(
                 result.cc_rows_repaired = store.patch_cottage_cheese_rates(patches)
         except store.MilkMoverStoreError as exc:
             # Non-fatal — surface and continue with the rest of the pipeline.
-            result.errors.append(f"Cottage Cheese skim/bfat repair failed: {exc}")
+            result.errors.append(f"Culture skim/bfat repair failed: {exc}")
 
     # ── 1. TTL guard ────────────────────────────────────────────────────────
     #
@@ -860,7 +867,7 @@ def maybe_update_from_pdfs(
                 except Exception as exc:
                     # Surface but never raise — partial success is acceptable.
                     result.errors.append(
-                        f"Cottage Cheese backfill failed: {exc}"
+                        f"Culture backfill failed: {exc}"
                     )
 
     return result

@@ -18,11 +18,11 @@ Co-located with ``fmmo_tracker.json`` and
 place a user can open in OneLake explorer.
 
 ``Protein Usage`` and ``Other Solids Usage`` were introduced for the
-Cottage Cheese category (May-2026). HTST/ESL items carry ``0`` for both
-so the additive cost formula in
+Culture category (formerly "Cottage Cheese", renamed May-2026-late).
+HTST/ESL items carry ``0`` for both so the additive cost formula in
 ``_build_milk_usage_with_movers`` collapses back to the legacy
-Skim+Butterfat behaviour for non-Cottage-Cheese items — the new schema
-is fully backward-compatible for cost arithmetic.
+Skim+Butterfat behaviour for non-Culture items — the new schema is
+fully backward-compatible for cost arithmetic.
 
 Why CSV and not JSON?
     * The file is 35 KB / ~685 rows — CSV stays human-readable in
@@ -91,8 +91,9 @@ _READ_CACHE_TTL_SECONDS: int = 300
 # ``_build_milk_usage_with_movers`` references each name by literal
 # string, so a silent column-drift bug is much worse than a loud
 # "missing column" error at read time. ``Protein Usage`` and
-# ``Other Solids Usage`` were added in May-2026 for the Cottage Cheese
-# category; legacy HTST/ESL items must carry ``0`` for both to preserve
+# ``Other Solids Usage`` were added in May-2026 for the Culture
+# category (formerly "Cottage Cheese", renamed May-2026-late);
+# legacy HTST/ESL items must carry ``0`` for both to preserve
 # their existing cost.
 _REQUIRED_COLUMNS: tuple[str, ...] = (
     "Item",
@@ -165,7 +166,7 @@ def _validate_columns(df: pd.DataFrame) -> None:
             f"Got columns: {list(df.columns)!r}. "
             "Re-upload the file with the canonical schema "
             "(HTST/ESL rows must use 0 for Protein Usage and "
-            "Other Solids Usage; Cottage Cheese rows carry the real "
+            "Other Solids Usage; Culture rows carry the real "
             "per-item usage values)."
         )
 

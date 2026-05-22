@@ -148,9 +148,16 @@ CASCADING_FILTERS: tuple[str, ...] = (
 # a New Price will always have matching Start / End dates, and a row
 # with no VBCS match will have all three blank.
 
-VBCS_COL_ITEM:        str = "item_name"
-VBCS_COL_UOM:         str = "pricinguom"
-VBCS_COL_SHIP_TO:     str = "Shiptoname"
+VBCS_COL_ITEM:        str = "Item_Name"
+VBCS_COL_UOM:         str = "Pricinguom"
+# IMPORTANT: VBCS files use "Shiptositename" (matches Oracle's VBCS upload
+# spec), NOT "Shiptoname".  The case-insensitive match in build_vbcs_lookup
+# tolerates capitalisation drift but NOT a missing 'site' syllable — a
+# stale "Shiptoname" constant here would silently reject every published
+# VBCS file (col_map[ship_to] = None → file skipped → New Price always
+# blank).  Verified against the writers in processing/{Fixed,KS,Variable,
+# Combine}_Pricing_VBCS.py — every one emits 'Shiptositename'.
+VBCS_COL_SHIP_TO:     str = "Shiptositename"
 VBCS_COL_AMOUNT:      str = "Adjustmentamount"
 VBCS_COL_START_DATE:  str = "Adjustmentstartdate"
 VBCS_COL_END_DATE:    str = "Adjustmentenddate"

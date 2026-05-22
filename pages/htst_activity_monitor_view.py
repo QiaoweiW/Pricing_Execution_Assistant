@@ -1012,13 +1012,39 @@ def _render_shipment_source() -> _ShipmentSourceResult:
         key="htst_shipment_refresh",
         help="Bypass the 15-minute cache and re-read the latest lakehouse snapshot.",
     )
-    try:
-        with st.spinner("Reading HTST Shipment Report from the Pricing Lakehouse…"):
+    # Why st.status (and not st.spinner)
+    # ----------------------------------
+    # The cold-path lakehouse pull is genuinely slow — auth (~1 s) + Delta
+    # scan over the network (often 30-300 s depending on table size and
+    # corporate-proxy latency) + dtype optimisation (~1 s).  A bare
+    # st.spinner shows ONE static message for that entire window, which
+    # makes the page look hung the first time an operator hits it.
+    # st.status auto-collapses on completion and supports stage labels
+    # so we get progress visibility without persistent UI noise — and a
+    # cache hit is fast enough (~ms) that the status panel barely
+    # flashes before collapsing.
+    with st.status(
+        "Reading HTST Shipment Report from the Pricing Lakehouse…",
+        expanded=False,
+    ) as status:
+        try:
+            status.update(label="Authenticating with Microsoft Fabric…")
             df, meta = fetch_htst_shipment_df(force_refresh=refresh_clicked)
-    except HTSTShipmentSourceError as exc:
-        # Don't surface an error banner here — render() decides how loudly
-        # to message the fallback once it has the structured failure.
-        return _ShipmentSourceResult(None, None, None, str(exc))
+        except HTSTShipmentSourceError as exc:
+            status.update(
+                label="Lakehouse read failed — see fallback message below.",
+                state="error",
+                expanded=False,
+            )
+            # Don't surface an error banner here — render() decides how
+            # loudly to message the fallback once it has the structured
+            # failure.
+            return _ShipmentSourceResult(None, None, None, str(exc))
+        status.update(
+            label=f"Loaded {meta.row_count:,} rows (Delta v{meta.version}).",
+            state="complete",
+            expanded=False,
+        )
 
     last_mod = meta.last_modified.strftime("%Y-%m-%d %H:%M UTC") if meta.last_modified else "unknown"
     st.caption(

@@ -347,6 +347,62 @@ def _start_metadata_thread(table_uri: str, token: str) -> tuple[_MetadataResult,
     return out, done
 
 
+def _shrink_for_memory(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert low-cardinality object columns to ``category`` dtype in-place.
+
+    Why
+    ---
+    The HTST shipment snapshot is roughly 445 K rows × ~50 columns. Half of
+    those columns are short, highly-repeated strings (``SHIPTONAME``,
+    ``PRODUCTDESC``, warehouse codes, product groups, customer names) where
+    the same handful of values occurs over and over.  In ``object`` dtype
+    pandas stores one Python ``str`` per cell — on the order of ~50 bytes
+    per value once you count interning + UTF-8 buffer + PyObject header.
+    ``category`` dtype replaces those with a single int8/int16 code per
+    cell + one shared dictionary of unique values, typically shrinking the
+    column by 5–10× and the whole frame by 30–60 %.
+
+    This is the difference between a frame that fits comfortably in a
+    1 GB Streamlit Cloud container and one that gets OOM-killed mid-render.
+
+    Heuristic
+    ---------
+    Convert any ``object`` column whose unique-value ratio is < 50 %.  At
+    that ratio the categorical dictionary is small enough that the dtype
+    saves memory on every realistic shape; above it the dictionary
+    overhead can negate the win (especially on free-text columns).
+    Operates on the frame *in place* but also returns it so the call site
+    can stay expression-style (``df = _shrink_for_memory(df)``).
+    """
+    if df is None or df.empty:
+        return df
+
+    row_count = len(df)
+    # Two-condition gate (both must hold) so we only categorise true
+    # enum-like columns:
+    #   * ratio < 50 % — necessary, weeds out near-unique columns where
+    #     the categorical dictionary would carry as many entries as the
+    #     codes array (zero memory win).
+    #   * absolute uniques ≤ 10 000 — sufficient, guarantees the
+    #     dictionary stays small even on the 445 K-row HTST snapshot.
+    # Catches the obvious wins (PRODUCTGROUP: ~7 uniques, SHIPTONAME:
+    # ~5 K, warehouse / customer codes: <1 K) while leaving free-text
+    # fields like order numbers or notes in plain ``object`` dtype.
+    threshold_ratio = 0.5
+    max_unique = 10_000
+
+    for col in df.select_dtypes(include=["object"]).columns:
+        try:
+            unique_count = df[col].nunique(dropna=True)
+        except Exception:  # noqa: BLE001 — pathological dtype; skip column
+            continue
+        if unique_count == 0 or unique_count > max_unique:
+            continue
+        if unique_count / row_count < threshold_ratio:
+            df[col] = df[col].astype("category")
+    return df
+
+
 def _scan_htst_subset(con, table_uri: str) -> pd.DataFrame:
     """Read the HTST-filtered subset of *table_uri* via DuckDB's Delta extension.
 
@@ -484,6 +540,21 @@ def _read_delta_table(table_uri: str, token: str, cfg: dict[str, str]) -> tuple[
             df = _scan_htst_subset(con, table_uri)
     except FabricAuthError as exc:
         raise HTSTShipmentSourceError(str(exc)) from exc
+    except MemoryError as exc:
+        # Distinct path because a MemoryError here is almost always a
+        # Streamlit Cloud container running out of RAM during the
+        # arrow → pandas materialisation (~445 K rows × ~50 columns can
+        # spike to 1.5–2 GB transiently).  Surface a Cloud-specific
+        # remediation hint instead of dumping a generic OOM trace.
+        raise HTSTShipmentSourceError(
+            "Out of memory while materialising the HTST shipment snapshot.  "
+            "This typically happens on Streamlit Community Cloud (≈1 GB RAM) "
+            "when the lakehouse table grows past ~400 K rows.  Mitigations: "
+            "(1) bump the container's memory tier, (2) request the upstream "
+            "Dataflow Gen2 to publish a pre-filtered HTST-only table so the "
+            "scan returns 1/7 of the rows, or (3) run the page on a local "
+            "workstation where memory is abundant."
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
         ssl_hint = ""
@@ -516,6 +587,21 @@ def _read_delta_table(table_uri: str, token: str, cfg: dict[str, str]) -> tuple[
         ) from exc
 
     scan_elapsed = time.monotonic() - scan_start
+
+    # Shrink the in-memory footprint BEFORE caching / returning so every
+    # downstream caller (Streamlit cache, page logic, CSV download) pays
+    # the lower-RAM cost.  This is a no-op on empty frames and never
+    # changes column values, only their physical representation.
+    pre_shrink_mb = df.memory_usage(deep=True).sum() / (1024 * 1024) if not df.empty else 0.0
+    df = _shrink_for_memory(df)
+    post_shrink_mb = df.memory_usage(deep=True).sum() / (1024 * 1024) if not df.empty else 0.0
+    if pre_shrink_mb > 0:
+        logger.info(
+            "HTST shipment frame memory: %.1f MB → %.1f MB after categorical shrink "
+            "(%.0f%% reduction)",
+            pre_shrink_mb, post_shrink_mb,
+            (1 - post_shrink_mb / pre_shrink_mb) * 100 if pre_shrink_mb > 0 else 0,
+        )
 
     # ── Wait briefly for the metadata thread, but don't block forever ───────
     # If delta-rs is being slow today (rare; corporate-proxy / TLS pathology),

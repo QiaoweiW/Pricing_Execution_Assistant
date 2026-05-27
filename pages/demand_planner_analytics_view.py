@@ -40,6 +40,7 @@ from typing import Callable
 import pandas as pd
 import streamlit as st
 
+from data_sources.fabric_lakehouse_io import LakehouseIOError, write_csv
 from data_sources.ibp_official import (
     IBPOfficialSourceError,
     IBPSnapshotMeta,
@@ -74,6 +75,21 @@ _DISTRIBUTION_TRACKER_URL = (
     "&file=New%20Distribution%20Tracker%20Corporate%20Group.xlsx"
     "&fromShare=true&action=default&mobileredirect=true"
 )
+
+# Microsoft Fabric folder used by the RO Comparison handoff workflow.
+_RO_TRACKING_FOLDER_URL = (
+    "https://app.fabric.microsoft.com/groups/bb11c51d-03c8-4f1b-938c-e20657a8f31d/"
+    "lakehouses/a01f513d-eee7-41eb-8c15-670bc40e7fc8?experience=fabric-developer&"
+    "selectedPath=Files%2FRO%20Tracking%2FAppend_New_History"
+)
+
+# The target Lakehouse object path under Files/.
+_RO_TRACKING_BLOB_PATH = (
+    "RO Tracking/Append_New_History/Distribution Tracker New 'Customer Input'.csv"
+)
+
+# The exact filename requested by the demand planning workflow.
+_RO_TRACKING_FILENAME = "Distribution Tracker New 'Customer Input'.csv"
 
 
 # ── 2. Section renderers ──────────────────────────────────────────────────────
@@ -201,6 +217,91 @@ def _render_ibp_table(
     )
 
 
+def _render_ro_comparison() -> None:
+    """Render the RO Comparison section and publish CSV into Fabric.
+
+    The user picks a local CSV file, we parse and normalise it via the shared
+    Lakehouse CSV writer, and then upload to the canonical RO Tracking path.
+    """
+    st.markdown("### 🔁 RO Comparison")
+    st.caption(
+        "Upload and save the latest customer-input CSV into the RO Tracking "
+        "append-history folder in Microsoft Fabric."
+    )
+
+    uploaded_file = st.file_uploader(
+        f"Select `{_RO_TRACKING_FILENAME}`",
+        type=["csv"],
+        key="ro_comparison_customer_input_upload",
+        help=(
+            "Choose the local CSV you want to publish. The uploaded file will be "
+            f"saved in Fabric as `{_RO_TRACKING_FILENAME}`."
+        ),
+    )
+
+    open_folder_col, save_col = st.columns([1, 1])
+    with open_folder_col:
+        st.link_button(
+            "📂 Open RO Tracking folder",
+            url=_RO_TRACKING_FOLDER_URL,
+            help="Open the target Fabric folder in a new browser tab.",
+        )
+
+    with save_col:
+        save_clicked = st.button(
+            "💾 Save CSV to Fabric folder",
+            key="ro_comparison_save_to_fabric",
+            type="primary",
+            disabled=uploaded_file is None,
+            help=(
+                "Uploads the selected CSV to "
+                f"`Files/{_RO_TRACKING_BLOB_PATH}` in the configured Fabric Lakehouse."
+            ),
+        )
+
+    if uploaded_file is None:
+        st.info("Select a CSV file to enable save.")
+        return
+
+    # Preview the payload before save so users can verify they picked
+    # the intended file during month-end updates.
+    try:
+        preview_df = pd.read_csv(uploaded_file)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"❌ Could not read the selected CSV file.\n\n{exc}")
+        return
+
+    st.caption(
+        f"Selected file: `{uploaded_file.name}` · "
+        f"{len(preview_df):,} rows · {len(preview_df.columns)} columns"
+    )
+    st.dataframe(preview_df.head(100), width="stretch", height=280)
+    if len(preview_df) > 100:
+        st.caption("_Showing first 100 rows before upload._")
+
+    if not save_clicked:
+        return
+
+    try:
+        with st.spinner("Saving CSV to Microsoft Fabric…"):
+            write_csv(
+                secrets_section="fabric_htst",
+                blob_path=_RO_TRACKING_BLOB_PATH,
+                df=preview_df,
+            )
+    except LakehouseIOError as exc:
+        st.error(
+            "❌ Failed to save the CSV into the RO Tracking append-history folder.\n\n"
+            f"{exc}"
+        )
+        return
+
+    st.success(
+        "✅ Saved successfully to "
+        f"`Files/{_RO_TRACKING_BLOB_PATH}` as `{_RO_TRACKING_FILENAME}`."
+    )
+
+
 def _render_current_plan_overview() -> None:
     """Render the Current Plan Overview (IBP Official) opt-in section.
 
@@ -295,6 +396,9 @@ def render() -> None:
     st.markdown("---")
 
     _render_distribution_tracker()
+    st.markdown("---")
+
+    _render_ro_comparison()
     st.markdown("---")
 
     _render_current_plan_overview()

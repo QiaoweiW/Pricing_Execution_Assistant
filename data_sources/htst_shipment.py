@@ -77,6 +77,10 @@ from data_sources.fabric_auth import (
     promote_sp_secrets_to_env,
     read_section,
 )
+from data_sources.fabric_tls import (
+    resolve_ca_cert_file as _resolve_ca_cert_file,
+    ssl_verify_enabled as _ssl_verify_enabled,
+)
 
 
 # deltalake is imported lazily inside _read_delta_table() so that this module
@@ -213,53 +217,11 @@ def _acquire_storage_token() -> str:
         raise HTSTShipmentSourceError(str(exc)) from exc
 
 
-# ── TLS / CA-bundle plumbing for the bundled libcurl ─────────────────────────
-
-def _resolve_ca_cert_file(cfg: dict[str, str]) -> Optional[str]:
-    """Return a filesystem path to a CA bundle libcurl can use, or None.
-
-    Resolution order (first hit wins):
-      1. ``[fabric_htst].ca_cert_file`` from secrets — explicit override the
-         operator can set to a corporate root-CA bundle (e.g. when Zscaler /
-         Netskope / a forward-proxy is doing TLS inspection on
-         ``*.fabric.microsoft.com``).
-      2. ``REQUESTS_CA_BUNDLE`` / ``CURL_CA_BUNDLE`` env vars — these are
-         already the de-facto standard for Python TLS clients on locked-down
-         corporate workstations, so we honor them transparently.
-      3. ``certifi.where()`` — the Mozilla root-CA bundle ships with
-         ``certifi`` (transitive dep of ``requests``), so it is virtually
-         always available.  Sufficient for any non-MITM connection.
-
-    Returning a real path lets the caller export ``CURL_CA_INFO`` /
-    ``CURL_CA_BUNDLE`` *before* DuckDB's azure extension initialises libcurl.
-    """
-    explicit = cfg.get("ca_cert_file")
-    if explicit and os.path.isfile(explicit):
-        return explicit
-
-    for env_name in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
-        env_val = os.environ.get(env_name)
-        if env_val and os.path.isfile(env_val):
-            return env_val
-
-    try:
-        import certifi  # transitive dep of requests / azure-* — always present
-    except ImportError:
-        return None
-    bundle = certifi.where()
-    return bundle if os.path.isfile(bundle) else None
-
-
-def _ssl_verify_enabled(cfg: dict[str, str]) -> bool:
-    """Return True unless secrets opt out via ``ssl_verify = false``.
-
-    Last-resort escape hatch for situations where (a) a corporate MITM
-    proxy is in play, (b) the operator cannot get the corporate root CA
-    file, and (c) the alternative is the page being completely unusable.
-    Logged loudly so it is impossible to leave on by accident.
-    """
-    raw = str(cfg.get("ssl_verify", "true")).strip().lower()
-    return raw not in ("false", "0", "no", "off")
+# TLS / CA-bundle plumbing lives in ``data_sources.fabric_tls`` and is
+# shared with every other OneLake Delta reader in this codebase.  The
+# helpers are aliased on import above so existing call sites
+# (``_resolve_ca_cert_file(cfg)`` / ``_ssl_verify_enabled(cfg)``)
+# continue to work without churn.
 
 
 # ── Core read path ────────────────────────────────────────────────────────────

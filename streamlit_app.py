@@ -1,23 +1,40 @@
 # streamlit_app.py - Darigold Pricing VBCS Generation Tool
-# UPDATED: 2025-01-27 - Dynamic view discovery from pages directory
 """
 Main Streamlit application entry point.
 This file handles routing and page navigation only.
 All page-specific UI code is in the pages/ directory.
+
+Diagnostics
+-----------
+Everything in this module logs via the stdlib ``logging`` module — never
+``print()``.  On Windows, ``print()`` raises ``OSError: [Errno 22] Invalid
+argument`` whenever stdout is closed/redirected (Python bug 35754 — the
+Windows equivalent of ``BrokenPipeError``).  Because Streamlit reruns
+the script on every widget interaction, a single misbehaving ``print``
+in the router can surface as a confusing red traceback for the user on
+every filter click.  ``logging`` writes to stderr (managed by Streamlit's
+own log handler), so the same diagnostics flow into the same terminal /
+``streamlit.log`` without the stdout fragility.
 """
-import streamlit as st
-print("=" * 80)
-print("STREAMLIT_APP.PY IS BEING EXECUTED - FILE LOADED!")
-print("=" * 80)
+import logging
 import warnings
+
+import streamlit as st
+
 warnings.filterwarnings('ignore')
 
-import os
 import importlib
 from pathlib import Path
 
-# Import shared utilities
 from utils.ui_helpers import apply_custom_css, render_footer
+
+
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    # Streamlit installs its own root handler in normal runs, but when the
+    # module is imported by a unit test or a CLI utility the root logger
+    # may be empty — surface our diagnostics in that case too.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 # Dynamic view discovery - only load views that exist in pages directory
 PAGES_DIR = Path(__file__).parent / "pages"
@@ -60,14 +77,13 @@ for view_file in PAGES_DIR.glob("*_view.py"):
                 display_name = VIEW_NAME_MAPPING[view_name]
                 AVAILABLE_VIEWS[display_name] = view_name
                 PAGE_ROUTER[display_name] = module.render
-                print(f"Loaded view: {display_name} ({view_name})")
+                logger.info("Loaded view: %s (%s)", display_name, view_name)
             else:
-                print(f"Warning: {view_name} does not have a render() function")
-        except Exception as e:
-            print(f"Error loading {view_name}: {e}")
+                logger.warning("View %s does not expose a render() function", view_name)
+        except Exception as exc:  # noqa: BLE001  defensive top-level guard
+            logger.exception("Error loading view %s: %s", view_name, exc)
 
-print(f"Total views loaded: {len(AVAILABLE_VIEWS)}")
-print("=" * 80)
+logger.info("Total views loaded: %d", len(AVAILABLE_VIEWS))
 
 # Page configuration
 st.set_page_config(
@@ -121,14 +137,14 @@ if "fabric_warm" not in st.session_state:
                     state="error",
                     expanded=False,
                 )
-                print(f"Fabric warm-up failed (non-fatal): {exc}")
+                logger.warning("Fabric warm-up failed (non-fatal): %s", exc)
             except Exception as exc:  # noqa: BLE001  defensive top-level guard
                 warm_status.update(
                     label=f"Microsoft Fabric warm-up errored ({exc}).",
                     state="error",
                     expanded=False,
                 )
-                print(f"Fabric warm-up errored (non-fatal): {exc}")
+                logger.exception("Fabric warm-up errored (non-fatal): %s", exc)
     finally:
         # Set the flag regardless of outcome — we only ever try ONCE per
         # session. A failed warm-up does NOT permanently disable Fabric;
@@ -196,11 +212,12 @@ if 'selected_page' not in st.session_state:
 render_function = PAGE_ROUTER.get(st.session_state.selected_page)
 
 if render_function:
-    # Special debug logging for Pricing Execution Automation
-    if st.session_state.selected_page == "Pricing Execution Automation":
-        print("=" * 80)
-        print("ROUTER: About to call pricing_execution_automation_view.render()")
-        print("=" * 80)
+    # NB: any per-page diagnostics belong in the page's own render(), not
+    # in the router.  Earlier versions printed a debug banner here, which
+    # ran on every Streamlit rerun (every widget click) and surfaced as
+    # ``OSError: [Errno 22]`` on Windows whenever stdout was closed or
+    # redirected — masking the real exception from the user.  If you need
+    # to trace routing, add a single ``logger.debug(...)`` here instead.
     render_function()
 else:
     # Default to Home if unknown page (shouldn't happen, but safety check)

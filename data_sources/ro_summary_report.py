@@ -42,7 +42,13 @@ A fixed 30-row template, indented like a tree:
         Totes
         QT Jug
       Butter
-        Western Quarters
+
+Butter is a single-row leaf — per the planner's data-pulling rules
+"Butter: Portfolio Major -> Butter" aggregates every Supply Format
+under PMaj=Butter with no sub-categorisation.  (Earlier revisions
+of this template carried a redundant ``Western Quarters`` child;
+that filter incorrectly excluded any Butter row whose SFmt wasn't
+exactly that string, so we collapsed it away.)
 
 The template is hardcoded because it represents a business reporting
 contract — the planner expects these exact rows to appear in this
@@ -269,7 +275,7 @@ def _subtotal(
 
 def _leaf(
     row_id: str, label: str, indent: int,
-    *, pmaj_disp: str, sfmt: str, pminor: str = "", bcat: str = "",
+    *, pmaj_disp: str, sfmt: str = "", pminor: str = "", bcat: str = "",
     pmaj_match: frozenset, brand_match: Optional[str] = None,
     pminor_match: Optional[str] = None,
 ) -> TemplateRow:
@@ -280,15 +286,21 @@ def _leaf(
     has ESL in some rows and "Extended Shelf Life" in others).
 
     *pmaj_match* / *sfmt* / *pminor_match* / *brand_match* drive the
-    actual data filter.  ``sfmt`` doubles as both display and
-    match — leaves never have an "any Supply Format" match.
+    actual data filter.  *sfmt* doubles as both display value and
+    filter criterion (most leaves match on the same string they
+    display).  Pass ``sfmt=""`` (or omit) to disable the Supply
+    Format filter — used by **Butter**, which per the data-pulling
+    rules aggregates every SFmt under PMaj=Butter.
     """
     return TemplateRow(
         row_id=row_id, label=label, indent=indent,
         portfolio_major=pmaj_disp, supply_format=sfmt,
         portfolio_minor=pminor, brand_category=bcat,
         is_subtotal=False, children=(),
-        pmaj_match=pmaj_match, sfmt_match=sfmt,
+        pmaj_match=pmaj_match,
+        # Empty *sfmt* (no display value) collapses to "no SFmt
+        # filter" so the legacy call sites stay terse.
+        sfmt_match=sfmt or None,
         pminor_match=pminor_match, brand_match=brand_match,
     )
 
@@ -380,9 +392,13 @@ RO_SUMMARY_TEMPLATE: tuple[TemplateRow, ...] = (
           pmaj_match=_FRESH_MILK),
 
     # ── Butter ────────────────────────────────────────────────────
-    _subtotal("but", "Butter", 1, ("but_wq",)),
-    _leaf("but_wq", "Western Quarters", 2,
-          pmaj_disp="Butter", sfmt="Western Quarters",
+    # Per the planner's data-pulling rules ("Butter: Portfolio Major
+    # -> Butter") Butter is a SINGLE leaf — every row with
+    # ``Portfolio Major == "Butter"`` regardless of Supply Format.
+    # No sub-categories (older revisions of this template carried
+    # a ``Western Quarters`` child that incorrectly filtered SFmt).
+    _leaf("but", "Butter", 1,
+          pmaj_disp="Butter",
           pmaj_match=_BUTTER),
 )
 
@@ -634,8 +650,8 @@ def build_summary_report(
         to hide them must call :func:`drop_all_zero_rows`.
     warnings
         List of human-readable warning strings the page can surface
-        above the table (e.g., "Western Quarters leaf matched 0
-        rows — check upstream data").
+        above the table (e.g., "Column X missing from
+        RO_Comparison_Output.csv — treated as 0").
     """
     warnings: list[str] = []
 

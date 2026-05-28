@@ -35,7 +35,7 @@ widget interaction.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable
 
 import pandas as pd
@@ -79,6 +79,13 @@ from data_sources.ro_comparison import (
     upload_customer_input,
     write_history_fingerprint,
 )
+from data_sources.ro_early_start_programs import (
+    COL_FORMAT as ESP_COL_FORMAT,
+    COL_PROGRAM as ESP_COL_PROGRAM,
+    COL_START_DATE as ESP_COL_START_DATE,
+    build_early_start_programs_table,
+    list_available_formats as list_esp_formats,
+)
 from data_sources.ro_summary_report import (
     COL_DELTA_CHANGE as SR_COL_DELTA_CHANGE,
     COL_DELTA_EXIT as SR_COL_DELTA_EXIT,
@@ -98,6 +105,7 @@ from data_sources.ro_summary_report import (
     clear_comparison_output_cache,
     diag_dim_summary,
     drop_all_zero_rows,
+    fetch_ro_comparison_output_df,
     recompute_subtotals,
     save_ro_summary_report,
 )
@@ -325,6 +333,19 @@ _SS_SUMMARY_REPORT_RAW_DF    = "_ro_sr_raw_df"
 # widget INSIDE the report fragment reruns.
 _SS_SUMMARY_REPORT_SIG       = "_ro_sr_sig"
 
+# Early-Start-Date Programs section.
+#
+# Sourcing model: reads ``RO_Comparison_Output.csv`` directly from
+# Fabric (via the cached :func:`fetch_ro_comparison_output_df`
+# connector) — the SAME cache slot the Summary Report uses, so the
+# "Refresh from Fabric" button at the top of the section invalidates
+# both with a single click and our fragment never pays a second
+# round-trip per render.  Keys persist the Format multiselect and
+# the cutoff-date picker selections so a fragment rerun (caused by
+# any other widget on the page) doesn't clear the planner's filters.
+_SS_ESP_FORMAT_FILTER = "_ro_esp_format_filter"
+_SS_ESP_DATE_FILTER   = "_ro_esp_date_filter"
+
 # Filterable columns for the field-filter row above the editable table.
 _RO_FILTER_COLUMNS: tuple[str, ...] = (
     "Format", "Customer", "Taxonomy", "Brand", "Item #", "Description",
@@ -491,7 +512,20 @@ def _render_ro_comparison() -> None:
         #      to sub-second.
         _render_filtered_editor_fragment(prior_month, le_month)
 
-        # 10. RO Summary Report — hierarchical roll-up of the
+        # 10. Early-Start-Date Programs — drilldown of the published
+        #     ``RO_Comparison_Output.csv``.  Sits between the per-
+        #     Format driver table (last thing in the editor fragment)
+        #     and the RO Summary Report below.  Reads from Fabric
+        #     directly (not from ``_SS_SUMMARY_DF``) so it always
+        #     reflects the planner's last *saved* baseline — the
+        #     same "approved view" semantics the Summary Report uses
+        #     for its Fabric snapshot.  Wrapped in its own fragment
+        #     so the Format / cutoff-date widgets rerun only this
+        #     section.
+        st.markdown("---")
+        _render_early_start_programs_section()
+
+        # 11. RO Summary Report — hierarchical roll-up of the
         #     **in-memory** comparison frame (``_SS_SUMMARY_DF``).
         #     Lives in its own ``@st.fragment`` so editing a leaf cell
         #     or hitting Save doesn't trigger any work above; on a
@@ -1190,6 +1224,140 @@ def _render_per_format_summary(view_df: pd.DataFrame) -> None:
         height=min(36 * (len(summary) + 1) + 38, 480),
         hide_index=True,
         column_config=column_config,
+    )
+
+
+# ── Early-Start-Date Programs (Fabric drilldown) ────────────────────────────
+
+def _render_early_start_programs_section() -> None:
+    """Render the header + delegate to the Early-Start-Date fragment.
+
+    Header (title + caption) lives OUTSIDE the fragment because it's
+    static text — wrapping it inside would add a stack frame to every
+    widget rerun for no benefit.  Matches the
+    :func:`_render_summary_report_section` shape so the two sections
+    read identically when skimming the page.
+    """
+    st.markdown("### 🗓️ Programs with Early Start Date")
+    st.caption(
+        "Programs from the **published** RO comparison whose "
+        "**LE First Ship Date** falls before a chosen cutoff.  "
+        "Independent of the field filters and month pickers above — "
+        "reads `Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv` "
+        "from Microsoft Fabric directly, so the table reflects the last "
+        "**saved** baseline rather than any unsaved edits in the editor."
+    )
+    _render_early_start_programs_fragment()
+
+
+@st.fragment
+def _render_early_start_programs_fragment() -> None:
+    """Render the Format / cutoff-date filters and the (Format, Program,
+    Start Date) table.
+
+    Wrapped in a fragment so changing the Format multiselect or the
+    cutoff-date picker reruns ONLY this block — no Fabric round-trip
+    (the comparison-output frame is served from the shared
+    ``@st.cache_data`` slot owned by
+    :mod:`ro_summary_report`), no comparison rebuild, no warnings
+    banner re-render.
+
+    Error model
+    -----------
+    A genuine Fabric I/O failure is surfaced as an inline error and
+    the fragment returns early — the rest of the page (Summary
+    Report below, editor above) is unaffected.  An empty / missing
+    published CSV degrades to an info banner with a hint to publish
+    the comparison first.
+    """
+    try:
+        comp_df = fetch_ro_comparison_output_df()
+    except RoSummaryReportError as exc:
+        # ``fetch_ro_comparison_output_df`` lives in
+        # ``ro_summary_report`` and raises that module's error type.
+        # We share the connector deliberately (one cache slot, one
+        # Fabric round-trip per refresh window) and therefore share
+        # the error type as well — no need to introduce a parallel
+        # exception just for this section.
+        st.error(
+            "❌ Could not read RO_Comparison_Output.csv from "
+            f"Microsoft Fabric.\n\n{exc}"
+        )
+        return
+
+    if comp_df is None or comp_df.empty:
+        st.info(
+            "ℹ️ `RO_Comparison_Output.csv` is empty or has not been "
+            "published yet.  Use **💾 Save to RO_Reporting (overwrite)** "
+            "above to publish the current comparison first."
+        )
+        return
+
+    # ── Filter widgets ────────────────────────────────────────────
+    # Side-by-side at typical browser widths; stack on mobile.
+    available_formats = list_esp_formats(comp_df)
+    fcol, dcol = st.columns([3, 1])
+    with fcol:
+        selected_formats = st.multiselect(
+            "Format",
+            options=available_formats,
+            key=_SS_ESP_FORMAT_FILTER,
+            help=(
+                "Limit to programs whose Format matches one of the "
+                "selected values.  Leave empty to include every Format."
+            ),
+        )
+    with dcol:
+        # Default the cutoff to today on first render — common case
+        # is "what's supposed to be shipping by now?".  After the
+        # planner picks a value Streamlit persists it in session_state
+        # under our key, so subsequent reruns preserve their choice.
+        before_cutoff: date = st.date_input(
+            "Start date before",
+            value=st.session_state.get(_SS_ESP_DATE_FILTER, date.today()),
+            key=_SS_ESP_DATE_FILTER,
+            help=(
+                "Show programs whose LE First Ship Date is **strictly "
+                "earlier** than this date.  Defaults to today."
+            ),
+        )
+
+    # ── Compute + render ──────────────────────────────────────────
+    table = build_early_start_programs_table(
+        comp_df,
+        formats_filter=selected_formats or None,
+        before_date=before_cutoff,
+    )
+
+    if table.empty:
+        st.info(
+            "No programs match the current Format / cutoff selection. "
+            "Try expanding the Format filter or pushing the cutoff date "
+            "forward."
+        )
+        return
+
+    st.caption(
+        f"Showing **{len(table):,}** program(s) with a Start Date before "
+        f"**{before_cutoff:%Y-%m-%d}**."
+    )
+
+    cc = st.column_config
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        # Header (38) + per-row (36) sized to fit a typical short
+        # list without scrolling, capped so a huge list (hundreds of
+        # programs at a far-future cutoff) doesn't dominate the page.
+        height=min(36 * (len(table) + 1) + 38, 480),
+        column_config={
+            ESP_COL_FORMAT:     cc.TextColumn("Format",     width="small"),
+            ESP_COL_PROGRAM:    cc.TextColumn("Program",    width="large"),
+            ESP_COL_START_DATE: cc.DateColumn(
+                "Start Date", format="YYYY-MM-DD", width="small",
+            ),
+        },
     )
 
 

@@ -81,6 +81,7 @@ from data_sources.ro_comparison import (
 )
 from data_sources.ro_early_start_programs import (
     COL_FORMAT as ESP_COL_FORMAT,
+    COL_LE_ANNUAL_OPP as ESP_COL_LE_ANNUAL_OPP,
     COL_PROGRAM as ESP_COL_PROGRAM,
     COL_START_DATE as ESP_COL_START_DATE,
     build_early_start_programs_table,
@@ -343,8 +344,9 @@ _SS_SUMMARY_REPORT_SIG       = "_ro_sr_sig"
 # round-trip per render.  Keys persist the Format multiselect and
 # the cutoff-date picker selections so a fragment rerun (caused by
 # any other widget on the page) doesn't clear the planner's filters.
-_SS_ESP_FORMAT_FILTER = "_ro_esp_format_filter"
-_SS_ESP_DATE_FILTER   = "_ro_esp_date_filter"
+_SS_ESP_FORMAT_FILTER  = "_ro_esp_format_filter"
+_SS_ESP_DATE_FILTER    = "_ro_esp_date_filter"
+_SS_ESP_MIN_OPP_FILTER = "_ro_esp_min_opp_filter"
 
 # Filterable columns for the field-filter row above the editable table.
 _RO_FILTER_COLUMNS: tuple[str, ...] = (
@@ -832,9 +834,12 @@ def _ensure_summary_in_session(
 def _render_warnings_banner(w: ComparisonWarnings) -> None:
     """Render the consolidated warnings banner above the table.
 
-    Listing item IDs (capped at 30 per category to keep the banner
-    legible) lets the planner ctrl-F them in the table immediately
-    instead of scrolling.
+    Foldable so a planner staring at a clean run doesn't have a
+    multi-line orange block dominating the page header — the banner
+    is collapsed by default and the title text gives the count.
+    Listing item IDs (capped at 30 per category to keep the body
+    legible once expanded) lets the planner ctrl-F them in the table
+    immediately instead of scrolling.
     """
     if not w.has_any():
         return
@@ -882,10 +887,17 @@ def _render_warnings_banner(w: ComparisonWarnings) -> None:
     for note in w.extras:
         lines.append(f"**Other:** {note}")
 
-    st.warning(
-        "⚠️ **Please review and fix the following before saving:**\n\n"
-        + "\n\n".join(f"- {line}" for line in lines)
-    )
+    # Foldable container — collapsed by default.  The expander label
+    # surfaces the *count* so the planner can decide at a glance
+    # whether to expand without reading the body.  Body uses markdown
+    # bullets so the existing **bold** category labels render
+    # consistently with the previous flat ``st.warning`` layout.
+    with st.expander(
+        f"⚠️ {len(lines)} note(s) — please review and fix before saving",
+        expanded=False,
+    ):
+        for line in lines:
+            st.markdown(f"- {line}")
 
 
 @st.fragment
@@ -1294,9 +1306,12 @@ def _render_early_start_programs_fragment() -> None:
         return
 
     # ── Filter widgets ────────────────────────────────────────────
-    # Side-by-side at typical browser widths; stack on mobile.
+    # Three side-by-side widgets at typical browser widths; stack on
+    # mobile.  Format gets the lion's share of horizontal space
+    # because its selected-chip list grows; date / min-opp are both
+    # single-value widgets.
     available_formats = list_esp_formats(comp_df)
-    fcol, dcol = st.columns([3, 1])
+    fcol, dcol, ocol = st.columns([3, 1.2, 1.2])
     with fcol:
         selected_formats = st.multiselect(
             "Format",
@@ -1321,25 +1336,50 @@ def _render_early_start_programs_fragment() -> None:
                 "earlier** than this date.  Defaults to today."
             ),
         )
+    with ocol:
+        # Step = 100,000 lbs so the +/- buttons increment in
+        # planner-meaningful chunks.  The planner can always type an
+        # exact threshold; the step only governs the up-down arrows.
+        # ``int`` everywhere so the widget renders a whole-pound input
+        # (matches the accounting format of the column itself).
+        min_le_annual_opp: int = int(st.number_input(
+            "Min LE Annual Opp (lbs)",
+            min_value=0,
+            value=int(st.session_state.get(_SS_ESP_MIN_OPP_FILTER, 0)),
+            step=100_000,
+            key=_SS_ESP_MIN_OPP_FILTER,
+            help=(
+                "Show only programs whose LE Annual Opportunity (lbs) "
+                "is ≥ this value.  0 (default) includes every program."
+            ),
+        ))
 
     # ── Compute + render ──────────────────────────────────────────
     table = build_early_start_programs_table(
         comp_df,
         formats_filter=selected_formats or None,
         before_date=before_cutoff,
+        min_le_annual_opp=min_le_annual_opp if min_le_annual_opp > 0 else None,
     )
 
     if table.empty:
         st.info(
-            "No programs match the current Format / cutoff selection. "
-            "Try expanding the Format filter or pushing the cutoff date "
-            "forward."
+            "No programs match the current Format / cutoff / Min Opp "
+            "selection.  Try expanding the Format filter, pushing the "
+            "cutoff date forward, or lowering the Min Opp threshold."
         )
         return
 
+    # Caption tells the planner exactly which filters are active so
+    # they don't mistake a small list for missing data.
+    filter_bits = [f"Start Date < **{before_cutoff:%Y-%m-%d}**"]
+    if min_le_annual_opp > 0:
+        filter_bits.append(f"LE Annual Opp ≥ **{min_le_annual_opp:,} lbs**")
     st.caption(
-        f"Showing **{len(table):,}** program(s) with a Start Date before "
-        f"**{before_cutoff:%Y-%m-%d}**."
+        f"Showing **{len(table):,}** program(s) — "
+        f"{' · '.join(filter_bits)}.  "
+        "_Programs at LE Probability = 100 % are always excluded._  "
+        "Click any column header to sort."
     )
 
     cc = st.column_config
@@ -1352,9 +1392,17 @@ def _render_early_start_programs_fragment() -> None:
         # programs at a far-future cutoff) doesn't dominate the page.
         height=min(36 * (len(table) + 1) + 38, 480),
         column_config={
-            ESP_COL_FORMAT:     cc.TextColumn("Format",     width="small"),
-            ESP_COL_PROGRAM:    cc.TextColumn("Program",    width="large"),
-            ESP_COL_START_DATE: cc.DateColumn(
+            ESP_COL_FORMAT:        cc.TextColumn("Format",  width="small"),
+            ESP_COL_PROGRAM:       cc.TextColumn("Program", width="large"),
+            # ``accounting`` format = comma thousands, no decimals,
+            # negatives in parentheses — matches every other Lbs
+            # column on this page so the planner reads them
+            # uniformly.  Numeric column → clickable header sorts
+            # numerically (not lexically).
+            ESP_COL_LE_ANNUAL_OPP: cc.NumberColumn(
+                "LE Annual Opp (lbs)", format="accounting", width="medium",
+            ),
+            ESP_COL_START_DATE:    cc.DateColumn(
                 "Start Date", format="YYYY-MM-DD", width="small",
             ),
         },

@@ -344,9 +344,17 @@ _SS_SUMMARY_REPORT_SIG       = "_ro_sr_sig"
 # round-trip per render.  Keys persist the Format multiselect and
 # the cutoff-date picker selections so a fragment rerun (caused by
 # any other widget on the page) doesn't clear the planner's filters.
-_SS_ESP_FORMAT_FILTER  = "_ro_esp_format_filter"
-_SS_ESP_DATE_FILTER    = "_ro_esp_date_filter"
-_SS_ESP_MIN_OPP_FILTER = "_ro_esp_min_opp_filter"
+_SS_ESP_FORMAT_FILTER     = "_ro_esp_format_filter"
+_SS_ESP_DATE_AFTER_FILTER = "_ro_esp_date_after_filter"
+_SS_ESP_DATE_FILTER       = "_ro_esp_date_filter"
+_SS_ESP_MIN_OPP_FILTER    = "_ro_esp_min_opp_filter"
+
+# Sentinel "no effective lower bound" for the Start-Date-After widget.
+# Predates any real Darigold program data, so by default the widget
+# is rendered but filters nothing.  Pinned at module scope so we get
+# one canonical spelling shared between the default-value, the
+# is-it-the-default test, and the help text.
+_ESP_AFTER_DATE_SENTINEL: date = date(1900, 1, 1)
 
 # Filterable columns for the field-filter row above the editable table.
 # ``Driver`` is one of {"New", "Exit", "Change", "No Change"} (see
@@ -1310,12 +1318,14 @@ def _render_early_start_programs_fragment() -> None:
         return
 
     # ── Filter widgets ────────────────────────────────────────────
-    # Three side-by-side widgets at typical browser widths; stack on
+    # Four side-by-side widgets at typical browser widths; stack on
     # mobile.  Format gets the lion's share of horizontal space
-    # because its selected-chip list grows; date / min-opp are both
-    # single-value widgets.
+    # because its selected-chip list grows; the date / min-opp
+    # inputs are all single-value widgets.  Reading order is the
+    # natural English phrasing of a range filter:
+    #   Format | after  | before | Min Opp
     available_formats = list_esp_formats(comp_df)
-    fcol, dcol, ocol = st.columns([3, 1.2, 1.2])
+    fcol, acol, dcol, ocol = st.columns([3, 1.2, 1.2, 1.2])
     with fcol:
         selected_formats = st.multiselect(
             "Format",
@@ -1324,6 +1334,28 @@ def _render_early_start_programs_fragment() -> None:
             help=(
                 "Limit to programs whose Format matches one of the "
                 "selected values.  Leave empty to include every Format."
+            ),
+        )
+    with acol:
+        # Default to the 1900-01-01 sentinel: widget is always-on so
+        # the planner sees it on first render, but it filters nothing
+        # by default (no real program data predates 1900).  Picking a
+        # later date narrows the report to a range.  ``min_value``
+        # lines up with the sentinel so the widget never complains
+        # "value out of range" on initial render.
+        after_cutoff: date = st.date_input(
+            "Start date after",
+            value=st.session_state.get(
+                _SS_ESP_DATE_AFTER_FILTER, _ESP_AFTER_DATE_SENTINEL,
+            ),
+            min_value=_ESP_AFTER_DATE_SENTINEL,
+            key=_SS_ESP_DATE_AFTER_FILTER,
+            help=(
+                "Show only programs whose LE First Ship Date is "
+                "**strictly later** than this date.  Defaults to "
+                f"{_ESP_AFTER_DATE_SENTINEL:%Y-%m-%d} (no effective "
+                "lower bound).  Pair with the 'Start date before' "
+                "picker on the right to narrow to a window."
             ),
         )
     with dcol:
@@ -1358,25 +1390,54 @@ def _render_early_start_programs_fragment() -> None:
             ),
         ))
 
+    # ── Bounds sanity check ──────────────────────────────────────
+    # Strict bounds (``after < d < before``) mean ``after >= before``
+    # is *guaranteed* to produce zero rows.  Warn the planner so
+    # they don't read an empty result as "no data" when it's
+    # actually a self-inflicted impossible range.
+    after_is_active = after_cutoff > _ESP_AFTER_DATE_SENTINEL
+    if after_is_active and after_cutoff >= before_cutoff:
+        st.warning(
+            "⚠️ **Start date after** "
+            f"(`{after_cutoff:%Y-%m-%d}`) is on or after "
+            f"**Start date before** (`{before_cutoff:%Y-%m-%d}`).  "
+            "The range is empty by construction — pick an earlier "
+            "*after* date or a later *before* date."
+        )
+
     # ── Compute + render ──────────────────────────────────────────
     table = build_early_start_programs_table(
         comp_df,
         formats_filter=selected_formats or None,
+        # Pass ``None`` when the widget is at the sentinel so the
+        # function short-circuits the lower-bound check rather than
+        # comparing every row against 1900-01-01.  Saves a vectorised
+        # pass on big frames and keeps test inputs deterministic.
+        after_date=after_cutoff if after_is_active else None,
         before_date=before_cutoff,
         min_le_annual_opp=min_le_annual_opp if min_le_annual_opp > 0 else None,
     )
 
     if table.empty:
         st.info(
-            "No programs match the current Format / cutoff / Min Opp "
-            "selection.  Try expanding the Format filter, pushing the "
-            "cutoff date forward, or lowering the Min Opp threshold."
+            "No programs match the current Format / date range / Min "
+            "Opp selection.  Try expanding the Format filter, "
+            "widening the date range, or lowering the Min Opp threshold."
         )
         return
 
     # Caption tells the planner exactly which filters are active so
-    # they don't mistake a small list for missing data.
-    filter_bits = [f"Start Date < **{before_cutoff:%Y-%m-%d}**"]
+    # they don't mistake a small list for missing data.  The Start
+    # Date bit shows the active range — single-bound when ``after``
+    # is at the sentinel, full range when both bounds are live.
+    if after_is_active:
+        date_bit = (
+            f"**{after_cutoff:%Y-%m-%d}** < Start Date < "
+            f"**{before_cutoff:%Y-%m-%d}**"
+        )
+    else:
+        date_bit = f"Start Date < **{before_cutoff:%Y-%m-%d}**"
+    filter_bits = [date_bit]
     if min_le_annual_opp > 0:
         filter_bits.append(f"LE Annual Opp ≥ **{min_le_annual_opp:,} lbs**")
     st.caption(

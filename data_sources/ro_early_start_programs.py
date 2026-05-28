@@ -60,6 +60,14 @@ earliest-shipping programs surface first.
 Filter semantics
 ----------------
 * ``formats_filter``     (page widget: multiselect, empty = no constraint).
+* ``after_date``         (page widget: date picker, default = "no lower
+                         bound").  Rows with ``LE First Ship Date <=
+                         after_date`` are dropped.  Strict ``>``
+                         comparison (mirrors the strict ``<`` on
+                         ``before_date``) so picking the same date on
+                         both bounds yields an empty range, not a
+                         single-day window.  Passing ``None`` disables
+                         the lower bound.
 * ``before_date``        (page widget: date picker, default = today).
                          Rows with ``LE First Ship Date >= before_date``
                          OR a missing/unparseable Start Date are
@@ -213,6 +221,7 @@ def build_early_start_programs_table(
     comp_df: pd.DataFrame,
     *,
     formats_filter: Optional[Iterable[str]] = None,
+    after_date: Optional[date] = None,
     before_date: Optional[date] = None,
     min_le_annual_opp: Optional[float] = None,
 ) -> pd.DataFrame:
@@ -231,12 +240,19 @@ def build_early_start_programs_table(
         Iterable of Format strings.  When ``None`` or empty, no
         Format constraint applies.  Whitespace-stripped comparison;
         empty strings inside the iterable are ignored.
+    after_date
+        Lower-bound cutoff.  Only rows with ``LE First Ship Date >
+        after_date`` are kept (strict — mirrors the strict ``<``
+        applied to ``before_date``).  ``None`` disables the lower
+        bound.  Useful for narrowing the report to a date range, e.g.
+        ``after_date=2026-01-01, before_date=2027-01-01`` keeps only
+        programs that should ship during calendar 2026.
     before_date
-        Cutoff date.  Only rows with ``LE First Ship Date <
+        Upper-bound cutoff.  Only rows with ``LE First Ship Date <
         before_date`` are kept.  Rows with a missing / unparseable
         Start Date are ALWAYS dropped — they don't belong in a
         "programs with a start date before X" report.  Passing
-        ``None`` disables the date filter (useful for tests).
+        ``None`` disables the upper bound (useful for tests).
     min_le_annual_opp
         Optional minimum LE Annual Opportunity (lbs).  Rows whose
         value is **below** the threshold (or missing / unparseable,
@@ -297,6 +313,14 @@ def build_early_start_programs_table(
     keep_mask = start_dt.notna()
     # ``NaN >= threshold`` is False → ~False = True → NaN rows survive.
     keep_mask &= ~(prob_numeric >= _PROB_LOCKED_THRESHOLD)
+
+    if after_date is not None:
+        after_ts = pd.Timestamp(after_date)
+        # Strict ``>`` mirrors the strict ``<`` below — picking the
+        # same date on both bounds yields an empty range, not a
+        # one-day window.  NaN-date rows were already dropped by the
+        # ``start_dt.notna()`` seed above.
+        keep_mask &= start_dt > after_ts
 
     if before_date is not None:
         before_ts = pd.Timestamp(before_date)

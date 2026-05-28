@@ -349,9 +349,13 @@ _SS_ESP_DATE_FILTER    = "_ro_esp_date_filter"
 _SS_ESP_MIN_OPP_FILTER = "_ro_esp_min_opp_filter"
 
 # Filterable columns for the field-filter row above the editable table.
+# ``Driver`` is one of {"New", "Exit", "Change", "No Change"} (see
+# :func:`ro_comparison._compute_driver`) — letting the planner narrow
+# the view to e.g. just "New" programs is a frequent use case when
+# they want to audit what drove the FY27 Δ in either direction.
 _RO_FILTER_COLUMNS: tuple[str, ...] = (
     "Format", "Customer", "Taxonomy", "Brand", "Item #", "Description",
-    "Portfolio Major", "Portfolio Minor", "Supply Format",
+    "Portfolio Major", "Portfolio Minor", "Supply Format", "Driver",
 )
 
 # Computed columns that must be read-only in the editor so a planner

@@ -47,6 +47,7 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from data_sources.demand_summary import (
+    BudgetLookup,
     DemandPivotError,
     DemandPivotFilters,
     DemandPivotResult,
@@ -54,13 +55,17 @@ from data_sources.demand_summary import (
     DemandSummarySnapshot,
     FORECAST_BASE_PLAN,
     FORECAST_R_AND_O,
+    TOTAL_BUDGET_COLUMN_LABEL,
     TOTAL_COLUMN_LABEL,
+    build_budget_lookup,
     build_demand_pivot,
     build_supply_format_lookup,
     clear_demand_summary_cache,
     fetch_mgmt_plan_full,
     fetch_pdh,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
+    fetch_static_budget_base,
+    fetch_static_budget_ro,
     fetch_total_item_level_demand,
     list_available_filter_values,
     mgmt_plan_full_blob_path,
@@ -82,6 +87,7 @@ from data_sources.ro_comparison import (
     CUR_FISCAL_PROB_PRIOR,
     PER_FORMAT_DELTA_COL,
     PER_FORMAT_DRIVER_COLS,
+    PER_FORMAT_DRIVER_BLANK_LABEL,
     PER_FORMAT_FORMAT_COL,
     PER_FORMAT_TOTAL_LABEL,
     SUBTOTAL_COLUMNS,
@@ -93,7 +99,7 @@ from data_sources.ro_comparison import (
     RoComparisonError,
     _recompute_derived_columns,
     build_ro_comparison,
-    compute_history_fingerprint,
+    compute_driver_items,
     compute_per_format_summary,
     detect_history_change,
     fetch_dimitems_df,
@@ -101,9 +107,7 @@ from data_sources.ro_comparison import (
     fetch_ro_item_master_df,
     list_months,
     regenerate_comparison_output,
-    save_ro_comparison_output,
     upload_customer_input,
-    write_history_fingerprint,
 )
 from data_sources.ro_early_start_programs import (
     COL_FORMAT as ESP_COL_FORMAT,
@@ -298,35 +302,31 @@ def _render_ibp_table(
 # 1. Upload control                — drops a local "Customer Input" CSV into
 #                                    Files/RO Tracking/Append_New_History/.
 # 2. Load RO_History + dp_dimitems — Fabric reads, both cached by the
-#                                    ro_comparison module.
+#                                    ro_comparison module.  Cache keys
+#                                    are ETag-driven, so a fresh upstream
+#                                    publish auto-invalidates on the
+#                                    next render — no manual Refresh
+#                                    button required (one was removed
+#                                    in May 2026 once the ETag cache
+#                                    key replaced the TTL-only flow).
 # 3. Month filters                 — Prior + LE month dropdowns sourced from
 #                                    the distinct values in RO_History "Month".
-# 4. Build comparison              — pure transform, cached on (Prior, LE) in
-#                                    session_state to keep filter / edit
-#                                    interactions zero-IO.
-# 5. Warnings banner               — every recoverable issue collected by
-#                                    build_ro_comparison surfaced in one place.
-# 6. Field filters                 — multiselects above the table; restrict
-#                                    both the visible rows and the subtotal.
-# 7. Editable table                — st.data_editor with computed columns
-#                                    disabled; edits to inputs trigger a live
-#                                    recompute of Change / Probability / Driver.
-# 8. Subtotal row                  — recomputes from the post-edit filtered
-#                                    view on every rerun.
-# 9. Save button                   — overwrites
-#                                    Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv.
+# 4. Auto-regen                    — when the RO_History ETag advances,
+#                                    `RO_Comparison_Output.csv` is silently
+#                                    regenerated + republished to Fabric;
+#                                    every downstream section (Early-Start
+#                                    Programs, Summary Report) reads from
+#                                    that same in-memory frame so the
+#                                    cascade is automatic.
+# 5. Field filters + Editable table + Subtotal + per-Format drivers
+#                                  — wrapped in a single @st.fragment for
+#                                    sub-second filter / edit interactions.
 
 # Session-state keys.  Centralised so we never typo a key elsewhere.
 _SS_SUMMARY_DF      = "_ro_cmp_summary_df"
 _SS_MONTHS_SIG      = "_ro_cmp_months_sig"
 _SS_WARNINGS        = "_ro_cmp_warnings"
 _SS_DIMITEMS_ERROR  = "_ro_cmp_dimitems_error"
-# History fingerprint of the just-fetched RO_History_Tracker.csv —
-# computed once per page render and stashed so the manual Save handler
-# can anchor the sidecar without re-fetching History.  Keeps "saved
-# CSV in sync with this History snapshot" invariant for both auto and
-# manual saves.
-_SS_HISTORY_FP      = "_ro_cmp_history_fp"
 # Tracks the (history-fingerprint, prior, le) signature of the LAST
 # auto-regen we ran in this session — guards against re-running the
 # same regen on every fragment rerun within a single page session.
@@ -428,27 +428,14 @@ def _render_ro_comparison() -> None:
         #    itself surfaces its own auth error if sign-in is missing.
         _render_customer_input_uploader()
 
-        # 1b. Consolidated "Refresh from Fabric" button.  Click → drop
-        #     every cached connector + every RO Comparison / Summary
-        #     Report session key + auto-regenerate the comparison
-        #     output → next render rebuilds end-to-end from the latest
-        #     Fabric snapshot.  This is the ONE button to use when a
-        #     planner suspects the auto-regen didn't fire (e.g.,
-        #     fingerprint sidecar drift, mid-session History push).
-        if st.button(
-            "🔄 Refresh from Fabric",
-            key="ro_cmp_refresh_from_fabric",
-            help=(
-                "Re-read RO_History_Tracker.csv, dp_dimitems, and "
-                "RO_Item_Master.csv from Microsoft Fabric, force-rebuild "
-                "the comparison + driver tables, and force-republish "
-                "RO_Comparison_Output.csv.  Use this if you suspect the "
-                "auto-refresh didn't pick up a new RO_History push."
-            ),
-        ):
-            _force_refresh_from_fabric()
-            st.rerun()
-
+        # 1b. "How to see your changes after upload" guidance.
+        #     Replaces the old "🔄 Refresh from Fabric" button.  The
+        #     auto-refresh path is now ETag-driven (see
+        #     ``ro_comparison._compute_history_blob_signature``), so a
+        #     manual button no longer adds any capability — but planners
+        #     still need to know WHAT to do when they don't see their
+        #     change.  Surface that flow explicitly here.
+        _render_post_upload_guidance()
         st.markdown("")  # vertical breathing room before the comparison block.
 
         # 2. Fabric auth gate — match the pattern used by every other
@@ -476,13 +463,6 @@ def _render_ro_comparison() -> None:
         except RoComparisonError as exc:
             st.error(f"❌ Could not load RO_History_Tracker.csv: {exc}")
             return
-
-        # Cache the History fingerprint for the lifetime of this render
-        # so both the auto-regen orchestrator (later in this function)
-        # and the manual Save handler (in the editor fragment) anchor
-        # the sidecar to the SAME snapshot.  Computed once — sub-100ms
-        # for realistic History sizes.
-        st.session_state[_SS_HISTORY_FP] = compute_history_fingerprint(history_df)
 
         try:
             with st.spinner("Reading dp_dimitems from Microsoft Fabric…"):
@@ -742,8 +722,9 @@ def _maybe_auto_regenerate_comparison_output(
         st.warning(
             "⚠️ Could not auto-regenerate `RO_Comparison_Output.csv` after "
             "detecting an `RO_History_Tracker.csv` refresh. The saved file "
-            "is left untouched; you can reload to retry, or use the "
-            "**Refresh from Fabric** button at the top of the section.\n\n"
+            "is left untouched; the auto-refresh will retry on the next "
+            "render, or you can hard-refresh the browser (see the "
+            "guidance at the top of the section).\n\n"
             f"Details: {exc}"
         )
         return
@@ -786,55 +767,47 @@ def _maybe_auto_regenerate_comparison_output(
     st.session_state[_SS_AUTO_REGEN_BANNER] = result
 
 
-def _force_refresh_from_fabric() -> None:
-    """Clear every cache & session state tied to the RO Comparison flow.
+def _render_post_upload_guidance() -> None:
+    """Tell the planner how to see their changes after uploading a new file.
 
-    Called by the consolidated **🔄 Refresh from Fabric** button at
-    the top of the RO Comparison section.  After this returns, the
-    next render will:
+    Replaces the deprecated "🔄 Refresh from Fabric" button.  Two
+    things changed since that button was useful:
 
-      * Re-fetch ``RO_History_Tracker.csv``, ``dp_dimitems``,
-        ``RO_Item_Master.csv`` (because their ``@st.cache_data`` is
-        cleared upstream of this call where relevant — see button
-        wiring).
-      * Rebuild the in-memory comparison frame from scratch (because
-        ``_SS_SUMMARY_DF`` is gone).
-      * Auto-regen ``RO_Comparison_Output.csv`` if the History
-        fingerprint differs (it will, because the sidecar is read
-        fresh).
-      * Rebuild the Summary Report from the fresh in-memory frame
-        (because ``_SS_SUMMARY_REPORT_*`` keys are popped).
+    1. ``RO_History_Tracker.csv`` cache keys are now ETag-driven (see
+       :func:`data_sources.ro_comparison._compute_history_blob_signature`),
+       so every render does a sub-100ms HEAD-equivalent to see if
+       Fabric has a fresh version.  When it does, the comparison
+       output + every downstream table auto-regenerate in the same
+       render — no button click required.
+    2. The "Upload Customer Input" path also writes into the same
+       Fabric pipeline.  Once Fabric materialises the new history
+       (typically minutes after upload — outside this app's control),
+       the next render here picks it up automatically.
 
-    Pure state-mutation — no UI rendering — so it's safe to call
-    inside an ``if button_clicked:`` block followed by ``st.rerun()``.
+    The remaining failure mode is *browser-side staleness* — a
+    proxy / browser cache pinning the previous Streamlit asset
+    bundle.  We surface the canonical hard-refresh shortcuts so the
+    planner can self-serve in those rare cases without us needing a
+    code-side "force refresh" hack.
     """
-    # Clear connector caches so the next render hits Fabric.
-    clear_comparison_output_cache()
-    fetch_ro_history_df.clear()                                  # type: ignore[attr-defined]
-    fetch_dimitems_df.clear()                                    # type: ignore[attr-defined]
-    fetch_ro_item_master_df.clear()                              # type: ignore[attr-defined]
-
-    # Drop every RO Comparison + RO Summary Report session key so the
-    # next render rebuilds from scratch.  Use a tuple to keep the
-    # set explicit and grep-able — DO NOT replace with a wildcard
-    # iteration over session_state keys: that would also nuke other
-    # pages' state on a multi-page session.
-    for key in (
-        # Comparison editor state
-        _SS_SUMMARY_DF,
-        _SS_MONTHS_SIG,
-        _SS_WARNINGS,
-        _SS_HISTORY_FP,
-        _SS_AUTO_REGEN_SIG,
-        _SS_AUTO_REGEN_BANNER,
-        # Summary Report state
-        _SS_SUMMARY_REPORT_DF,
-        _SS_SUMMARY_REPORT_LOADED_AT,
-        _SS_SUMMARY_REPORT_WARNINGS,
-        _SS_SUMMARY_REPORT_RAW_DF,
-        _SS_SUMMARY_REPORT_SIG,
-    ):
-        st.session_state.pop(key, None)
+    st.info(
+        "✅ **Changes auto-refresh.**  Once Fabric ingests your upload "
+        "(usually within a few minutes), this page detects the new "
+        "`RO_History_Tracker.csv` ETag on the next render and "
+        "automatically rebuilds the RO Comparison table, the driver "
+        "breakdown, the Early-Start-Date Programs table, and the "
+        "RO Summary Report — no button click required.\n\n"
+        "**If you still don't see your changes after a few minutes:**\n"
+        "1. Wait one more minute, then reload the page tab.\n"
+        "2. If the table is still stale, do a **hard refresh** to clear "
+        "your browser's local cache:\n"
+        "   - **Windows / Linux:** `Ctrl` + `Shift` + `R` (or `Ctrl` + `F5`)\n"
+        "   - **macOS:** `⌘` + `Shift` + `R`\n"
+        "3. As a last resort, sign out of Microsoft Fabric (top of the "
+        "sidebar) and sign back in — this drops every cached token and "
+        "forces a fresh read.",
+        icon="ℹ️",
+    )
 
 
 def _render_auto_regen_banner_once() -> None:
@@ -1037,51 +1010,28 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     # Per-Format driver summary is a portfolio-wide diagnostic — it
     # MUST ignore the field filters above (per planner spec) so the
     # totals are meaningful regardless of what's currently selected.
-    # Reads from the (now-recomputed) full master frame.
+    # Reads from the (now-recomputed) full master frame.  The drill-
+    # down expander beneath it also reads the full frame so the
+    # planner can chase ANY driver bucket without re-narrowing the
+    # filters at the top of the section.
     _render_per_format_summary(summary_df)
 
-    if st.button(
-        "💾 Save to RO_Reporting (overwrite)",
-        key="ro_cmp_save_to_reporting",
-        type="primary",
-        help=(
-            "Overwrites Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv "
-            "with the current edited table (full table, not just the filtered view)."
-        ),
-    ):
-        try:
-            with st.spinner("Saving RO_Comparison_Output.csv to Microsoft Fabric…"):
-                blob_path = save_ro_comparison_output(summary_df)
-        except RoComparisonError as exc:
-            st.error(f"❌ Save failed.\n\n{exc}")
-        else:
-            # Anchor the History fingerprint sidecar so the next page
-            # load doesn't auto-regen-and-overwrite the just-saved
-            # edits.  Tolerated to fail softly: a sidecar miss merely
-            # triggers an auto-regen on the next reload, which is the
-            # planner's stated intent for History changes.
-            history_fp = st.session_state.get(_SS_HISTORY_FP, "")
-            if history_fp:
-                try:
-                    write_history_fingerprint(history_fp)
-                except RoComparisonError as exc:
-                    st.warning(
-                        "Saved the comparison successfully, but failed "
-                        "to update the History fingerprint sidecar. The "
-                        "next page reload may auto-regenerate over your "
-                        f"edits.\n\nDetails: {exc}"
-                    )
+    # No manual Save button: the auto-regen path republishes
+    # ``RO_Comparison_Output.csv`` to Fabric automatically whenever
+    # the upstream ``RO_History_Tracker.csv`` ETag advances (see
+    # ``_maybe_auto_regenerate_comparison_output``).  Planner edits
+    # in the table above are session-scoped — useful for in-tab
+    # exploration / driver inspection, intentionally not persisted
+    # to Fabric (that's the upstream pipeline's job).
 
-            st.success(f"✅ Saved to `Files/{blob_path}`.")
-            # NOTE: no need to invalidate the Summary Report cache —
-            # the report fragment now reads from the in-memory
-            # ``_SS_SUMMARY_DF`` (which was just edited / saved) and
-            # rebuilds whenever the comparison signature changes.
-            # The connector cache for ``RO_Comparison_Output.csv`` is
-            # cleared centrally by the top-of-section "🔄 Refresh
-            # from Fabric" button when the planner explicitly wants
-            # to re-read what was just published.
-            clear_comparison_output_cache()
+
+# Sentinel option surfaced inside every filter multiselect — picking
+# it narrows the view to rows where the column is blank (NaN, empty
+# string, or whitespace-only).  Centralised so the multiselect option
+# list, the help text, and the apply-filter path all stay in lockstep.
+# Spelled with parentheses + lowercase to avoid colliding with any
+# real value in any of the filterable columns.
+_BLANK_FILTER_SENTINEL: str = "(blank)"
 
 
 def _render_field_filters_and_apply(summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -1091,15 +1041,26 @@ def _render_field_filters_and_apply(summary_df: pd.DataFrame) -> pd.DataFrame:
     persists in ``st.session_state`` under stable keys so a rerun
     (caused by an edit or month change) doesn't clear the planner's
     selections.
+
+    Blank-cell handling
+    -------------------
+    Every column whose source frame has at least one blank cell
+    (NaN / empty string / whitespace) exposes a special
+    ``"(blank)"`` option at the top of its multiselect.  Picking it
+    narrows the view to *exactly those blank rows* — the canonical
+    way for a planner to find e.g. items missing a Portfolio Minor
+    that need triaging.  See :data:`_BLANK_FILTER_SENTINEL`.
     """
     with st.expander("🔍 Filters", expanded=False):
+        st.caption(
+            "Tip: pick **(blank)** in any filter to surface rows where "
+            "that column is empty (handy for finding items missing a "
+            "Portfolio Minor, Supply Format, etc.)."
+        )
         cols = st.columns(3)
         for i, col_name in enumerate(_RO_FILTER_COLUMNS):
             with cols[i % 3]:
-                options = sorted({
-                    str(v) for v in summary_df[col_name].dropna()
-                    if str(v).strip()
-                })
+                options = _filter_options_for_column(summary_df[col_name])
                 st.multiselect(
                     col_name,
                     options=options,
@@ -1107,6 +1068,28 @@ def _render_field_filters_and_apply(summary_df: pd.DataFrame) -> pd.DataFrame:
                 )
 
     return _apply_filters(summary_df, _read_filter_state_from_session())
+
+
+def _filter_options_for_column(series: pd.Series) -> list[str]:
+    """Return the sorted dropdown options for a single filter column.
+
+    Output layout:
+
+    * ``"(blank)"`` first (only when the column actually has at least
+      one blank value — otherwise the option is omitted to avoid
+      cluttering filters with non-actionable choices).
+    * Real non-blank values sorted ascending, string-cast for stable
+      ordering across mixed dtypes (Item # stored as int vs str).
+    """
+    str_series = series.astype("string")
+    has_blank = bool(
+        str_series.isna().any()
+        or (str_series.fillna("").str.strip() == "").any()
+    )
+    real_values = sorted({
+        str(v).strip() for v in str_series.dropna() if str(v).strip()
+    })
+    return ([_BLANK_FILTER_SENTINEL] if has_blank else []) + real_values
 
 
 def _filter_widget_key(col_name: str) -> str:
@@ -1130,12 +1113,28 @@ def _apply_filters(df: pd.DataFrame, selections: dict) -> pd.DataFrame:
     Comparison is string-cast so a multiselect of ``["370072"]`` matches
     ``Item #`` cells stored as int or float without surprising the user
     with dtype-driven mismatches.
+
+    The :data:`_BLANK_FILTER_SENTINEL` value is handled specially: when
+    present in a column's selection, it adds "row is blank in this
+    column" (NaN / empty / whitespace-only) as an additional accepted
+    value.  Mixed selections (e.g. ``["(blank)", "Costco"]``) match
+    rows that satisfy EITHER condition — same as the user's mental
+    model for a normal multiselect with an extra option.
     """
     mask = pd.Series(True, index=df.index)
     for col, values in selections.items():
         if not values:
             continue
-        mask &= df[col].astype(str).isin([str(v) for v in values])
+        col_str = df[col].astype("string")
+        is_blank = col_str.isna() | (col_str.fillna("").str.strip() == "")
+        wants_blank = _BLANK_FILTER_SENTINEL in values
+        non_blank_values = [
+            str(v) for v in values if v != _BLANK_FILTER_SENTINEL
+        ]
+        col_mask = col_str.fillna("").str.strip().isin(non_blank_values)
+        if wants_blank:
+            col_mask = col_mask | is_blank
+        mask &= col_mask
     return df.loc[mask]
 
 
@@ -1232,8 +1231,15 @@ def _render_per_format_summary(view_df: pd.DataFrame) -> None:
     """Render the per-Format Δ Current Fiscal Probabilized Lbs summary.
 
     One row per Format with the net Δ (LE − Prior of "Current Fiscal
-    Probabilized Lbs") and the top 3 drivers by ``|Δ|`` displayed
+    Probabilized Lbs") and the top 3 driver buckets — each bucket is
+    one ``(Customer, Portfolio Minor)`` combination — displayed
     inline.  A TOTAL footer row reconciles to the section subtotal.
+
+    Beneath the summary, an "🔬 Drill into items" expander lets the
+    planner pick any (Format, Customer, Portfolio Minor) bucket and
+    see the item-level rows that compose it — the bridge from
+    "where's the money moving?" (this table) to "which SKUs?" (the
+    drill-down).
 
     Visual treatment
     ----------------
@@ -1243,8 +1249,9 @@ def _render_per_format_summary(view_df: pd.DataFrame) -> None:
     * The TOTAL row is rendered in bold to set it apart from the
       individual-Format rows.
     * The Δ column uses ``format="accounting"`` like the rest of the
-      section.  Driver cells are pre-formatted text (Item # — Desc
-      (±value)), rendered as plain strings.
+      section.  Driver cells are pre-formatted text
+      ``"{Customer} — {Portfolio Minor}  (±value)"`` rendered as
+      plain strings.
 
     Lives INSIDE the same ``@st.fragment`` as the editor + subtotal,
     so it recomputes instantly on every filter change or cell edit
@@ -1256,11 +1263,11 @@ def _render_per_format_summary(view_df: pd.DataFrame) -> None:
 
     st.markdown(
         "**Δ Current Fiscal Probabilized Lbs — by Format**  \n"
-        "_Net change and top 3 drivers per Format (drivers ranked by absolute "
-        "magnitude; TOTAL row reconciles to the subtotal above)._"
+        "_Net change and top 3 driver buckets per Format.  Each driver "
+        "bucket is one **(Customer, Portfolio Minor)** combo — the table "
+        "above shows the items behind every bucket.  Use the drill-down "
+        "expander below to inspect the SKUs in any one bucket._"
     )
-
-    is_total = summary[PER_FORMAT_FORMAT_COL].eq(PER_FORMAT_TOTAL_LABEL)
 
     def _color_signed(v):
         """Return a CSS color for a signed numeric value (red / green / none)."""
@@ -1304,6 +1311,191 @@ def _render_per_format_summary(view_df: pd.DataFrame) -> None:
         hide_index=True,
         column_config=column_config,
     )
+
+    # ── Drill-down: items behind a single driver bucket ───────────────
+    # Reads the FULL master frame (passed in as *view_df*) so the
+    # planner can chase any bucket regardless of the field filters
+    # at the top of the section — same "portfolio-wide diagnostic"
+    # contract as the summary table itself.
+    _render_driver_drill_down(view_df, summary)
+
+
+def _render_driver_drill_down(
+    view_df: pd.DataFrame, summary: pd.DataFrame,
+) -> None:
+    """Render the (Format → Customer/PMinor → Items) drill-down expander.
+
+    Wiring
+    ------
+    * The Format selector is populated from the per-Format summary
+      (excluding the TOTAL footer row) so it lists exactly the
+      Formats the planner can see in the table above.
+    * The (Customer, PMinor) selector is populated from
+      ``compute_per_format_summary``'s underlying buckets — recomputed
+      for the chosen Format only so the planner never picks a bucket
+      that doesn't exist.  Blank values flow through as the
+      :data:`PER_FORMAT_DRIVER_BLANK_LABEL` sentinel (matching the
+      table's behaviour).
+    * The item table is computed via :func:`compute_driver_items` and
+      sorted by ``|Δ Current Fiscal Probabilized Lbs|`` desc so the
+      biggest movers within the bucket land at the top.
+
+    Visual treatment matches the rest of the section: accounting
+    formatting on the Lbs columns + a small height cap so the
+    drilldown never dominates the page.
+    """
+    # Format selector — exclude the synthetic TOTAL row.
+    format_options = [
+        f for f in summary[PER_FORMAT_FORMAT_COL].tolist()
+        if f != PER_FORMAT_TOTAL_LABEL
+    ]
+    if not format_options:
+        return  # Nothing to drill into.
+
+    with st.expander(
+        "🔬 Drill into items — pick a driver bucket to see the SKUs behind it",
+        expanded=False,
+    ):
+        sel_format = st.selectbox(
+            "Format",
+            options=format_options,
+            index=0,
+            key="ro_cmp_driver_drill_format",
+            help=(
+                "Pick the Format whose driver bucket you want to inspect. "
+                "The list mirrors the per-Format summary table above."
+            ),
+        )
+
+        # Build the (Customer, PMinor) options for the chosen Format
+        # from the SAME normalised bucket keys the summary uses, so
+        # blank-customer / blank-PMinor buckets are reachable.
+        bucket_options = _list_driver_buckets_for_format(view_df, sel_format)
+        if not bucket_options:
+            st.info("No driver buckets for this Format on the current view.")
+            return
+
+        bucket_labels = {
+            (c, p): _bucket_display_label(c, p)
+            for (c, p) in bucket_options
+        }
+        sel_bucket = st.selectbox(
+            "Driver bucket (Customer — Portfolio Minor)",
+            options=bucket_options,
+            index=0,
+            format_func=lambda key: bucket_labels[key],
+            key="ro_cmp_driver_drill_bucket",
+            help=(
+                "Lists every (Customer, Portfolio Minor) combo present in "
+                "the chosen Format, sorted by absolute net Δ (largest "
+                "movers first).  Pick \"(blank)\" entries to find rows "
+                "missing a Customer or Portfolio Minor."
+            ),
+        )
+
+        sel_customer, sel_pminor = sel_bucket
+        items_df = compute_driver_items(
+            view_df, sel_format, sel_customer, sel_pminor,
+        )
+        if items_df.empty:
+            st.caption(
+                "_No items match the current driver bucket — "
+                "this can happen if a cell edit just emptied a "
+                "Format/Customer/PMinor combination._"
+            )
+            return
+
+        cc = st.column_config
+        column_config = {
+            "Item #":          cc.TextColumn("Item #", width="small"),
+            "Description":     cc.TextColumn("Description", width="medium"),
+            "Brand":           cc.TextColumn("Brand", width="small"),
+            "Driver":          cc.TextColumn("Driver", width="small"),
+            CUR_FISCAL_PROB_PRIOR: cc.NumberColumn(format="accounting"),
+            CUR_FISCAL_PROB_LE:    cc.NumberColumn(format="accounting"),
+            CUR_FISCAL_PROB_CHANGE: cc.NumberColumn(
+                "Δ Lbs", format="accounting",
+            ),
+        }
+        st.caption(
+            f"**{len(items_df):,} item(s)** in **{sel_format} → "
+            f"{bucket_labels[sel_bucket]}**"
+        )
+        st.dataframe(
+            items_df,
+            use_container_width=True,
+            height=min(36 * (len(items_df) + 1) + 38, 420),
+            hide_index=True,
+            column_config=column_config,
+        )
+
+
+def _list_driver_buckets_for_format(
+    view_df: pd.DataFrame, format_name: str,
+) -> list[tuple[str, str]]:
+    """Return ``(Customer, Portfolio Minor)`` buckets for *format_name*.
+
+    Buckets are sorted by ``|net Δ|`` desc so the planner sees the
+    same ordering they'd expect from the per-Format summary table.
+    Blank values are normalised to :data:`PER_FORMAT_DRIVER_BLANK_LABEL`
+    so a blank-Customer / blank-PMinor combo is selectable instead of
+    vanishing under a NaN groupby key.
+
+    Pure helper — no IO, no Streamlit dependencies — extracted from
+    :func:`_render_driver_drill_down` so the selector logic is
+    independently inspectable / unit-testable.
+    """
+    if view_df is None or view_df.empty:
+        return []
+
+    work = view_df.copy()
+    work["_fmt"] = (
+        work[PER_FORMAT_FORMAT_COL].astype(str).str.strip()
+        .replace({"": "(Unspecified)", "nan": "(Unspecified)"})
+    )
+    work = work.loc[work["_fmt"].eq((format_name or "").strip() or "(Unspecified)")]
+    if work.empty:
+        return []
+
+    # Mirror the bucket-key normalisation used by ``compute_per_format_summary``
+    # so a "(blank)" Customer in the summary table maps to the same option
+    # offered by the drill-down selector.
+    customers = (
+        work["Customer"].astype("string").fillna("").str.strip()
+        .where(lambda s: s.ne(""), PER_FORMAT_DRIVER_BLANK_LABEL)
+    )
+    pminors = (
+        work.get("Portfolio Minor", pd.Series(dtype="string"))
+            .astype("string").fillna("").str.strip()
+            .where(lambda s: s.ne(""), PER_FORMAT_DRIVER_BLANK_LABEL)
+    )
+    deltas = pd.to_numeric(
+        work[CUR_FISCAL_PROB_CHANGE], errors="coerce",
+    ).fillna(0.0).abs()
+
+    keys = pd.DataFrame({
+        "customer": customers.values,
+        "pminor": pminors.values,
+        "_abs": deltas.values,
+    })
+    # Sum |Δ| per bucket for the ranking — the SIGN of Δ is irrelevant
+    # to "which buckets matter most" — both growers and shrinkers
+    # should be reachable from the top of the list.
+    ranked = (
+        keys.groupby(["customer", "pminor"], dropna=False)["_abs"]
+            .sum().reset_index()
+            .sort_values(by=["_abs", "customer", "pminor"],
+                         ascending=[False, True, True],
+                         kind="mergesort")
+    )
+    return [(str(r.customer), str(r.pminor)) for r in ranked.itertuples()]
+
+
+def _bucket_display_label(customer: str, pminor: str) -> str:
+    """Render a ``(Customer, PMinor)`` tuple as a human-friendly select option."""
+    customer_disp = customer or PER_FORMAT_DRIVER_BLANK_LABEL
+    pminor_disp = pminor or PER_FORMAT_DRIVER_BLANK_LABEL
+    return f"{customer_disp} — {pminor_disp}"
 
 
 # ── Early-Start-Date Programs (Fabric drilldown) ────────────────────────────
@@ -1367,8 +1559,10 @@ def _render_early_start_programs_fragment() -> None:
     if comp_df is None or comp_df.empty:
         st.info(
             "ℹ️ `RO_Comparison_Output.csv` is empty or has not been "
-            "published yet.  Use **💾 Save to RO_Reporting (overwrite)** "
-            "above to publish the current comparison first."
+            "published yet.  It is **auto-published** by this app the "
+            "next time `RO_History_Tracker.csv` changes in Fabric — "
+            "wait a few minutes for Fabric to ingest your upload and "
+            "reload this page."
         )
         return
 
@@ -1890,10 +2084,13 @@ def _summary_report_column_config() -> dict:
 # Kept distinct from any other download / refresh key on the page so a
 # rerun doesn't accidentally re-trigger the wrong button.
 
-# Number of rows shown in each preview.  Hard-pinned at 20 per the
-# planner's spec — covers a typical eyeball-check without flooding the
-# UI on tables with thousands of rows.
-_DEMAND_SUMMARY_PREVIEW_ROWS: int = 20
+# Number of rows shown in each preview.  Pinned at 5 per the planner's
+# direction — the preview is an EXAMPLE EXTRACT only.  Anyone who
+# wants the full dataset clicks the prominent download button above
+# the preview, which streams the byte-for-byte source CSV from Fabric.
+# Keeping the preview tiny also makes the section render instantly
+# even on the largest sources (millions of rows).
+_DEMAND_SUMMARY_PREVIEW_ROWS: int = 5
 
 
 def _format_last_modified_utc(ts) -> str:
@@ -1940,7 +2137,7 @@ def _render_demand_summary_table(
     download_basename: str,
     download_button_key: str,
 ) -> None:
-    """Render one Demand Summary file: metadata caption + ⬇️ + top-20 preview.
+    """Render one Demand Summary file: metadata caption + ⬇️ + tiny example extract.
 
     Parameters
     ----------
@@ -1957,13 +2154,16 @@ def _render_demand_summary_table(
     download_button_key
         Stable Streamlit widget key — must be unique across the page.
 
-    Why the download button comes BEFORE the preview
-    ------------------------------------------------
-    Per planner direction, the export action must be "easy to find".
-    Rendering it above the table guarantees it's visible without
-    scrolling for any reasonable browser viewport, even when the
-    preview table itself is tall (20 rows × variable column count can
-    push the bottom of the preview off-screen on a 13" laptop).
+    UX rationale
+    ------------
+    The preview on this page is an **example extract** (first
+    :data:`_DEMAND_SUMMARY_PREVIEW_ROWS` rows), not a working table.
+    Planners who need to inspect, slice, or hand off the data go
+    through the prominent download button at the top of the section —
+    its label and the caption above the preview both spell out that
+    the displayed rows are illustrative only.  Keeping the preview
+    tiny is intentional: the source CSVs can carry millions of rows
+    and pushing that into the browser would freeze the tab.
     """
     st.markdown(f"#### {icon} {title}")
     last_mod = _format_last_modified_utc(snapshot.last_modified)
@@ -1977,7 +2177,7 @@ def _render_demand_summary_table(
         f"**{snapshot.column_count}** columns"
     )
 
-    # ── Download button (above the preview — "easy to find") ────────
+    # ── Download button (above the preview — the canonical path) ────
     #
     # We hand the user the RAW bytes from OneLake (via
     # ``fetch_raw_bytes``) instead of a re-serialised
@@ -2000,7 +2200,10 @@ def _render_demand_summary_table(
         )
     else:
         st.download_button(
-            label=f"⬇️ Download `{download_basename}.csv` (full file from Fabric)",
+            label=(
+                f"⬇️ Download FULL `{download_basename}.csv` "
+                f"({snapshot.row_count:,} rows from Fabric)"
+            ),
             data=raw_bytes,
             file_name=f"{download_basename}_{today}.csv",
             mime="text/csv",
@@ -2010,23 +2213,34 @@ def _render_demand_summary_table(
                 f"Downloads a byte-for-byte copy of "
                 f"`Files/{snapshot.blob_path}` straight from Microsoft "
                 "Fabric — no re-serialisation, so numeric types / "
-                "quoting / line endings match the source exactly."
+                "quoting / line endings match the source exactly. "
+                "This is the canonical path to the data; the preview "
+                "below is just an example extract."
             ),
         )
 
-    # ── Top-20 preview ──────────────────────────────────────────────
+    # ── Tiny example extract (NOT a working table) ──────────────────
     #
     # Read-only preview only — the planner doesn't edit these tables.
     # ``st.dataframe`` (not ``st.data_editor``) keeps the widget light
     # and renders the data with built-in column sorting.  Pinning the
     # row count to ``_DEMAND_SUMMARY_PREVIEW_ROWS`` keeps the section
     # vertically bounded regardless of how big the underlying file is
-    # — the download button is the path to the full data.
+    # — the download button above is the path to the full data.
+    n_shown = min(_DEMAND_SUMMARY_PREVIEW_ROWS, snapshot.row_count)
+    st.markdown(
+        f"**📄 Example extract** — first **{n_shown:,}** of "
+        f"**{snapshot.row_count:,}** rows.  Use the download button "
+        "above to get the full file."
+    )
     preview = snapshot.df.head(_DEMAND_SUMMARY_PREVIEW_ROWS)
+    # Compact height — 5 rows + header fits in <200 px so the section
+    # never crowds the page; download button stays inside the viewport.
+    preview_height = 36 * (len(preview) + 1) + 38
     st.dataframe(
         preview,
         width="stretch",
-        height=520,
+        height=preview_height,
         # Render any datetime-typed column as a clean ``YYYY-MM-DD``
         # date instead of Streamlit's default ``YYYY-MM-DD HH:MM:SS``
         # display.  The connector already coerces ``Start of Month``
@@ -2037,21 +2251,15 @@ def _render_demand_summary_table(
         # might add in the future.
         column_config=_demand_preview_column_config(preview),
     )
-    if snapshot.row_count > _DEMAND_SUMMARY_PREVIEW_ROWS:
-        st.caption(
-            f"_Showing the first {_DEMAND_SUMMARY_PREVIEW_ROWS:,} of "
-            f"{snapshot.row_count:,} rows.  Use the download button above "
-            "for the full dataset._"
-        )
 
 
 def _render_demand_summary() -> None:
     """Render the Demand Summary section end-to-end inside a foldable expander.
 
     Loads both Demand Plan CSVs from Microsoft Fabric (with the same
-    15-minute TTL cache the rest of the page uses), shows a top-20-row
-    preview of each, and exposes prominent download buttons for the
-    full files.
+    15-minute TTL cache the rest of the page uses), shows a tiny
+    example extract of each, and exposes prominent download buttons
+    for the full files.
 
     Wrapped in ``st.expander(expanded=False)`` to match the foldable
     pattern used by the other dashboards on this page — collapsed by
@@ -2069,11 +2277,13 @@ def _render_demand_summary() -> None:
     """
     with st.expander("📈 Demand Summary", expanded=False):
         st.caption(
-            "Latest **Demand Plan** CSV exports from Microsoft Fabric — "
-            "rendered with a top-20-row preview for a quick eyeball check, "
-            "and a prominent download button on each table for the full "
-            "file.  Reads `Files/RO Tracking/Demand Plan/` and inherits "
-            "the same 15-min cache cadence as the RO Comparison section."
+            "Latest **Demand Plan** CSV exports from Microsoft Fabric.  "
+            f"Each table below is just an **example extract** "
+            f"(first {_DEMAND_SUMMARY_PREVIEW_ROWS} rows) — use the "
+            "prominent download button above each preview to grab the "
+            "full file.  Reads `Files/RO Tracking/Demand Plan/` and "
+            "inherits the same 15-min cache cadence as the RO Comparison "
+            "section."
         )
 
         # Fabric auth gate — match the RO Comparison gate so the planner
@@ -2266,6 +2476,54 @@ def _build_demand_pivot_supply_format_lookup() -> dict[str, str]:
     return build_supply_format_lookup(pdh_df, item_master_df)
 
 
+def _build_demand_pivot_budget_lookup() -> BudgetLookup:
+    """Return the annual-budget lookup for the Demand Pivot Summary.
+
+    Composes the two static-budget CSVs — ``Static_Budget_Base_Lbs.csv``
+    and ``Static_Budget_RO_Lbs.csv`` — into a single
+    :class:`BudgetLookup` via :func:`build_budget_lookup`.  Both reads
+    are wrapped in try/except so a transient outage on either source
+    degrades the cascade gracefully:
+
+    * Base unavailable → R&O budget alone fills the Total Budget column.
+    * RO unavailable   → Base budget alone fills the Total Budget column.
+    * Both unavailable → empty lookup; :attr:`BudgetLookup.has_data`
+      reports ``False`` and the page suppresses both the column and
+      the chart's dotted budget line.
+
+    Failure logs stay INFO-level (not warnings) because a missing
+    static-budget file is recoverable — every other section on the
+    page keeps working, and the planner has plenty of other visual
+    cues that the budget is unavailable (an absent column, an absent
+    chart line).
+    """
+    # Base tier.
+    try:
+        base_snapshot = fetch_static_budget_base()
+        base_df = base_snapshot.df
+    except DemandSummaryError as exc:
+        logger.info(
+            "Static_Budget_Base_Lbs.csv unavailable for the Demand Pivot "
+            "budget lookup (will fall back to RO-only budget): %s",
+            exc,
+        )
+        base_df = None
+
+    # R&O tier.
+    try:
+        ro_snapshot = fetch_static_budget_ro()
+        ro_df = ro_snapshot.df
+    except DemandSummaryError as exc:
+        logger.info(
+            "Static_Budget_RO_Lbs.csv unavailable for the Demand Pivot "
+            "budget lookup (will fall back to Base-only budget): %s",
+            exc,
+        )
+        ro_df = None
+
+    return build_budget_lookup(base_df, ro_df)
+
+
 def _render_demand_pivot_section() -> None:
     """Render the Demand Pivot Summary header + delegate to the fragment.
 
@@ -2334,6 +2592,12 @@ def _render_demand_pivot_fragment() -> None:
     #    sentinel where the planner can spot them.
     supply_format_lookup = _build_demand_pivot_supply_format_lookup()
 
+    # 2b. Build the per-leaf annual budget lookup from the two
+    #     static-budget CSVs (Base + R&O).  Same graceful-degradation
+    #     story as the Supply Format cascade — a missing source
+    #     simply leaves that tier blank in the Total Budget column.
+    budget_lookup = _build_demand_pivot_budget_lookup()
+
     # 3. Discover the available filter values from the FULL frame so
     #    a selection in one filter doesn't shrink the option list of
     #    another (matches the planner's expectation when slicing).
@@ -2354,6 +2618,7 @@ def _render_demand_pivot_fragment() -> None:
             result = build_demand_pivot(
                 snapshot.df, filters,
                 supply_format_lookup=supply_format_lookup,
+                budget_lookup=budget_lookup,
             )
     except DemandPivotError as exc:
         st.error(f"❌ Could not build the Demand Pivot Summary.\n\n{exc}")
@@ -2476,13 +2741,18 @@ def _render_demand_pivot_filters(
     )
 
 
-def _demand_pivot_column_config(month_columns: tuple[str, ...]) -> dict:
+def _demand_pivot_column_config(
+    month_columns: tuple[str, ...], *, include_budget: bool,
+) -> dict:
     """Return the ``column_config`` mapping for the pivot editor.
 
     All month columns + the Total column use ``format="%.1f"`` to
     match the screenshot's "47.8 M lb" display precision (one
     decimal place).  ``Row Label`` is wide enough to fit the deepest
-    indent without truncation.
+    indent without truncation.  The Total Budget column is included
+    only when *include_budget* is True (the page passes ``False`` if
+    both static-budget CSVs were unavailable, so the column doesn't
+    render as a misleading all-zero strip).
     """
     cc = st.column_config
     num_fmt = "%.1f"
@@ -2495,6 +2765,20 @@ def _demand_pivot_column_config(month_columns: tuple[str, ...]) -> dict:
     config[TOTAL_COLUMN_LABEL] = cc.NumberColumn(
         TOTAL_COLUMN_LABEL, format=num_fmt, disabled=True,
     )
+    if include_budget:
+        config[TOTAL_BUDGET_COLUMN_LABEL] = cc.NumberColumn(
+            TOTAL_BUDGET_COLUMN_LABEL,
+            format=num_fmt,
+            disabled=True,
+            help=(
+                "Annual budget for this row (in millions of lbs), "
+                "sourced from `Static_Budget_Base_Lbs.csv` (Base Plan "
+                "rows) and `Static_Budget_RO_Lbs.csv` (R&O rows). "
+                "Aggregated at the row's natural level — leaves show "
+                "the per-(PMaj, SFmt) budget; subtotals sum their "
+                "children; Grand Total bundles every visible row."
+            ),
+        )
     return config
 
 
@@ -2505,8 +2789,9 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
     :func:`st.data_editor`) because the planner doesn't edit this
     view — it's a pure roll-up of the source CSV.  ``column_order``
     pins the Row Label first, then every month in ascending order,
-    then the Total column on the right (mirrors the Excel screenshot
-    column layout exactly).
+    then the Total column, then the Total Budget column on the
+    far right (mirrors the Excel screenshot column layout exactly,
+    with the budget appended per the planner's direction).
     """
     # ── Download button (above the table — "easy to find") ──────────
     #
@@ -2525,12 +2810,21 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
         help=(
             "Downloads the current pivot view as a CSV — preserves "
             "the indented Row Label hierarchy so the file mirrors the "
-            "on-screen layout.  Honours your active filters."
+            "on-screen layout, including the Total Budget column. "
+            "Honours your active filters."
         ),
     )
 
-    # ── Column layout: Row Label · months ascending · Total ──────────
-    column_order: list[str] = ["Row Label", *result.month_columns, TOTAL_COLUMN_LABEL]
+    # ── Column layout: Row Label · months ascending · Total · Total Budget ─
+    column_order: list[str] = [
+        "Row Label", *result.month_columns, TOTAL_COLUMN_LABEL,
+    ]
+    if result.has_budget_data:
+        column_order.append(TOTAL_BUDGET_COLUMN_LABEL)
+
+    column_config = _demand_pivot_column_config(
+        result.month_columns, include_budget=result.has_budget_data,
+    )
 
     # Pivot table.  Height sized so the typical 10-30 row range fits
     # without scrolling, capped so a wide filter doesn't dominate the
@@ -2542,46 +2836,65 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
         hide_index=True,
         height=table_height,
         column_order=column_order,
-        column_config=_demand_pivot_column_config(result.month_columns),
+        column_config=column_config,
     )
 
-    # ── Dynamic footer subtotals (Base Plan / R&O) ───────────────────
+    # ── Dynamic subtotals (Base Plan / R&O / bundled Total Budget) ───
     #
     # Per the planner's spec, these are SEPARATE from the Grand Total
     # row inside the pivot above — they make the Base/R&O split
     # explicit at a glance, regardless of which Portfolio Major
     # rows ended up visible (e.g. R&O total is non-zero even when the
     # planner filtered to PMaj that have only Base-Plan leaves).
+    #
+    # The bundled Total Budget row is appended at the bottom so a
+    # single glance answers "what's the budget across both Base and
+    # R&O for the current filter window?" — same number that drives
+    # the dotted line on the chart below.
     st.markdown("**Dynamic subtotals** (live: reflects current filters)")
-    footer_df = pd.concat(
-        [result.base_plan_totals, result.r_and_o_totals],
-        ignore_index=True,
-    )
+    footer_parts = [result.base_plan_totals, result.r_and_o_totals]
+    if result.has_budget_data:
+        footer_parts.append(result.budget_totals)
+    footer_df = pd.concat(footer_parts, ignore_index=True)
     st.dataframe(
         footer_df,
         use_container_width=True,
         hide_index=True,
         height=35 * (len(footer_df) + 1) + 38,
         column_order=column_order,
-        column_config=_demand_pivot_column_config(result.month_columns),
+        column_config=column_config,
     )
+    if result.has_budget_data:
+        st.caption(
+            f"💰 **Bundled Total Budget (Base + R&O):** "
+            f"**{result.budget_total_m:,.1f} M lbs** "
+            "(annual; same figure shown as the dotted line on the "
+            "Base + RO Summary chart below)."
+        )
 
 
 def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
-    """Render the Base + RO Summary stacked area chart.
+    """Render the Base + RO Summary stacked area chart + Total Budget line.
 
     Mirrors the screenshot the planner shared: Base Plan stacked on
     the bottom (dark blue), R&O on top (orange), x-axis = month,
-    y-axis = millions of pounds.
+    y-axis = millions of pounds.  When a Total Budget value is
+    available (see :attr:`DemandPivotResult.has_budget_data`), a
+    bright dotted line is overlaid at the **monthly** budget level
+    — that's the annual bundled (Base + R&O) budget divided by the
+    number of months in the filter window — so a planner can see at
+    a glance whether each month's actual demand is tracking above or
+    below the budget target.
 
     Why Plotly (not ``st.area_chart``)
     -----------------------------------
     ``st.area_chart`` produces a stacked area by default but does
-    NOT expose colour overrides per series.  The planner explicitly
-    wants the Base/R&O colours from the reference screenshot
-    (dark blue / orange), so we drive the colours directly through
-    a Plotly figure.  This module already lists ``plotly`` as a
-    required dependency (see ``requirements.txt``).
+    NOT expose colour overrides per series, and cannot overlay an
+    arbitrary reference line.  The planner explicitly wants the
+    Base/R&O colours from the reference screenshot (dark blue /
+    orange) AND the dotted budget line, so we drive the chart
+    directly through a Plotly figure.  This module already lists
+    ``plotly`` as a required dependency (see ``requirements.txt``).
     """
     chart_df = result.chart_long
     if chart_df.empty:
@@ -2591,10 +2904,21 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
         return
 
     st.markdown("**Base + RO Summary**")
-    st.caption(
-        "Stacked area of monthly Base Plan + R&O totals in millions "
-        "of pounds.  Updates live with the filter selections above."
-    )
+    if result.has_budget_data:
+        st.caption(
+            "Stacked area of monthly Base Plan + R&O totals in millions "
+            "of pounds, with a dotted line at the **monthly Total "
+            "Budget** target (annual Base + R&O budget ÷ months in "
+            "the filter window).  Updates live with the filter "
+            "selections above."
+        )
+    else:
+        st.caption(
+            "Stacked area of monthly Base Plan + R&O totals in millions "
+            "of pounds.  Updates live with the filter selections above. "
+            "_Total Budget line unavailable — the static-budget CSVs "
+            "could not be read from Fabric._"
+        )
 
     # Pivot the long frame into one column per series so each ``go.Scatter``
     # trace can read its full y-vector in one indexer call — cleaner than
@@ -2654,6 +2978,34 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
                 "<b>%{x}</b><br>"
                 f"{FORECAST_R_AND_O}: "
                 "%{y:.1f} M lbs<extra></extra>"
+            ),
+        ))
+
+    # Total Budget overlay — bright dotted line at the monthly budget
+    # level (annual ÷ months).  NOT inside the stackgroup so it sits
+    # on top of the areas instead of summing into them.  Coloured a
+    # high-contrast magenta + 3 px stroke + dot pattern so it stays
+    # readable against the dark blue Base Plan fill underneath.
+    n_months = len(wide.index)
+    if result.has_budget_data and n_months > 0:
+        monthly_budget_m = float(result.budget_total_m) / float(n_months)
+        fig.add_trace(go.Scatter(
+            x=x_labels,
+            y=[monthly_budget_m] * n_months,
+            name=(
+                f"Total Budget (monthly): {monthly_budget_m:,.1f} M lbs · "
+                f"annual: {result.budget_total_m:,.1f} M lbs"
+            ),
+            mode="lines",
+            # No stackgroup → drawn as an overlay reference line.
+            line=dict(
+                color="#d62728",            # bright red — high contrast
+                width=3,
+                dash="dot",
+            ),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Total Budget (monthly): %{y:.1f} M lbs<extra></extra>"
             ),
         ))
 

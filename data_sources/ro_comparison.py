@@ -956,6 +956,14 @@ PER_FORMAT_DRIVER_COLS: tuple[str, str, str] = (
 PER_FORMAT_TOTAL_LABEL: str = "TOTAL"
 
 
+# Sentinel display value for blank (Customer, Portfolio Minor) tuples
+# so a row whose Customer or Portfolio Minor is missing still appears
+# in the driver ranking instead of vanishing under a None group key.
+# The same string is the join key the page uses to look the driver up
+# in the drill-down helper.
+PER_FORMAT_DRIVER_BLANK_LABEL: str = "(blank)"
+
+
 def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
     """Return a per-Format roll-up of ``Change Current Fiscal Probabilized Lbs``.
 
@@ -963,9 +971,9 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
 
         Format │ Δ Current Fiscal Probabilized Lbs │ #1 Driver │ #2 Driver │ #3 Driver
         ───────┼───────────────────────────────────┼───────────┼───────────┼───────────
-        WMC    │   +245,300                         │ 1234 — V… │ 5678 — C… │ 9012 — S…
-        DCO    │   −180,000                         │ 4321 — Y… │ 8765 — B… │ 2468 — S…
-        TOTAL  │    +65,300                         │           │           │
+        WMC    │   +245,300                        │ Costco — Yogurt (+180,000) │ … │ …
+        DCO    │   −180,000                        │ Sysco — Cottage Cheese (−120,000) │ … │ …
+        TOTAL  │    +65,300                        │                            │   │
 
     Rules
     -----
@@ -977,14 +985,23 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
       silently disappear from the roll-up.
     * Format rows are sorted by ``|Δ|`` descending so the biggest
       movers are at the top.  Ties are broken by Format name (asc).
-    * Drivers are the rows with the 3 largest ``|Δ Current Fiscal
-      Probabilized Lbs|`` within each Format (top movers in either
-      direction).  Ties are broken by ``Item #`` ascending for
-      deterministic display.
-    * Driver cell format: ``"{Item #} — {Description}  ({signed Δ in
-      accounting})"``.  Empty string for Formats with fewer than 3
-      rows.  Signed Δ uses commas + a leading ``+``/``−`` so the
+    * **Drivers are aggregated by (Customer, Portfolio Minor)** —
+      every Item belonging to the same Customer + Portfolio Minor
+      within a Format collapses into a single driver bucket whose Δ
+      is the sum of those Items' Δ.  Top 3 buckets by ``|aggregated
+      Δ|`` are reported per Format.  This matches the planner's
+      mental model when chasing root-cause attribution (one customer
+      flipping its yogurt commit shows up as ONE driver, not as five
+      separate Item rows).  Items are reachable via the drill-down
+      helper :func:`compute_driver_items` (one call per driver cell).
+    * Driver cell format: ``"{Customer} — {Portfolio Minor}  ({signed
+      Δ in accounting})"``.  Empty string for Formats with fewer than
+      3 buckets.  Signed Δ uses commas + a leading ``+``/``−`` so the
       page can colour-style it without re-parsing.
+    * Customer / Portfolio Minor blanks are bucketed under the literal
+      :data:`PER_FORMAT_DRIVER_BLANK_LABEL` (``"(blank)"``) so they
+      still appear in the ranking — and the drill-down helper takes
+      that same sentinel back as a lookup key.
     * TOTAL row sums Δ across all visible Formats; its driver cells
       are blank (the per-Format drivers don't compose into a single
       cross-Format pick).
@@ -1013,28 +1030,41 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
     work["_delta"] = pd.to_numeric(
         work[CUR_FISCAL_PROB_CHANGE], errors="coerce",
     ).fillna(0.0)
+    # Canonical (Customer, Portfolio Minor) bucket keys.  Coerce both
+    # to stripped strings and replace blank/NaN with the same sentinel
+    # the drill-down API understands, so empty values aren't silently
+    # dropped by ``groupby`` (which drops NaN keys by default unless
+    # ``dropna=False`` is passed — we go a step further and explicitly
+    # label them so the user can SEE the blank bucket in the table).
+    work["_customer"] = _normalise_driver_key(work.get("Customer"))
+    work["_pminor"]   = _normalise_driver_key(work.get("Portfolio Minor"))
 
-    # ── 1. Per-Format net Δ + ranked drivers ─────────────────────────
+    # ── 1. Per-Format net Δ + top-3 (Customer, PMinor) drivers ──────
     rows: list[dict[str, Any]] = []
     for fmt, group in work.groupby(PER_FORMAT_FORMAT_COL, sort=False):
         net_delta = float(group["_delta"].sum())
 
-        # Top 3 by |Δ|.  Ties → Item # ascending for stability.
-        ranked = group.assign(_abs=group["_delta"].abs()).sort_values(
-            by=["_abs", "Item #"],
-            ascending=[False, True],
+        # Aggregate Δ by (Customer, Portfolio Minor) bucket.  Sum first
+        # — that's what the planner means by "driver"; sorting by |sum|
+        # then surfaces the buckets that moved the Format's needle
+        # furthest in either direction.
+        bucketed = (
+            group.groupby(["_customer", "_pminor"], dropna=False, sort=False)
+                 ["_delta"].sum().reset_index()
+        )
+        ranked = bucketed.assign(_abs=bucketed["_delta"].abs()).sort_values(
+            by=["_abs", "_customer", "_pminor"],
+            ascending=[False, True, True],
             kind="mergesort",
         )
+
         drivers: list[str] = []
         for _, r in ranked.head(3).iterrows():
-            customer = str(r.get("Customer", "")).strip()
-            item = str(r.get("Item #", "")).strip() or "?"
-            desc = str(r.get("Description", "")).strip()
-            driver = str(r.get("Driver", "")).strip()
-            delta_val = float(r["_delta"])
-            drivers.append(
-                _format_driver_cell(customer, item, desc, driver, delta_val)
-            )
+            drivers.append(_format_driver_cell(
+                customer=str(r["_customer"]),
+                pminor=str(r["_pminor"]),
+                delta=float(r["_delta"]),
+            ))
         while len(drivers) < 3:
             drivers.append("")
 
@@ -1067,22 +1097,122 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _normalise_driver_key(series: Any) -> Any:
+    """Return a ``Series`` whose blank/NaN entries become the blank sentinel.
+
+    Centralised so the per-Format summary, the drill-down lookup, and
+    every consumer of "driver buckets" use the SAME normalisation —
+    a blank Customer in the table and a "(blank)" pick from the drill-
+    down selector will always reference the same set of rows.
+
+    When *series* is ``None`` (the source frame lacks the column
+    entirely — e.g. a legacy frame without ``Portfolio Minor``) the
+    helper returns the blank sentinel as a SCALAR.  The caller assigns
+    the result with ``df["_col"] = _normalise_driver_key(...)`` so
+    pandas broadcasts the scalar to fill every row uniformly — no
+    length-mismatch errors, no per-call boilerplate.
+    """
+    if series is None:
+        return PER_FORMAT_DRIVER_BLANK_LABEL
+    s = pd.Series(series).astype("string").fillna("").str.strip()
+    return s.where(s.ne(""), PER_FORMAT_DRIVER_BLANK_LABEL)
+
+
+def compute_driver_items(
+    view_df: pd.DataFrame,
+    format_name: str,
+    customer: str,
+    pminor: str,
+) -> pd.DataFrame:
+    """Return the items that compose a single driver bucket — for drill-down.
+
+    Parameters
+    ----------
+    view_df
+        The same in-memory comparison frame the per-Format summary
+        was computed from (so item-level rows reflect every active
+        filter + edit).
+    format_name
+        Format the driver bucket belongs to.
+    customer, pminor
+        The bucket's Customer + Portfolio Minor values, as displayed
+        in the driver cell.  Pass :data:`PER_FORMAT_DRIVER_BLANK_LABEL`
+        (or an empty string — both are normalised to the same key) to
+        target the blank-bucket.
+
+    Returns
+    -------
+    pd.DataFrame
+        Item-level columns useful for a planner's drill-down:
+        ``Item #``, ``Description``, ``Brand``, ``Driver``,
+        ``Prior Current Fiscal Probabilized Lbs``,
+        ``LE Current Fiscal Probabilized Lbs``,
+        ``Change Current Fiscal Probabilized Lbs``.
+        Sorted by ``|Δ|`` desc so the biggest movers are at the top.
+        Returns an empty DataFrame (with the canonical column order)
+        when no rows match — the page renders "no items" gracefully.
+
+    Pure function — no I/O, no Streamlit dependencies.
+    """
+    output_cols = [
+        "Item #", "Description", "Brand", "Driver",
+        CUR_FISCAL_PROB_PRIOR, CUR_FISCAL_PROB_LE, CUR_FISCAL_PROB_CHANGE,
+    ]
+    if view_df is None or view_df.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    # Mirror the bucket-key normalisation used by
+    # ``compute_per_format_summary`` so a "(blank)" selection from the
+    # UI matches every blank row in the source frame.
+    fmt_key = (
+        (format_name or "").strip()
+        or "(Unspecified)"
+    )
+    customer_key = (customer or "").strip() or PER_FORMAT_DRIVER_BLANK_LABEL
+    pminor_key   = (pminor   or "").strip() or PER_FORMAT_DRIVER_BLANK_LABEL
+
+    work = view_df.copy()
+    work[PER_FORMAT_FORMAT_COL] = (
+        work[PER_FORMAT_FORMAT_COL].astype(str).str.strip()
+        .replace({"": "(Unspecified)", "nan": "(Unspecified)"})
+    )
+    work["_customer"] = _normalise_driver_key(work.get("Customer"))
+    work["_pminor"]   = _normalise_driver_key(work.get("Portfolio Minor"))
+    work["_delta"]    = pd.to_numeric(
+        work[CUR_FISCAL_PROB_CHANGE], errors="coerce",
+    ).fillna(0.0)
+
+    mask = (
+        work[PER_FORMAT_FORMAT_COL].eq(fmt_key)
+        & work["_customer"].eq(customer_key)
+        & work["_pminor"].eq(pminor_key)
+    )
+    filtered = work.loc[mask]
+    if filtered.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    # Sort by |Δ| desc, then Item # asc for a deterministic order.
+    filtered = filtered.assign(_abs=filtered["_delta"].abs()).sort_values(
+        by=["_abs", "Item #"],
+        ascending=[False, True],
+        kind="mergesort",
+    )
+    # Hand back ONLY the display columns the drill-down UI uses — keeps
+    # the rendered table tight and avoids surfacing every internal
+    # comparison field to the planner.
+    return filtered.loc[:, output_cols].reset_index(drop=True)
+
+
 def _format_driver_cell(
-    customer: str, item: str, desc: str, driver: str, delta: float,
+    customer: str, pminor: str, delta: float,
 ) -> str:
-    """Render a driver cell as ``"{Customer} — {Item #} — {Description} — {Driver}  ({signed Δ})"``.
+    """Render a driver cell as ``"{Customer} — {Portfolio Minor}  ({signed Δ})"``.
 
-    The ``driver`` token is one of ``"New" / "Exit" / "Change" / "No
-    Change"`` and identifies WHY this RO contributed to the Format's
-    Δ.  Including it inline saves the planner a click into the main
-    table to disambiguate (a row with ``-7,000`` could be a customer
-    exit OR a forecast cut — the label removes ambiguity).
-
-    Blank components are dropped so an item without a Description
-    renders as ``"{Customer} — {Item #} — {Driver}  ({signed Δ})"``
-    instead of a stray double em-dash.  When every identifier is
-    blank the cell falls back to ``"?"`` so the row is still
-    discoverable.
+    The cell summarises one (Customer, Portfolio Minor) bucket inside a
+    Format.  Both labels are surfaced verbatim — including the blank
+    sentinel — so the planner can spot driver buckets whose Customer
+    or Portfolio Minor is missing.  When every label is blank the
+    cell falls back to ``"?"`` so the row is still discoverable.
 
     Signed delta uses commas + an explicit ``+`` / ``−`` (Unicode
     minus to match accounting / spreadsheet aesthetics) so the page
@@ -1097,9 +1227,7 @@ def _format_driver_cell(
     else:
         signed = "0"
 
-    parts = [
-        p.strip() for p in (customer, item, desc, driver) if p and p.strip()
-    ]
+    parts = [p.strip() for p in (customer, pminor) if p and p.strip()]
     base = " — ".join(parts) if parts else "?"
     return f"{base}  ({signed})"
 
@@ -1693,7 +1821,9 @@ __all__ = [
     # Per-Format summary surface.
     "PER_FORMAT_FORMAT_COL", "PER_FORMAT_DELTA_COL",
     "PER_FORMAT_DRIVER_COLS", "PER_FORMAT_TOTAL_LABEL",
+    "PER_FORMAT_DRIVER_BLANK_LABEL",
     "compute_per_format_summary",
+    "compute_driver_items",
     # Value objects + errors.
     "ComparisonWarnings",
     "RoComparisonError",

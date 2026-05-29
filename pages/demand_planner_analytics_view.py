@@ -36,19 +36,29 @@ widget interaction.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Callable
+from typing import Callable, Optional
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from data_sources.demand_summary import (
+    DemandPivotError,
+    DemandPivotFilters,
+    DemandPivotResult,
     DemandSummaryError,
     DemandSummarySnapshot,
+    FORECAST_BASE_PLAN,
+    FORECAST_R_AND_O,
+    TOTAL_COLUMN_LABEL,
+    build_demand_pivot,
     clear_demand_summary_cache,
     fetch_mgmt_plan_full,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
     fetch_total_item_level_demand,
+    list_available_filter_values,
     mgmt_plan_full_blob_path,
+    pivot_for_download,
     total_item_level_demand_blob_path,
 )
 from data_sources.ibp_official import (
@@ -2082,6 +2092,15 @@ def _render_demand_summary() -> None:
             download_button_key="demand_summary_dl_total_item_level_demand",
         )
 
+        # ── Demand Pivot Summary (hierarchical roll-up) ─────────────
+        #
+        # Lives below the two raw-CSV previews because it's a derived
+        # view of the second file (qry_total_item_level_demand.csv).
+        # The horizontal rule keeps the visual separation crisp so
+        # planners don't conflate the raw preview with the roll-up.
+        st.markdown("---")
+        _render_demand_pivot_section()
+
 
 def _render_demand_summary_file(
     *,
@@ -2128,6 +2147,428 @@ def _render_demand_summary_file(
         download_basename=download_basename,
         download_button_key=download_button_key,
     )
+
+
+# ── Demand Pivot Summary (hierarchical roll-up) ─────────────────────────────
+#
+# Mirrors the Excel pivot the planner pasted in the chat:
+#   Rows:  Portfolio Major → Forecast Type ("Base Plan" / "R&O") → Supply Format
+#   Cols:  one per month + a trailing "Total" column
+#   Vals:  Sum of Demand Plan Pounds, in millions, rounded to 1 decimal
+#
+# Source: ``Files/RO Tracking/Demand Plan/qry_total_item_level_demand.csv``
+# (loaded via the same cached fetcher the raw preview above uses, so the
+# pivot benefits from the same freshness guarantees — a refresh of the
+# source CSV in Fabric automatically propagates to this section on the
+# next page render).
+#
+# Filter widget keys — separated from the rest of the page's keys with a
+# distinct ``ro_dp_`` prefix so a key collision can't accidentally
+# reset a planner's selection in another section.
+
+_SS_DP_PMAJ_FILTER:  str = "ro_dp_pmaj_filter"
+_SS_DP_SFMT_FILTER:  str = "ro_dp_sfmt_filter"
+_SS_DP_START_FILTER: str = "ro_dp_start_month_filter"
+_SS_DP_END_FILTER:   str = "ro_dp_end_month_filter"
+
+# Hidden columns owned by the pivot builder — kept in sync with
+# ``data_sources/demand_summary._HIDDEN_COLS``.  Listed locally so the
+# page doesn't need to reach into the private module surface to know
+# which columns to suppress from the editor.
+_DP_HIDDEN_COLS: tuple[str, ...] = ("_row_id", "_indent", "_is_subtotal")
+
+
+def _render_demand_pivot_section() -> None:
+    """Render the Demand Pivot Summary header + delegate to the fragment.
+
+    The header (title + caption) stays OUTSIDE the fragment because
+    it's static text — the fragment owns only the interactive widgets
+    + table + chart so filter / date-range changes rerun only the
+    pivot view, not the surrounding headers.
+    """
+    st.markdown("### 📊 Demand Pivot Summary")
+    st.caption(
+        "Hierarchical roll-up of **`qry_total_item_level_demand.csv`** "
+        "from Microsoft Fabric — Portfolio Major → Forecast Type → "
+        "Supply Format — with monthly columns in **millions of pounds**.  "
+        "Auto-refreshes whenever the source file changes in Fabric (same "
+        "freshness model as the raw preview above).  Use the filters to "
+        "narrow by Portfolio Major / Supply Format / month range; the "
+        "footer subtotals and the Base + RO chart below update live."
+    )
+    _render_demand_pivot_fragment()
+
+
+@st.fragment
+def _render_demand_pivot_fragment() -> None:
+    """Render the filters, hierarchical pivot table, footer subtotals, and chart.
+
+    Why this is a ``@st.fragment``
+    -------------------------------
+    The widget set (PMaj / SFmt multiselects + month-range pickers)
+    is interactive, but the surrounding sections of the page have
+    nothing to do with the pivot.  Wrapping this block in a
+    fragment scopes each filter change to a rerun of just this
+    function — no upstream Fabric reads, no RO Comparison rebuild.
+
+    Sourcing model
+    --------------
+    Reads the cached ``DemandSummarySnapshot`` from
+    :func:`fetch_total_item_level_demand`.  That fetcher is keyed by
+    blob etag/size/last_modified (see the connector), so any update
+    to the source CSV invalidates the cache and the pivot reflects
+    the fresh data on the same render — no manual refresh click
+    needed.
+    """
+    # 1. Load the source frame (or surface an error + bail).
+    try:
+        with st.spinner("Reading qry_total_item_level_demand.csv from Microsoft Fabric…"):
+            snapshot = fetch_total_item_level_demand()
+    except DemandSummaryError as exc:
+        st.error(
+            "❌ Could not load **qry_total_item_level_demand.csv** for "
+            f"the pivot.\n\n{exc}"
+        )
+        return
+
+    if snapshot.df.empty:
+        st.info(
+            "ℹ️ `qry_total_item_level_demand.csv` is empty — nothing to "
+            "roll up.  Check the upstream Fabric pipeline."
+        )
+        return
+
+    # 2. Discover the available filter values from the FULL frame so
+    #    a selection in one filter doesn't shrink the option list of
+    #    another (matches the planner's expectation when slicing).
+    try:
+        filter_values = list_available_filter_values(snapshot.df)
+    except DemandPivotError as exc:
+        st.error(f"❌ Pivot source has an unexpected schema.\n\n{exc}")
+        return
+
+    # 3. Render the filter row.
+    filters = _render_demand_pivot_filters(filter_values)
+
+    # 4. Build the pivot.
+    try:
+        with st.spinner("Building Demand Pivot Summary…"):
+            result = build_demand_pivot(snapshot.df, filters)
+    except DemandPivotError as exc:
+        st.error(f"❌ Could not build the Demand Pivot Summary.\n\n{exc}")
+        return
+
+    # 5. Empty-after-filter case — show a hint, don't render an empty
+    #    table or a degenerate empty chart.
+    if result.pivot.empty:
+        st.info(
+            "No rows match the current Portfolio Major / Supply Format / "
+            "month range selection.  Widen one of the filters above to "
+            "see data."
+        )
+        return
+
+    # 6. Render the pivot + footer totals + download button.
+    _render_demand_pivot_table(result)
+
+    # 7. Stacked area chart of monthly Base Plan + R&O.
+    st.markdown("---")
+    _render_base_ro_summary_chart(result)
+
+
+def _render_demand_pivot_filters(
+    filter_values: dict[str, list],
+) -> DemandPivotFilters:
+    """Render the four filter widgets and return a :class:`DemandPivotFilters`.
+
+    Layout
+    ------
+    Four columns at typical browser widths — PMaj and SFmt get the
+    wider slots because their selected-chip lists grow with each
+    pick, while the month-range pickers are single-value widgets.
+
+    Defaults
+    --------
+    * PMaj / SFmt multiselects start EMPTY, which the pivot builder
+      interprets as "include every value" (matches the screenshot
+      where no slicer is active by default).
+    * Month range defaults to the full available window so the table
+      shows the same dataset the Excel pivot does when first opened.
+    """
+    pmaj_opts: list[str] = filter_values["portfolio_majors"]
+    sfmt_opts: list[str] = filter_values["supply_formats"]
+    month_opts: list[date] = filter_values["months"]
+
+    # Sensible default month bounds — full available window.
+    min_month: Optional[date] = month_opts[0]  if month_opts else None
+    max_month: Optional[date] = month_opts[-1] if month_opts else None
+
+    with st.expander("🔍 Filters", expanded=True):
+        cols = st.columns([2, 2, 1.2, 1.2])
+        with cols[0]:
+            selected_pmaj = st.multiselect(
+                "Portfolio Major",
+                options=pmaj_opts,
+                key=_SS_DP_PMAJ_FILTER,
+                help=(
+                    "Limit the pivot to specific Portfolio Major "
+                    "value(s).  Empty = include every Portfolio Major."
+                ),
+            )
+        with cols[1]:
+            selected_sfmt = st.multiselect(
+                "Supply Format",
+                options=sfmt_opts,
+                key=_SS_DP_SFMT_FILTER,
+                help=(
+                    "Limit the pivot to specific Supply Format "
+                    "value(s).  Empty = include every Supply Format."
+                ),
+            )
+        with cols[2]:
+            start_month = st.date_input(
+                "Month range — start",
+                value=st.session_state.get(_SS_DP_START_FILTER, min_month),
+                min_value=min_month,
+                max_value=max_month,
+                key=_SS_DP_START_FILTER,
+                help=(
+                    "Inclusive lower bound on `Start of Month`.  Defaults "
+                    "to the earliest month available in the source CSV."
+                ),
+            )
+        with cols[3]:
+            end_month = st.date_input(
+                "Month range — end",
+                value=st.session_state.get(_SS_DP_END_FILTER, max_month),
+                min_value=min_month,
+                max_value=max_month,
+                key=_SS_DP_END_FILTER,
+                help=(
+                    "Inclusive upper bound on `Start of Month`.  Defaults "
+                    "to the latest month available in the source CSV."
+                ),
+            )
+
+    # Warn (don't block) on an inverted range — the pivot builder will
+    # simply return zero rows, which is correct but unhelpful without
+    # an explanation.
+    if (
+        isinstance(start_month, date)
+        and isinstance(end_month, date)
+        and start_month > end_month
+    ):
+        st.warning(
+            f"⚠️ Month-range start (`{start_month:%Y-%m}`) is after "
+            f"end (`{end_month:%Y-%m}`).  The pivot will be empty — "
+            "swap the two dates or widen the range."
+        )
+
+    return DemandPivotFilters(
+        portfolio_majors=tuple(selected_pmaj) or None,
+        supply_formats=tuple(selected_sfmt) or None,
+        # Pickers are always-on and always return a date, so we forward
+        # them straight through — the builder treats Python ``date``
+        # values inclusively on both ends.
+        start_month=start_month if isinstance(start_month, date) else None,
+        end_month=end_month     if isinstance(end_month, date)   else None,
+    )
+
+
+def _demand_pivot_column_config(month_columns: tuple[str, ...]) -> dict:
+    """Return the ``column_config`` mapping for the pivot editor.
+
+    All month columns + the Total column use ``format="%.1f"`` to
+    match the screenshot's "47.8 M lb" display precision (one
+    decimal place).  ``Row Label`` is wide enough to fit the deepest
+    indent without truncation.
+    """
+    cc = st.column_config
+    num_fmt = "%.1f"
+
+    config: dict = {
+        "Row Label": cc.TextColumn("Row Labels", width="large", disabled=True),
+    }
+    for c in month_columns:
+        config[c] = cc.NumberColumn(c, format=num_fmt, disabled=True)
+    config[TOTAL_COLUMN_LABEL] = cc.NumberColumn(
+        TOTAL_COLUMN_LABEL, format=num_fmt, disabled=True,
+    )
+    return config
+
+
+def _render_demand_pivot_table(result: DemandPivotResult) -> None:
+    """Render the pivot table + dynamic footer subtotals + download button.
+
+    The pivot itself is rendered with :func:`st.dataframe` (not
+    :func:`st.data_editor`) because the planner doesn't edit this
+    view — it's a pure roll-up of the source CSV.  ``column_order``
+    pins the Row Label first, then every month in ascending order,
+    then the Total column on the right (mirrors the Excel screenshot
+    column layout exactly).
+    """
+    # ── Download button (above the table — "easy to find") ──────────
+    #
+    # Hand the planner a clean CSV (internal _row_id / _indent /
+    # _is_subtotal columns stripped) so the file they hand off
+    # downstream looks identical to what's on screen.
+    download_df = pivot_for_download(result.pivot)
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        label="⬇️ Download Demand Pivot Summary (CSV)",
+        data=download_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"demand_pivot_summary_{today}.csv",
+        mime="text/csv",
+        key="demand_pivot_summary_download",
+        type="primary",
+        help=(
+            "Downloads the current pivot view as a CSV — preserves "
+            "the indented Row Label hierarchy so the file mirrors the "
+            "on-screen layout.  Honours your active filters."
+        ),
+    )
+
+    # ── Column layout: Row Label · months ascending · Total ──────────
+    column_order: list[str] = ["Row Label", *result.month_columns, TOTAL_COLUMN_LABEL]
+
+    # Pivot table.  Height sized so the typical 10-30 row range fits
+    # without scrolling, capped so a wide filter doesn't dominate the
+    # page.  Each row is ~35 px tall; header ~38 px.
+    table_height = min(35 * (len(result.pivot) + 1) + 38, 720)
+    st.dataframe(
+        result.pivot,
+        use_container_width=True,
+        hide_index=True,
+        height=table_height,
+        column_order=column_order,
+        column_config=_demand_pivot_column_config(result.month_columns),
+    )
+
+    # ── Dynamic footer subtotals (Base Plan / R&O) ───────────────────
+    #
+    # Per the planner's spec, these are SEPARATE from the Grand Total
+    # row inside the pivot above — they make the Base/R&O split
+    # explicit at a glance, regardless of which Portfolio Major
+    # rows ended up visible (e.g. R&O total is non-zero even when the
+    # planner filtered to PMaj that have only Base-Plan leaves).
+    st.markdown("**Dynamic subtotals** (live: reflects current filters)")
+    footer_df = pd.concat(
+        [result.base_plan_totals, result.r_and_o_totals],
+        ignore_index=True,
+    )
+    st.dataframe(
+        footer_df,
+        use_container_width=True,
+        hide_index=True,
+        height=35 * (len(footer_df) + 1) + 38,
+        column_order=column_order,
+        column_config=_demand_pivot_column_config(result.month_columns),
+    )
+
+
+def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
+    """Render the Base + RO Summary stacked area chart.
+
+    Mirrors the screenshot the planner shared: Base Plan stacked on
+    the bottom (dark blue), R&O on top (orange), x-axis = month,
+    y-axis = millions of pounds.
+
+    Why Plotly (not ``st.area_chart``)
+    -----------------------------------
+    ``st.area_chart`` produces a stacked area by default but does
+    NOT expose colour overrides per series.  The planner explicitly
+    wants the Base/R&O colours from the reference screenshot
+    (dark blue / orange), so we drive the colours directly through
+    a Plotly figure.  This module already lists ``plotly`` as a
+    required dependency (see ``requirements.txt``).
+    """
+    chart_df = result.chart_long
+    if chart_df.empty:
+        # Already handled upstream (empty pivot returns early), but
+        # double-guard so the chart helper is safe to call from
+        # anywhere in the future.
+        return
+
+    st.markdown("**Base + RO Summary**")
+    st.caption(
+        "Stacked area of monthly Base Plan + R&O totals in millions "
+        "of pounds.  Updates live with the filter selections above."
+    )
+
+    # Pivot the long frame into one column per series so each ``go.Scatter``
+    # trace can read its full y-vector in one indexer call — cleaner than
+    # filtering the long frame twice.
+    wide = chart_df.pivot_table(
+        index="Month",
+        columns="Forecast Type",
+        values="Pounds_M",
+        aggfunc="sum",
+        fill_value=0.0,
+        observed=True,
+    ).sort_index()
+
+    # Format x-axis ticks as ``M/YY`` — the screenshot uses that short
+    # form so the labels don't crowd at typical chart widths.  We build
+    # the label manually (rather than via the POSIX-only ``%-m``
+    # strftime token) so the formatter works on Windows AND POSIX
+    # without an OS-specific branch.
+    x_labels = [
+        f"{pd.Timestamp(d).month}/{pd.Timestamp(d).strftime('%y')}"
+        for d in wide.index
+    ]
+
+    fig = go.Figure()
+
+    # Base Plan trace — dark blue, drawn first so it sits on the
+    # bottom of the stack.  ``stackgroup`` ties traces into the same
+    # stack; sharing one group across both series gives us the stacked-
+    # area look the planner expects.
+    if FORECAST_BASE_PLAN in wide.columns:
+        fig.add_trace(go.Scatter(
+            x=x_labels,
+            y=wide[FORECAST_BASE_PLAN].tolist(),
+            name=FORECAST_BASE_PLAN,
+            mode="lines",
+            stackgroup="one",
+            fillcolor="#1f4e79",         # dark blue (matches screenshot)
+            line=dict(width=0.5, color="#1f4e79"),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                f"{FORECAST_BASE_PLAN}: "
+                "%{y:.1f} M lbs<extra></extra>"
+            ),
+        ))
+
+    # R&O trace — orange, drawn on top of Base Plan.
+    if FORECAST_R_AND_O in wide.columns:
+        fig.add_trace(go.Scatter(
+            x=x_labels,
+            y=wide[FORECAST_R_AND_O].tolist(),
+            name=FORECAST_R_AND_O,
+            mode="lines",
+            stackgroup="one",
+            fillcolor="#ed7d31",         # orange (matches screenshot)
+            line=dict(width=0.5, color="#ed7d31"),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                f"{FORECAST_R_AND_O}: "
+                "%{y:.1f} M lbs<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        height=360,
+        margin=dict(l=40, r=20, t=10, b=40),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=-0.25,
+            xanchor="center", x=0.5,
+        ),
+        xaxis=dict(title=None, tickangle=0),
+        yaxis=dict(title="Millions of lbs.", rangemode="tozero"),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def _render_current_plan_overview() -> None:

@@ -6,8 +6,8 @@ Sections
 2. Section renderers              (_render_instructions,
                                    _render_demand_planning_dashboard,
                                    _render_distribution_tracker,
-                                   _render_current_plan_overview,
-                                   _render_ibp_table)
+                                   _render_ro_comparison,
+                                   _render_demand_summary)
 3. Entry point                    (render)
 
 Page layout
@@ -20,13 +20,15 @@ Page layout
 5. Foldable: "New Distribution Tracker" — embeds the SharePoint Excel
    workbook in Office-Online read-mode.
 6. ── divider ──
-7. "Current Plan Overview (IBP Official)" — opt-in checkbox that, when
-   ticked, pulls the dbo.IBP Orders and dbo.IBP Shipments Delta tables
-   from the Microsoft Fabric Lakehouse.
+7. Foldable: "RO Comparison" — month-over-month RO comparison editor +
+   per-Format driver table + Early-Start-Date programs + Summary Report.
+8. ── divider ──
+9. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
+   Demand Pivot Summary + Base + RO chart with Total Budget overlay.
 
 Why every external resource gets its own foldable section
 ---------------------------------------------------------
-The three external dashboards each render a heavy ``<iframe>`` that
+The two external dashboards each render a heavy ``<iframe>`` that
 forces an HTTP round trip when expanded.  Wrapping each in
 ``st.expander(expanded=False)`` lets the user load only the panels
 they actually want, keeps initial page load fast, and avoids hammering
@@ -71,12 +73,6 @@ from data_sources.demand_summary import (
     mgmt_plan_full_blob_path,
     pivot_for_download,
     total_item_level_demand_blob_path,
-)
-from data_sources.ibp_official import (
-    IBPOfficialSourceError,
-    IBPSnapshotMeta,
-    fetch_ibp_orders_df,
-    fetch_ibp_shipments_df,
 )
 from data_sources.ro_comparison import (
     ANNUAL_OPP_CHANGE,
@@ -222,77 +218,6 @@ def _render_distribution_tracker() -> None:
                 "Online with full editing rights."
             ),
         )
-
-
-def _render_ibp_table(
-    title: str,
-    icon: str,
-    fetch_fn: Callable[..., tuple[pd.DataFrame, IBPSnapshotMeta]],
-    *,
-    force_refresh: bool,
-    download_basename: str,
-) -> None:
-    """Render a single IBP table fetched from the Fabric Lakehouse.
-
-    Parameters
-    ----------
-    title
-        Human-readable heading shown above the data preview (e.g.
-        "IBP Orders").
-    icon
-        Single emoji used as a leading badge in the heading.
-    fetch_fn
-        One of :func:`fetch_ibp_orders_df` or
-        :func:`fetch_ibp_shipments_df` — the connector function that
-        returns ``(df, meta)``.
-    force_refresh
-        Forwarded straight through to *fetch_fn* — true when the user
-        clicked the "Refresh from Fabric" button on this rerun.
-    download_basename
-        Filename stem used for the CSV download button (no extension,
-        no date — the function appends both).
-    """
-    st.markdown(f"#### {icon} {title}")
-    try:
-        with st.spinner(f"Reading {title} from Microsoft Fabric…"):
-            df, meta = fetch_fn(force_refresh=force_refresh)
-    except IBPOfficialSourceError as exc:
-        st.error(f"❌ Could not load {title} from the Fabric Lakehouse.\n\n{exc}")
-        return
-
-    last_mod = (
-        meta.last_modified.strftime("%Y-%m-%d %H:%M UTC")
-        if meta.last_modified else "unknown"
-    )
-    st.caption(
-        f"🛰️ {title} **as of {last_mod}** · "
-        f"Delta version **v{meta.version}** · "
-        f"**{meta.row_count:,}** rows · **{len(df.columns)}** columns"
-    )
-
-    # Preview the first N rows only — full DataFrames can be tens of
-    # millions of rows; pushing them all to the browser would freeze
-    # the tab.  Users who want everything can hit the download button.
-    preview_rows = 200
-    st.dataframe(df.head(preview_rows), width="stretch", height=320)
-    if len(df) > preview_rows:
-        st.caption(
-            f"_Showing the first {preview_rows:,} rows. "
-            f"Use the download button below for the full dataset._"
-        )
-
-    # CSV download streams over HTTP, not the WebSocket — there is no
-    # client-side cap on payload size, so this works for arbitrarily
-    # large snapshots (memory permitting on the server side).
-    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    st.download_button(
-        label=f"⬇️ Download {title} (CSV)",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{download_basename}_{today}.csv",
-        mime="text/csv",
-        key=f"ibp_{download_basename}_csv_download",
-        help=f"Full {title} snapshot from the Fabric Lakehouse Delta table.",
-    )
 
 
 # ── RO Comparison ────────────────────────────────────────────────────────────
@@ -2098,8 +2023,7 @@ def _format_last_modified_utc(ts) -> str:
 
     Handles ``datetime`` (timezone-aware or naive), ``pandas.Timestamp``,
     and ``None``.  Naive timestamps are assumed to be UTC — same
-    convention the rest of the page uses (see
-    :func:`_render_ibp_table`).
+    convention the rest of the page uses.
     """
     if ts is None:
         return "unknown"
@@ -3024,74 +2948,6 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
-def _render_current_plan_overview() -> None:
-    """Render the Current Plan Overview (IBP Official) opt-in section.
-
-    The IBP Official path requires interactive Azure sign-in (browser
-    popup) to acquire a OneLake storage token.  Streamlit Cloud is
-    headless — the popup cannot open — so this is gated behind an opt-
-    in checkbox with a loud warning to keep web users away from it.
-    The same gating pattern is used by the HTST Activity Monitor
-    page; keeping the wording consistent here helps users build a
-    single mental model for the toggle.
-    """
-    st.markdown("### 📈 Current Plan Overview (IBP Official)")
-
-    use_dataflow = st.checkbox(
-        "Use Microsoft Fabric Dataflow as the source — "
-        "**DO NOT CLICK IF YOU ARE A WEB USER**",
-        value=False,
-        key="demand_planner_use_fabric",
-        help=(
-            "Default (unchecked): no data is fetched. The Current Plan "
-            "Overview remains collapsed.\n\n"
-            "Checked: pull the dbo.IBP Orders and dbo.IBP Shipments "
-            "Delta tables directly from the Microsoft Fabric Lakehouse. "
-            "Requires interactive Azure sign-in or a service principal — "
-            "only works in a local desktop session, not on a headless "
-            "Streamlit Cloud server."
-        ),
-    )
-
-    if not use_dataflow:
-        # Nothing to do until the user opts in — show a brief hint and
-        # return early so we don't accidentally trigger an auth prompt.
-        st.info(
-            "Tick the checkbox above to load the latest IBP Orders and "
-            "IBP Shipments tables from the Microsoft Fabric Lakehouse."
-        )
-        return
-
-    # The refresh button must be rendered BEFORE the connector calls so
-    # that a click on this rerun clears the cache for both tables in one
-    # pass (otherwise the Orders table would be served from cache while
-    # only Shipments is refreshed, leaving the two desynchronised).
-    refresh_clicked = st.button(
-        "🔄 Refresh from Fabric",
-        key="ibp_official_refresh",
-        help="Bypass the 15-minute cache and re-read both Delta tables now.",
-    )
-
-    _render_ibp_table(
-        title="IBP Orders",
-        icon="📦",
-        fetch_fn=fetch_ibp_orders_df,
-        force_refresh=refresh_clicked,
-        download_basename="IBP_Orders",
-    )
-    st.markdown("")  # vertical breathing room between the two tables
-    _render_ibp_table(
-        title="IBP Shipments",
-        icon="🚚",
-        fetch_fn=fetch_ibp_shipments_df,
-        # The Orders fetch above already cleared the cache for both
-        # tables when refresh_clicked was True — passing False here
-        # avoids a redundant clear() on a fresh cache slot.
-        force_refresh=False,
-        download_basename="IBP_Shipments",
-    )
-
-
 # ── 3. Entry point ────────────────────────────────────────────────────────────
 
 
@@ -3105,7 +2961,6 @@ def render() -> None:
     3. New Distribution Tracker     (collapsible, collapsed by default)
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
-    6. Current Plan Overview (IBP Official) — opt-in via checkbox
     """
     apply_custom_css()
     st.markdown(
@@ -3126,6 +2981,3 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
-    st.markdown("---")
-
-    _render_current_plan_overview()

@@ -93,22 +93,29 @@ _PDH_BLOB_PATH: str = (
 # top-level ``Files/RO Tracking/`` folder (NOT inside ``Demand Plan/``
 # — these are static planning artefacts published once per cycle).
 #
-# Schemas (per the planner's confirmation):
+# Schemas (per the planner's confirmation, May 2026):
 #
 #   Static_Budget_Base_Lbs.csv
 #   --------------------------
 #   Portfolio Major, Supply Format, Brand Name, Portfolio Minor,
-#   Sum of consensus_forecast   ← annual lbs for that (PMaj, SFmt)
+#   Demand Plan Pounds   ← annual lbs for that (PMaj, SFmt) Base bucket
 #
 #   Static_Budget_RO_Lbs.csv
 #   ------------------------
-#   Format, Customer, Taxonomy, Brand, Item No, Item Desc, Probability,
-#   First Ship Date, Lbs./yr, Lbs./yr Exp, Days in Year,
-#   FY Lbs. Total, FY Lbs. Exp, Portfolio Major
-#                              ↑ "Format" is the Supply-Format equivalent
-#                              ↑ ``FY Lbs. Total`` is the annual
-#                                budget figure we attribute to the
-#                                (PMaj, R&O, SFmt) leaf
+#   Supply Format, Customer, Taxonomy, Brand, Item No, Item Desc,
+#   Probability, First Ship Date, Lbs./yr, Lbs./yr Exp, Days in Year,
+#   FY Lbs. Total, Demand Plan Pounds, Portfolio Major
+#                              ↑ ``Demand Plan Pounds`` is the planner-
+#                                approved annual budget figure we
+#                                attribute to the (PMaj, R&O, SFmt)
+#                                leaf.  ``FY Lbs. Total`` / ``Lbs./yr``
+#                                are per-program capacity variants —
+#                                informational, NOT the budget.
+#
+# Both files therefore agree on:
+#   key   = (Portfolio Major, Supply Format)
+#   value = Demand Plan Pounds   (raw lbs; the lookup converts to M)
+# which keeps :func:`build_budget_lookup` symmetric across tiers.
 _STATIC_BUDGET_BASE_BLOB_PATH: str = (
     "RO Tracking/Static_Budget_Base_Lbs.csv"
 )
@@ -320,7 +327,7 @@ def fetch_static_budget_base(
 
     Backs the "Total Budget" column on every Base-Plan leaf of the
     Demand Pivot Summary.  The pivot builder consumes this via
-    :func:`build_budget_lookup`, which sums ``Sum of consensus_forecast``
+    :func:`build_budget_lookup`, which sums ``Demand Plan Pounds``
     per ``(Portfolio Major, Supply Format)`` bucket.
 
     See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
@@ -337,10 +344,10 @@ def fetch_static_budget_ro(
 
     Backs the "Total Budget" column on every R&O leaf of the Demand
     Pivot Summary.  The pivot builder consumes this via
-    :func:`build_budget_lookup`, which sums ``FY Lbs. Total`` per
-    ``(Portfolio Major, Format)`` bucket (the per-program ``Format``
-    column in this CSV is the same dimension as ``Supply Format``
-    elsewhere in the model).
+    :func:`build_budget_lookup`, which sums ``Demand Plan Pounds``
+    per ``(Portfolio Major, Supply Format)`` bucket — exactly the
+    same shape as the Base tier so a leaf lookup is a single
+    ``dict.get`` regardless of forecast type.
 
     See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
     """
@@ -919,6 +926,12 @@ def build_supply_format_lookup(
 # keeps the join robust to minor schema drift (we have observed two
 # different spellings of the same column across publish cycles).
 # First match wins; intentionally ordered most-likely first.
+# Both static-budget CSVs publish the budget value under the same column
+# name (``Demand Plan Pounds``), and the RO file's per-program SFmt
+# column was renamed from the legacy ``Format`` to ``Supply Format``.
+# Order matters: ``_resolve_column`` returns the FIRST candidate that
+# exists in the frame, so the live column name is first and legacy
+# spellings trail behind for cross-cycle robustness.
 _BUDGET_BASE_PMAJ_CANDIDATES: tuple[str, ...] = (
     "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
 )
@@ -926,6 +939,10 @@ _BUDGET_BASE_SFMT_CANDIDATES: tuple[str, ...] = (
     "Supply Format", "Supply_Format", "SupplyFormat", "SFmt", "Format",
 )
 _BUDGET_BASE_VALUE_CANDIDATES: tuple[str, ...] = (
+    # Live canonical column (May 2026 onward); the rest are legacy
+    # spellings kept as a safety net so a one-off pre-rename publish
+    # cycle still aggregates instead of silently zeroing out.
+    "Demand Plan Pounds",
     "Sum of consensus_forecast", "Consensus Forecast", "consensus_forecast",
     "Budget Lbs", "Lbs",
 )
@@ -933,9 +950,16 @@ _BUDGET_RO_PMAJ_CANDIDATES: tuple[str, ...] = (
     "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
 )
 _BUDGET_RO_SFMT_CANDIDATES: tuple[str, ...] = (
-    "Format", "Supply Format", "Supply_Format", "SupplyFormat", "SFmt",
+    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt", "Format",
 )
 _BUDGET_RO_VALUE_CANDIDATES: tuple[str, ...] = (
+    # Live canonical column.  ``FY Lbs. Total`` / ``FY Lbs. Exp`` and
+    # other size-related columns still ship in the same CSV but are
+    # NOT the budget figure — they're per-program annual capacity /
+    # probability-adjusted variants that the planner manually rolls
+    # into ``Demand Plan Pounds``.  Reading them here would double-
+    # count or under-count depending on the program mix.
+    "Demand Plan Pounds",
     "FY Lbs. Total", "FY Lbs Total", "FY_Lbs_Total", "FY Total Lbs",
     "FY Lbs",  # fall-through legacy spelling
 )
@@ -1035,17 +1059,22 @@ def build_budget_lookup(
 
     Aggregation
     -----------
-    * **Base tier** (``Static_Budget_Base_Lbs.csv``): sum
-      ``Sum of consensus_forecast`` per
-      ``(Portfolio Major, Supply Format)``.  Emits one leaf per
-      group, keyed under :data:`FORECAST_BASE_PLAN`.
-    * **R&O tier** (``Static_Budget_RO_Lbs.csv``): sum
-      ``FY Lbs. Total`` per ``(Portfolio Major, Format)``.  Emits
-      one leaf per group, keyed under :data:`FORECAST_R_AND_O`.
+    Both tiers share the same shape: sum ``Demand Plan Pounds`` per
+    ``(Portfolio Major, Supply Format)``, then key the result under
+    the appropriate Forecast Type so the pivot can attribute each
+    leaf cleanly.
+
+    * **Base tier** (``Static_Budget_Base_Lbs.csv``) → emits one leaf
+      per group under :data:`FORECAST_BASE_PLAN`.
+    * **R&O tier** (``Static_Budget_RO_Lbs.csv``)   → emits one leaf
+      per group under :data:`FORECAST_R_AND_O`.
 
     Values are converted from raw lbs to **millions of lbs** so the
     Total Budget column lines up unit-for-unit with the rest of the
-    pivot (which is also in millions).
+    pivot (which is also in millions).  ``FY Lbs. Total`` /
+    ``Lbs./yr`` / ``Lbs./yr Exp`` columns that also exist in the R&O
+    file are **intentionally ignored** — those are per-program capacity
+    variants, NOT the planner-approved budget figure.
 
     Robustness
     ----------

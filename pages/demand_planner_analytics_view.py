@@ -35,12 +35,16 @@ widget interaction.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Callable, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+
+logger = logging.getLogger(__name__)
 
 from data_sources.demand_summary import (
     DemandPivotError,
@@ -52,8 +56,10 @@ from data_sources.demand_summary import (
     FORECAST_R_AND_O,
     TOTAL_COLUMN_LABEL,
     build_demand_pivot,
+    build_supply_format_lookup,
     clear_demand_summary_cache,
     fetch_mgmt_plan_full,
+    fetch_pdh,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
     fetch_total_item_level_demand,
     list_available_filter_values,
@@ -1908,6 +1914,24 @@ def _format_last_modified_utc(ts) -> str:
     return normalised.strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _demand_preview_column_config(df: pd.DataFrame) -> dict:
+    """Return a ``column_config`` mapping that formats date columns as dates.
+
+    Auto-detects every ``datetime64[*]`` column in *df* and assigns
+    ``st.column_config.DateColumn(format="YYYY-MM-DD")`` so the
+    preview shows the date without the misleading ``00:00:00`` time
+    component pandas attaches when round-tripping a date through
+    ``datetime64[ns]``.  Non-date columns are left to Streamlit's
+    auto-detection.
+    """
+    cc = st.column_config
+    config: dict = {}
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            config[col] = cc.DateColumn(col, format="YYYY-MM-DD")
+    return config
+
+
 def _render_demand_summary_table(
     *,
     title: str,
@@ -1999,7 +2023,20 @@ def _render_demand_summary_table(
     # vertically bounded regardless of how big the underlying file is
     # — the download button is the path to the full data.
     preview = snapshot.df.head(_DEMAND_SUMMARY_PREVIEW_ROWS)
-    st.dataframe(preview, width="stretch", height=520)
+    st.dataframe(
+        preview,
+        width="stretch",
+        height=520,
+        # Render any datetime-typed column as a clean ``YYYY-MM-DD``
+        # date instead of Streamlit's default ``YYYY-MM-DD HH:MM:SS``
+        # display.  The connector already coerces ``Start of Month``
+        # from its raw Excel-serial form to ``datetime64`` (see
+        # ``_coerce_demand_dates_for_display``); this config makes the
+        # output look like the planner expects.  Auto-detected so the
+        # same renderer works for any other date column either file
+        # might add in the future.
+        column_config=_demand_preview_column_config(preview),
+    )
     if snapshot.row_count > _DEMAND_SUMMARY_PREVIEW_ROWS:
         st.caption(
             f"_Showing the first {_DEMAND_SUMMARY_PREVIEW_ROWS:,} of "
@@ -2178,6 +2215,57 @@ _SS_DP_END_FILTER:   str = "ro_dp_end_month_filter"
 _DP_HIDDEN_COLS: tuple[str, ...] = ("_row_id", "_indent", "_is_subtotal")
 
 
+def _build_demand_pivot_supply_format_lookup() -> dict[str, str]:
+    """Return the per-item Supply Format lookup for the Demand Pivot Summary.
+
+    Composes two Fabric reads — ``qry_pdh.csv`` (primary) and
+    ``RO_Item_Master.csv`` (fallback) — into a single
+    ``{item -> supply_format}`` dict via
+    :func:`build_supply_format_lookup`.  Both reads are wrapped in
+    try/except so a transient outage on either source degrades the
+    cascade gracefully:
+
+    * ``qry_pdh.csv`` down → fallback alone populates the lookup.
+    * Both down                       → returns an empty dict (every item
+      shows up under the ``(blank)`` Supply Format sentinel — visible
+      to the planner but not blocking).
+
+    Failure logs are intentionally INFO-level (not warnings) because a
+    blank Supply Format column is recoverable and the user has plenty
+    of other visual cues in the pivot.
+    """
+    # Primary tier: qry_pdh.csv via the Demand Summary connector.
+    try:
+        pdh_snapshot = fetch_pdh()
+        pdh_df = pdh_snapshot.df
+    except DemandSummaryError as exc:
+        # Non-fatal — fallback will carry the lookup on its own.
+        logger.info(
+            "qry_pdh.csv unavailable for Demand Pivot Supply Format "
+            "lookup (will fall back to RO_Item_Master.csv only): %s",
+            exc,
+        )
+        pdh_df = None
+
+    # Fallback tier: RO_Item_Master.csv via the RO Comparison connector.
+    # Using the existing connector avoids a duplicate read + cache slot
+    # — Item Master is already loaded on the RO Comparison render path,
+    # so this is a cache hit in the common case.
+    try:
+        item_master_df = fetch_ro_item_master_df()
+    except RoComparisonError as exc:
+        # Non-fatal — pivot still renders with primary-tier-only or
+        # empty-lookup Supply Format.
+        logger.info(
+            "RO_Item_Master.csv unavailable for Demand Pivot Supply "
+            "Format fallback (continuing with primary tier only): %s",
+            exc,
+        )
+        item_master_df = None
+
+    return build_supply_format_lookup(pdh_df, item_master_df)
+
+
 def _render_demand_pivot_section() -> None:
     """Render the Demand Pivot Summary header + delegate to the fragment.
 
@@ -2238,22 +2326,35 @@ def _render_demand_pivot_fragment() -> None:
         )
         return
 
-    # 2. Discover the available filter values from the FULL frame so
+    # 2. Build the per-item Supply Format lookup with the two-tier
+    #    cascade (qry_pdh primary, RO_Item_Master fallback).  Both
+    #    sources are non-fatal — a missing or empty tier just drops
+    #    out of the cascade, and items absent from BOTH tiers
+    #    surface in the pivot under the "(blank)" Supply Format
+    #    sentinel where the planner can spot them.
+    supply_format_lookup = _build_demand_pivot_supply_format_lookup()
+
+    # 3. Discover the available filter values from the FULL frame so
     #    a selection in one filter doesn't shrink the option list of
     #    another (matches the planner's expectation when slicing).
     try:
-        filter_values = list_available_filter_values(snapshot.df)
+        filter_values = list_available_filter_values(
+            snapshot.df, supply_format_lookup=supply_format_lookup,
+        )
     except DemandPivotError as exc:
         st.error(f"❌ Pivot source has an unexpected schema.\n\n{exc}")
         return
 
-    # 3. Render the filter row.
+    # 4. Render the filter row.
     filters = _render_demand_pivot_filters(filter_values)
 
-    # 4. Build the pivot.
+    # 5. Build the pivot.
     try:
         with st.spinner("Building Demand Pivot Summary…"):
-            result = build_demand_pivot(snapshot.df, filters)
+            result = build_demand_pivot(
+                snapshot.df, filters,
+                supply_format_lookup=supply_format_lookup,
+            )
     except DemandPivotError as exc:
         st.error(f"❌ Could not build the Demand Pivot Summary.\n\n{exc}")
         return

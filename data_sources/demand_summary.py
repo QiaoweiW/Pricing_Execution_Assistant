@@ -79,6 +79,14 @@ _MGMT_PLAN_FULL_BLOB_PATH: str = (
 _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH: str = (
     "RO Tracking/Demand Plan/qry_total_item_level_demand.csv"
 )
+# Primary source for the per-item Supply Format lookup used by the
+# Demand Pivot Summary.  Joined on Item.  When a row is missing here,
+# we fall back to RO_Item_Master.csv (read via the existing
+# ``ro_comparison.fetch_ro_item_master_df`` connector — see
+# :func:`build_supply_format_lookup`).
+_PDH_BLOB_PATH: str = (
+    "RO Tracking/Demand Plan/qry_pdh.csv"
+)
 
 # 15-minute Streamlit cache TTL.  Mirrors the RO Comparison / IBP /
 # Summary Report cadence so the whole Demand Planner Analytics page has
@@ -244,11 +252,83 @@ def fetch_total_item_level_demand(
 ) -> DemandSummarySnapshot:
     """Return the latest ``qry_total_item_level_demand.csv`` as a snapshot.
 
+    The returned snapshot's ``df`` has the raw ``Start of Month`` column
+    (Excel-serial integers from the source CSV) converted into proper
+    ``datetime64[ns]`` so the preview table renders human-readable
+    dates instead of opaque numbers.  The conversion is lossless —
+    every parseable value becomes a date; unparseables stay as
+    ``NaT`` so we don't silently coerce bad input.  The ``raw bytes``
+    download path is unaffected: planners who hit the ⬇️ button still
+    get a byte-for-byte copy of what's in Fabric.
+
     See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
     """
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH, "default")
+    snapshot = _cached_fetch(_TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH, "default")
+    return _coerce_demand_dates_for_display(snapshot)
+
+
+def fetch_pdh(*, force_refresh: bool = False) -> DemandSummarySnapshot:
+    """Return the latest ``qry_pdh.csv`` as a snapshot.
+
+    Primary source for the per-item Supply Format lookup consumed by
+    the Demand Pivot Summary (see :func:`build_supply_format_lookup`).
+    Joined on the item-number column inside ``qry_pdh.csv`` (auto-
+    detected from a small whitelist of likely names, see
+    :data:`_PDH_ITEM_KEY_CANDIDATES`).
+
+    See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
+    """
+    if force_refresh:
+        _cached_fetch.clear()
+    return _cached_fetch(_PDH_BLOB_PATH, "default")
+
+
+# ── Display-side date coercion ──────────────────────────────────────────────
+#
+# The source CSV stores ``Start of Month`` as an Excel serial integer.
+# Showing those raw in the preview table is unfriendly; the pivot
+# logic below already parses them via ``_coerce_start_of_month``, so
+# the preview frame can use the same primitive to convert in place
+# without changing what the raw download path serves.
+
+def _coerce_demand_dates_for_display(
+    snapshot: DemandSummarySnapshot,
+) -> DemandSummarySnapshot:
+    """Return *snapshot* with ``Start of Month`` coerced to ``datetime64``.
+
+    Pure: returns a new snapshot (the underlying DataFrame is
+    shallow-copied and the affected column overwritten).  Idempotent
+    — calling twice is a no-op once the column is already a datetime
+    dtype.  Tolerates the column being absent (some files might not
+    have it, in which case the caller still gets a valid snapshot
+    back, with a debug log entry).
+    """
+    df = snapshot.df
+    if COL_START_OF_MONTH not in df.columns:
+        return snapshot
+    if pd.api.types.is_datetime64_any_dtype(df[COL_START_OF_MONTH]):
+        return snapshot  # Already a date dtype — nothing to do.
+
+    out = df.copy()
+    out[COL_START_OF_MONTH] = (
+        out[COL_START_OF_MONTH]
+        .map(_coerce_start_of_month)
+        .map(lambda d: pd.Timestamp(d) if d is not None else pd.NaT)
+    )
+    # Coerce the whole column to ``datetime64[ns]`` so Streamlit's
+    # ``st.dataframe`` renders it via DateColumn defaults (YYYY-MM-DD).
+    out[COL_START_OF_MONTH] = pd.to_datetime(
+        out[COL_START_OF_MONTH], errors="coerce",
+    )
+    return DemandSummarySnapshot(
+        df=out,
+        etag=snapshot.etag,
+        size=snapshot.size,
+        last_modified=snapshot.last_modified,
+        blob_path=snapshot.blob_path,
+    )
 
 
 # ── Raw-bytes download path ──────────────────────────────────────────────────
@@ -295,10 +375,16 @@ def total_item_level_demand_blob_path() -> str:
 # ── Cache management ─────────────────────────────────────────────────────────
 
 def clear_demand_summary_cache() -> None:
-    """Invalidate the cached snapshots for BOTH Demand Summary CSVs.
+    """Invalidate the cached snapshots for EVERY Demand Summary CSV.
+
+    Covers ``qry_mgmt_plan_full.csv``,
+    ``qry_total_item_level_demand.csv``, and ``qry_pdh.csv`` — they
+    share a single ``@st.cache_data`` slot (the cached impl is the
+    same function, keyed by blob path), so one ``clear()`` call
+    invalidates the whole family.
 
     Wired to the section's "🔄 Refresh from Fabric" button so a single
-    click forces fresh reads of both files on the next render.  Exposed
+    click forces fresh reads of every file on the next render.  Exposed
     as a public function (rather than reaching into the cached impl from
     the page) so the page doesn't need to know about Streamlit's
     ``.clear()`` decorator API.
@@ -342,10 +428,31 @@ def clear_demand_summary_cache() -> None:
 # Source column names.  Pinned as module constants so they appear in
 # one place — change here if the upstream schema ever drifts.
 COL_START_OF_MONTH: str   = "Start of Month"
+COL_ITEM: str             = "Item"
 COL_PORTFOLIO_MAJOR: str  = "Portfolio Major"
 COL_SUPPLY_FORMAT: str    = "Supply Format"
 COL_FORECAST_TYPE: str    = "Forecast Type"
 COL_DEMAND_LBS: str       = "Demand Plan Pounds"
+
+# Column-name CANDIDATES for the two lookup CSVs.  ``qry_pdh`` and
+# ``RO_Item_Master`` are owned by different upstream teams and have
+# historically used slightly different column spellings — we probe
+# the most likely names instead of hard-failing on a single literal.
+# First match wins (the lists are intentionally ordered most-likely
+# first).  Add new spellings here rather than special-casing in the
+# join logic.
+_PDH_ITEM_KEY_CANDIDATES: tuple[str, ...] = (
+    "Item No", "Item", "Item Number", "Item #", "ItemNo", "Item_No",
+)
+_PDH_SFMT_CANDIDATES: tuple[str, ...] = (
+    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt",
+)
+_ITEM_MASTER_ITEM_KEY_CANDIDATES: tuple[str, ...] = (
+    "Item #", "Item No", "Item", "Item Number", "ItemNo",
+)
+_ITEM_MASTER_SFMT_CANDIDATES: tuple[str, ...] = (
+    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt",
+)
 
 # Canonical labels for the Forecast Type bucket.  Anything that does
 # not normalise to one of these two falls into "Base Plan" by default
@@ -543,11 +650,14 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
 
     Centralising the schema check keeps the build pipeline below
     short and gives the planner a single, actionable error when the
-    upstream CSV schema drifts.
+    upstream CSV schema drifts.  ``Supply Format`` is NOT required
+    here — it's enriched from a separate lookup (see
+    :func:`build_supply_format_lookup`) so the demand CSV is allowed
+    to omit it.
     """
     required = (
-        COL_START_OF_MONTH, COL_PORTFOLIO_MAJOR,
-        COL_SUPPLY_FORMAT, COL_FORECAST_TYPE, COL_DEMAND_LBS,
+        COL_START_OF_MONTH, COL_ITEM, COL_PORTFOLIO_MAJOR,
+        COL_FORECAST_TYPE, COL_DEMAND_LBS,
     )
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -555,30 +665,190 @@ def _ensure_required_columns(df: pd.DataFrame) -> None:
             f"qry_total_item_level_demand.csv is missing required column(s): "
             f"{missing!r}.  Available columns: "
             f"{list(df.columns)!r}.  Check the upstream Fabric query — "
-            "the pivot needs all five of: "
-            f"{list(required)!r}."
+            "the pivot needs at minimum: "
+            f"{list(required)!r}.  Supply Format is enriched from a "
+            "separate lookup (qry_pdh / RO_Item_Master)."
         )
 
 
-def _prepare_long_frame(df: pd.DataFrame) -> pd.DataFrame:
+def _normalise_item_key(value) -> str:
+    """Return a canonical string form of an item identifier.
+
+    Joins between the three CSVs are unreliable when one side stores
+    item numbers as numeric (e.g. ``370072`` int / ``370072.0`` float)
+    and the other as text (``"370072"``).  Coercing to "string with
+    trailing-``.0``-stripped" normalises every shape we have observed:
+
+    * ``370072`` int     → ``"370072"``
+    * ``370072.0`` float → ``"370072"``
+    * ``" 370072 "`` str → ``"370072"``
+    * ``"P-370072"`` str → ``"P-370072"`` (unchanged)
+    * ``NaN`` / ``None`` → ``""`` (empty key — won't match anything)
+    """
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if not s:
+        return ""
+    # Strip the trailing ``.0`` from floats-that-are-integers so the
+    # join key matches the int-typed side without surprise.
+    if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+        s = s[:-2]
+    return s
+
+
+def _resolve_column(
+    df: pd.DataFrame, candidates: tuple[str, ...],
+) -> Optional[str]:
+    """Return the first column name in *candidates* that exists in *df*.
+
+    Case-sensitive — Fabric column names are usually exact-cased and
+    a fuzzy match risks picking up an unrelated column on a name
+    collision.  Returns ``None`` when no candidate matches; callers
+    treat that as "this source contributes nothing" rather than an
+    error so the cascade can degrade gracefully.
+    """
+    if df is None or df.empty:
+        return None
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def build_supply_format_lookup(
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame],
+) -> dict[str, str]:
+    """Return a ``{item_key -> supply_format}`` lookup with a two-tier cascade.
+
+    Cascade order (per planner spec)
+    ---------------------------------
+    1. **Primary** — ``qry_pdh.csv`` keyed on its item-number column
+       (auto-detected from :data:`_PDH_ITEM_KEY_CANDIDATES`).
+    2. **Fallback** — ``RO_Item_Master.csv`` keyed on its item-number
+       column (auto-detected from :data:`_ITEM_MASTER_ITEM_KEY_CANDIDATES`).
+       Only items missing from the primary tier consult the fallback.
+
+    Returns
+    -------
+    dict
+        ``{normalised_item_key -> supply_format_string}``.  Keys are
+        normalised via :func:`_normalise_item_key` so the caller can
+        look up using whatever native dtype the demand frame carries
+        (int / float / str) by normalising the same way at the call
+        site.  Returns an empty dict when both inputs are unusable
+        — callers treat that as "every item's Supply Format is blank".
+
+    Robustness
+    ----------
+    * Either input may be ``None``, empty, or missing one of the
+      required columns; we silently skip that tier rather than
+      raising, so the pivot keeps working when (e.g.) ``qry_pdh.csv``
+      is mid-publish.
+    * Multiple rows per item on the same tier: last row wins (matches
+      ``dict`` insertion semantics).  Pivot consumers only need a
+      stable answer per item; the planner can audit the source CSV
+      directly if a multi-row item is surprising.
+    """
+    lookup: dict[str, str] = {}
+
+    # ── Fallback tier first ──────────────────────────────────────
+    #
+    # We populate the fallback tier first and then OVERWRITE with
+    # the primary tier on top.  Net effect: any item present in the
+    # primary tier takes its value from there (one ``dict.update``
+    # at the end is the most idiomatic implementation of the spec's
+    # "primary wins, fallback covers gaps" rule).
+    fb_item_col = _resolve_column(item_master_df, _ITEM_MASTER_ITEM_KEY_CANDIDATES)
+    fb_sfmt_col = _resolve_column(item_master_df, _ITEM_MASTER_SFMT_CANDIDATES)
+    if (
+        item_master_df is not None and not item_master_df.empty
+        and fb_item_col and fb_sfmt_col
+    ):
+        for raw_item, raw_sfmt in zip(
+            item_master_df[fb_item_col], item_master_df[fb_sfmt_col],
+        ):
+            key = _normalise_item_key(raw_item)
+            if not key:
+                continue
+            try:
+                if pd.isna(raw_sfmt):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            sfmt = str(raw_sfmt).strip()
+            if sfmt:
+                lookup[key] = sfmt
+
+    # ── Primary tier — overwrites the fallback on collisions ──────
+    p_item_col = _resolve_column(pdh_df, _PDH_ITEM_KEY_CANDIDATES)
+    p_sfmt_col = _resolve_column(pdh_df, _PDH_SFMT_CANDIDATES)
+    if (
+        pdh_df is not None and not pdh_df.empty
+        and p_item_col and p_sfmt_col
+    ):
+        primary: dict[str, str] = {}
+        for raw_item, raw_sfmt in zip(pdh_df[p_item_col], pdh_df[p_sfmt_col]):
+            key = _normalise_item_key(raw_item)
+            if not key:
+                continue
+            try:
+                if pd.isna(raw_sfmt):
+                    continue
+            except (TypeError, ValueError):
+                pass
+            sfmt = str(raw_sfmt).strip()
+            if sfmt:
+                primary[key] = sfmt
+        lookup.update(primary)
+
+    logger.info(
+        "Supply Format lookup built: %s items (primary: %s, fallback: %s).",
+        len(lookup),
+        "yes" if p_item_col and p_sfmt_col else "skipped",
+        "yes" if fb_item_col and fb_sfmt_col else "skipped",
+    )
+    return lookup
+
+
+def _prepare_long_frame(
+    df: pd.DataFrame,
+    supply_format_lookup: Optional[dict[str, str]] = None,
+) -> pd.DataFrame:
     """Return a tidy long frame ready for the pivot pipeline.
 
     Steps:
-    1. Validate the required schema (raises on drift).
+    1. Validate the required schema (raises on drift — Supply Format
+       is NOT required because it's enriched, not sourced).
     2. Coerce ``Start of Month`` to ``date`` and drop unparseables —
        a row with no parseable date can't go into a month-bucketed
        pivot, so it's dropped with a warning logged.
     3. Coerce ``Demand Plan Pounds`` to numeric (non-numeric → 0).
     4. Normalise ``Forecast Type`` into the two canonical buckets.
-    5. Stringify the dimension columns and replace blank PMaj with
-       the ``(blank)`` sentinel.
+    5. Stringify Portfolio Major and replace blanks with ``(blank)``.
+    6. Enrich each row with Supply Format from the lookup; rows whose
+       item has no Supply Format entry get the ``(blank)`` sentinel
+       so they still appear in the pivot under a clearly-labelled
+       "unknown format" bucket rather than vanishing.
     """
     _ensure_required_columns(df)
 
-    out = df.loc[:, [
-        COL_START_OF_MONTH, COL_PORTFOLIO_MAJOR,
-        COL_SUPPLY_FORMAT, COL_FORECAST_TYPE, COL_DEMAND_LBS,
-    ]].copy()
+    keep_cols = [
+        COL_START_OF_MONTH, COL_ITEM, COL_PORTFOLIO_MAJOR,
+        COL_FORECAST_TYPE, COL_DEMAND_LBS,
+    ]
+    # Keep an in-source Supply Format column if the upstream CSV ever
+    # starts carrying one — it'll override the lookup in that case
+    # (single source of truth: trust the row over the join).
+    if COL_SUPPLY_FORMAT in df.columns:
+        keep_cols.append(COL_SUPPLY_FORMAT)
+    out = df.loc[:, keep_cols].copy()
 
     out["__month"] = out[COL_START_OF_MONTH].map(_coerce_start_of_month)
     unparseable = int(out["__month"].isna().sum())
@@ -599,9 +869,24 @@ def _prepare_long_frame(df: pd.DataFrame) -> pd.DataFrame:
         .astype("string").fillna("").str.strip()
         .replace("", PMAJ_BLANK_LABEL)
     )
+
+    # Supply Format enrichment via the two-tier lookup, with the
+    # in-source column (when present) as an opportunistic upgrade
+    # path for items the lookup doesn't know.
+    lookup = supply_format_lookup or {}
+    item_keys = out[COL_ITEM].map(_normalise_item_key)
+    looked_up = item_keys.map(lookup).fillna("")
+    if COL_SUPPLY_FORMAT in out.columns:
+        # In-source values take precedence over the lookup when
+        # non-blank — the demand CSV is authoritative for its own
+        # rows.  This is currently a no-op (the upstream CSV doesn't
+        # carry the column) but keeps the code future-proof.
+        in_source = out[COL_SUPPLY_FORMAT].astype("string").fillna("").str.strip()
+        sfmt_series = in_source.where(in_source.ne(""), looked_up)
+    else:
+        sfmt_series = looked_up
     out["__sfmt"] = (
-        out[COL_SUPPLY_FORMAT]
-        .astype("string").fillna("").str.strip()
+        sfmt_series.astype("string").fillna("").str.strip()
         .replace("", PMAJ_BLANK_LABEL)
     )
 
@@ -639,7 +924,10 @@ def _build_indented_label(label: str, indent: int) -> str:
     return f"{_INDENT_UNIT * indent}{label}"
 
 
-def list_available_filter_values(df: pd.DataFrame) -> dict[str, list]:
+def list_available_filter_values(
+    df: pd.DataFrame,
+    supply_format_lookup: Optional[dict[str, str]] = None,
+) -> dict[str, list]:
     """Return the sort-stable distinct values for every filter widget.
 
     Exposed publicly so the page renderer can populate its multiselect
@@ -649,13 +937,25 @@ def list_available_filter_values(df: pd.DataFrame) -> dict[str, list]:
     filter (matches the planner's mental model when comparing across
     formats).
 
+    Parameters
+    ----------
+    df
+        Raw ``qry_total_item_level_demand.csv`` frame.
+    supply_format_lookup
+        Output of :func:`build_supply_format_lookup` — used to enrich
+        the demand frame with Supply Format values before enumerating
+        the distinct list.  Pass ``None`` (the default) to skip
+        enrichment; the Supply Format option list then collapses to
+        just the ``(blank)`` sentinel (and any in-source values, if
+        the upstream CSV ever starts carrying the column).
+
     Returns
     -------
     dict
         ``{"portfolio_majors": [...], "supply_formats": [...],
            "months": [date(...), ...]}``
     """
-    long_df = _prepare_long_frame(df)
+    long_df = _prepare_long_frame(df, supply_format_lookup=supply_format_lookup)
     return {
         "portfolio_majors": sorted(long_df["__pmaj"].dropna().unique().tolist()),
         "supply_formats":   sorted(long_df["__sfmt"].dropna().unique().tolist()),
@@ -666,6 +966,8 @@ def list_available_filter_values(df: pd.DataFrame) -> dict[str, list]:
 def build_demand_pivot(
     df: pd.DataFrame,
     filters: Optional[DemandPivotFilters] = None,
+    *,
+    supply_format_lookup: Optional[dict[str, str]] = None,
 ) -> DemandPivotResult:
     """Build the hierarchical Demand Pivot Summary.
 
@@ -706,7 +1008,7 @@ def build_demand_pivot(
     """
     filters = filters or DemandPivotFilters()
 
-    long_df = _prepare_long_frame(df)
+    long_df = _prepare_long_frame(df, supply_format_lookup=supply_format_lookup)
     long_df = _apply_pivot_filters(long_df, filters)
 
     # Empty post-filter frame — return a fully-shaped zero-row result
@@ -950,17 +1252,19 @@ __all__ = [
     "DemandSummarySnapshot",
     "fetch_mgmt_plan_full",
     "fetch_total_item_level_demand",
+    "fetch_pdh",
     "fetch_raw_bytes",
     "mgmt_plan_full_blob_path",
     "total_item_level_demand_blob_path",
     "clear_demand_summary_cache",
     # Pivot surface.
-    "COL_START_OF_MONTH", "COL_PORTFOLIO_MAJOR", "COL_SUPPLY_FORMAT",
-    "COL_FORECAST_TYPE", "COL_DEMAND_LBS",
+    "COL_START_OF_MONTH", "COL_ITEM", "COL_PORTFOLIO_MAJOR",
+    "COL_SUPPLY_FORMAT", "COL_FORECAST_TYPE", "COL_DEMAND_LBS",
     "FORECAST_BASE_PLAN", "FORECAST_R_AND_O",
     "PMAJ_BLANK_LABEL", "TOTAL_COLUMN_LABEL",
     "DemandPivotError", "DemandPivotFilters", "DemandPivotResult",
     "build_demand_pivot",
+    "build_supply_format_lookup",
     "list_available_filter_values",
     "pivot_for_download",
 ]

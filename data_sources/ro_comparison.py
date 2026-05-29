@@ -75,6 +75,7 @@ from data_sources.fabric_auth import (
 )
 from data_sources.fabric_lakehouse_io import (
     LakehouseIOError,
+    get_file_properties,
     read_bytes,
     read_csv,
     write_bytes,
@@ -1246,6 +1247,47 @@ def _cached_dimitems_df(_signature: str) -> pd.DataFrame:
     return df
 
 
+def _compute_history_blob_signature() -> str:
+    """Return a cheap, monotone-with-content signature for RO_History_Tracker.
+
+    Issues ONE Fabric ``get_file_properties`` round-trip (a HEAD-style
+    metadata read — no body bytes, sub-100ms on a warm token) and
+    serialises ``(etag, last_modified, size)`` into a single string.
+
+    Why
+    ----
+    The ``@st.cache_data`` decorator on :func:`_cached_history_df`
+    keys cache slots by the function's call arguments.  By passing
+    this signature as the argument, ANY Fabric-side change to the
+    blob (a re-upload changes etag + last_modified, an in-place
+    rewrite changes etag + size, etc.) yields a different signature,
+    misses the cache, and triggers a fresh body read on the very
+    next render.  Without this check, a fresh upload to Fabric
+    would not be visible to the page until the 15-min TTL expired.
+
+    Graceful degradation
+    --------------------
+    If the properties fetch fails (auth blip, network), we fall back
+    to the literal sentinel ``"default"`` — the same key we used
+    before this freshness check existed.  That means in the worst
+    case we degrade to the previous TTL-only behaviour, never to a
+    hard error.  Logged at INFO so the operator can see it without
+    a noisy WARN ladder.
+    """
+    try:
+        props = get_file_properties(_SECRETS_SECTION, _RO_HISTORY_BLOB_PATH)
+    except LakehouseIOError as exc:
+        logger.info(
+            "RO_History freshness check failed (non-fatal — falling back "
+            "to TTL-only caching for this render): %s", exc,
+        )
+        return "default"
+    if props is None:
+        # Blob absent — keep a stable key so we don't churn the cache.
+        return "default"
+    return f"etag={props.etag}|lm={props.last_modified}|sz={props.size}"
+
+
 def fetch_ro_history_df(*, force_refresh: bool = False) -> pd.DataFrame:
     """Return the latest ``RO_History_Tracker.csv`` as a DataFrame.
 
@@ -1254,10 +1296,28 @@ def fetch_ro_history_df(*, force_refresh: bool = False) -> pd.DataFrame:
     force_refresh : bool, default False
         When True, clears this connector's Streamlit cache before
         reading.  Wire this to a "Refresh from Fabric" button.
+
+    Freshness model
+    ---------------
+    Each call issues a cheap Fabric ``get_file_properties`` round-trip
+    (a HEAD-style metadata read — see
+    :func:`_compute_history_blob_signature`) and uses the resulting
+    ``(etag, last_modified, size)`` triple as the cache key.  Any
+    Fabric-side update to the blob produces a different key, misses
+    the cache, and triggers a fresh body read on the very next
+    render — without waiting for the 15-min TTL to expire.
+
+    This means downstream cascades (auto-regenerated
+    ``RO_Comparison_Output.csv``, Early-Start-Date table, RO Summary
+    Report) automatically pick up source-CSV updates on the next
+    page load.  See ``_maybe_auto_regenerate_comparison_output``
+    in :mod:`pages.demand_planner_analytics_view` for the full
+    end-to-end flow.
     """
     if force_refresh:
         _cached_history_df.clear()
-    return _cached_history_df("default")
+    signature = _compute_history_blob_signature()
+    return _cached_history_df(signature)
 
 
 def fetch_dimitems_df(*, force_refresh: bool = False) -> pd.DataFrame:

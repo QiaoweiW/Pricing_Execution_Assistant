@@ -41,6 +41,16 @@ from typing import Callable
 import pandas as pd
 import streamlit as st
 
+from data_sources.demand_summary import (
+    DemandSummaryError,
+    DemandSummarySnapshot,
+    clear_demand_summary_cache,
+    fetch_mgmt_plan_full,
+    fetch_raw_bytes as fetch_demand_summary_raw_bytes,
+    fetch_total_item_level_demand,
+    mgmt_plan_full_blob_path,
+    total_item_level_demand_blob_path,
+)
 from data_sources.ibp_official import (
     IBPOfficialSourceError,
     IBPSnapshotMeta,
@@ -722,12 +732,41 @@ def _maybe_auto_regenerate_comparison_output(
         )
         return
 
+    # Invalidate the entire downstream cascade so this render rebuilds
+    # end-to-end from the fresh History snapshot:
+    #
+    #   * ``_SS_SUMMARY_DF`` / ``_SS_MONTHS_SIG`` — drop so
+    #     ``_ensure_summary_in_session`` (called immediately below)
+    #     rebuilds the in-memory comparison frame instead of serving
+    #     the stale pre-regen copy that still matches the (Prior, LE)
+    #     signature.  Without this drop the editor + per-Format driver
+    #     table + Subtotal would silently render OLD numbers even though
+    #     the saved CSV is fresh.
+    #   * ``_SS_SUMMARY_REPORT_*`` — pop so the Summary Report
+    #     fragment's "rebuild iff signature drifted" guard sees a fresh
+    #     signature and recomputes from the new ``_SS_SUMMARY_DF``.
+    #   * ``clear_comparison_output_cache()`` — invalidates the shared
+    #     ``@st.cache_data`` slot read by the Early-Start-Date Programs
+    #     section AND any other consumer of the published
+    #     ``RO_Comparison_Output.csv``.  Without this clear, the
+    #     drilldown would keep serving the previous baseline from cache
+    #     for up to 15 minutes after the underlying CSV was overwritten.
+    #
+    # Net effect: a single source-CSV update on Fabric → next page
+    # render → auto-regen → editor / drivers / Subtotal / Early-Start-
+    # Date table / Summary Report all reflect the new baseline on the
+    # SAME render.  No manual refresh click required.
+    for key in (
+        _SS_SUMMARY_DF, _SS_MONTHS_SIG, _SS_WARNINGS, _SS_DIMITEMS_ERROR,
+        _SS_SUMMARY_REPORT_DF, _SS_SUMMARY_REPORT_LOADED_AT,
+        _SS_SUMMARY_REPORT_WARNINGS, _SS_SUMMARY_REPORT_RAW_DF,
+        _SS_SUMMARY_REPORT_SIG,
+    ):
+        st.session_state.pop(key, None)
+    clear_comparison_output_cache()
+
     # Stash the banner payload — rendered ONCE by
-    # ``_render_auto_regen_banner_once`` later in the page flow.  No
-    # downstream cache invalidation needed: the in-memory comparison
-    # frame is rebuilt by ``_ensure_summary_in_session`` on the same
-    # render, and the Summary Report consumes that in-memory frame
-    # directly (see ``_render_summary_report_fragment``).
+    # ``_render_auto_regen_banner_once`` later in the page flow.
     st.session_state[_SS_AUTO_REGEN_BANNER] = result
 
 
@@ -1811,6 +1850,286 @@ def _summary_report_column_config() -> dict:
     }
 
 
+# ── Demand Summary (Fabric CSV preview + download) ──────────────────────────
+#
+# Section flow
+# ------------
+# 1. Single foldable expander wrapping the whole section so the planner
+#    can collapse the two preview tables when not in use — same
+#    pattern as the "🔁 RO Comparison" expander above.
+# 2. Single "🔄 Refresh from Fabric" button.  One click invalidates BOTH
+#    cached snapshots so the planner gets a consistent re-read pair —
+#    matches the consolidated refresh model the RO Comparison section
+#    uses.
+# 3. Two side-by-side sub-sections (one per file).  Each one renders:
+#       a. Metadata caption (rows × cols, blob path, last_modified UTC).
+#       b. Prominent ⬇️ download button BEFORE the table — keeps the
+#          export action in the "above the fold" area, exactly where
+#          the planner is told to look.
+#       c. Top-20-row preview rendered via ``st.dataframe`` (read-only,
+#          no editor — these tables are pure outputs, not inputs).
+#
+# Section keys (Streamlit widget identity)
+# ----------------------------------------
+# Kept distinct from any other download / refresh key on the page so a
+# rerun doesn't accidentally re-trigger the wrong button.
+
+# Number of rows shown in each preview.  Hard-pinned at 20 per the
+# planner's spec — covers a typical eyeball-check without flooding the
+# UI on tables with thousands of rows.
+_DEMAND_SUMMARY_PREVIEW_ROWS: int = 20
+
+
+def _format_last_modified_utc(ts) -> str:
+    """Return a planner-friendly ``"YYYY-MM-DD HH:MM UTC"`` for a snapshot ts.
+
+    Handles ``datetime`` (timezone-aware or naive), ``pandas.Timestamp``,
+    and ``None``.  Naive timestamps are assumed to be UTC — same
+    convention the rest of the page uses (see
+    :func:`_render_ibp_table`).
+    """
+    if ts is None:
+        return "unknown"
+    try:
+        # ``pd.to_datetime`` normalises every flavour we accept.
+        normalised = pd.to_datetime(ts, utc=True)
+    except (TypeError, ValueError):
+        return "unknown"
+    return normalised.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _render_demand_summary_table(
+    *,
+    title: str,
+    icon: str,
+    snapshot: DemandSummarySnapshot,
+    download_basename: str,
+    download_button_key: str,
+) -> None:
+    """Render one Demand Summary file: metadata caption + ⬇️ + top-20 preview.
+
+    Parameters
+    ----------
+    title
+        Human-readable section heading (e.g., "qry_mgmt_plan_full").
+    icon
+        Single emoji used as a leading badge in the heading.
+    snapshot
+        :class:`DemandSummarySnapshot` returned by the connector.
+    download_basename
+        Filename stem used for the CSV download (no extension, no
+        date — appended below).  Pinned to the source filename for
+        traceability.
+    download_button_key
+        Stable Streamlit widget key — must be unique across the page.
+
+    Why the download button comes BEFORE the preview
+    ------------------------------------------------
+    Per planner direction, the export action must be "easy to find".
+    Rendering it above the table guarantees it's visible without
+    scrolling for any reasonable browser viewport, even when the
+    preview table itself is tall (20 rows × variable column count can
+    push the bottom of the preview off-screen on a 13" laptop).
+    """
+    st.markdown(f"#### {icon} {title}")
+    last_mod = _format_last_modified_utc(snapshot.last_modified)
+    size_bit = (
+        f" · **{snapshot.size:,}** bytes" if snapshot.size is not None else ""
+    )
+    st.caption(
+        f"🛰️ Source: `Files/{snapshot.blob_path}` · "
+        f"Last modified **{last_mod}**{size_bit} · "
+        f"**{snapshot.row_count:,}** rows · "
+        f"**{snapshot.column_count}** columns"
+    )
+
+    # ── Download button (above the preview — "easy to find") ────────
+    #
+    # We hand the user the RAW bytes from OneLake (via
+    # ``fetch_raw_bytes``) instead of a re-serialised
+    # ``snapshot.df.to_csv(...)``.  Re-serialising would drop trailing
+    # newlines, coerce numeric types (e.g. integer item codes → floats),
+    # rewrite quoting style, and locale-format dates — every one of
+    # which is a recurring class of breakage for downstream Excel /
+    # pivot-table consumers.  Raw bytes preserve byte-for-byte fidelity
+    # with what's in Fabric, which is what the planner expects when
+    # they hand the file to someone else.
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    try:
+        raw_bytes = fetch_demand_summary_raw_bytes(snapshot.blob_path)
+    except DemandSummaryError as exc:
+        # Don't block the preview on a download-bytes failure — surface
+        # an inline warning so the planner can still inspect the data.
+        st.warning(
+            f"⚠️ Could not prepare the download for `{snapshot.blob_path}`."
+            f"\n\nDetails: {exc}"
+        )
+    else:
+        st.download_button(
+            label=f"⬇️ Download `{download_basename}.csv` (full file from Fabric)",
+            data=raw_bytes,
+            file_name=f"{download_basename}_{today}.csv",
+            mime="text/csv",
+            key=download_button_key,
+            type="primary",
+            help=(
+                f"Downloads a byte-for-byte copy of "
+                f"`Files/{snapshot.blob_path}` straight from Microsoft "
+                "Fabric — no re-serialisation, so numeric types / "
+                "quoting / line endings match the source exactly."
+            ),
+        )
+
+    # ── Top-20 preview ──────────────────────────────────────────────
+    #
+    # Read-only preview only — the planner doesn't edit these tables.
+    # ``st.dataframe`` (not ``st.data_editor``) keeps the widget light
+    # and renders the data with built-in column sorting.  Pinning the
+    # row count to ``_DEMAND_SUMMARY_PREVIEW_ROWS`` keeps the section
+    # vertically bounded regardless of how big the underlying file is
+    # — the download button is the path to the full data.
+    preview = snapshot.df.head(_DEMAND_SUMMARY_PREVIEW_ROWS)
+    st.dataframe(preview, width="stretch", height=520)
+    if snapshot.row_count > _DEMAND_SUMMARY_PREVIEW_ROWS:
+        st.caption(
+            f"_Showing the first {_DEMAND_SUMMARY_PREVIEW_ROWS:,} of "
+            f"{snapshot.row_count:,} rows.  Use the download button above "
+            "for the full dataset._"
+        )
+
+
+def _render_demand_summary() -> None:
+    """Render the Demand Summary section end-to-end inside a foldable expander.
+
+    Loads both Demand Plan CSVs from Microsoft Fabric (with the same
+    15-minute TTL cache the rest of the page uses), shows a top-20-row
+    preview of each, and exposes prominent download buttons for the
+    full files.
+
+    Wrapped in ``st.expander(expanded=False)`` to match the foldable
+    pattern used by the other dashboards on this page — collapsed by
+    default to keep the page lightweight; expanding triggers the
+    Fabric reads (or hits the cache on a hot rerun).
+
+    Error handling
+    --------------
+    A genuine Fabric I/O failure is surfaced as an inline error and
+    the section returns early — every OTHER section on the page is
+    unaffected (we render the whole thing inside a self-contained
+    expander).  An auth gate matches the RO Comparison gate so the
+    planner sees the same "Sign in via Home" hint instead of an
+    exception stack.
+    """
+    with st.expander("📈 Demand Summary", expanded=False):
+        st.caption(
+            "Latest **Demand Plan** CSV exports from Microsoft Fabric — "
+            "rendered with a top-20-row preview for a quick eyeball check, "
+            "and a prominent download button on each table for the full "
+            "file.  Reads `Files/RO Tracking/Demand Plan/` and inherits "
+            "the same 15-min cache cadence as the RO Comparison section."
+        )
+
+        # Fabric auth gate — match the RO Comparison gate so the planner
+        # sees one consistent "sign-in needed" message across the page
+        # rather than two slightly-different banners.
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.warning(
+                "🔒 **Microsoft Fabric is not connected.**\n\n"
+                "Please visit **Home & Fabric Sign-in** in the sidebar to "
+                "sign in.  Once signed in, return here — the Demand Summary "
+                "tables will load automatically."
+            )
+            return
+
+        # Consolidated "Refresh from Fabric" button.  One click clears
+        # BOTH cached snapshots so the planner gets a consistent re-read
+        # pair — matches the refresh model the RO Comparison section
+        # uses ("🔄 Refresh from Fabric") so the two sections feel
+        # uniform.
+        if st.button(
+            "🔄 Refresh from Fabric",
+            key="demand_summary_refresh_from_fabric",
+            help=(
+                "Re-read both `qry_mgmt_plan_full.csv` and "
+                "`qry_total_item_level_demand.csv` from Microsoft Fabric "
+                "now — bypasses the 15-minute cache."
+            ),
+        ):
+            clear_demand_summary_cache()
+            st.rerun()
+
+        # Load both files.  We catch errors PER FILE so a failure on
+        # one source doesn't hide the other (common case: one of the
+        # upstream queries is still running and its CSV is missing,
+        # while the other is already published).
+        st.markdown("")  # vertical breathing room before the first table.
+        _render_demand_summary_file(
+            title="Management Plan (Full)",
+            icon="📋",
+            fetch_fn=fetch_mgmt_plan_full,
+            blob_path_fn=mgmt_plan_full_blob_path,
+            download_basename="qry_mgmt_plan_full",
+            download_button_key="demand_summary_dl_mgmt_plan_full",
+        )
+
+        st.markdown("---")
+        _render_demand_summary_file(
+            title="Total Item-Level Demand",
+            icon="📦",
+            fetch_fn=fetch_total_item_level_demand,
+            blob_path_fn=total_item_level_demand_blob_path,
+            download_basename="qry_total_item_level_demand",
+            download_button_key="demand_summary_dl_total_item_level_demand",
+        )
+
+
+def _render_demand_summary_file(
+    *,
+    title: str,
+    icon: str,
+    fetch_fn: Callable[..., DemandSummarySnapshot],
+    blob_path_fn: Callable[[], str],
+    download_basename: str,
+    download_button_key: str,
+) -> None:
+    """Fetch + render one Demand Summary file with per-file error containment.
+
+    Parameters
+    ----------
+    title, icon, download_basename, download_button_key
+        Forwarded verbatim to :func:`_render_demand_summary_table`.
+    fetch_fn
+        One of :func:`fetch_mgmt_plan_full` or
+        :func:`fetch_total_item_level_demand` — the connector function
+        that returns a :class:`DemandSummarySnapshot`.
+    blob_path_fn
+        Returns the POSIX blob path; used in the error message so the
+        planner sees exactly which file failed when the load errors.
+
+    Per-file error containment keeps the two file sub-sections
+    independent: a transient read failure on one file (e.g. upstream
+    pipeline mid-write, permissions blip) does NOT prevent the other
+    file from rendering on the same page load.
+    """
+    try:
+        with st.spinner(f"Reading {title} from Microsoft Fabric…"):
+            snapshot = fetch_fn()
+    except DemandSummaryError as exc:
+        st.error(
+            f"❌ Could not load **{title}** "
+            f"(`{blob_path_fn()}`).\n\n{exc}"
+        )
+        return
+
+    _render_demand_summary_table(
+        title=title,
+        icon=icon,
+        snapshot=snapshot,
+        download_basename=download_basename,
+        download_button_key=download_button_key,
+    )
+
+
 def _render_current_plan_overview() -> None:
     """Render the Current Plan Overview (IBP Official) opt-in section.
 
@@ -1890,7 +2209,9 @@ def render() -> None:
     1. Page header + Instructions
     2. Demand Planning BI Dashboard (collapsible, collapsed by default)
     3. New Distribution Tracker     (collapsible, collapsed by default)
-    4. Current Plan Overview (IBP Official) — opt-in via checkbox
+    4. RO Comparison                (collapsible, expanded by default)
+    5. Demand Summary               (collapsible, collapsed by default)
+    6. Current Plan Overview (IBP Official) — opt-in via checkbox
     """
     apply_custom_css()
     st.markdown(
@@ -1908,6 +2229,9 @@ def render() -> None:
     st.markdown("---")
 
     _render_ro_comparison()
+    st.markdown("---")
+
+    _render_demand_summary()
     st.markdown("---")
 
     _render_current_plan_overview()

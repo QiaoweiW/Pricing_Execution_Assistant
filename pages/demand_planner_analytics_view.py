@@ -57,16 +57,19 @@ from data_sources.demand_summary import (
     DemandSummarySnapshot,
     FORECAST_BASE_PLAN,
     FORECAST_R_AND_O,
+    MonthlyBudgetLookup,
     TOTAL_BUDGET_COLUMN_LABEL,
     TOTAL_COLUMN_LABEL,
     build_budget_lookup,
     build_demand_pivot,
+    build_monthly_budget_lookup,
     build_supply_format_lookup,
     clear_demand_summary_cache,
     fetch_mgmt_plan_full,
     fetch_pdh,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
     fetch_static_budget_base,
+    fetch_static_budget_monthly,
     fetch_static_budget_ro,
     fetch_total_item_level_demand,
     list_available_filter_values,
@@ -2401,51 +2404,46 @@ def _build_demand_pivot_supply_format_lookup() -> dict[str, str]:
 
 
 def _build_demand_pivot_budget_lookup() -> BudgetLookup:
-    """Return the annual-budget lookup for the Demand Pivot Summary.
-
-    Composes the two static-budget CSVs — ``Static_Budget_Base_Lbs.csv``
-    and ``Static_Budget_RO_Lbs.csv`` — into a single
-    :class:`BudgetLookup` via :func:`build_budget_lookup`.  Both reads
-    are wrapped in try/except so a transient outage on either source
-    degrades the cascade gracefully:
-
-    * Base unavailable → R&O budget alone fills the Total Budget column.
-    * RO unavailable   → Base budget alone fills the Total Budget column.
-    * Both unavailable → empty lookup; :attr:`BudgetLookup.has_data`
-      reports ``False`` and the page suppresses both the column and
-      the chart's dotted budget line.
-
-    Failure logs stay INFO-level (not warnings) because a missing
-    static-budget file is recoverable — every other section on the
-    page keeps working, and the planner has plenty of other visual
-    cues that the budget is unavailable (an absent column, an absent
-    chart line).
-    """
-    # Base tier.
+    """Annual leaf budget for the hierarchical pivot table only."""
     try:
-        base_snapshot = fetch_static_budget_base()
-        base_df = base_snapshot.df
+        base_df = fetch_static_budget_base().df
     except DemandSummaryError as exc:
         logger.info(
-            "Static_Budget_Base_Lbs.csv unavailable for the Demand Pivot "
-            "budget lookup (will fall back to RO-only budget): %s",
+            "Static_Budget_Base_Lbs.csv unavailable (pivot Total Budget): %s",
             exc,
         )
         base_df = None
-
-    # R&O tier.
     try:
-        ro_snapshot = fetch_static_budget_ro()
-        ro_df = ro_snapshot.df
+        ro_df = fetch_static_budget_ro().df
     except DemandSummaryError as exc:
         logger.info(
-            "Static_Budget_RO_Lbs.csv unavailable for the Demand Pivot "
-            "budget lookup (will fall back to Base-only budget): %s",
+            "Static_Budget_RO_Lbs.csv unavailable (pivot Total Budget): %s",
             exc,
         )
         ro_df = None
-
     return build_budget_lookup(base_df, ro_df)
+
+
+def _load_demand_pivot_monthly_budget() -> MonthlyBudgetLookup:
+    """Load bundled monthly budget for footer Total Budget + chart.
+
+    Reads ``Static_Budget_Base&RO_by_Month.csv`` from Fabric and parses
+    it via :func:`build_monthly_budget_lookup`.  A missing file yields
+    an empty lookup; the page suppresses the footer Total Budget row
+    and the chart overlay without blocking the rest of the pivot.
+    """
+    try:
+        snapshot = fetch_static_budget_monthly()
+        budget_df = snapshot.df
+    except DemandSummaryError as exc:
+        logger.info(
+            "Static_Budget_Base&RO_by_Month.csv unavailable for Demand "
+            "Pivot budget (footer + chart suppressed): %s",
+            exc,
+        )
+        budget_df = None
+
+    return build_monthly_budget_lookup(budget_df)
 
 
 def _render_demand_pivot_section() -> None:
@@ -2516,11 +2514,10 @@ def _render_demand_pivot_fragment() -> None:
     #    sentinel where the planner can spot them.
     supply_format_lookup = _build_demand_pivot_supply_format_lookup()
 
-    # 2b. Build the per-leaf annual budget lookup from the two
-    #     static-budget CSVs (Base + R&O).  Same graceful-degradation
-    #     story as the Supply Format cascade — a missing source
-    #     simply leaves that tier blank in the Total Budget column.
+    # 2b. Annual budget → pivot table Total Budget column (unchanged).
     budget_lookup = _build_demand_pivot_budget_lookup()
+    # 2c. Monthly budget → footer Total Budget row + chart only.
+    monthly_budget = _load_demand_pivot_monthly_budget()
 
     # 3. Discover the available filter values from the FULL frame so
     #    a selection in one filter doesn't shrink the option list of
@@ -2543,6 +2540,7 @@ def _render_demand_pivot_fragment() -> None:
                 snapshot.df, filters,
                 supply_format_lookup=supply_format_lookup,
                 budget_lookup=budget_lookup,
+                monthly_budget=monthly_budget,
             )
     except DemandPivotError as exc:
         st.error(f"❌ Could not build the Demand Pivot Summary.\n\n{exc}")
@@ -2695,12 +2693,11 @@ def _demand_pivot_column_config(
             format=num_fmt,
             disabled=True,
             help=(
-                "Annual budget for this row (in millions of lbs), "
-                "sourced from `Static_Budget_Base_Lbs.csv` (Base Plan "
-                "rows) and `Static_Budget_RO_Lbs.csv` (R&O rows). "
-                "Aggregated at the row's natural level — leaves show "
-                "the per-(PMaj, SFmt) budget; subtotals sum their "
-                "children; Grand Total bundles every visible row."
+                "Annual budget (millions of lbs) for this pivot row, "
+                "from `Static_Budget_Base_Lbs.csv` / "
+                "`Static_Budget_RO_Lbs.csv`.  The footer Total Budget "
+                "row uses monthly data from "
+                "`Static_Budget_Base&RO_by_Month.csv`."
             ),
         )
     return config
@@ -2713,9 +2710,8 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
     :func:`st.data_editor`) because the planner doesn't edit this
     view — it's a pure roll-up of the source CSV.  ``column_order``
     pins the Row Label first, then every month in ascending order,
-    then the Total column, then the Total Budget column on the
-    far right (mirrors the Excel screenshot column layout exactly,
-    with the budget appended per the planner's direction).
+    then the Total column, then Total Budget when annual budget data
+    is available (same layout as before the monthly-budget change).
     """
     # ── Download button (above the table — "easy to find") ──────────
     #
@@ -2734,21 +2730,23 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
         help=(
             "Downloads the current pivot view as a CSV — preserves "
             "the indented Row Label hierarchy so the file mirrors the "
-            "on-screen layout, including the Total Budget column. "
-            "Honours your active filters."
+            "on-screen layout, including the Total Budget column when "
+            "annual budget data is available.  Honours your active filters."
         ),
     )
 
-    # ── Column layout: Row Label · months ascending · Total · Total Budget ─
     column_order: list[str] = [
         "Row Label", *result.month_columns, TOTAL_COLUMN_LABEL,
     ]
-    if result.has_budget_data:
+    show_budget_col = result.has_pivot_budget_data or result.has_budget_data
+    if show_budget_col:
         column_order.append(TOTAL_BUDGET_COLUMN_LABEL)
 
-    column_config = _demand_pivot_column_config(
-        result.month_columns, include_budget=result.has_budget_data,
+    pivot_column_config = _demand_pivot_column_config(
+        result.month_columns, include_budget=result.has_pivot_budget_data,
     )
+    # Footer uses the same columns; monthly Total Budget row fills month cells.
+    footer_column_config = pivot_column_config
 
     # Pivot table.  Height sized so the typical 10-30 row range fits
     # without scrolling, capped so a wide filter doesn't dominate the
@@ -2760,7 +2758,7 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
         hide_index=True,
         height=table_height,
         column_order=column_order,
-        column_config=column_config,
+        column_config=pivot_column_config,
     )
 
     # ── Dynamic subtotals (Base Plan / R&O / bundled Total Budget) ───
@@ -2786,13 +2784,14 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
         hide_index=True,
         height=35 * (len(footer_df) + 1) + 38,
         column_order=column_order,
-        column_config=column_config,
+        column_config=footer_column_config,
     )
     if result.has_budget_data:
         st.caption(
             f"💰 **Bundled Total Budget (Base + R&O):** "
             f"**{result.budget_total_m:,.1f} M lbs** "
-            "(annual; same figure shown as the dotted line on the "
+            "for the visible month window (from "
+            "`Static_Budget_Base&RO_by_Month.csv`; green line on the "
             "Base + RO Summary chart below)."
         )
 
@@ -2802,13 +2801,10 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
 
     Mirrors the screenshot the planner shared: Base Plan stacked on
     the bottom (dark blue), R&O on top (orange), x-axis = month,
-    y-axis = millions of pounds.  When a Total Budget value is
+    y-axis = millions of pounds.  When monthly budget data is
     available (see :attr:`DemandPivotResult.has_budget_data`), a
-    bright dotted line is overlaid at the **monthly** budget level
-    — that's the annual bundled (Base + R&O) budget divided by the
-    number of months in the filter window — so a planner can see at
-    a glance whether each month's actual demand is tracking above or
-    below the budget target.
+    green dotted line plots the bundled budget per month from
+    ``Static_Budget_Base&RO_by_Month.csv``.
 
     Why Plotly (not ``st.area_chart``)
     -----------------------------------
@@ -2831,17 +2827,17 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
     if result.has_budget_data:
         st.caption(
             "Stacked area of monthly Base Plan + R&O totals in millions "
-            "of pounds, with a dotted line at the **monthly Total "
-            "Budget** target (annual Base + R&O budget ÷ months in "
-            "the filter window).  Updates live with the filter "
-            "selections above."
+            "of pounds, with a **green** dotted **Total Budget** line "
+            "from `Static_Budget_Base&RO_by_Month.csv`.  Demand subtotals "
+            "above update with filters; the budget line is static per month."
         )
     else:
         st.caption(
             "Stacked area of monthly Base Plan + R&O totals in millions "
             "of pounds.  Updates live with the filter selections above. "
-            "_Total Budget line unavailable — the static-budget CSVs "
-            "could not be read from Fabric._"
+            "_Total Budget line unavailable — "
+            "`Static_Budget_Base&RO_by_Month.csv` could not be read "
+            "from Fabric._"
         )
 
     # Pivot the long frame into one column per series so each ``go.Scatter``
@@ -2905,31 +2901,23 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
             ),
         ))
 
-    # Total Budget overlay — bright dotted line at the monthly budget
-    # level (annual ÷ months).  NOT inside the stackgroup so it sits
-    # on top of the areas instead of summing into them.  Coloured a
-    # high-contrast magenta + 3 px stroke + dot pattern so it stays
-    # readable against the dark blue Base Plan fill underneath.
-    n_months = len(wide.index)
-    if result.has_budget_data and n_months > 0:
-        monthly_budget_m = float(result.budget_total_m) / float(n_months)
+    # Total Budget overlay — green dotted line per month from Fabric.
+    if result.has_budget_data and len(wide.index) > 0:
+        budget_y: list[float] = []
+        for month_date in wide.index:
+            # Keys match pivot month columns (%Y-%m).
+            month_label = pd.Timestamp(month_date).strftime("%Y-%m")
+            budget_y.append(float(result.budget_by_month.get(month_label, float("nan"))))
+
         fig.add_trace(go.Scatter(
             x=x_labels,
-            y=[monthly_budget_m] * n_months,
-            name=(
-                f"Total Budget (monthly): {monthly_budget_m:,.1f} M lbs · "
-                f"annual: {result.budget_total_m:,.1f} M lbs"
-            ),
+            y=budget_y,
+            name="Total Budget (Base + R&O)",
             mode="lines",
-            # No stackgroup → drawn as an overlay reference line.
-            line=dict(
-                color="#d62728",            # bright red — high contrast
-                width=3,
-                dash="dot",
-            ),
+            line=dict(color="#2ca02c", width=3, dash="dot"),
             hovertemplate=(
                 "<b>%{x}</b><br>"
-                "Total Budget (monthly): %{y:.1f} M lbs<extra></extra>"
+                "Total Budget: %{y:.1f} M lbs<extra></extra>"
             ),
         ))
 

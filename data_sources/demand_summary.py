@@ -88,39 +88,29 @@ _PDH_BLOB_PATH: str = (
     "RO Tracking/Demand Plan/qry_pdh.csv"
 )
 
-# Annual budget sources for the Demand Pivot Summary's "Total Budget"
-# column + the Base+RO chart's dotted budget line.  Both live in the
-# top-level ``Files/RO Tracking/`` folder (NOT inside ``Demand Plan/``
-# — these are static planning artefacts published once per cycle).
+# Monthly bundled (Base + R&O) budget for the Demand Pivot Summary's
+# dynamic-subtotal "Total Budget" row and the Base+RO chart overlay.
+# Published as a single static artefact under ``Files/RO Tracking/``.
 #
-# Schemas (per the planner's confirmation, May 2026):
+# Schema (May 2026):
 #
-#   Static_Budget_Base_Lbs.csv
-#   --------------------------
-#   Portfolio Major, Supply Format, Brand Name, Portfolio Minor,
-#   Demand Plan Pounds   ← annual lbs for that (PMaj, SFmt) Base bucket
-#
-#   Static_Budget_RO_Lbs.csv
-#   ------------------------
-#   Supply Format, Customer, Taxonomy, Brand, Item No, Item Desc,
-#   Probability, First Ship Date, Lbs./yr, Lbs./yr Exp, Days in Year,
-#   FY Lbs. Total, Demand Plan Pounds, Portfolio Major
-#                              ↑ ``Demand Plan Pounds`` is the planner-
-#                                approved annual budget figure we
-#                                attribute to the (PMaj, R&O, SFmt)
-#                                leaf.  ``FY Lbs. Total`` / ``Lbs./yr``
-#                                are per-program capacity variants —
-#                                informational, NOT the budget.
-#
-# Both files therefore agree on:
-#   key   = (Portfolio Major, Supply Format)
-#   value = Demand Plan Pounds   (raw lbs; the lookup converts to M)
-# which keeps :func:`build_budget_lookup` symmetric across tiers.
+#   Static_Budget_Base&RO_by_Month.csv
+#   --------------------------------
+#   Month, Demand Plan Pounds
+#        ↑ ``Month`` is ``M/YY`` (e.g. ``4/26`` = April 2026)
+#        ↑ ``Demand Plan Pounds`` is already in **millions of lbs**
+#          for that calendar month (matches the pivot's display unit)
+# Per-leaf annual budget for the hierarchical pivot table (unchanged).
 _STATIC_BUDGET_BASE_BLOB_PATH: str = (
     "RO Tracking/Static_Budget_Base_Lbs.csv"
 )
 _STATIC_BUDGET_RO_BLOB_PATH: str = (
     "RO Tracking/Static_Budget_RO_Lbs.csv"
+)
+
+# Monthly bundled budget — footer Total Budget row + chart only.
+_STATIC_BUDGET_MONTHLY_BLOB_PATH: str = (
+    "RO Tracking/Static_Budget_Base&RO_by_Month.csv"
 )
 
 # 15-minute Streamlit cache TTL.  Mirrors the RO Comparison / IBP /
@@ -323,15 +313,7 @@ def fetch_pdh(*, force_refresh: bool = False) -> DemandSummarySnapshot:
 def fetch_static_budget_base(
     *, force_refresh: bool = False,
 ) -> DemandSummarySnapshot:
-    """Return the latest ``Static_Budget_Base_Lbs.csv`` as a snapshot.
-
-    Backs the "Total Budget" column on every Base-Plan leaf of the
-    Demand Pivot Summary.  The pivot builder consumes this via
-    :func:`build_budget_lookup`, which sums ``Demand Plan Pounds``
-    per ``(Portfolio Major, Supply Format)`` bucket.
-
-    See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
-    """
+    """Return ``Static_Budget_Base_Lbs.csv`` for pivot-row Total Budget."""
     if force_refresh:
         _cached_fetch.clear()
     return _cached_fetch(_STATIC_BUDGET_BASE_BLOB_PATH, "default")
@@ -340,20 +322,27 @@ def fetch_static_budget_base(
 def fetch_static_budget_ro(
     *, force_refresh: bool = False,
 ) -> DemandSummarySnapshot:
-    """Return the latest ``Static_Budget_RO_Lbs.csv`` as a snapshot.
+    """Return ``Static_Budget_RO_Lbs.csv`` for pivot-row Total Budget."""
+    if force_refresh:
+        _cached_fetch.clear()
+    return _cached_fetch(_STATIC_BUDGET_RO_BLOB_PATH, "default")
 
-    Backs the "Total Budget" column on every R&O leaf of the Demand
-    Pivot Summary.  The pivot builder consumes this via
-    :func:`build_budget_lookup`, which sums ``Demand Plan Pounds``
-    per ``(Portfolio Major, Supply Format)`` bucket — exactly the
-    same shape as the Base tier so a leaf lookup is a single
-    ``dict.get`` regardless of forecast type.
+
+def fetch_static_budget_monthly(
+    *, force_refresh: bool = False,
+) -> DemandSummarySnapshot:
+    """Return the latest ``Static_Budget_Base&RO_by_Month.csv`` snapshot.
+
+    Feeds the Demand Pivot Summary dynamic-subtotal **Total Budget**
+    row and the Base+RO Summary chart budget line via
+    :func:`build_monthly_budget_lookup`.  Values are month-keyed and
+    are **not** re-sliced by Portfolio Major / Supply Format filters.
 
     See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
     """
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_STATIC_BUDGET_RO_BLOB_PATH, "default")
+    return _cached_fetch(_STATIC_BUDGET_MONTHLY_BLOB_PATH, "default")
 
 
 # ── Display-side date coercion ──────────────────────────────────────────────
@@ -607,18 +596,15 @@ class DemandPivotResult:
     ----------
     pivot
         Wide-format DataFrame with one row per (PMaj, ForecastType,
-        SFmt or subtotal) and one column per month + a trailing
-        ``Total`` column + a final ``Total Budget`` column.  Monthly
-        + Total values are in **millions of pounds** rounded to 1
-        decimal; the Total Budget column holds the per-row annual
-        budget (in millions) sourced from the two static-budget
-        CSVs.  Internal metadata lives in three hidden columns:
-        ``_row_id``, ``_indent``, ``_is_subtotal``.
+        SFmt or subtotal) and one column per month + ``Total`` + optional
+        ``Total Budget`` (annual, from Base/RO static CSVs).  Monthly
+        values are in **millions of pounds** rounded to 1 decimal.
     month_columns
-        Ordered list of the month-column names actually present in
-        ``pivot`` (excludes ``Total`` and ``Total Budget``).  Use
-        this to drive the column_config of the page renderer without
-        re-parsing.
+        Ordered list of month-column names in ``pivot`` (excludes
+        ``Total`` and ``Total Budget``).
+    has_pivot_budget_data
+        ``True`` when annual leaf budgets loaded — controls the pivot
+        table's ``Total Budget`` column only.
     base_plan_totals, r_and_o_totals
         Two single-row DataFrames keyed by ``month_columns`` + the
         trailing ``Total`` + ``Total Budget`` columns, holding the
@@ -626,22 +612,20 @@ class DemandPivotResult:
         Always present even when the pivot is empty — saves the page
         a guard clause.
     budget_totals
-        Single-row DataFrame bundling Base + R&O annual budgets into
-        one number under the ``"Total Budget (Base + R&O)"`` label.
-        Lives in the same shape as ``base_plan_totals`` /
-        ``r_and_o_totals`` so the page can stack all three in one
-        footer table.  Monthly cells are blank (NaN) because budget
-        is annual and has no monthly slice.
+        Single-row DataFrame for the static **Total Budget (Base + R&O)**
+        footer row.  Month columns hold bundled budget millions from
+        ``Static_Budget_Base&RO_by_Month.csv`` (not re-filtered by
+        PMaj / SFmt — only the month-range filter narrows which
+        columns appear).
+    budget_by_month
+        ``{month_column_label -> millions}`` for the visible month
+        window.  Drives the green budget line on the Base+RO chart.
     budget_total_m
-        Bundled annual budget (Base + R&O, post-filter) in millions
-        of lbs.  Drives the chart's dotted budget line — the chart
-        renderer slices this by ``len(month_columns)`` to plot a
-        per-month equivalent.
+        Sum of ``budget_by_month`` over the visible month columns
+        (caption + footer ``Total`` / ``Total Budget`` cells).
     has_budget_data
-        ``True`` iff at least one budget leaf contributed to the
-        visible pivot.  ``False`` when both source CSVs are empty /
-        unavailable / have no rows that survive the user filters;
-        the page hides the budget column + line in that case.
+        ``True`` iff the monthly budget CSV parsed at least one row.
+        Controls the footer Total Budget row and the chart overlay.
     chart_long
         Long-form DataFrame ``(Month, Forecast Type, Pounds_M)`` ready
         to hand to Plotly for the stacked area chart.  Contains only
@@ -653,7 +637,9 @@ class DemandPivotResult:
     base_plan_totals: pd.DataFrame
     r_and_o_totals: pd.DataFrame
     budget_totals: pd.DataFrame
+    budget_by_month: dict[str, float]
     budget_total_m: float
+    has_pivot_budget_data: bool
     has_budget_data: bool
     chart_long: pd.DataFrame
 
@@ -920,117 +906,6 @@ def build_supply_format_lookup(
     return lookup
 
 
-# ── Budget lookup (Static_Budget_Base_Lbs + Static_Budget_RO_Lbs) ───────────
-
-# Column-name CANDIDATES per static-budget CSV.  Probing for variants
-# keeps the join robust to minor schema drift (we have observed two
-# different spellings of the same column across publish cycles).
-# First match wins; intentionally ordered most-likely first.
-# Both static-budget CSVs publish the budget value under the same column
-# name (``Demand Plan Pounds``), and the RO file's per-program SFmt
-# column was renamed from the legacy ``Format`` to ``Supply Format``.
-# Order matters: ``_resolve_column`` returns the FIRST candidate that
-# exists in the frame, so the live column name is first and legacy
-# spellings trail behind for cross-cycle robustness.
-_BUDGET_BASE_PMAJ_CANDIDATES: tuple[str, ...] = (
-    "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
-)
-_BUDGET_BASE_SFMT_CANDIDATES: tuple[str, ...] = (
-    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt", "Format",
-)
-_BUDGET_BASE_VALUE_CANDIDATES: tuple[str, ...] = (
-    # Live canonical column (May 2026 onward); the rest are legacy
-    # spellings kept as a safety net so a one-off pre-rename publish
-    # cycle still aggregates instead of silently zeroing out.
-    "Demand Plan Pounds",
-    "Sum of consensus_forecast", "Consensus Forecast", "consensus_forecast",
-    "Budget Lbs", "Lbs",
-)
-_BUDGET_RO_PMAJ_CANDIDATES: tuple[str, ...] = (
-    "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
-)
-_BUDGET_RO_SFMT_CANDIDATES: tuple[str, ...] = (
-    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt", "Format",
-)
-_BUDGET_RO_VALUE_CANDIDATES: tuple[str, ...] = (
-    # Live canonical column.  ``FY Lbs. Total`` / ``FY Lbs. Exp`` and
-    # other size-related columns still ship in the same CSV but are
-    # NOT the budget figure — they're per-program annual capacity /
-    # probability-adjusted variants that the planner manually rolls
-    # into ``Demand Plan Pounds``.  Reading them here would double-
-    # count or under-count depending on the program mix.
-    "Demand Plan Pounds",
-    "FY Lbs. Total", "FY Lbs Total", "FY_Lbs_Total", "FY Total Lbs",
-    "FY Lbs",  # fall-through legacy spelling
-)
-
-
-@dataclass(frozen=True)
-class BudgetLookup:
-    """Per-(PMaj, ForecastType, SFmt) annual budget in millions of lbs.
-
-    Built by :func:`build_budget_lookup` from the two static-budget
-    CSVs.  Returned by the connector layer so the pivot builder can
-    join it onto every leaf without re-reading Fabric.
-
-    Attributes
-    ----------
-    by_leaf
-        ``{(pmaj, forecast_type, sfmt) -> annual lbs in millions}``.
-        Keys use the same normalisation the pivot does (blank values
-        replaced with :data:`PMAJ_BLANK_LABEL`) so a leaf lookup is a
-        straight ``dict.get`` with no extra coercion.
-    has_data
-        ``True`` iff at least one budget row could be parsed.  The
-        page renderer uses this to decide whether to surface the
-        "Total Budget" column / chart line at all — when both source
-        CSVs are unavailable, hiding the column keeps the pivot from
-        showing a misleading all-zero budget line.
-
-    The class is intentionally tiny — a single dict + a helper.  Any
-    aggregations the pivot needs (subtotals, per-Forecast slices) are
-    computed by the pivot builder itself so this struct stays
-    side-effect-free and trivially memoisable.
-    """
-    by_leaf: dict[tuple[str, str, str], float]
-    has_data: bool
-
-    @property
-    def total_m(self) -> float:
-        """Sum of every leaf budget (millions of lbs)."""
-        return float(sum(self.by_leaf.values()))
-
-    def lookup_leaf(self, pmaj: str, forecast: str, sfmt: str) -> float:
-        """Return the annual budget for one (PMaj, ForecastType, SFmt) leaf."""
-        return float(self.by_leaf.get((pmaj, forecast, sfmt), 0.0))
-
-    def slice_total(
-        self,
-        *,
-        forecast: Optional[str] = None,
-        pmaj_whitelist: Optional[set[str]] = None,
-        sfmt_whitelist: Optional[set[str]] = None,
-    ) -> float:
-        """Return the annual budget summed over a subset of leaves.
-
-        Used by the pivot builder to roll up subtotals (per Forecast
-        Type, per Portfolio Major, etc.) and to drive the chart's
-        dotted budget line.  Filter arguments are ANDed conjunctively;
-        passing ``None`` means "include every value on that
-        dimension".
-        """
-        total = 0.0
-        for (pmaj, fc, sfmt), value in self.by_leaf.items():
-            if forecast is not None and fc != forecast:
-                continue
-            if pmaj_whitelist is not None and pmaj not in pmaj_whitelist:
-                continue
-            if sfmt_whitelist is not None and sfmt not in sfmt_whitelist:
-                continue
-            total += value
-        return total
-
-
 def _norm_pmaj(value) -> str:
     """Return a Portfolio-Major value normalised to the pivot's bucket key."""
     if value is None:
@@ -1046,75 +921,97 @@ def _norm_pmaj(value) -> str:
 
 def _norm_sfmt(value) -> str:
     """Return a Supply-Format value normalised to the pivot's leaf key."""
-    # Same normalisation as PMaj — the pivot uses ``PMAJ_BLANK_LABEL``
-    # for every "(blank)" dimension regardless of column name.
     return _norm_pmaj(value)
+
+
+# ── Annual pivot budget (Static_Budget_Base_Lbs + Static_Budget_RO_Lbs) ─────
+
+_BUDGET_BASE_PMAJ_CANDIDATES: tuple[str, ...] = (
+    "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
+)
+_BUDGET_BASE_SFMT_CANDIDATES: tuple[str, ...] = (
+    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt", "Format",
+)
+_BUDGET_BASE_VALUE_CANDIDATES: tuple[str, ...] = (
+    "Demand Plan Pounds",
+    "Sum of consensus_forecast", "Consensus Forecast", "consensus_forecast",
+    "Budget Lbs", "Lbs",
+)
+_BUDGET_RO_PMAJ_CANDIDATES: tuple[str, ...] = (
+    "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
+)
+_BUDGET_RO_SFMT_CANDIDATES: tuple[str, ...] = (
+    "Supply Format", "Supply_Format", "SupplyFormat", "SFmt", "Format",
+)
+_BUDGET_RO_VALUE_CANDIDATES: tuple[str, ...] = (
+    "Demand Plan Pounds",
+    "FY Lbs. Total", "FY Lbs Total", "FY_Lbs_Total", "FY Total Lbs",
+    "FY Lbs",
+)
+
+
+@dataclass(frozen=True)
+class BudgetLookup:
+    """Per-(PMaj, ForecastType, SFmt) annual budget in millions of lbs.
+
+    Powers the hierarchical pivot table ``Total Budget`` column only.
+    """
+    by_leaf: dict[tuple[str, str, str], float]
+    has_data: bool
+
+    def lookup_leaf(self, pmaj: str, forecast: str, sfmt: str) -> float:
+        return float(self.by_leaf.get((pmaj, forecast, sfmt), 0.0))
+
+    def slice_total(
+        self,
+        *,
+        forecast: Optional[str] = None,
+        pmaj_whitelist: Optional[set[str]] = None,
+        sfmt_whitelist: Optional[set[str]] = None,
+    ) -> float:
+        total = 0.0
+        for (pmaj, fc, sfmt), value in self.by_leaf.items():
+            if forecast is not None and fc != forecast:
+                continue
+            if pmaj_whitelist is not None and pmaj not in pmaj_whitelist:
+                continue
+            if sfmt_whitelist is not None and sfmt not in sfmt_whitelist:
+                continue
+            total += value
+        return total
 
 
 def build_budget_lookup(
     base_df: Optional[pd.DataFrame],
     ro_df: Optional[pd.DataFrame],
 ) -> BudgetLookup:
-    """Return a :class:`BudgetLookup` built from the two static-budget CSVs.
-
-    Aggregation
-    -----------
-    Both tiers share the same shape: sum ``Demand Plan Pounds`` per
-    ``(Portfolio Major, Supply Format)``, then key the result under
-    the appropriate Forecast Type so the pivot can attribute each
-    leaf cleanly.
-
-    * **Base tier** (``Static_Budget_Base_Lbs.csv``) → emits one leaf
-      per group under :data:`FORECAST_BASE_PLAN`.
-    * **R&O tier** (``Static_Budget_RO_Lbs.csv``)   → emits one leaf
-      per group under :data:`FORECAST_R_AND_O`.
-
-    Values are converted from raw lbs to **millions of lbs** so the
-    Total Budget column lines up unit-for-unit with the rest of the
-    pivot (which is also in millions).  ``FY Lbs. Total`` /
-    ``Lbs./yr`` / ``Lbs./yr Exp`` columns that also exist in the R&O
-    file are **intentionally ignored** — those are per-program capacity
-    variants, NOT the planner-approved budget figure.
-
-    Robustness
-    ----------
-    Either source frame may be ``None`` / empty / missing one of its
-    required columns — in those cases that tier silently contributes
-    nothing, the cascade keeps building from the other tier, and
-    :attr:`BudgetLookup.has_data` flips to ``False`` only when BOTH
-    tiers degenerate.  Same "graceful-degradation" pattern used by
-    :func:`build_supply_format_lookup`.
-    """
+    """Build annual leaf budgets for the hierarchical pivot table."""
     by_leaf: dict[tuple[str, str, str], float] = {}
 
-    # ── Base tier ────────────────────────────────────────────────
     base_pmaj_col = _resolve_column(base_df, _BUDGET_BASE_PMAJ_CANDIDATES)
     base_sfmt_col = _resolve_column(base_df, _BUDGET_BASE_SFMT_CANDIDATES)
-    base_val_col  = _resolve_column(base_df, _BUDGET_BASE_VALUE_CANDIDATES)
+    base_val_col = _resolve_column(base_df, _BUDGET_BASE_VALUE_CANDIDATES)
     if (
         base_df is not None and not base_df.empty
         and base_pmaj_col and base_sfmt_col and base_val_col
     ):
-        # Vectorised aggregation: groupby then iterate, far faster
-        # than the equivalent per-row loop on large budget frames.
         base_work = base_df[[base_pmaj_col, base_sfmt_col, base_val_col]].copy()
         base_work[base_pmaj_col] = base_work[base_pmaj_col].map(_norm_pmaj)
         base_work[base_sfmt_col] = base_work[base_sfmt_col].map(_norm_sfmt)
-        base_work[base_val_col]  = pd.to_numeric(
+        base_work[base_val_col] = pd.to_numeric(
             base_work[base_val_col], errors="coerce",
         ).fillna(0.0)
         grouped = (
             base_work.groupby([base_pmaj_col, base_sfmt_col], dropna=False)
-                     [base_val_col].sum()
+            [base_val_col].sum()
         )
         for (pmaj, sfmt), lbs in grouped.items():
             key = (str(pmaj), FORECAST_BASE_PLAN, str(sfmt))
             by_leaf[key] = by_leaf.get(key, 0.0) + float(lbs) / _LBS_PER_MILLION
 
-    # ── R&O tier ─────────────────────────────────────────────────
     ro_pmaj_col = _resolve_column(ro_df, _BUDGET_RO_PMAJ_CANDIDATES)
     ro_sfmt_col = _resolve_column(ro_df, _BUDGET_RO_SFMT_CANDIDATES)
-    ro_val_col  = _resolve_column(ro_df, _BUDGET_RO_VALUE_CANDIDATES)
+    ro_val_col = _resolve_column(ro_df, _BUDGET_RO_VALUE_CANDIDATES)
     if (
         ro_df is not None and not ro_df.empty
         and ro_pmaj_col and ro_sfmt_col and ro_val_col
@@ -1122,12 +1019,12 @@ def build_budget_lookup(
         ro_work = ro_df[[ro_pmaj_col, ro_sfmt_col, ro_val_col]].copy()
         ro_work[ro_pmaj_col] = ro_work[ro_pmaj_col].map(_norm_pmaj)
         ro_work[ro_sfmt_col] = ro_work[ro_sfmt_col].map(_norm_sfmt)
-        ro_work[ro_val_col]  = pd.to_numeric(
+        ro_work[ro_val_col] = pd.to_numeric(
             ro_work[ro_val_col], errors="coerce",
         ).fillna(0.0)
         grouped = (
             ro_work.groupby([ro_pmaj_col, ro_sfmt_col], dropna=False)
-                   [ro_val_col].sum()
+            [ro_val_col].sum()
         )
         for (pmaj, sfmt), lbs in grouped.items():
             key = (str(pmaj), FORECAST_R_AND_O, str(sfmt))
@@ -1135,12 +1032,124 @@ def build_budget_lookup(
 
     has_data = bool(by_leaf)
     logger.info(
-        "Budget lookup built: %s leaf(s) (base: %s, ro: %s).",
-        len(by_leaf),
-        "yes" if (base_pmaj_col and base_sfmt_col and base_val_col) else "skipped",
-        "yes" if (ro_pmaj_col and ro_sfmt_col and ro_val_col) else "skipped",
+        "Annual pivot budget lookup built: %s leaf(s).", len(by_leaf),
     )
     return BudgetLookup(by_leaf=by_leaf, has_data=has_data)
+
+
+# ── Monthly budget (Static_Budget_Base&RO_by_Month.csv) ─────────────────────
+
+# Column-name candidates for the monthly bundled-budget CSV.
+_BUDGET_MONTH_COL_CANDIDATES: tuple[str, ...] = (
+    "Month", "Start of Month", "StartOfMonth", "month",
+)
+_BUDGET_MONTHLY_VALUE_CANDIDATES: tuple[str, ...] = (
+    "Demand Plan Pounds",
+    "Budget M", "Budget", "Pounds_M", "Pounds",
+)
+
+
+@dataclass(frozen=True)
+class MonthlyBudgetLookup:
+    """Bundled (Base + R&O) budget by pivot month column (millions of lbs).
+
+    Built from ``Static_Budget_Base&RO_by_Month.csv``.  Keys are
+    :func:`_format_month_label` strings (``%Y-%m``) so footer rows and
+    the chart align with the demand pivot's month columns without a
+    second date parser in the page layer.
+    """
+    by_month: dict[str, float]
+    has_data: bool
+
+    def values_for_labels(self, month_labels: tuple[str, ...]) -> dict[str, float]:
+        """Return budget millions for each label in *month_labels* (NaN if missing)."""
+        return {
+            label: float(self.by_month.get(label, float("nan")))
+            for label in month_labels
+        }
+
+    def sum_for_labels(self, month_labels: tuple[str, ...]) -> float:
+        """Sum budget millions over labels that exist in the lookup."""
+        total = 0.0
+        for label in month_labels:
+            if label in self.by_month:
+                total += float(self.by_month[label])
+        return total
+
+
+def _parse_budget_csv_month(value) -> Optional[date]:
+    """Parse a month cell from the monthly budget CSV into a :class:`date`.
+
+    The live file uses ``M/YY`` (e.g. ``4/26`` → 2026-04-01).  Falls
+    back to :func:`_coerce_start_of_month` for Excel serials / ISO
+    strings so a one-off publish format change does not break the read.
+    """
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    s = str(value).strip()
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 2:
+            try:
+                month_num = int(parts[0].strip())
+                year_num = int(parts[1].strip())
+                if year_num < 100:
+                    year_num += 2000
+                return date(year_num, month_num, 1)
+            except (ValueError, TypeError):
+                pass
+
+    return _coerce_start_of_month(value)
+
+
+def build_monthly_budget_lookup(
+    budget_df: Optional[pd.DataFrame],
+) -> MonthlyBudgetLookup:
+    """Build a :class:`MonthlyBudgetLookup` from the monthly budget CSV.
+
+    Values in ``Demand Plan Pounds`` are treated as **millions of lbs**
+    when they are already pivot-scale (typical magnitudes < 10 000).
+    Raw-lb magnitudes are auto-converted via :data:`_LBS_PER_MILLION`.
+    """
+    by_month: dict[str, float] = {}
+    if budget_df is None or budget_df.empty:
+        return MonthlyBudgetLookup(by_month=by_month, has_data=False)
+
+    month_col = _resolve_column(budget_df, _BUDGET_MONTH_COL_CANDIDATES)
+    value_col = _resolve_column(budget_df, _BUDGET_MONTHLY_VALUE_CANDIDATES)
+    if not month_col or not value_col:
+        logger.info(
+            "Monthly budget CSV missing required columns (month=%s, value=%s).",
+            month_col, value_col,
+        )
+        return MonthlyBudgetLookup(by_month=by_month, has_data=False)
+
+    work = budget_df[[month_col, value_col]].copy()
+    work["__month_date"] = work[month_col].map(_parse_budget_csv_month)
+    work["__lbs"] = pd.to_numeric(work[value_col], errors="coerce")
+    work = work.dropna(subset=["__month_date", "__lbs"])
+    if work.empty:
+        return MonthlyBudgetLookup(by_month=by_month, has_data=False)
+
+    # Heuristic: values already in millions (e.g. 86.4) vs raw lbs.
+    median_val = float(work["__lbs"].median())
+    scale = 1.0 if median_val < 10_000 else (1.0 / _LBS_PER_MILLION)
+
+    for month_date, lbs in zip(work["__month_date"], work["__lbs"]):
+        label = _format_month_label(month_date)
+        by_month[label] = by_month.get(label, 0.0) + float(lbs) * scale
+
+    has_data = bool(by_month)
+    logger.info(
+        "Monthly budget lookup built: %s month(s).", len(by_month),
+    )
+    return MonthlyBudgetLookup(by_month=by_month, has_data=has_data)
 
 
 def _prepare_long_frame(
@@ -1295,6 +1304,7 @@ def build_demand_pivot(
     *,
     supply_format_lookup: Optional[dict[str, str]] = None,
     budget_lookup: Optional[BudgetLookup] = None,
+    monthly_budget: Optional[MonthlyBudgetLookup] = None,
 ) -> DemandPivotResult:
     """Build the hierarchical Demand Pivot Summary.
 
@@ -1312,14 +1322,11 @@ def build_demand_pivot(
         each demand row with its Supply Format (the source CSV does
         not carry the column).
     budget_lookup
-        Optional :class:`BudgetLookup` (from
-        :func:`build_budget_lookup`).  When provided, every row in
-        the pivot gains a ``Total Budget`` column populated from the
-        lookup at the row's natural level (leaf, subtotal, grand-
-        total).  When omitted (or empty), the column is still
-        present but zero-valued, and
-        :attr:`DemandPivotResult.has_budget_data` reports ``False``
-        so the page can hide the column / chart line.
+        Optional :class:`BudgetLookup` for the hierarchical pivot
+        table ``Total Budget`` column (annual Base/RO static CSVs).
+    monthly_budget
+        Optional :class:`MonthlyBudgetLookup` for the footer
+        **Total Budget (Base + R&O)** row and chart line only.
 
     Returns
     -------
@@ -1335,22 +1342,24 @@ def build_demand_pivot(
     4. Group by ``(PMaj, ForecastType, SFmt, Month)`` and sum the
        millions column → wide-form pivot (one column per month).
     5. Walk the PMaj × ForecastType groups in screenshot order to
-       build the indented row sequence (leaf rows + subtotals).
-       Each row's Total Budget cell is computed from
-       *budget_lookup* at the row's natural aggregation level.
+       build the indented row sequence (leaf rows + subtotals),
+       attaching annual ``Total Budget`` from *budget_lookup*.
     6. Drop rows where every month value rounds to 0 (within
        :data:`_EMPTY_ROW_TOLERANCE_M`).  Subtotal rows are kept iff
        at least one of their leaves survives, so the pivot never
        shows a subtotal whose children all vanished.
-    7. Append a ``Total`` column + a ``Total Budget`` column to every row.
-    8. Build the footer totals (Base Plan / R&O / Grand Total) and
+    7. Append ``Total`` + ``Total Budget`` (annual) to every pivot row.
+    8. Build the footer totals (Base Plan / R&O / static Total Budget) and
        the long-form chart frame from the **post-filter, pre-roll-up**
        millions frame — those two outputs reflect the planner's
        filter selection exactly.
     """
     filters = filters or DemandPivotFilters()
-    budget = budget_lookup if budget_lookup is not None else BudgetLookup(
+    annual = budget_lookup if budget_lookup is not None else BudgetLookup(
         by_leaf={}, has_data=False,
+    )
+    monthly = monthly_budget if monthly_budget is not None else MonthlyBudgetLookup(
+        by_month={}, has_data=False,
     )
 
     long_df = _prepare_long_frame(df, supply_format_lookup=supply_format_lookup)
@@ -1371,7 +1380,9 @@ def build_demand_pivot(
             base_plan_totals=empty_footer,
             r_and_o_totals=empty_footer,
             budget_totals=empty_footer,
+            budget_by_month={},
             budget_total_m=0.0,
+            has_pivot_budget_data=False,
             has_budget_data=False,
             chart_long=empty_chart,
         )
@@ -1400,11 +1411,6 @@ def build_demand_pivot(
     wide.columns = pd.Index([_format_month_label(d) for d in month_dates])
     month_col_labels = tuple(wide.columns.tolist())
 
-    # Pre-compute the post-filter PMaj / SFmt whitelists for budget
-    # slicing — the chart's dotted budget line + the footer "Total
-    # Budget" subtotal must reflect EXACTLY the buckets that survived
-    # the filters (otherwise the line would drift to a value the
-    # planner can't tie back to the pivot rows).
     visible_pmajs = {str(p) for p in wide.index.get_level_values(0).unique()}
     visible_sfmts = {str(s) for s in wide.index.get_level_values(2).unique()}
 
@@ -1464,10 +1470,7 @@ def build_demand_pivot(
             # subtotals AND every empty leaf below.
             continue
 
-        # PMaj-level budget: sum every leaf for this PMaj across both
-        # Forecast Types, restricted to visible SFmts so the column
-        # reconciles with the on-screen leaves.
-        pmaj_budget_m = budget.slice_total(
+        pmaj_budget_m = annual.slice_total(
             pmaj_whitelist={pmaj}, sfmt_whitelist=visible_sfmts,
         )
         pmaj_idx = len(output_rows)
@@ -1486,8 +1489,7 @@ def build_demand_pivot(
             if _is_empty_values(f_totals):
                 continue
 
-            # Forecast-Type budget at the (PMaj, ForecastType) level.
-            f_budget_m = budget.slice_total(
+            f_budget_m = annual.slice_total(
                 forecast=forecast,
                 pmaj_whitelist={pmaj},
                 sfmt_whitelist=visible_sfmts,
@@ -1505,7 +1507,7 @@ def build_demand_pivot(
                 leaf_values = f_slice.xs(sfmt, level=2).iloc[0].to_dict()
                 if _is_empty_values(leaf_values):
                     continue
-                leaf_budget_m = budget.lookup_leaf(pmaj, forecast, sfmt)
+                leaf_budget_m = annual.lookup_leaf(pmaj, forecast, sfmt)
                 output_rows.append(
                     _make_row(
                         sfmt, 2, leaf_values, is_subtotal=False,
@@ -1528,13 +1530,12 @@ def build_demand_pivot(
             output_rows.pop(pmaj_idx)
             next_row_id -= 1
 
-    # ── Grand Total row + visible budget totals ──────────────────
-    grand_budget_base_m = budget.slice_total(
+    grand_budget_base_m = annual.slice_total(
         forecast=FORECAST_BASE_PLAN,
         pmaj_whitelist=visible_pmajs,
         sfmt_whitelist=visible_sfmts,
     )
-    grand_budget_ro_m = budget.slice_total(
+    grand_budget_ro_m = annual.slice_total(
         forecast=FORECAST_R_AND_O,
         pmaj_whitelist=visible_pmajs,
         sfmt_whitelist=visible_sfmts,
@@ -1576,44 +1577,59 @@ def build_demand_pivot(
             footer_wide.loc[forecast] = 0.0
 
     def _row_to_footer_df(
-        label: str, series: pd.Series, budget_m: float,
+        label: str,
+        series: pd.Series,
+        *,
+        include_budget_col: bool,
+        budget_col_value: float = float("nan"),
     ) -> pd.DataFrame:
-        """Return a single-row footer frame with rounded values + Total + Total Budget."""
+        """Return a single-row footer frame (dynamic demand subtotals)."""
         values = {c: round(float(series.get(c, 0.0)), 1) for c in month_col_labels}
         values[TOTAL_COLUMN_LABEL] = round(
             float(sum(series.get(c, 0.0) for c in month_col_labels)), 1,
         )
-        values[TOTAL_BUDGET_COLUMN_LABEL] = round(float(budget_m), 1)
-        # The label uses the "Row Label" column name so the footer
-        # frame slots underneath the pivot with identical schema.
+        if include_budget_col:
+            values[TOTAL_BUDGET_COLUMN_LABEL] = budget_col_value
         return pd.DataFrame([{"Row Label": label, **values}])
 
+    # Footer table shares one schema: annual values on Base/R&O rows,
+    # monthly values on the bundled Total Budget row.
+    include_footer_budget_col = annual.has_data or monthly.has_data
     base_plan_totals = _row_to_footer_df(
         "Total Base Plan",
         footer_wide.loc[FORECAST_BASE_PLAN],
-        grand_budget_base_m,
+        include_budget_col=include_footer_budget_col,
+        budget_col_value=(
+            round(float(grand_budget_base_m), 1)
+            if annual.has_data else float("nan")
+        ),
     )
     r_and_o_totals = _row_to_footer_df(
         "Total R&O",
         footer_wide.loc[FORECAST_R_AND_O],
-        grand_budget_ro_m,
+        include_budget_col=include_footer_budget_col,
+        budget_col_value=(
+            round(float(grand_budget_ro_m), 1)
+            if annual.has_data else float("nan")
+        ),
     )
 
-    # Bundled Budget row — what the planner asked for ("include a
-    # Total Budget in the dynamic subtotals (bundle budget base and
-    # budget RO)").  Monthly cells are intentionally blank / NaN
-    # because budget is an annual figure with no monthly slice — we
-    # don't want to imply a 1/12-style decomposition the source data
-    # doesn't support.  The Total Budget column carries the bundled
-    # annual figure.
+    # Static Total Budget row — monthly millions from Fabric (not
+    # re-sliced by PMaj / SFmt; only the visible month columns apply).
+    budget_by_month = monthly.values_for_labels(month_col_labels)
     budget_label = f"{TOTAL_BUDGET_COLUMN_LABEL} (Base + R&O)"
-    budget_totals_values: dict[str, float] = {
-        c: float("nan") for c in month_col_labels
-    }
-    budget_totals_values[TOTAL_COLUMN_LABEL] = float("nan")
-    budget_totals_values[TOTAL_BUDGET_COLUMN_LABEL] = round(
-        float(grand_budget_total_m), 1,
-    )
+    budget_totals_values: dict[str, float] = {}
+    for col in month_col_labels:
+        raw = budget_by_month.get(col, float("nan"))
+        budget_totals_values[col] = (
+            round(float(raw), 1) if pd.notna(raw) else float("nan")
+        )
+    budget_total_m = monthly.sum_for_labels(month_col_labels)
+    budget_totals_values[TOTAL_COLUMN_LABEL] = round(float(budget_total_m), 1)
+    if monthly.has_data:
+        budget_totals_values[TOTAL_BUDGET_COLUMN_LABEL] = round(
+            float(budget_total_m), 1,
+        )
     budget_totals = pd.DataFrame(
         [{"Row Label": budget_label, **budget_totals_values}]
     )
@@ -1647,8 +1663,16 @@ def build_demand_pivot(
         base_plan_totals=base_plan_totals,
         r_and_o_totals=r_and_o_totals,
         budget_totals=budget_totals,
-        budget_total_m=float(grand_budget_total_m),
-        has_budget_data=bool(budget.has_data and grand_budget_total_m > 0),
+        budget_by_month={
+            k: round(float(v), 1)
+            for k, v in budget_by_month.items()
+            if pd.notna(v)
+        },
+        budget_total_m=float(budget_total_m),
+        has_pivot_budget_data=bool(
+            annual.has_data and grand_budget_total_m > 0,
+        ),
+        has_budget_data=bool(monthly.has_data and budget_total_m > 0),
         chart_long=chart_long,
     )
 
@@ -1677,6 +1701,7 @@ __all__ = [
     "fetch_pdh",
     "fetch_static_budget_base",
     "fetch_static_budget_ro",
+    "fetch_static_budget_monthly",
     "fetch_raw_bytes",
     "mgmt_plan_full_blob_path",
     "total_item_level_demand_blob_path",
@@ -1688,6 +1713,7 @@ __all__ = [
     "PMAJ_BLANK_LABEL", "TOTAL_COLUMN_LABEL", "TOTAL_BUDGET_COLUMN_LABEL",
     "DemandPivotError", "DemandPivotFilters", "DemandPivotResult",
     "BudgetLookup", "build_budget_lookup",
+    "MonthlyBudgetLookup", "build_monthly_budget_lookup",
     "build_demand_pivot",
     "build_supply_format_lookup",
     "list_available_filter_values",

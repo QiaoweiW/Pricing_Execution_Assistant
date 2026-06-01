@@ -138,6 +138,7 @@ from data_sources.ro_summary_report import (
     fetch_ro_comparison_output_df,
     recompute_subtotals,
     save_ro_summary_report,
+    summary_to_csv_bytes,
 )
 from utils import fabric_signin_widget
 from utils.embed_helpers import (
@@ -1779,6 +1780,10 @@ def _render_summary_report_fragment() -> None:
     # ── Render the editor ────────────────────────────────────────
     view_df = full_df if show_empty else drop_all_zero_rows(full_df)
     if view_df.empty:
+        # No visible rows, but the full template may still exist in
+        # session — offer download/save of the all-zero shape.
+        export_ready = recompute_subtotals(full_df)
+        _render_summary_report_actions(export_ready)
         st.info(
             "Every row is zero — nothing to display.  Tick **Show empty "
             "rows** to edit the template directly, or change the Prior / "
@@ -1811,24 +1816,66 @@ def _render_summary_report_fragment() -> None:
     merged = recompute_subtotals(merged)
     st.session_state[_SS_SUMMARY_REPORT_DF] = merged
 
-    # ── Save button ──────────────────────────────────────────────
-    if st.button(
-        "💾 Save RO_Summary_Report.csv (overwrite)",
-        key="ro_sr_save",
-        type="primary",
-        help=(
-            "Overwrites `Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv` "
-            "with the FULL 30-row template (subtotals + every leaf, including "
-            "all-zero rows) so downstream consumers get a stable shape."
-        ),
-    ):
-        try:
-            with st.spinner("Saving RO_Summary_Report.csv to Microsoft Fabric…"):
-                blob_path = save_ro_summary_report(merged)
-        except RoSummaryReportError as exc:
-            st.error(f"❌ Save failed.\n\n{exc}")
-        else:
-            st.success(f"✅ Saved to `Files/{blob_path}`.")
+    # ── Download + Save (after editor — reflects live edits) ─────
+    _render_summary_report_actions(merged)
+
+
+def _render_summary_report_actions(export_df: pd.DataFrame) -> None:
+    """Render Download + Save controls for the RO Summary Report.
+
+    Placed **after** the data editor so both actions reflect the
+    planner's latest in-session edits (merged back into the full
+    template + subtotals recomputed).  Layout matches other editable
+    sections on this page and across the app: ``⬇️ Download … (CSV)``
+    label, ``text/csv`` mime, ``YYYYMMDD`` filename suffix, primary
+    styling on the download action.
+
+    Parameters
+    ----------
+    export_df
+        Full 30-row template with subtotals reconciled — the same
+        frame passed to :func:`save_ro_summary_report`.
+    """
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    row_count = len(export_df)
+
+    dl_col, save_col = st.columns([1, 1])
+    with dl_col:
+        st.download_button(
+            label="⬇️ Download RO Summary Report (CSV)",
+            data=summary_to_csv_bytes(export_df),
+            file_name=f"RO_Summary_Report_{today}.csv",
+            mime="text/csv",
+            key="ro_sr_download",
+            type="primary",
+            use_container_width=True,
+            help=(
+                "Downloads the current report as a CSV — same column "
+                "headers and row shape as "
+                "`Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv` "
+                "(full template, all rows including zeros).  Includes "
+                "any edits you just made in the table above."
+            ),
+        )
+    with save_col:
+        if st.button(
+            "💾 Save RO_Summary_Report.csv (overwrite)",
+            key="ro_sr_save",
+            type="primary",
+            use_container_width=True,
+            help=(
+                "Overwrites `Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv` "
+                "with the FULL 30-row template (subtotals + every leaf, including "
+                "all-zero rows) so downstream consumers get a stable shape."
+            ),
+        ):
+            try:
+                with st.spinner("Saving RO_Summary_Report.csv to Microsoft Fabric…"):
+                    blob_path = save_ro_summary_report(export_df)
+            except RoSummaryReportError as exc:
+                st.error(f"❌ Save failed.\n\n{exc}")
+            else:
+                st.success(f"✅ Saved to `Files/{blob_path}` ({row_count} rows).")
 
 
 def _render_summary_report_warnings(warnings: list[str]) -> None:

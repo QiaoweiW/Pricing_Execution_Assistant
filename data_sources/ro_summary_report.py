@@ -917,28 +917,97 @@ def clear_comparison_output_cache() -> None:
     _cached_comparison_output_df.clear()
 
 
+# ── Export / download shape (shared with Fabric save) ────────────────────────
+#
+# The page's ``st.download_button`` and :func:`save_ro_summary_report`
+# must emit the *same* column set, order, and header labels so a
+# planner who downloads locally and later hits Save publishes an
+# identical file.  All shaping lives here — the view only calls
+# :func:`summary_to_csv_bytes`.
+
+# Left-to-right order for ``RO_Summary_Report.csv`` (dims → label → metrics).
+_EXPORT_COLUMN_ORDER: tuple[str, ...] = (
+    *DIM_COLS,
+    COL_LABEL,
+    *DATA_COLS,
+)
+
+
+def prepare_summary_for_export(df: pd.DataFrame) -> pd.DataFrame:
+    """Return *df* shaped for Fabric save or local CSV download.
+
+    Transformations (applied in order)
+    --------------------------------
+    1. Drop internal metadata columns (:data:`META_COLS`) — the page
+       uses these for subtotal rollup and indent styling only.
+    2. Rename internal data-column IDs to the grouped display labels
+       in :data:`SAVED_COLUMN_LABELS` (matches the planner's Excel
+       screenshot and the published Fabric file).
+    3. Reorder columns to :data:`_EXPORT_COLUMN_ORDER` so every
+       export has a stable shape regardless of pandas column order.
+
+    The returned frame is the FULL template (all 30 rows when built
+    from the standard template), including all-zero leaves — same
+    contract as :func:`save_ro_summary_report`.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+
+    drop_cols = [c for c in META_COLS if c in out.columns]
+    if drop_cols:
+        out = out.drop(columns=drop_cols)
+
+    out = out.rename(columns=SAVED_COLUMN_LABELS)
+
+    # After rename, dim + label columns keep their display names; only
+    # the eight metric columns pick up the grouped ``|`` labels.
+    ordered_labels: list[str] = [
+        SAVED_COLUMN_LABELS.get(col, col) for col in _EXPORT_COLUMN_ORDER
+    ]
+    present = [c for c in ordered_labels if c in out.columns]
+    extra = [c for c in out.columns if c not in present]
+    return out.loc[:, present + extra].copy()
+
+
+def summary_for_download(df: pd.DataFrame) -> pd.DataFrame:
+    """Public entry: prepare the in-memory report for a CSV download.
+
+    Thin alias over :func:`prepare_summary_for_export` so the page
+    mirrors the ``pivot_for_download`` pattern in ``demand_summary.py``.
+    """
+    return prepare_summary_for_export(df)
+
+
+def summary_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serialise the export-shaped report to UTF-8 CSV bytes.
+
+    Intended for ``st.download_button`` on the Demand Planner
+    Analytics page — HTTP download, not WebSocket, so there is no
+    row-count cap beyond what the browser can accept (the template
+    is fixed at ~30 rows).
+    """
+    export_df = prepare_summary_for_export(df)
+    if export_df.empty:
+        return b""
+    return export_df.to_csv(index=False).encode("utf-8")
+
+
 def save_ro_summary_report(df: pd.DataFrame) -> str:
     """Overwrite ``Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv``.
 
     The saved CSV contains the FULL 30-row template (subtotals + every
     leaf, including all-zero rows) so downstream consumers get a
-    stable shape every month.  Internal metadata columns
-    (``_row_id`` / ``_indent`` / ``_is_subtotal``) are stripped, and
-    the internal data-column IDs are renamed to the grouped display
-    labels in :data:`SAVED_COLUMN_LABELS`.
+    stable shape every month.  Shaping is delegated to
+    :func:`prepare_summary_for_export` so the Fabric file matches a
+    local download byte-for-byte (modulo line-ending normalisation by
+    the storage layer).
 
     Returns the destination blob path.  Raises
     :class:`RoSummaryReportError` on any underlying write failure.
     """
-    out = df.copy()
-
-    # Strip internal metadata columns the CSV consumer doesn't need.
-    drop_cols = [c for c in META_COLS if c in out.columns]
-    if drop_cols:
-        out = out.drop(columns=drop_cols)
-
-    # Rename internal data IDs to grouped display labels.
-    out = out.rename(columns=SAVED_COLUMN_LABELS)
+    out = prepare_summary_for_export(df)
 
     try:
         write_csv(
@@ -977,6 +1046,10 @@ __all__ = [
     "drop_all_zero_rows",
     # Diagnostics (used by the page's Diagnostic expander)
     "diag_dim_summary",
+    # Export (download + Fabric save share the same shape)
+    "prepare_summary_for_export",
+    "summary_for_download",
+    "summary_to_csv_bytes",
     # Fabric I/O
     "clear_comparison_output_cache",
     "fetch_ro_comparison_output_df",

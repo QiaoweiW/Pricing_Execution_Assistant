@@ -95,9 +95,16 @@ input contract narrow (only RO_Comparison_Output.csv).
 
 Portfolio Major normalisation
 -----------------------------
-"ESL" and "Extended Shelf Life" are treated as synonyms FOR MATCHING
-ONLY (the rest of the section keeps raw values).  See the
-``pmaj_match`` frozensets in :data:`RO_SUMMARY_TEMPLATE`.
+Some portfolio families use synonym frozensets in ``pmaj_match`` so
+leaves roll up correctly when upstream dim tables disagree on the
+literal string (matching only — display columns keep screenshot
+values):
+
+* **ESL** — ``"ESL"`` and ``"Extended Shelf Life"``
+* **Fresh Milk** — ``"Fresh Milk"`` and ``"HTST"`` (RO Comparison /
+  dp_dimitems often labels HTST fresh-milk SKUs as PMaj=HTST)
+
+See :data:`_ESL` and :data:`_FRESH_MILK` in :data:`RO_SUMMARY_TEMPLATE`.
 """
 from __future__ import annotations
 
@@ -252,12 +259,14 @@ class TemplateRow:
     brand_match: Optional[str]
 
 
-# Synonym set used by every ESL/Extended Shelf Life leaf — defined
-# once at module scope so we don't allocate identical frozensets in
-# every TemplateRow row literal.
+# Portfolio Major synonym sets — one frozenset per family that needs
+# more than one upstream literal.  Defined at module scope so every
+# leaf reuses the same object (mirrors :data:`_ESL`).
 _ESL: frozenset = frozenset({"ESL", "Extended Shelf Life"})
 _CULTURED: frozenset = frozenset({"Cultured"})
-_FRESH_MILK: frozenset = frozenset({"Fresh Milk"})
+# Fresh Milk leaves aggregate rows whose PMaj is either the report
+# label or the HTST code used in dp_dimitems / RO_Item_Master.
+_FRESH_MILK: frozenset = frozenset({"Fresh Milk", "HTST"})
 _BUTTER: frozenset = frozenset({"Butter"})
 
 # Reusable helper to keep the TemplateRow literals readable.
@@ -365,6 +374,8 @@ RO_SUMMARY_TEMPLATE: tuple[TemplateRow, ...] = (
           pmaj_match=_CULTURED, pminor_match="Sour Cream"),
 
     # ── Fresh Milk ────────────────────────────────────────────────
+    # All leaves use :data:`_FRESH_MILK` (Fresh Milk | HTST) for PMaj
+    # filtering; display column stays "Fresh Milk" per the screenshot.
     _subtotal("fm", "Fresh Milk", 1,
               ("fm_gj", "fm_cj", "fm_mc", "fm_hg", "fm_bo", "fm_to", "fm_qt")),
     _leaf("fm_gj", "Gallon Jug", 2,

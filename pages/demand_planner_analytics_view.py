@@ -93,6 +93,13 @@ from data_sources.demand_plan_comparison import (
     DRV_BASE_PLAN_VALUE,
     DRV_PM_ACTUAL_VALUE,
     DRV_DRIVER_COLS,
+    DRV_ITEM_COL_ITEM,
+    DRV_ITEM_COL_DESC,
+    DRV_ITEM_COL_BRAND,
+    DRV_ITEM_COL_CUSTOMER,
+    DRV_ITEM_COL_CUSTOMER_ID,
+    DRV_ITEM_COL_DELTA,
+    DriverTableResult,
     PMAF_COL_PRIOR_PLAN,
     PMAF_COL_ORDERED,
     PMAF_COL_SHIPPED,
@@ -107,7 +114,9 @@ from data_sources.demand_plan_comparison import (
     build_prior_month_actual_vs_fcst_table,
     build_pm_actual_driver_table,
     comparison_to_csv_bytes,
+    compute_demand_driver_items,
     driver_table_to_csv_bytes,
+    list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
     list_tracker_months,
@@ -333,6 +342,7 @@ _SS_SUMMARY_REPORT_RAW_DF    = "_ro_sr_raw_df"
 # rebuild when the picker changes; preserve planner edits when a
 # widget INSIDE the report fragment reruns.
 _SS_SUMMARY_REPORT_SIG       = "_ro_sr_sig"
+_SS_SUMMARY_REPORT_TEMPLATE  = "_ro_sr_template"
 
 # Early-Start-Date Programs section.
 #
@@ -553,8 +563,9 @@ def _render_customer_input_uploader() -> None:
     # section's body text but below the section's h3 heading.
     st.markdown(
         "<h4 style='font-size:1.35rem; margin-top:0.25rem;'>"
-        "📤 Save the 'Customer Input' table in the \"Distribution Tracker New\" "
-        "as csv file to Upload here"
+        "📤 Save the 'Customer Input' table as a "
+        "&quot;Distribution_Tracker.csv&quot; file (+a new column "
+        "&quot;Month&quot; with the start date of current month) to upload here"
         "</h4>",
         unsafe_allow_html=True,
     )
@@ -564,16 +575,17 @@ def _render_customer_input_uploader() -> None:
         "independently and is always visible."
     )
     uploaded = st.file_uploader(
-        "Save the 'Customer Input' table in the \"Distribution Tracker New\" as csv file to Upload here",
+        "Save the 'Customer Input' table as a Distribution_Tracker.csv file "
+        "(+ Month column with the start date of current month) to upload here",
         type=["csv"],
         key="ro_cmp_customer_input_upload",
         label_visibility="collapsed",
         help=(
-            "Pick the local CSV (typically named "
-            "\"Distribution Tracker New 'Customer Input'.csv\"). "
-            "On Save it lands in Files/RO Tracking/Append_New_History/ "
-            "under its original filename — Fabric never sees the file "
-            "until you click Save."
+            "Export the Customer Input table as Distribution_Tracker.csv "
+            "and add a Month column with the first day of the current month "
+            "(e.g. 2026-06-01). On Save it lands in "
+            "Files/RO Tracking/Append_New_History/ under its original "
+            "filename — Fabric never sees the file until you click Save."
         ),
     )
 
@@ -731,7 +743,7 @@ def _maybe_auto_regenerate_comparison_output(
         _SS_SUMMARY_DF, _SS_MONTHS_SIG, _SS_WARNINGS, _SS_DIMITEMS_ERROR,
         _SS_SUMMARY_REPORT_DF, _SS_SUMMARY_REPORT_LOADED_AT,
         _SS_SUMMARY_REPORT_WARNINGS, _SS_SUMMARY_REPORT_RAW_DF,
-        _SS_SUMMARY_REPORT_SIG,
+        _SS_SUMMARY_REPORT_SIG, _SS_SUMMARY_REPORT_TEMPLATE,
     ):
         st.session_state.pop(key, None)
     clear_comparison_output_cache()
@@ -1776,12 +1788,13 @@ def _render_summary_report_fragment() -> None:
     )
     if needs_rebuild:
         try:
-            report_df, report_warnings = build_summary_report(summary_df)
+            report_df, report_warnings, runtime_template = build_summary_report(summary_df)
         except RoSummaryReportError as exc:
             st.error(f"❌ Could not build the RO Summary Report.\n\n{exc}")
             return
         st.session_state[_SS_SUMMARY_REPORT_DF]        = report_df
         st.session_state[_SS_SUMMARY_REPORT_WARNINGS]  = report_warnings
+        st.session_state[_SS_SUMMARY_REPORT_TEMPLATE]  = runtime_template
         st.session_state[_SS_SUMMARY_REPORT_LOADED_AT] = datetime.now()
         st.session_state[_SS_SUMMARY_REPORT_RAW_DF]    = summary_df.copy()
         st.session_state[_SS_SUMMARY_REPORT_SIG]       = months_sig
@@ -1827,7 +1840,10 @@ def _render_summary_report_fragment() -> None:
     if view_df.empty:
         # No visible rows, but the full template may still exist in
         # session — offer download/save of the all-zero shape.
-        export_ready = recompute_subtotals(full_df)
+        export_ready = recompute_subtotals(
+            full_df,
+            st.session_state.get(_SS_SUMMARY_REPORT_TEMPLATE),
+        )
         _render_summary_report_actions(export_ready)
         st.info(
             "Every row is zero — nothing to display.  Tick **Show empty "
@@ -1858,7 +1874,10 @@ def _render_summary_report_fragment() -> None:
     merged = full_df.copy()
     overlap = [c for c in edited_view.columns if c in merged.columns]
     merged.loc[edited_view.index, overlap] = edited_view[overlap].values
-    merged = recompute_subtotals(merged)
+    merged = recompute_subtotals(
+        merged,
+        st.session_state.get(_SS_SUMMARY_REPORT_TEMPLATE),
+    )
     st.session_state[_SS_SUMMARY_REPORT_DF] = merged
 
     # ── Download + Save (after editor — reflects live edits) ─────
@@ -3194,7 +3213,7 @@ def _cached_prior_month_actual_vs_fcst_table(
 def _cached_base_plan_driver_table(
     sig_key: tuple, filters: ComparisonFilters, dim_sig: tuple,
     _enriched: EnrichedSources, _dim_df: Optional[pd.DataFrame],
-) -> pd.DataFrame:
+) -> DriverTableResult:
     """Cache the Base Plan driver build per ``(data signature, filters, dim)``."""
     return build_base_plan_driver_table(
         None, None, _dim_df, filters, enriched=_enriched,
@@ -3205,7 +3224,7 @@ def _cached_base_plan_driver_table(
 def _cached_pm_actual_driver_table(
     sig_key: tuple, filters: ComparisonFilters, dim_sig: tuple,
     _enriched: EnrichedSources, _dim_df: Optional[pd.DataFrame],
-) -> pd.DataFrame:
+) -> DriverTableResult:
     """Cache the PM Actual driver build per ``(data signature, filters, dim)``."""
     return build_pm_actual_driver_table(
         None, None, None, _dim_df, filters, enriched=_enriched,
@@ -3700,20 +3719,18 @@ def _render_demand_comparison_table(result) -> None:
 
 
 def _render_one_driver_table(
-    table: pd.DataFrame, value_col: str, key_prefix: str,
+    result: DriverTableResult,
+    value_col: str,
+    key_prefix: str,
 ) -> None:
-    """Render one driver table with sort/search filters + download.
-
-    Filters are intentionally planner-oriented (dimension picks +
-    free-text item/customer search) and are applied client-side to the
-    already-built driver frame — no extra Fabric reads.
-    """
+    """Render one driver table with filters, drill-down, and download."""
+    table = result.table
+    buckets = result.buckets
     if table is None or table.empty:
         st.info("No driver rows to display for the current selection.")
         return
 
-    filtered = _render_driver_filters(table, key_prefix)
-    # Enforce deterministic alphabetical ordering requested by planner.
+    filtered = _render_driver_filters(table, buckets, key_prefix)
     filtered = filtered.sort_values(
         by=[DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
         ascending=[True, True, True],
@@ -3747,22 +3764,32 @@ def _render_one_driver_table(
         height=table_height,
         column_config=column_config,
     )
+    _render_demand_driver_drill_down(buckets, filtered, key_prefix)
 
 
-def _render_driver_filters(table: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+def _render_driver_filters(
+    table: pd.DataFrame,
+    buckets: pd.DataFrame,
+    key_prefix: str,
+) -> pd.DataFrame:
     """Render driver-table filters and return the filtered frame.
 
     Search semantics:
-    - Portfolio Major / Supply Format / Brand are exact-dimension filters.
+    - Portfolio Major / Supply Format / Brand / Portfolio Minor are
+      exact-dimension filters (PMinor uses the item-level bucket frame).
     - Item Description / Customer are case-insensitive substring matches
-      against the three driver text cells (#1/#2/#3 Driver), which keeps
-      the UI lightweight while still enabling quick pinpoint search.
+      against the five driver text cells.
     """
     pmaj_values = sorted(v for v in table[DRV_COL_PMAJ].dropna().astype(str).str.strip().unique() if v)
     sfmt_values = sorted(v for v in table[DRV_COL_SFMT].dropna().astype(str).str.strip().unique() if v)
     brand_values = sorted(v for v in table[DRV_COL_BRAND].dropna().astype(str).str.strip().unique() if v)
+    pminor_values: list[str] = []
+    if buckets is not None and not buckets.empty and "pminor" in buckets.columns:
+        pminor_values = sorted(
+            v for v in buckets["pminor"].dropna().astype(str).str.strip().unique() if v
+        )
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         selected_pmaj = st.multiselect(
             "Portfolio Major",
@@ -3782,6 +3809,13 @@ def _render_driver_filters(table: pd.DataFrame, key_prefix: str) -> pd.DataFrame
             "Brand",
             options=brand_values,
             key=f"{key_prefix}_flt_brand",
+            placeholder="All",
+        )
+    with c4:
+        selected_pminor = st.multiselect(
+            "Portfolio Minor",
+            options=pminor_values,
+            key=f"{key_prefix}_flt_pminor",
             placeholder="All",
         )
 
@@ -3807,9 +3841,45 @@ def _render_driver_filters(table: pd.DataFrame, key_prefix: str) -> pd.DataFrame
     if selected_brand:
         out = out.loc[out[DRV_COL_BRAND].isin(selected_brand)]
 
-    if item_query or customer_query:
-        # Search against driver text cells only (#1/#2/#3) so we don't
-        # need to carry raw driver-bucket columns into the display table.
+    if selected_pminor and buckets is not None and not buckets.empty:
+        bucket_groups = (
+            buckets.loc[buckets["pminor"].isin(selected_pminor)]
+            .groupby(["pmaj", "sfmt", "brand"], dropna=False)
+            .size()
+            .reset_index()[["pmaj", "sfmt", "brand"]]
+        )
+        if bucket_groups.empty:
+            out = out.iloc[0:0]
+        else:
+            out = out.merge(
+                bucket_groups,
+                left_on=[DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
+                right_on=["pmaj", "sfmt", "brand"],
+                how="inner",
+            ).drop(columns=["pmaj", "sfmt", "brand"])
+
+    if item_query and buckets is not None and not buckets.empty:
+        item_groups = (
+            buckets.loc[
+                buckets["item_desc"].astype(str).str.casefold().str.contains(
+                    item_query, regex=False,
+                )
+            ]
+            .groupby(["pmaj", "sfmt", "brand"], dropna=False)
+            .size()
+            .reset_index()[["pmaj", "sfmt", "brand"]]
+        )
+        if item_groups.empty:
+            out = out.iloc[0:0]
+        else:
+            out = out.merge(
+                item_groups,
+                left_on=[DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
+                right_on=["pmaj", "sfmt", "brand"],
+                how="inner",
+            ).drop(columns=["pmaj", "sfmt", "brand"])
+
+    if customer_query:
         text_blob = (
             out[list(DRV_DRIVER_COLS)]
             .fillna("")
@@ -3817,15 +3887,93 @@ def _render_driver_filters(table: pd.DataFrame, key_prefix: str) -> pd.DataFrame
             .agg(" | ".join, axis=1)
             .str.casefold()
         )
-        if item_query:
-            out = out.loc[text_blob.str.contains(item_query, regex=False)]
-            text_blob = text_blob.loc[out.index]
-        if customer_query:
-            out = out.loc[text_blob.str.contains(customer_query, regex=False)]
+        out = out.loc[text_blob.str.contains(customer_query, regex=False)]
 
     if out.empty:
         st.caption("No rows match the current driver filters.")
     return out.reset_index(drop=True)
+
+
+def _render_demand_driver_drill_down(
+    buckets: pd.DataFrame,
+    driver_table: pd.DataFrame,
+    key_prefix: str,
+) -> None:
+    """Render drill-down expander for one demand-comparison driver table."""
+    if buckets is None or buckets.empty or driver_table is None or driver_table.empty:
+        return
+
+    group_options = [
+        (row[DRV_COL_PMAJ], row[DRV_COL_SFMT], row[DRV_COL_BRAND])
+        for _, row in driver_table.iterrows()
+    ]
+    if not group_options:
+        return
+
+    group_labels = {
+        g: f"{g[0]} → {g[1]} → {g[2]}"
+        for g in group_options
+    }
+
+    with st.expander(
+        "🔬 Drill into items — pick a driver bucket to see the SKUs behind it",
+        expanded=False,
+    ):
+        sel_group = st.selectbox(
+            "Group (Portfolio Major → Supply Format → Brand)",
+            options=group_options,
+            index=0,
+            format_func=lambda g: group_labels[g],
+            key=f"{key_prefix}_drill_group",
+        )
+        sel_pmaj, sel_sfmt, sel_brand = sel_group
+
+        bucket_options = list_driver_buckets_for_group(
+            buckets, sel_pmaj, sel_sfmt, sel_brand,
+        )
+        if not bucket_options:
+            st.info("No driver buckets for this group on the current view.")
+            return
+
+        sel_bucket = st.selectbox(
+            "Driver bucket (Customer — Account / Customer No)",
+            options=bucket_options,
+            index=0,
+            key=f"{key_prefix}_drill_bucket",
+        )
+
+        items_df = compute_demand_driver_items(
+            buckets, sel_pmaj, sel_sfmt, sel_brand, sel_bucket,
+        )
+        if items_df.empty:
+            st.caption(
+                "_No items match the current driver bucket — "
+                "try widening the filters above._"
+            )
+            return
+
+        cc = st.column_config
+        column_config = {
+            DRV_ITEM_COL_ITEM: cc.TextColumn("Item #", width="small"),
+            DRV_ITEM_COL_DESC: cc.TextColumn("Description", width="medium"),
+            DRV_ITEM_COL_BRAND: cc.TextColumn("Brand", width="small"),
+            DRV_ITEM_COL_CUSTOMER: cc.TextColumn("Customer", width="medium"),
+            DRV_ITEM_COL_CUSTOMER_ID: cc.TextColumn(
+                "Customer / Account No", width="small",
+            ),
+            DRV_ITEM_COL_DELTA: cc.NumberColumn(format="%.1f"),
+        }
+        st.caption(
+            f"**{len(items_df):,} item(s)** in **{group_labels[sel_group]} → "
+            f"{sel_bucket}**"
+        )
+        st.dataframe(
+            items_df,
+            width="stretch",
+            height=min(36 * (len(items_df) + 1) + 38, 420),
+            hide_index=True,
+            column_config=column_config,
+        )
 
 
 def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
@@ -3919,36 +4067,37 @@ def _render_demand_comparison_driver_tables_cached(
     so repeated reruns at the same selection are essentially free.
 
     Each table breaks the comparison's metric down by
-    (Portfolio Major × Supply Format × Brand) and surfaces the top-3
-    customer/item drivers (signed, in millions of lbs).  Values are
+    (Portfolio Major × Supply Format × Brand) and surfaces the top-5
+    customer/account drivers (signed, in millions of lbs).  Values are
     *deltas*, matching the comparison's PM Actual / Base Plan columns.
     """
     st.markdown("#### 🔍 Drivers")
     st.caption(
-        "Top-3 movers behind **PM Actual** and **Base Plan**, by "
-        "Portfolio Major × Supply Format × Brand.  Each driver shows its "
-        "signed contribution in millions of lbs."
+        "Top-5 movers behind **PM Actual** and **Base Plan**, by "
+        "Portfolio Major × Supply Format × Brand.  Each driver shows "
+        "Customer – Account/Customer No and its signed contribution "
+        "in millions of lbs."
     )
 
     with st.spinner("Building driver tables…"):
-        pm_table = _cached_pm_actual_driver_table(
+        pm_result = _cached_pm_actual_driver_table(
             enrich_sig, filters, dim_sig, enriched, dim_df,
         )
-        bp_table = _cached_base_plan_driver_table(
+        bp_result = _cached_base_plan_driver_table(
             enrich_sig, filters, dim_sig, enriched, dim_df,
         )
 
     st.markdown(
-        f"**PM Actual drivers**  —  _driver = Customer Name – Item Description "
+        f"**PM Actual drivers**  —  _driver = Customer Name – Customer No "
         f"(prior month: {filters.prior_month.strftime('%b %Y')})_"
     )
-    _render_one_driver_table(pm_table, DRV_PM_ACTUAL_VALUE, "pm_actual_drivers")
+    _render_one_driver_table(pm_result, DRV_PM_ACTUAL_VALUE, "pm_actual_drivers")
 
     st.markdown(
-        "**Base Plan drivers**  —  _driver = Customer – Party Site – Item "
-        "Description (current vs prior cycle, forecast months)_"
+        "**Base Plan drivers**  —  _driver = Customer – Party Site No "
+        "(current vs prior cycle, forecast months)_"
     )
-    _render_one_driver_table(bp_table, DRV_BASE_PLAN_VALUE, "base_plan_drivers")
+    _render_one_driver_table(bp_result, DRV_BASE_PLAN_VALUE, "base_plan_drivers")
 
 
 # ── 3. Entry point ────────────────────────────────────────────────────────────

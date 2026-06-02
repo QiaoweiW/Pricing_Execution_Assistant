@@ -42,13 +42,13 @@ A fixed 30-row template, indented like a tree:
         Totes
         QT Jug
       Butter
+        <Supply Format>   ← dynamic leaf per format present in data
+        …
 
-Butter is a single-row leaf — per the planner's data-pulling rules
-"Butter: Portfolio Major -> Butter" aggregates every Supply Format
-under PMaj=Butter with no sub-categorisation.  (Earlier revisions
-of this template carried a redundant ``Western Quarters`` child;
-that filter incorrectly excluded any Butter row whose SFmt wasn't
-exactly that string, so we collapsed it away.)
+Butter is a **subtotal** whose children are Supply Format leaves
+discovered at build time from rows with ``Portfolio Major == "Butter"``.
+Only formats that actually appear in the comparison frame are emitted
+(planner request, 2026-06) — no fixed format list and no Brand tier.
 
 The template is hardcoded because it represents a business reporting
 contract — the planner expects these exact rows to appear in this
@@ -403,14 +403,10 @@ RO_SUMMARY_TEMPLATE: tuple[TemplateRow, ...] = (
           pmaj_match=_FRESH_MILK),
 
     # ── Butter ────────────────────────────────────────────────────
-    # Per the planner's data-pulling rules ("Butter: Portfolio Major
-    # -> Butter") Butter is a SINGLE leaf — every row with
-    # ``Portfolio Major == "Butter"`` regardless of Supply Format.
-    # No sub-categories (older revisions of this template carried
-    # a ``Western Quarters`` child that incorrectly filtered SFmt).
-    _leaf("but", "Butter", 1,
-          pmaj_disp="Butter",
-          pmaj_match=_BUTTER),
+    # Static placeholder — :func:`_build_runtime_template` injects
+    # one Supply Format leaf per format present in the source frame
+    # and wires those ids into this subtotal's ``children`` tuple.
+    _subtotal("but", "Butter", 1, ()),
 )
 
 # Lookup index — id → TemplateRow.  Used everywhere we need to fetch
@@ -418,6 +414,119 @@ RO_SUMMARY_TEMPLATE: tuple[TemplateRow, ...] = (
 TEMPLATE_BY_ID: dict[str, TemplateRow] = {
     row.row_id: row for row in RO_SUMMARY_TEMPLATE
 }
+
+
+def _slugify_for_row_id(text: str) -> str:
+    """Return a safe row-id slug from display text."""
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in text.strip())
+    cleaned = "_".join(part for part in cleaned.split("_") if part)
+    return cleaned or "blank"
+
+
+def _stable_unique_row_ids(prefix: str, labels: list[str]) -> list[str]:
+    """Return deterministic, collision-safe row ids for dynamic labels."""
+    seen: dict[str, int] = {}
+    ids: list[str] = []
+    for label in labels:
+        base = f"{prefix}_sfmt_{_slugify_for_row_id(label)}"
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        ids.append(base if n == 0 else f"{base}_{n+1}")
+    return ids
+
+
+def _collect_butter_supply_formats(df: pd.DataFrame) -> list[str]:
+    """Return sorted distinct Supply Formats for rows in the Butter PMaj."""
+    if df is None or df.empty or COL_DIM_PMAJ not in df.columns:
+        return []
+    pmaj = df[COL_DIM_PMAJ].astype(str).str.strip()
+    mask = pmaj.isin(_BUTTER)
+    if COL_DIM_SFMT not in df.columns:
+        return []
+    sfmts = (
+        df.loc[mask, COL_DIM_SFMT]
+        .astype(str).str.strip()
+        .replace({"nan": "", "None": ""})
+    )
+    return sorted({s for s in sfmts.tolist() if s})
+
+
+def _build_dynamic_butter_rows(formats: list[str]) -> tuple[TemplateRow, ...]:
+    """Build Butter Supply Format leaf rows for the runtime template."""
+    if not formats:
+        return ()
+    row_ids = _stable_unique_row_ids("but", formats)
+    return tuple(
+        _leaf(
+            row_id, sfmt, 2,
+            pmaj_disp="Butter", sfmt=sfmt,
+            pmaj_match=_BUTTER,
+        )
+        for sfmt, row_id in zip(formats, row_ids)
+    )
+
+
+def _build_runtime_template(source_df: pd.DataFrame) -> tuple[TemplateRow, ...]:
+    """Return the report template with dynamic Butter format children."""
+    butter_formats = _collect_butter_supply_formats(source_df)
+    butter_leaves = _build_dynamic_butter_rows(butter_formats)
+    butter_child_ids = tuple(leaf.row_id for leaf in butter_leaves)
+
+    out: list[TemplateRow] = []
+    for tpl in RO_SUMMARY_TEMPLATE:
+        if tpl.row_id == "but":
+            out.append(_subtotal("but", "Butter", 1, butter_child_ids))
+            out.extend(butter_leaves)
+        else:
+            out.append(tpl)
+    return tuple(out)
+
+
+def _template_by_id(template: tuple[TemplateRow, ...]) -> dict[str, TemplateRow]:
+    """Return ``{row_id -> TemplateRow}`` for a runtime template."""
+    return {row.row_id: row for row in template}
+
+
+def _template_from_report_df(df: pd.DataFrame) -> tuple[TemplateRow, ...]:
+    """Reconstruct a runtime template from an existing report frame.
+
+    Used by :func:`recompute_subtotals` when the caller does not pass
+    an explicit template — e.g. after a session reload.  Dynamic Butter
+    leaves are recovered from rows whose ``_row_id`` starts with
+    ``but_sfmt_``.
+    """
+    if df is None or df.empty or COL_ROW_ID not in df.columns:
+        return RO_SUMMARY_TEMPLATE
+
+    dynamic_ids = [
+        str(rid) for rid in df[COL_ROW_ID].tolist()
+        if str(rid).startswith("but_sfmt_")
+    ]
+    if not dynamic_ids:
+        return RO_SUMMARY_TEMPLATE
+
+    butter_leaves: list[TemplateRow] = []
+    for rid in dynamic_ids:
+        row = df.loc[df[COL_ROW_ID] == rid].iloc[0]
+        sfmt = str(row.get(COL_DIM_SFMT, "")).strip()
+        label = str(row.get(COL_LABEL, sfmt)).strip()
+        # Strip leading NBSP indent from the display label.
+        label = label.lstrip("\u00a0 ").strip() or sfmt
+        butter_leaves.append(_leaf(
+            rid, label, 2,
+            pmaj_disp="Butter", sfmt=sfmt,
+            pmaj_match=_BUTTER,
+        ))
+
+    butter_child_ids = tuple(leaf.row_id for leaf in butter_leaves)
+    out: list[TemplateRow] = []
+    for tpl in RO_SUMMARY_TEMPLATE:
+        if tpl.row_id == "but":
+            out.append(_subtotal("but", "Butter", 1, butter_child_ids))
+            out.extend(butter_leaves)
+        else:
+            out.append(tpl)
+    return tuple(out)
 
 
 # ── Pure helpers — no I/O, no Streamlit ──────────────────────────────────────
@@ -637,8 +746,8 @@ def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
 
 def build_summary_report(
     comp_output_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Build the full 30-row summary report DataFrame from RO_Comparison_Output.
+) -> tuple[pd.DataFrame, list[str], tuple[TemplateRow, ...]]:
+    """Build the summary report DataFrame from RO_Comparison_Output.
 
     Parameters
     ----------
@@ -651,7 +760,7 @@ def build_summary_report(
     Returns
     -------
     df
-        30-row DataFrame in template order.  Columns:
+        DataFrame in runtime template order.  Columns:
           * Internal meta (3): ``_row_id``, ``_indent``, ``_is_subtotal``
           * Dim display (4): ``Portfolio Major``, ``Supply Format``,
             ``Portfolio Minor``, ``Brand Category``
@@ -663,13 +772,20 @@ def build_summary_report(
         List of human-readable warning strings the page can surface
         above the table (e.g., "Column X missing from
         RO_Comparison_Output.csv — treated as 0").
+    template
+        Runtime template tuple (static rows + dynamic Butter format
+        leaves).  Pass this to :func:`recompute_subtotals` so
+        subtotal roll-ups stay consistent after planner edits.
     """
     warnings: list[str] = []
 
     if comp_output_df is None or comp_output_df.empty:
         return _empty_template_frame(), [
             "RO_Comparison_Output.csv is empty — nothing to roll up.",
-        ]
+        ], RO_SUMMARY_TEMPLATE
+
+    runtime_template = _build_runtime_template(comp_output_df)
+    template_by_id = _template_by_id(runtime_template)
 
     # ── Pre-process: derive Brand Category + coerce numerics ──────
     df = comp_output_df.copy()
@@ -717,7 +833,7 @@ def build_summary_report(
     # later if the planner decides they want the per-leaf trace
     # behind a "verbose" toggle.
     leaf_vals: dict[str, dict[str, float]] = {}
-    for tpl in RO_SUMMARY_TEMPLATE:
+    for tpl in runtime_template:
         if tpl.is_subtotal:
             continue
         sub = _filter_for_leaf(df, tpl)
@@ -729,19 +845,19 @@ def build_summary_report(
     def _resolve(row_id: str) -> dict[str, float]:
         if row_id in rollup:
             return rollup[row_id]
-        tpl = TEMPLATE_BY_ID[row_id]
+        tpl = template_by_id[row_id]
         # Subtotal: sum across children's data columns.
         kids = [_resolve(c) for c in tpl.children]
         summed = {col: sum(k[col] for k in kids) for col in DATA_COLS}
         rollup[row_id] = summed
         return summed
 
-    for tpl in RO_SUMMARY_TEMPLATE:
+    for tpl in runtime_template:
         _resolve(tpl.row_id)
 
     # ── Assemble output frame in template order ───────────────────
     rows: list[dict] = []
-    for tpl in RO_SUMMARY_TEMPLATE:
+    for tpl in runtime_template:
         record = {
             COL_ROW_ID:      tpl.row_id,
             COL_INDENT:      tpl.indent,
@@ -763,17 +879,20 @@ def build_summary_report(
     for col in DATA_COLS:
         out[col] = (out[col] / 1_000_000).round(1)
 
-    return out, warnings
+    return out, warnings, runtime_template
 
 
-def _empty_template_frame() -> pd.DataFrame:
-    """Return a 30-row template frame with every data column zeroed.
+def _empty_template_frame(
+    template: tuple[TemplateRow, ...] | None = None,
+) -> pd.DataFrame:
+    """Return a template frame with every data column zeroed.
 
     Used as the canonical "nothing loaded yet" fallback so the page
     can always render a stable shape even before the first fetch.
     """
+    tpl_rows = template or RO_SUMMARY_TEMPLATE
     rows = []
-    for tpl in RO_SUMMARY_TEMPLATE:
+    for tpl in tpl_rows:
         record = {
             COL_ROW_ID:      tpl.row_id,
             COL_INDENT:      tpl.indent,
@@ -792,7 +911,10 @@ def _empty_template_frame() -> pd.DataFrame:
     ])
 
 
-def recompute_subtotals(df: pd.DataFrame) -> pd.DataFrame:
+def recompute_subtotals(
+    df: pd.DataFrame,
+    template: tuple[TemplateRow, ...] | None = None,
+) -> pd.DataFrame:
     """Recompute every subtotal row's data columns from its children.
 
     Walks the template hierarchy in dependency order (children before
@@ -808,12 +930,18 @@ def recompute_subtotals(df: pd.DataFrame) -> pd.DataFrame:
         DataFrame produced by :func:`build_summary_report`, possibly
         with edited data-column values.  Must contain ``_row_id`` and
         all DATA_COLS.
+    template
+        Runtime template returned by :func:`build_summary_report`.
+        When omitted, inferred from dynamic Butter rows present in
+        *df* via :func:`_template_from_report_df`.
 
     Returns
     -------
     A new DataFrame (defensive copy) with the subtotal rows
     refreshed.  Leaf rows are untouched (planner edits preserved).
     """
+    runtime_template = template or _template_from_report_df(df)
+    template_by_id = _template_by_id(runtime_template)
     out = df.copy()
     # row_id → row index lookup.  We may end up with row_ids that are
     # missing if the caller dropped all-zero rows — those subtotals
@@ -823,7 +951,7 @@ def recompute_subtotals(df: pd.DataFrame) -> pd.DataFrame:
     }
 
     def _resolve(row_id: str) -> dict[str, float]:
-        tpl = TEMPLATE_BY_ID[row_id]
+        tpl = template_by_id[row_id]
         idx = idx_by_id.get(row_id)
         if not tpl.is_subtotal:
             # Leaf: take whatever's currently in the row (may have been
@@ -840,7 +968,7 @@ def recompute_subtotals(df: pd.DataFrame) -> pd.DataFrame:
                 out.at[idx, col] = round(val, 1)
         return summed
 
-    for tpl in RO_SUMMARY_TEMPLATE:
+    for tpl in runtime_template:
         if tpl.is_subtotal:
             _resolve(tpl.row_id)
     return out

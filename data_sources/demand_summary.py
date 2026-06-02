@@ -128,10 +128,16 @@ _STATIC_BUDGET_MONTHLY_BLOB_PATH: str = (
     "RO Tracking/Static_Budget_Base&RO_by_Month.csv"
 )
 
-# 15-minute Streamlit cache TTL.  Mirrors the RO Comparison / IBP /
-# Summary Report cadence so the whole Demand Planner Analytics page has
-# one consistent freshness window.
-_CACHE_TTL_SECONDS: int = 15 * 60
+# 60-minute Streamlit cache TTL.  Was 15 min (matching the live RO
+# Comparison cadence), but the Demand Plan CSVs (`qry_mgmt_plan_full`,
+# `qry_total_item_level_demand`, `qry_pdh`, `qry_mgmt_plan_history_tracker`,
+# the static budgets) refresh DAILY upstream — a 15-minute TTL forced
+# repeated 20+MB cold reads on the same data without any freshness gain.
+# Planners who genuinely need an immediate re-read still have the
+# "🔄 Refresh from Fabric" button (which calls
+# :func:`clear_demand_summary_cache`), so this only changes the cost of
+# the *no-change* case.
+_CACHE_TTL_SECONDS: int = 60 * 60
 
 
 # ── Public types ─────────────────────────────────────────────────────────────
@@ -604,11 +610,18 @@ def clear_demand_summary_cache() -> None:
 #
 # Source columns (from the planner's confirmation)
 # ------------------------------------------------
-# ``Start of Month``      — Excel serial (e.g., 46174 = 2026-05-01)
-# ``Portfolio Major``     — text (e.g., "Butter", "Cultured", …)
-# ``Supply Format``       — text (e.g., "Large Carton", "Tanker", …)
-# ``Forecast Type``       — text ∈ {"Base Plan", "R&O", …}
+# ``Start of Month``      — date (e.g., 2026-05-01)
+# ``Item``                — item number (join key for Supply Format lookup)
+# ``Item Description``    — text (carried for traceability; not used in pivot)
 # ``Demand Plan Pounds``  — numeric (raw lbs; converted to millions)
+# ``Forecast Type``       — text ∈ {"Base Plan", "R&O", …}
+# ``Business Unit``       — text (e.g., "B2C")
+# ``Portfolio Major``     — text (e.g., "Butter", "Cultured", …)
+# ``IBP Product Group``   — text (upstream metadata; not used in pivot)
+#
+# There is **no** Supply Format column on this CSV — each row's format
+# is enriched via :func:`build_supply_format_lookup` (``qry_pdh.csv``
+# primary, ``RO_Item_Master.csv`` fallback keyed on Item #).
 
 # Source column names.  Pinned as module constants so they appear in
 # one place — change here if the upstream schema ever drifts.
@@ -1330,9 +1343,10 @@ def _prepare_long_frame(
         .replace("", PMAJ_BLANK_LABEL)
     )
 
-    # Supply Format enrichment via the two-tier lookup, with the
-    # in-source column (when present) as an opportunistic upgrade
-    # path for items the lookup doesn't know.
+    # Supply Format enrichment — two-tier lookup keyed on Item number
+    # (PDH primary, RO_Item_Master fallback).  Rows with no match get
+    # the ``(blank)`` sentinel so they remain visible under an
+    # "unknown format" bucket rather than vanishing from the pivot.
     lookup = supply_format_lookup or {}
     item_keys = out[COL_ITEM].map(_normalise_item_key)
     looked_up = item_keys.map(lookup).fillna("")

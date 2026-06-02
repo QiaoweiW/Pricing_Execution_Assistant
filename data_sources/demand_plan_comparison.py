@@ -1890,22 +1890,49 @@ def _make_indented_label(label: str, indent: int, is_memo: bool) -> str:
 # Two diagnostic tables that "explain" the comparison's PM Actual and
 # Base Plan columns.  Each is grouped by the raw (Portfolio Major,
 # Supply Format, Brand) dimensions present in the data (NOT the template
-# hierarchy) and, per group, surfaces the top-3 drivers — the buckets
+# hierarchy) and, per group, surfaces the top-5 drivers — the buckets
 # whose signed contribution moved the group's value the most.
 #
-#   Portfolio Major │ Supply Format │ Brand │ <metric> │ #1 │ #2 │ #3
+#   Portfolio Major │ Supply Format │ Brand │ <metric> │ #1 … #5
 #
-# Both metrics are *deltas* (signed), so a driver's sign tells the
-# planner whether that customer/item pushed the number up or down.
+# Driver cells show ``Customer – Account/Customer No  (+amount)`` (no
+# item description — that lives in the drill-down).  Both metrics are
+# *deltas* (signed), so a driver's sign tells the planner whether that
+# customer/account pushed the number up or down.
 
 DRV_COL_PMAJ: str = "Portfolio Major"
 DRV_COL_SFMT: str = "Supply Format"
 DRV_COL_BRAND: str = "Brand"
 DRV_BASE_PLAN_VALUE: str = "Base Plan"
 DRV_PM_ACTUAL_VALUE: str = "PM Actual"
-DRV_DRIVER_COLS: tuple[str, str, str] = ("#1 Driver", "#2 Driver", "#3 Driver")
+DRV_DRIVER_COLS: tuple[str, ...] = (
+    "#1 Driver", "#2 Driver", "#3 Driver", "#4 Driver", "#5 Driver",
+)
 _DRV_BLANK: str = "(blank)"
-_DRV_TOP_N: int = 3
+_DRV_TOP_N: int = 5
+
+# Item-level bucket frame — powers Portfolio Minor filtering and the
+# drill-down expander beneath each driver table.
+_DRV_BUCKET_COLS: tuple[str, ...] = (
+    "pmaj", "sfmt", "brand", "pminor", "bucket_label",
+    "item_key", "item_desc", "customer_name", "customer_id", "delta",
+)
+
+# Drill-down display columns (page maps these to column_config).
+DRV_ITEM_COL_ITEM: str = "Item #"
+DRV_ITEM_COL_DESC: str = "Description"
+DRV_ITEM_COL_BRAND: str = "Brand"
+DRV_ITEM_COL_CUSTOMER: str = "Customer"
+DRV_ITEM_COL_CUSTOMER_ID: str = "Customer / Account No"
+DRV_ITEM_COL_DELTA: str = "Δ (millions lbs)"
+
+
+@dataclass(frozen=True)
+class DriverTableResult:
+    """Aggregated driver table plus item-level bucket detail."""
+
+    table: pd.DataFrame
+    buckets: pd.DataFrame
 
 
 def _format_millions_signed(value_m: float) -> str:
@@ -1931,14 +1958,32 @@ def _empty_driver_table(value_col: str) -> pd.DataFrame:
     ])
 
 
+def _empty_driver_buckets() -> pd.DataFrame:
+    """Return an empty item-level bucket frame."""
+    return pd.DataFrame(columns=list(_DRV_BUCKET_COLS))
+
+
+def _empty_driver_result(value_col: str) -> DriverTableResult:
+    return DriverTableResult(
+        table=_empty_driver_table(value_col),
+        buckets=_empty_driver_buckets(),
+    )
+
+
+def _normalise_driver_group_value(value: object) -> str:
+    """Normalise a dimension value for driver grouping / filtering."""
+    s = _clean_str(value)
+    return s if s else "(Unspecified)"
+
+
 def _build_driver_table(buckets: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    """Group *buckets* by (PMaj, SFmt, Brand) → value + top-3 drivers.
+    """Group *buckets* by (PMaj, SFmt, Brand) → value + top-5 drivers.
 
     *buckets* must carry columns ``pmaj, sfmt, brand, bucket_label,
     delta`` where ``delta`` is the signed contribution **in pounds**.
     Buckets sharing a ``bucket_label`` within a group are summed first
-    (so one customer/item collapses into a single driver), then the top
-    three by ``|Σ delta|`` are reported.  The group value is the net
+    (so one customer/account collapses into a single driver), then the
+    top five by ``|Σ delta|`` are reported.  The group value is the net
     Σ delta in millions, rounded to 1 dp.
 
     Output rows are sorted alphabetically by Portfolio Major →
@@ -1950,10 +1995,7 @@ def _build_driver_table(buckets: pd.DataFrame, value_col: str) -> pd.DataFrame:
 
     work = buckets.copy()
     for c in ("pmaj", "sfmt", "brand"):
-        work[c] = (
-            work[c].astype(str).str.strip()
-            .replace({"": "(Unspecified)", "nan": "(Unspecified)"})
-        )
+        work[c] = work[c].map(_normalise_driver_group_value)
     work["bucket_label"] = work["bucket_label"].astype(str)
     work["delta"] = pd.to_numeric(work["delta"], errors="coerce").fillna(0.0)
 
@@ -1978,13 +2020,13 @@ def _build_driver_table(buckets: pd.DataFrame, value_col: str) -> pd.DataFrame:
         while len(drivers) < _DRV_TOP_N:
             drivers.append("")
 
-        rows.append({
+        row_data = {
             DRV_COL_PMAJ: pmaj, DRV_COL_SFMT: sfmt, DRV_COL_BRAND: brand,
             value_col: round(net_m, 1),
-            DRV_DRIVER_COLS[0]: drivers[0],
-            DRV_DRIVER_COLS[1]: drivers[1],
-            DRV_DRIVER_COLS[2]: drivers[2],
-        })
+        }
+        for col_name, cell in zip(DRV_DRIVER_COLS, drivers):
+            row_data[col_name] = cell
+        rows.append(row_data)
 
     out = pd.DataFrame(rows, columns=cols)
     out = out.sort_values(
@@ -1993,6 +2035,116 @@ def _build_driver_table(buckets: pd.DataFrame, value_col: str) -> pd.DataFrame:
         kind="mergesort",
     ).reset_index(drop=True)
     return out
+
+
+def _prepare_driver_bucket_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normalise an item-level bucket frame for aggregation + drill-down."""
+    if raw is None or raw.empty:
+        return _empty_driver_buckets()
+    out = raw.copy()
+    for col in _DRV_BUCKET_COLS:
+        if col not in out.columns:
+            out[col] = ""
+    for c in ("pmaj", "sfmt", "brand"):
+        out[c] = out[c].map(_normalise_driver_group_value)
+    out["pminor"] = out["pminor"].map(_clean_str).replace({"": _DRV_BLANK})
+    out["bucket_label"] = out["bucket_label"].astype(str)
+    out["item_key"] = out["item_key"].map(_clean_str)
+    out["item_desc"] = out["item_desc"].map(_clean_str)
+    out["customer_name"] = out["customer_name"].map(_clean_str).replace({"": _DRV_BLANK})
+    out["customer_id"] = out["customer_id"].map(_clean_str).replace({"": _DRV_BLANK})
+    out["delta"] = pd.to_numeric(out["delta"], errors="coerce").fillna(0.0)
+    return out[list(_DRV_BUCKET_COLS)]
+
+
+def _assemble_driver_result(
+    buckets: pd.DataFrame, value_col: str,
+) -> DriverTableResult:
+    """Build the aggregated table + normalised bucket detail."""
+    prepared = _prepare_driver_bucket_frame(buckets)
+    table = _build_driver_table(prepared, value_col)
+    return DriverTableResult(table=table, buckets=prepared)
+
+
+def list_driver_buckets_for_group(
+    buckets: pd.DataFrame,
+    pmaj: str,
+    sfmt: str,
+    brand: str,
+) -> list[str]:
+    """Return driver bucket labels for one (PMaj, SFmt, Brand) group.
+
+    Sorted by absolute net delta descending so the drill-down selector
+    mirrors the ranking logic in :func:`_build_driver_table`.
+    """
+    if buckets is None or buckets.empty:
+        return []
+    work = buckets.copy()
+    for c in ("pmaj", "sfmt", "brand"):
+        work[c] = work[c].map(_normalise_driver_group_value)
+    mask = (
+        work["pmaj"].eq(_normalise_driver_group_value(pmaj))
+        & work["sfmt"].eq(_normalise_driver_group_value(sfmt))
+        & work["brand"].eq(_normalise_driver_group_value(brand))
+    )
+    sub = work.loc[mask]
+    if sub.empty:
+        return []
+    ranked = (
+        sub.groupby("bucket_label", dropna=False)["delta"]
+        .sum().reset_index()
+        .assign(_abs=lambda d: d["delta"].abs())
+        .sort_values(by=["_abs", "bucket_label"], ascending=[False, True],
+                     kind="mergesort")
+    )
+    return [str(r.bucket_label) for r in ranked.itertuples()]
+
+
+def compute_demand_driver_items(
+    buckets: pd.DataFrame,
+    pmaj: str,
+    sfmt: str,
+    brand: str,
+    bucket_label: str,
+) -> pd.DataFrame:
+    """Return item-level rows composing one driver bucket (drill-down).
+
+    Pure function — no I/O, no Streamlit.  Output sorted by ``|Δ|`` desc.
+    """
+    output_cols = [
+        DRV_ITEM_COL_ITEM, DRV_ITEM_COL_DESC, DRV_ITEM_COL_BRAND,
+        DRV_ITEM_COL_CUSTOMER, DRV_ITEM_COL_CUSTOMER_ID, DRV_ITEM_COL_DELTA,
+    ]
+    if buckets is None or buckets.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    work = _prepare_driver_bucket_frame(buckets)
+    mask = (
+        work["pmaj"].eq(_normalise_driver_group_value(pmaj))
+        & work["sfmt"].eq(_normalise_driver_group_value(sfmt))
+        & work["brand"].eq(_normalise_driver_group_value(brand))
+        & work["bucket_label"].eq(str(bucket_label))
+    )
+    filtered = work.loc[mask]
+    if filtered.empty:
+        return pd.DataFrame(columns=output_cols)
+
+    filtered = filtered.assign(
+        _abs=filtered["delta"].abs(),
+    ).sort_values(
+        by=["_abs", "item_key"],
+        ascending=[False, True],
+        kind="mergesort",
+    )
+    out = pd.DataFrame({
+        DRV_ITEM_COL_ITEM: filtered["item_key"],
+        DRV_ITEM_COL_DESC: filtered["item_desc"],
+        DRV_ITEM_COL_BRAND: filtered["brand"],
+        DRV_ITEM_COL_CUSTOMER: filtered["customer_name"],
+        DRV_ITEM_COL_CUSTOMER_ID: filtered["customer_id"],
+        DRV_ITEM_COL_DELTA: (filtered["delta"] / _LBS_PER_MILLION).round(1),
+    })
+    return out[output_cols].reset_index(drop=True)
 
 
 def _party_site_lookup(
@@ -2045,14 +2197,14 @@ def build_base_plan_driver_table(
     filters: ComparisonFilters,
     *,
     enriched: Optional[EnrichedSources] = None,
-) -> pd.DataFrame:
-    """Return the Base Plan driver table.
+) -> DriverTableResult:
+    """Return the Base Plan driver table + item-level bucket detail.
 
     Value + driver magnitude = **Base Plan delta** = current-cycle minus
     prior-cycle ``Base Plan`` pounds over the forecast months (the same
     quantity as the comparison's *Base Plan* column).  Driver buckets are
-    ``(account_description – Party Site Number – Item Description)``, the
-    customer name resolved via ``Party Site Number → party_site_code``.
+    ``(account_description – Party Site Number)`` — customer name resolved
+    via ``Party Site Number → party_site_code``.
 
     Pass *enriched* to share PDH enrichment with the comparison and the
     PM Actual driver builder (cuts the dominant cold-build cost).
@@ -2061,7 +2213,7 @@ def build_base_plan_driver_table(
         enriched = build_enriched_sources(tracker_df, None, None, pdh_df)
     trk = enriched.tracker
     if trk.empty:
-        return _empty_driver_table(DRV_BASE_PLAN_VALUE)
+        return _empty_driver_result(DRV_BASE_PLAN_VALUE)
 
     forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
     sub = trk.loc[
@@ -2070,7 +2222,7 @@ def build_base_plan_driver_table(
         & (trk["cycle"].isin([filters.current_cycle, filters.prior_cycle]))
     ].copy()
     if sub.empty:
-        return _empty_driver_table(DRV_BASE_PLAN_VALUE)
+        return _empty_driver_result(DRV_BASE_PLAN_VALUE)
 
     # Signed pounds: + for current cycle, − for prior cycle → delta.
     sub["delta"] = sub["pounds"].where(
@@ -2079,14 +2231,19 @@ def build_base_plan_driver_table(
     ps_to_acct = _party_site_lookup(dim_df, _DIM_ACCOUNT_DESC_CANDIDATES)
     cust = _vectorised_item_key(sub["party_site"]).map(
         lambda k: ps_to_acct.get(k, ""))
+    party_site = sub["party_site"].map(_clean_str)
+    sub["customer_name"] = cust.map(_clean_str).replace({"": _DRV_BLANK})
+    sub["customer_id"] = party_site.replace({"": _DRV_BLANK})
     sub["bucket_label"] = [
-        _join_label([c, ps, desc])
-        for c, ps, desc in zip(cust, sub["party_site"], sub["item_desc"])
+        _join_label([c, ps])
+        for c, ps in zip(sub["customer_name"], sub["customer_id"])
     ]
-    return _build_driver_table(
-        sub[["pmaj", "sfmt", "brand", "bucket_label", "delta"]],
-        DRV_BASE_PLAN_VALUE,
-    )
+    bucket_cols = [
+        "pmaj", "sfmt", "brand", "pminor", "bucket_label",
+        "item_key", "item_desc", "customer_name", "customer_id", "delta",
+    ]
+    sub["item_key"] = sub["item_key"].map(_clean_str)
+    return _assemble_driver_result(sub[bucket_cols], DRV_BASE_PLAN_VALUE)
 
 
 def build_pm_actual_driver_table(
@@ -2097,16 +2254,16 @@ def build_pm_actual_driver_table(
     filters: ComparisonFilters,
     *,
     enriched: Optional[EnrichedSources] = None,
-) -> pd.DataFrame:
-    """Return the PM Actual driver table.
+) -> DriverTableResult:
+    """Return the PM Actual driver table + item-level bucket detail.
 
     Value + driver magnitude = **PM Actual delta** = prior-month IBP
     actual minus prior-month current-cycle (Base + R&O) tracker forecast
     (the same quantity as the comparison's *PM Actual* column).  Driver
-    buckets are ``(Customer Name – Item Description)``: the actual side
-    keys on IBP's own ``Customer Name``; the forecast side maps
-    ``Party Site Number → customer_num → Customer Name`` so both sides
-    net within the same bucket.
+    buckets are ``(Customer Name – Customer No)``: the actual side keys on
+    IBP's own ``Customer Name`` / ``Customer No``; the forecast side maps
+    ``Party Site Number → customer_num`` so both sides net within the
+    same bucket.
 
     Pass *enriched* to share PDH enrichment with the comparison and the
     Base Plan driver builder (cuts the dominant cold-build cost).
@@ -2118,18 +2275,27 @@ def build_pm_actual_driver_table(
     prior_month = filters.prior_month.replace(day=1)
 
     parts: list[pd.DataFrame] = []
+    bucket_cols = [
+        "pmaj", "sfmt", "brand", "pminor", "bucket_label",
+        "item_key", "item_desc", "customer_name", "customer_id", "delta",
+    ]
 
     # ── Actual side (IBP, prior month): +pounds ──────────────────────
     if not ibp.empty:
         act = ibp.loc[ibp["month"] == prior_month].copy()
         if not act.empty:
             act["delta"] = act["pounds"]
-            name = act["customer_name"].where(
-                act["customer_name"].astype(bool), act["customer_no"])
+            act["customer_name"] = act["customer_name"].map(_clean_str).replace({"": _DRV_BLANK})
+            act["customer_id"] = act["customer_no"].map(_clean_str).replace({"": _DRV_BLANK})
+            act["customer_name"] = act["customer_name"].where(
+                act["customer_name"].ne(_DRV_BLANK), act["customer_id"],
+            )
             act["bucket_label"] = [
-                _join_label([c, d]) for c, d in zip(name, act["item_desc"])
+                _join_label([c, cid])
+                for c, cid in zip(act["customer_name"], act["customer_id"])
             ]
-            parts.append(act[["pmaj", "sfmt", "brand", "bucket_label", "delta"]])
+            act["item_key"] = act["item_key"].map(_clean_str)
+            parts.append(act[bucket_cols])
 
     # ── Forecast side (tracker, current cycle, Base+R&O, prior month): −pounds ─
     if not trk.empty:
@@ -2144,15 +2310,20 @@ def build_pm_actual_driver_table(
             num_to_name = _customer_num_to_name(ibp)
             cust_num = _vectorised_item_key(fc["party_site"]).map(
                 lambda k: ps_to_num.get(k, ""))
-            name = cust_num.map(lambda n: num_to_name.get(n, n))
+            fc["customer_id"] = cust_num.map(_clean_str).replace({"": _DRV_BLANK})
+            fc["customer_name"] = fc["customer_id"].map(
+                lambda n: num_to_name.get(n, n) if n else _DRV_BLANK,
+            )
             fc["bucket_label"] = [
-                _join_label([c, d]) for c, d in zip(name, fc["item_desc"])
+                _join_label([c, cid])
+                for c, cid in zip(fc["customer_name"], fc["customer_id"])
             ]
-            parts.append(fc[["pmaj", "sfmt", "brand", "bucket_label", "delta"]])
+            fc["item_key"] = fc["item_key"].map(_clean_str)
+            parts.append(fc[bucket_cols])
 
     if not parts:
-        return _empty_driver_table(DRV_PM_ACTUAL_VALUE)
-    return _build_driver_table(pd.concat(parts, ignore_index=True), DRV_PM_ACTUAL_VALUE)
+        return _empty_driver_result(DRV_PM_ACTUAL_VALUE)
+    return _assemble_driver_result(pd.concat(parts, ignore_index=True), DRV_PM_ACTUAL_VALUE)
 
 
 def driver_table_to_csv_bytes(table: pd.DataFrame) -> bytes:
@@ -2208,10 +2379,19 @@ __all__ = [
     "build_base_plan_driver_table",
     "build_pm_actual_driver_table",
     "driver_table_to_csv_bytes",
+    "DriverTableResult",
+    "compute_demand_driver_items",
+    "list_driver_buckets_for_group",
     "DRV_COL_PMAJ",
     "DRV_COL_SFMT",
     "DRV_COL_BRAND",
     "DRV_BASE_PLAN_VALUE",
     "DRV_PM_ACTUAL_VALUE",
     "DRV_DRIVER_COLS",
+    "DRV_ITEM_COL_ITEM",
+    "DRV_ITEM_COL_DESC",
+    "DRV_ITEM_COL_BRAND",
+    "DRV_ITEM_COL_CUSTOMER",
+    "DRV_ITEM_COL_CUSTOMER_ID",
+    "DRV_ITEM_COL_DELTA",
 ]

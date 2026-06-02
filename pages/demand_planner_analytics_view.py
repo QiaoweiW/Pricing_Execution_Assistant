@@ -158,8 +158,10 @@ from data_sources.ro_comparison import (
     fetch_dimitems_df,
     fetch_ro_history_df,
     fetch_ro_item_master_df,
+    fetch_ro_item_master_raw_bytes,
     list_months,
     regenerate_comparison_output,
+    ro_item_master_blob_path,
     upload_customer_input,
 )
 from data_sources.ro_early_start_programs import (
@@ -406,6 +408,8 @@ def _render_ro_comparison() -> None:
             "and publish the result to the RO_Reporting folder in Microsoft Fabric."
         )
 
+        _render_ro_item_master_download_button()
+
         # 1. Upload control — fully independent of the comparison flow
         #    below so a planner can drop a new Customer Input CSV even
         #    if there is a downstream Fabric outage.  The Save action
@@ -546,6 +550,68 @@ def _render_ro_comparison() -> None:
 
 
 # ── RO Comparison helpers ───────────────────────────────────────────────────
+
+def _render_ro_item_master_download_button() -> None:
+    """Render a red download button for ``RO_Item_Master.csv`` from Fabric."""
+    if not fabric_signin_widget.is_fabric_signed_in():
+        st.caption(
+            "_Sign in via **Home & Fabric Sign-in** to download "
+            "`RO_Item_Master.csv`._"
+        )
+        return
+
+    blob_path = ro_item_master_blob_path()
+    try:
+        raw_bytes = fetch_ro_item_master_raw_bytes()
+        item_master_df = fetch_ro_item_master_df()
+        row_count = len(item_master_df) if item_master_df is not None else 0
+    except RoComparisonError as exc:
+        st.warning(
+            f"⚠️ Could not prepare the download for `Files/{blob_path}`."
+            f"\n\nDetails: {exc}"
+        )
+        return
+
+    # Scope red styling to this download via a marker + sibling selector.
+    st.markdown(
+        '<span id="ro-item-master-dl-marker"></span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <style>
+        #ro-item-master-dl-marker ~ div [data-testid="stDownloadButton"] button {
+            background-color: #d32f2f !important;
+            color: #ffffff !important;
+            border: 1px solid #b71c1c !important;
+        }
+        #ro-item-master-dl-marker ~ div [data-testid="stDownloadButton"] button:hover {
+            background-color: #b71c1c !important;
+            border-color: #8b0000 !important;
+            color: #ffffff !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        label=(
+            f"⬇️ Download RO_Item_Master.csv "
+            f"({row_count:,} rows from Fabric)"
+        ),
+        data=raw_bytes,
+        file_name=f"RO_Item_Master_{today}.csv",
+        mime="text/csv",
+        key="ro_cmp_dl_item_master",
+        type="primary",
+        help=(
+            f"Downloads a byte-for-byte copy of `Files/{blob_path}` "
+            "from Microsoft Fabric — no re-serialisation."
+        ),
+    )
+
 
 def _render_customer_input_uploader() -> None:
     """Render the "Upload Customer Input CSV" control row.

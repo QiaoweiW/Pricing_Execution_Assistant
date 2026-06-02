@@ -36,7 +36,8 @@ Module layout
   ``_recompute_derived_columns``)
 * Streamlit-cached Fabric I/O wrappers
   (``fetch_ro_history_df``, ``fetch_dimitems_df``,
-  ``fetch_ro_item_master_df``, ``upload_customer_input``,
+  ``fetch_ro_item_master_df``, ``fetch_ro_item_master_raw_bytes``,
+  ``upload_customer_input``,
   ``save_ro_comparison_output``, ``list_months``)
 * ``__all__`` contract
 
@@ -1514,6 +1515,39 @@ def fetch_ro_item_master_df(*, force_refresh: bool = False) -> pd.DataFrame:
     return _cached_item_master_df("default")
 
 
+def ro_item_master_blob_path() -> str:
+    """Return the OneLake path for ``RO_Item_Master.csv`` (no ``Files/`` prefix)."""
+    return _RO_ITEM_MASTER_BLOB_PATH
+
+
+@st.cache_data(ttl=_ITEM_MASTER_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_item_master_raw_bytes(_signature: str) -> bytes:
+    """Cached raw read of ``RO_Item_Master.csv`` for download buttons."""
+    try:
+        raw, _etag = read_bytes(_SECRETS_SECTION, _RO_ITEM_MASTER_BLOB_PATH)
+    except LakehouseIOError as exc:
+        raise RoComparisonError(
+            "Could not download RO_Item_Master.csv from Microsoft Fabric: "
+            f"{exc}"
+        ) from exc
+    if raw is None:
+        raise RoComparisonError(
+            f"OneLake blob 'Files/{_RO_ITEM_MASTER_BLOB_PATH}' does not exist."
+        )
+    return raw
+
+
+def fetch_ro_item_master_raw_bytes(*, force_refresh: bool = False) -> bytes:
+    """Return raw bytes of ``RO_Item_Master.csv`` for Streamlit downloads.
+
+    Preserves byte-for-byte fidelity with the Fabric source (no
+    re-serialisation through pandas).  Shares the Item Master cache TTL.
+    """
+    if force_refresh:
+        _cached_item_master_raw_bytes.clear()
+    return _cached_item_master_raw_bytes("default")
+
+
 def upload_customer_input(filename: str, payload: bytes) -> str:
     """Save *payload* under ``Files/RO Tracking/Append_New_History/<filename>``.
 
@@ -1834,6 +1868,8 @@ __all__ = [
     "fetch_dimitems_df",
     "fetch_ro_history_df",
     "fetch_ro_item_master_df",
+    "fetch_ro_item_master_raw_bytes",
+    "ro_item_master_blob_path",
     "list_months",
     "save_ro_comparison_output",
     "upload_customer_input",

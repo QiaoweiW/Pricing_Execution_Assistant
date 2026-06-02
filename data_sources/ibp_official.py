@@ -206,9 +206,26 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
 
 # ── Cached fetch helpers ──────────────────────────────────────────────────────
 
+# What the cache stores + why it is a tuple of NATIVE values
+# -----------------------------------------------------------
+# ``st.cache_data`` pickles every cached return value.  Returning a
+# custom class such as :class:`IBPSnapshotMeta` makes pickle look the
+# class up by qualified name on the way back in — and when Streamlit's
+# file-watcher has re-executed this module (a normal occurrence during
+# development and multi-page navigation) the *re-defined* class is "not
+# the same object" as the one the cached instance references, so pickle
+# raises and the whole fetch fails (``UnserializableReturnValueError``).
+# Caching only DataFrames + plain scalars sidesteps that entirely;
+# :func:`_fetch` rebuilds the :class:`IBPSnapshotMeta` outside the cache.
 @st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
-def _cached_fetch(table_name: str, _cache_token: str) -> tuple[pd.DataFrame, IBPSnapshotMeta]:
+def _cached_fetch(
+    table_name: str, _cache_token: str,
+) -> tuple[pd.DataFrame, int, Optional[datetime], int, str]:
     """Streamlit-cached fetch keyed by ``(table_name, opaque token)``.
+
+    Returns native values — ``(df, version, last_modified, row_count,
+    source_uri)`` — never the :class:`IBPSnapshotMeta` class (see the
+    note above).  :func:`_fetch` wraps these back into the meta object.
 
     The leading-underscore arg name is the documented Streamlit
     convention for "include in the cache key but do not hash the
@@ -217,22 +234,20 @@ def _cached_fetch(table_name: str, _cache_token: str) -> tuple[pd.DataFrame, IBP
     table_uri = _build_table_uri(table_name)
     token = _acquire_storage_token()
     df, version, last_modified = _read_delta_table(table_uri, token)
-    meta = IBPSnapshotMeta(
-        table=table_name,
-        version=version,
-        last_modified=last_modified,
-        row_count=len(df),
-        source_uri=table_uri,
-    )
     logger.info(
         "Loaded IBP snapshot table=%s v%s (%s rows) from %s",
         table_name, version, len(df), table_uri,
     )
-    return df, meta
+    return df, version, last_modified, len(df), table_uri
 
 
 def _fetch(table_name: str, *, force_refresh: bool) -> tuple[pd.DataFrame, IBPSnapshotMeta]:
-    """Internal helper — fetch *table_name*, optionally bypassing the cache."""
+    """Internal helper — fetch *table_name*, optionally bypassing the cache.
+
+    Assembles the :class:`IBPSnapshotMeta` *outside* the cache from the
+    native values returned by :func:`_cached_fetch`, so the cached layer
+    never has to (de)serialise a custom class.
+    """
     if force_refresh:
         # ``cache_data.clear()`` purges every cached entry of the
         # decorated function regardless of args.  That is the desired
@@ -240,7 +255,15 @@ def _fetch(table_name: str, *, force_refresh: bool) -> tuple[pd.DataFrame, IBPSn
         # tables are pulled together, so dropping both cached snapshots
         # at once keeps them in sync.
         _cached_fetch.clear()
-    return _cached_fetch(table_name, "default")
+    df, version, last_modified, row_count, source_uri = _cached_fetch(table_name, "default")
+    meta = IBPSnapshotMeta(
+        table=table_name,
+        version=version,
+        last_modified=last_modified,
+        row_count=row_count,
+        source_uri=source_uri,
+    )
+    return df, meta
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

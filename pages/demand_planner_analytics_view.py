@@ -65,9 +65,12 @@ from data_sources.demand_summary import (
     build_monthly_budget_lookup,
     build_supply_format_lookup,
     clear_demand_summary_cache,
+    demand_plan_comparison_blob_path,
     fetch_mgmt_plan_full,
+    fetch_mgmt_plan_history_tracker,
     fetch_pdh,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
+    save_demand_plan_comparison,
     fetch_static_budget_base,
     fetch_static_budget_monthly,
     fetch_static_budget_ro,
@@ -76,6 +79,23 @@ from data_sources.demand_summary import (
     mgmt_plan_full_blob_path,
     pivot_for_download,
     total_item_level_demand_blob_path,
+)
+from data_sources.demand_plan_comparison import (
+    ComparisonFilters,
+    DISPLAY_LABELS as DPC_DISPLAY_LABELS,
+    DISPLAY_ORDER as DPC_DISPLAY_ORDER,
+    PERCENT_COLS as DPC_PERCENT_COLS,
+    COL_LABEL as DPC_COL_LABEL,
+    build_demand_plan_comparison,
+    comparison_to_csv_bytes,
+    fetch_ro_summary_total_delta_by_path,
+    list_tracker_cycles,
+    list_tracker_months,
+    validate_filters,
+)
+from data_sources.ibp_official import (
+    IBPOfficialSourceError,
+    fetch_ibp_shipments_df,
 )
 from data_sources.ro_comparison import (
     ANNUAL_OPP_CHANGE,
@@ -1874,6 +1894,12 @@ def _render_summary_report_actions(export_df: pd.DataFrame) -> None:
                     blob_path = save_ro_summary_report(export_df)
             except RoSummaryReportError as exc:
                 st.error(f"❌ Save failed.\n\n{exc}")
+            except Exception as exc:  # noqa: BLE001 — surface any other failure
+                logger.exception("Unexpected error saving RO_Summary_Report.csv")
+                st.error(
+                    "❌ Save failed unexpectedly — the file was not written.\n\n"
+                    f"{type(exc).__name__}: {exc}"
+                )
             else:
                 st.success(f"✅ Saved to `Files/{blob_path}` ({row_count} rows).")
 
@@ -2322,6 +2348,14 @@ def _render_demand_summary() -> None:
         st.markdown("---")
         _render_demand_pivot_section()
 
+        # ── Demand Plan Comparison Summary (cycle-over-cycle) ───────
+        #
+        # Sits directly below the MOM roll-up.  Pulls plan numbers from
+        # the plan-history tracker, actuals from IBP Shipments, and
+        # dimensions/brand from PDH — see ``demand_plan_comparison``.
+        st.markdown("---")
+        _render_demand_plan_comparison_section()
+
 
 def _render_demand_summary_file(
     *,
@@ -2501,7 +2535,7 @@ def _render_demand_pivot_section() -> None:
     + table + chart so filter / date-range changes rerun only the
     pivot view, not the surrounding headers.
     """
-    st.markdown("### 📊 Demand Pivot Summary")
+    st.markdown("### 📊 Demand MOM Summary")
     st.caption(
         "Hierarchical roll-up of **`qry_total_item_level_demand.csv`** "
         "from Microsoft Fabric — Portfolio Major → Forecast Type → "
@@ -2981,6 +3015,384 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True, theme=None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Demand Plan Comparison Summary (cycle-over-cycle)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Renders below the Demand MOM Summary.  Pulls plan numbers from
+# ``qry_mgmt_plan_history_tracker.csv``, actuals from ``dbo.IBP
+# Shipments``, dimensions/brand from ``qry_pdh.csv``, and the R&O column
+# from the saved RO Summary Report.  All heavy lifting lives in
+# ``data_sources.demand_plan_comparison``; this layer only wires widgets
+# → filters → builder → a styled table.
+
+
+def _render_demand_plan_comparison_section() -> None:
+    """Render the Demand Plan Comparison Summary header + fragment.
+
+    The static header lives outside the fragment so cycle / month-range
+    changes rerun only the interactive block, not the surrounding text.
+    """
+    st.markdown("### 🔀 Demand Plan Comparison Summary")
+    st.caption(
+        "Cycle-over-cycle comparison from "
+        "**`qry_mgmt_plan_history_tracker.csv`** (plan), **`dbo.IBP "
+        "Shipments`** (actuals), and **`qry_pdh.csv`** (Portfolio Major / "
+        "Supply Format / Brand).  Pick a current vs prior cycle, the "
+        "actual and forecast month ranges (which must not overlap), and "
+        "the month treated as *Prior Month*.  The **R&O** column reads "
+        "*FY27 Total Delta* from the saved RO Summary Report.  All values "
+        "are in **millions of pounds**."
+    )
+    _render_demand_plan_comparison_fragment()
+
+
+@st.fragment
+def _render_demand_plan_comparison_fragment() -> None:
+    """Load sources, render the pickers, build + render the comparison.
+
+    Wrapped in a ``@st.fragment`` so a picker change reruns only this
+    block (no upstream Fabric re-reads, no MOM-pivot rebuild).  Every
+    Fabric read is wrapped so one missing source degrades gracefully
+    (plan-only or actuals-only) instead of breaking the whole section.
+    """
+    # 1. Load the tracker (the spine of the section — bail if missing).
+    try:
+        with st.spinner("Reading qry_mgmt_plan_history_tracker.csv from Microsoft Fabric…"):
+            tracker_snapshot = fetch_mgmt_plan_history_tracker()
+    except DemandSummaryError as exc:
+        st.error(
+            "❌ Could not load **qry_mgmt_plan_history_tracker.csv** for "
+            f"the comparison.\n\n{exc}"
+        )
+        return
+    tracker_df = tracker_snapshot.df
+    if tracker_df is None or tracker_df.empty:
+        st.info(
+            "ℹ️ `qry_mgmt_plan_history_tracker.csv` is empty — nothing to "
+            "compare.  Check the upstream Fabric pipeline."
+        )
+        return
+
+    # 2. Discover cycles + months for the pickers.
+    cycles = list_tracker_cycles(tracker_df)
+    months = list_tracker_months(tracker_df)
+    if len(cycles) < 2:
+        st.warning(
+            "Need at least two distinct **Cycle** values in the tracker to "
+            f"compare — found: {cycles or 'none'}."
+        )
+        return
+    if not months:
+        st.warning(
+            "No parseable **Start of Month** values in the tracker — cannot "
+            "build the month-range pickers."
+        )
+        return
+
+    # 3. Render the pickers and assemble a filter selection.
+    filters = _render_demand_comparison_filters(cycles, months)
+
+    # 4. Validate (disjoint ranges, distinct cycles, ordered bounds).
+    errors = validate_filters(filters)
+    if errors:
+        for msg in errors:
+            st.error(f"❌ {msg}")
+        return
+
+    # 5. Load the supporting sources (non-fatal — builder degrades).
+    pdh_df = _load_demand_comparison_pdh()
+    ibp_df, ibp_warning = _load_demand_comparison_ibp()
+    ro_lookup = fetch_ro_summary_total_delta_by_path()
+
+    # 6. Build.
+    with st.spinner("Building Demand Plan Comparison Summary…"):
+        result = build_demand_plan_comparison(
+            tracker_df, ibp_df, pdh_df, filters,
+            ro_total_delta_by_path=ro_lookup,
+        )
+
+    # 7. Surface advisories (missing IBP column, empty PDH, no RO Summary).
+    warnings = list(result.warnings)
+    if ibp_warning:
+        warnings.insert(0, ibp_warning)
+    for msg in warnings:
+        st.warning(f"⚠️ {msg}")
+
+    # 8. Render the table + download.
+    _render_demand_comparison_table(result)
+
+
+def _render_demand_comparison_filters(
+    cycles: list[str], months: list[date],
+) -> ComparisonFilters:
+    """Render the cycle + month-range pickers; return a filter selection.
+
+    Defaults are chosen to be immediately useful: the two most recent
+    cycles (current vs prior), the latest month as *Prior Month*, the
+    actual window as everything up to and including it, and the forecast
+    window as everything after it (so the two windows start out
+    disjoint).
+    """
+    # Sensible default indices.
+    # ── Cycle defaults: prefer C3 (current) vs C2 (prior) ──────────────
+    default_current = "C3" if "C3" in cycles else cycles[-1]
+    default_prior = "C2" if "C2" in cycles else cycles[-2]
+    if default_prior == default_current:  # guard very small cycle lists
+        default_prior = next(
+            (c for c in reversed(cycles) if c != default_current), cycles[0]
+        )
+
+    # ── Month defaults ─────────────────────────────────────────────────
+    # The computed disjoint split is the FALLBACK; the planner's preferred
+    # windows (Apr–May actuals, Jun 2026–Mar 2027 forecast, May prior
+    # month) override it whenever those exact months exist in the tracker.
+    n_months = len(months)
+    last_idx = n_months - 1
+    prior_fallback_idx = max(0, min(n_months // 2, n_months - 2)) if n_months >= 2 else 0
+
+    def _month_idx(target: date, fallback: int) -> int:
+        """Index of *target* in the month list, or *fallback* if absent."""
+        return months.index(target) if target in months else fallback
+
+    actual_start_idx = _month_idx(date(2026, 4, 1), 0)
+    actual_end_idx = _month_idx(date(2026, 5, 1), prior_fallback_idx)
+    fc_start_idx = _month_idx(date(2026, 6, 1), min(prior_fallback_idx + 1, last_idx))
+    fc_end_idx = _month_idx(date(2027, 3, 1), last_idx)
+    prior_default_idx = _month_idx(date(2026, 5, 1), prior_fallback_idx)
+
+    fmt_cycle = lambda c: c  # noqa: E731 — trivial identity for clarity
+    # Spell the month out ("Apr 2026") so the selected value is easy to
+    # read in the dropdown (the bare "4/2026" form was hard to parse).
+    fmt_month = lambda d: d.strftime("%b %Y")  # noqa: E731
+
+    row1 = st.columns(2)
+    with row1[0]:
+        current_cycle = st.selectbox(
+            "Current cycle", options=cycles,
+            index=cycles.index(default_current),
+            key="dpc_current_cycle", format_func=fmt_cycle,
+            help="The cycle whose plan you're evaluating.",
+        )
+    with row1[1]:
+        prior_cycle = st.selectbox(
+            "Prior cycle", options=cycles,
+            index=cycles.index(default_prior),
+            key="dpc_prior_cycle", format_func=fmt_cycle,
+            help="The earlier cycle to compare against (drives Base Plan).",
+        )
+
+    st.markdown("**Actual month range** (IBP Shipments + current-cycle actuals)")
+    row2 = st.columns(2)
+    with row2[0]:
+        actual_start = st.selectbox(
+            "Actual — beginning month", options=months, index=actual_start_idx,
+            key="dpc_actual_start", format_func=fmt_month,
+        )
+    with row2[1]:
+        actual_end = st.selectbox(
+            "Actual — end month", options=months, index=actual_end_idx,
+            key="dpc_actual_end", format_func=fmt_month,
+        )
+
+    st.markdown("**Forecast month range** (must not overlap the actual range)")
+    row3 = st.columns(2)
+    with row3[0]:
+        forecast_start = st.selectbox(
+            "Forecast — beginning month", options=months, index=fc_start_idx,
+            key="dpc_forecast_start", format_func=fmt_month,
+        )
+    with row3[1]:
+        forecast_end = st.selectbox(
+            "Forecast — end month", options=months, index=fc_end_idx,
+            key="dpc_forecast_end", format_func=fmt_month,
+        )
+
+    prior_month = st.selectbox(
+        "Prior Month (for PM Actual / Prior Month Forecast)",
+        options=months, index=prior_default_idx,
+        key="dpc_prior_month", format_func=fmt_month,
+        help="The single month used for the Prior-Month columns.",
+    )
+
+    # Plain-language echo of the current selection — makes the active
+    # window obvious at a glance regardless of dropdown contrast.
+    st.caption(
+        f"📌 Comparing **{current_cycle}** (current) vs **{prior_cycle}** (prior)  ·  "
+        f"Actuals **{fmt_month(actual_start)} – {fmt_month(actual_end)}**  ·  "
+        f"Forecast **{fmt_month(forecast_start)} – {fmt_month(forecast_end)}**  ·  "
+        f"Prior month **{fmt_month(prior_month)}**"
+    )
+
+    return ComparisonFilters(
+        current_cycle=current_cycle,
+        prior_cycle=prior_cycle,
+        actual_start=actual_start,
+        actual_end=actual_end,
+        forecast_start=forecast_start,
+        forecast_end=forecast_end,
+        prior_month=prior_month,
+    )
+
+
+def _load_demand_comparison_pdh() -> Optional[pd.DataFrame]:
+    """Return the PDH frame for dimension/brand enrichment, or ``None``.
+
+    Non-fatal: a PDH failure leaves dimensions blank (the builder then
+    surfaces its own "PDH empty" warning) rather than breaking the
+    section.
+    """
+    try:
+        return fetch_pdh().df
+    except DemandSummaryError as exc:
+        logger.info("qry_pdh.csv unavailable for Demand Plan Comparison: %s", exc)
+        return None
+
+
+def _load_demand_comparison_ibp() -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(IBP Shipments frame, warning)`` — warning is ``None`` on success.
+
+    Non-fatal: an IBP failure yields an empty-actuals build (plan
+    columns still render) plus a user-facing warning string.
+    """
+    try:
+        df, _meta = fetch_ibp_shipments_df()
+        return df, None
+    except IBPOfficialSourceError as exc:
+        logger.info("IBP Shipments unavailable for Demand Plan Comparison: %s", exc)
+        return None, (
+            "IBP Shipments could not be read, so the Actuals columns are "
+            f"zero.  ({exc})"
+        )
+
+
+def _demand_comparison_column_config(percent_labels: list[str]) -> dict:
+    """Return the ``column_config`` for the comparison table.
+
+    The row-label column is pinned and widened so the indented hierarchy
+    stays readable; metric columns format as one-decimal millions, and
+    the two ratio columns format as one-decimal percentages.
+    """
+    config: dict = {
+        DPC_COL_LABEL: st.column_config.TextColumn(
+            DPC_COL_LABEL, width="large", pinned=True,
+        ),
+    }
+    for col_id in DPC_DISPLAY_ORDER:
+        label = DPC_DISPLAY_LABELS[col_id]
+        if label in percent_labels:
+            config[label] = st.column_config.NumberColumn(label, format="%.1f%%")
+        else:
+            config[label] = st.column_config.NumberColumn(label, format="%.1f")
+    return config
+
+
+def _render_demand_comparison_table(result) -> None:
+    """Render the comparison table (styled) + a CSV download button.
+
+    Subtotal rows are shaded + bold; memo rows (Cottage Cheese / Sour
+    Cream) are italicised.  Percentage columns are scaled to whole
+    percents for display.  The download serves the on-screen frame
+    (internal metadata columns stripped).
+    """
+    table = result.table
+    if table is None or table.empty:
+        st.info("No comparison rows to display.")
+        return
+
+    # Clean frame (no internal metadata cols) — shared by the download
+    # and the Fabric save so both emit exactly what's on screen.
+    save_df = table.drop(
+        columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
+                 if c in table.columns]
+    ).reset_index(drop=True)
+
+    # ── Download + Save to Fabric (above the table — easy to find) ────
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    dl_col, save_col = st.columns([1, 1])
+    with dl_col:
+        st.download_button(
+            label="⬇️ Download Demand Plan Comparison Summary (CSV)",
+            data=comparison_to_csv_bytes(result),
+            file_name=f"demand_plan_comparison_summary_{today}.csv",
+            mime="text/csv",
+            key="demand_plan_comparison_download",
+            type="primary",
+            width="stretch",
+            help=(
+                "Downloads the comparison as shown — preserves the indented "
+                "row hierarchy and every metric column."
+            ),
+        )
+    with save_col:
+        if st.button(
+            "💾 Save to Fabric (overwrite)",
+            key="demand_plan_comparison_save",
+            type="primary",
+            width="stretch",
+            help=(
+                "Overwrites `Files/RO Tracking/Demand Plan/"
+                "qry_demand_plan_comparison_summary.csv` with the table as "
+                "shown, so the comparison can be consumed without recomputing."
+            ),
+        ):
+            try:
+                with st.spinner("Saving Demand Plan Comparison Summary to Microsoft Fabric…"):
+                    blob_path = save_demand_plan_comparison(save_df)
+            except DemandSummaryError as exc:
+                st.error(f"❌ Save failed.\n\n{exc}")
+            else:
+                st.success(f"✅ Saved to `Files/{blob_path}` ({len(save_df)} rows).")
+
+    # ── Build the display frame ───────────────────────────────────────
+    # Percent ids → display labels; the stored values are fractions, so
+    # multiply by 100 for a whole-percent display.
+    percent_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_PERCENT_COLS]
+
+    # Row-type flags (positional) for styling, captured before we drop
+    # the internal metadata columns.
+    subtotal_flags = table["_is_subtotal"].tolist()
+    memo_flags = table["_is_memo"].tolist()
+
+    display_df = table.drop(
+        columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
+                 if c in table.columns]
+    ).reset_index(drop=True)
+    for label in percent_labels:
+        if label in display_df.columns:
+            display_df[label] = display_df[label] * 100.0
+
+    # Pin column order: label first, then metrics in display order.
+    column_order = [DPC_COL_LABEL, *[DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER]]
+
+    def _style_row(row: pd.Series) -> list[str]:
+        """Shade subtotals, italicise memo rows (by positional index)."""
+        i = int(row.name)
+        if i < len(subtotal_flags) and subtotal_flags[i]:
+            return ["background-color: #fde9d9; font-weight: 600"] * len(row)
+        if i < len(memo_flags) and memo_flags[i]:
+            return ["font-style: italic; color: #555555"] * len(row)
+        return [""] * len(row)
+
+    styled = display_df.style.apply(_style_row, axis=1)
+
+    table_height = min(35 * (len(display_df) + 1) + 38, 900)
+    st.dataframe(
+        styled,
+        width="stretch",
+        hide_index=True,
+        height=table_height,
+        column_order=column_order,
+        column_config=_demand_comparison_column_config(percent_labels),
+    )
+
+    if not result.ro_summary_available:
+        st.caption(
+            "_R&O is zero because the RO Summary Report could not be read. "
+            "Save the RO Summary Report above to populate it._"
+        )
 
 
 # ── 3. Entry point ────────────────────────────────────────────────────────────

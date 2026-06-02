@@ -55,6 +55,7 @@ from data_sources.fabric_lakehouse_io import (
     get_file_properties,
     read_bytes,
     read_csv,
+    write_csv,
 )
 
 
@@ -86,6 +87,20 @@ _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH: str = (
 # :func:`build_supply_format_lookup`).
 _PDH_BLOB_PATH: str = (
     "RO Tracking/Demand Plan/qry_pdh.csv"
+)
+# Plan-history tracker — one row per Item × Party Site × Month × Cycle ×
+# Forecast Type.  Backs the *Demand Plan Comparison Summary* (cycle-over-
+# cycle deltas).  Lives in the same Demand Plan folder as the other RO
+# Tracking CSVs, so it inherits the shared ``[fabric_htst]`` secrets and
+# the 15-minute cache cadence used everywhere else on the page.
+_MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH: str = (
+    "RO Tracking/Demand Plan/qry_mgmt_plan_history_tracker.csv"
+)
+# Destination for the saved Demand Plan Comparison Summary.  Lives in the
+# same Demand Plan folder so the planner finds it alongside the other RO
+# Tracking exports.  Overwritten on every Save click.
+_DEMAND_PLAN_COMPARISON_BLOB_PATH: str = (
+    "RO Tracking/Demand Plan/qry_demand_plan_comparison_summary.csv"
 )
 
 # Monthly bundled (Base + R&O) budget for the Demand Pivot Summary's
@@ -174,17 +189,47 @@ class DemandSummarySnapshot:
 # that the public wrapper can:
 #   1. Accept a ``force_refresh=True`` flag without spilling the
 #      Streamlit-specific ``.clear()`` API onto callers.
-#   2. Always return a strongly-typed :class:`DemandSummarySnapshot`.
+#   2. Assemble a strongly-typed :class:`DemandSummarySnapshot` *outside*
+#      the cache from native values returned by the cached impl.
+#
+# Why the cache returns a tuple of NATIVE types (not the snapshot)
+# ----------------------------------------------------------------
+# ``st.cache_data`` serialises every cached return value.  It has
+# first-class, efficient handling for pandas ``DataFrame`` objects and
+# plain scalars, but a *custom* class such as ``DemandSummarySnapshot``
+# falls back to a stricter generic-pickle path that some Streamlit
+# builds reject outright with ``UnserializableReturnValueError`` (and
+# when the store fails, every call becomes a cache MISS → slow repeated
+# Fabric reads).  Caching the native ``(df, etag, size, last_modified)``
+# tuple keeps the fast, reliable serialisation path and lets us rebuild
+# the snapshot cheaply on the way out.
 #
 # The cached impl's ``_signature`` argument is the documented Streamlit
 # pattern for an explicit cache key — it participates in cache identity
 # but its contents are never hashed by us.
 
+# Per-blob ``read_csv`` overrides.  The plan-history tracker is read as
+# all-strings: the Demand Plan Comparison builder re-parses every column
+# itself (dates, pounds, cycles), and all-string content guarantees a
+# clean, picklable cache payload regardless of how the upstream export
+# typed its columns.
+_READ_CSV_KWARGS_BY_BLOB: dict[str, dict] = {
+    _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH: {"dtype": str},
+}
+
+
 @st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
-def _cached_fetch(blob_path: str, _signature: str) -> DemandSummarySnapshot:
+def _cached_fetch(
+    blob_path: str, _signature: str,
+) -> tuple[pd.DataFrame, Optional[str], Optional[int], Optional[datetime]]:
     """Cached read of a single Demand Summary CSV blob.
 
-    Centralised so both top-level fetchers share one implementation —
+    Returns a tuple of **native** values — ``(df, etag, size,
+    last_modified)`` — rather than a :class:`DemandSummarySnapshot`, so
+    Streamlit caches it via its fast DataFrame-aware path (see the note
+    above).  :func:`_fetch_snapshot` wraps this back into a snapshot.
+
+    Centralised so every top-level fetcher shares one implementation —
     add a new file by introducing a single thin wrapper, not a parallel
     cached function.  Raises :class:`DemandSummaryError` on any
     underlying read / parse failure.
@@ -225,8 +270,12 @@ def _cached_fetch(blob_path: str, _signature: str) -> DemandSummarySnapshot:
 
     # 2. Authoritative body read.  Any I/O failure surfaces as a
     #    domain-specific error so the page can render one clean banner.
+    read_kwargs = _READ_CSV_KWARGS_BY_BLOB.get(blob_path)
     try:
-        df, etag = read_csv(_SECRETS_SECTION, blob_path)
+        df, etag = read_csv(
+            _SECRETS_SECTION, blob_path,
+            read_csv_kwargs=read_kwargs,
+        )
     except LakehouseIOError as exc:
         raise DemandSummaryError(
             f"Could not read 'Files/{blob_path}' from Microsoft Fabric: {exc}"
@@ -244,13 +293,28 @@ def _cached_fetch(blob_path: str, _signature: str) -> DemandSummarySnapshot:
         blob_path, len(df), len(df.columns),
     )
 
+    # ``last_modified`` may be UTC-aware from the SDK; normalise to UTC
+    # so the snapshot exposes a consistent tz.  All four returned values
+    # are native (DataFrame + str/int/datetime) → fast, reliable cache.
+    last_modified_utc = (
+        last_modified.astimezone(timezone.utc) if last_modified else None
+    )
+    return df, etag, size, last_modified_utc
+
+
+def _fetch_snapshot(blob_path: str) -> DemandSummarySnapshot:
+    """Assemble a :class:`DemandSummarySnapshot` from the cached payload.
+
+    Built *outside* the cache so the cached layer only ever stores
+    native types (see the note above the cached impl).  Cheap: the
+    DataFrame is shared by reference from the cache, not copied here.
+    """
+    df, etag, size, last_modified = _cached_fetch(blob_path, "default")
     return DemandSummarySnapshot(
         df=df,
         etag=etag,
         size=size,
-        # ``last_modified`` may be UTC-aware from the SDK; we keep it
-        # as-is — UI converts to a display string when needed.
-        last_modified=last_modified.astimezone(timezone.utc) if last_modified else None,
+        last_modified=last_modified,
         blob_path=blob_path,
     )
 
@@ -269,7 +333,7 @@ def fetch_mgmt_plan_full(*, force_refresh: bool = False) -> DemandSummarySnapsho
     """
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_MGMT_PLAN_FULL_BLOB_PATH, "default")
+    return _fetch_snapshot(_MGMT_PLAN_FULL_BLOB_PATH)
 
 
 def fetch_total_item_level_demand(
@@ -290,7 +354,7 @@ def fetch_total_item_level_demand(
     """
     if force_refresh:
         _cached_fetch.clear()
-    snapshot = _cached_fetch(_TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH, "default")
+    snapshot = _fetch_snapshot(_TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH)
     return _coerce_demand_dates_for_display(snapshot)
 
 
@@ -307,7 +371,29 @@ def fetch_pdh(*, force_refresh: bool = False) -> DemandSummarySnapshot:
     """
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_PDH_BLOB_PATH, "default")
+    return _fetch_snapshot(_PDH_BLOB_PATH)
+
+
+def fetch_mgmt_plan_history_tracker(
+    *, force_refresh: bool = False,
+) -> DemandSummarySnapshot:
+    """Return the latest ``qry_mgmt_plan_history_tracker.csv`` snapshot.
+
+    Source for the *Demand Plan Comparison Summary*.  Schema (one row
+    per Item × Party Site × Month × Cycle × Forecast Type)::
+
+        Start of Month, Item, Item Description, Party Site Number,
+        Demand Plan Pounds, Forecast Type, Business Unit, Cycle
+
+    The frame is returned raw (no date coercion) — the comparison
+    builder in :mod:`data_sources.demand_plan_comparison` owns all
+    parsing so the connector stays a thin, reusable I/O wrapper.
+
+    See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
+    """
+    if force_refresh:
+        _cached_fetch.clear()
+    return _fetch_snapshot(_MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH)
 
 
 def fetch_static_budget_base(
@@ -316,7 +402,7 @@ def fetch_static_budget_base(
     """Return ``Static_Budget_Base_Lbs.csv`` for pivot-row Total Budget."""
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_STATIC_BUDGET_BASE_BLOB_PATH, "default")
+    return _fetch_snapshot(_STATIC_BUDGET_BASE_BLOB_PATH)
 
 
 def fetch_static_budget_ro(
@@ -325,7 +411,7 @@ def fetch_static_budget_ro(
     """Return ``Static_Budget_RO_Lbs.csv`` for pivot-row Total Budget."""
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_STATIC_BUDGET_RO_BLOB_PATH, "default")
+    return _fetch_snapshot(_STATIC_BUDGET_RO_BLOB_PATH)
 
 
 def fetch_static_budget_monthly(
@@ -342,7 +428,7 @@ def fetch_static_budget_monthly(
     """
     if force_refresh:
         _cached_fetch.clear()
-    return _cached_fetch(_STATIC_BUDGET_MONTHLY_BLOB_PATH, "default")
+    return _fetch_snapshot(_STATIC_BUDGET_MONTHLY_BLOB_PATH)
 
 
 # ── Display-side date coercion ──────────────────────────────────────────────
@@ -432,13 +518,52 @@ def total_item_level_demand_blob_path() -> str:
     return _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH
 
 
+def mgmt_plan_history_tracker_blob_path() -> str:
+    """Return the POSIX path of the plan-history-tracker CSV under ``Files/``."""
+    return _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH
+
+
+def demand_plan_comparison_blob_path() -> str:
+    """Return the POSIX path of the saved Demand Plan Comparison CSV."""
+    return _DEMAND_PLAN_COMPARISON_BLOB_PATH
+
+
+def save_demand_plan_comparison(df: pd.DataFrame) -> str:
+    """Overwrite the Demand Plan Comparison Summary CSV in Fabric.
+
+    Writes *df* (the display-ready comparison table) to
+    ``Files/RO Tracking/Demand Plan/qry_demand_plan_comparison_summary.csv``
+    — create-or-overwrite, no ETag guard, mirroring the "Save … (overwrite)"
+    contract used by the RO Summary Report.
+
+    Returns the destination blob path.  Raises :class:`DemandSummaryError`
+    on any underlying write failure so the page renders one clean banner.
+    """
+    if df is None or df.empty:
+        raise DemandSummaryError(
+            "Nothing to save — the comparison table is empty.  Adjust the "
+            "filters so at least one row is produced, then try again."
+        )
+    try:
+        write_csv(
+            _SECRETS_SECTION, _DEMAND_PLAN_COMPARISON_BLOB_PATH, df, etag=None,
+        )
+    except LakehouseIOError as exc:
+        raise DemandSummaryError(
+            "Could not save the Demand Plan Comparison Summary to "
+            f"'Files/{_DEMAND_PLAN_COMPARISON_BLOB_PATH}': {exc}"
+        ) from exc
+    return _DEMAND_PLAN_COMPARISON_BLOB_PATH
+
+
 # ── Cache management ─────────────────────────────────────────────────────────
 
 def clear_demand_summary_cache() -> None:
     """Invalidate the cached snapshots for EVERY Demand Summary CSV.
 
     Covers ``qry_mgmt_plan_full.csv``,
-    ``qry_total_item_level_demand.csv``, and ``qry_pdh.csv`` — they
+    ``qry_total_item_level_demand.csv``, ``qry_pdh.csv``, and
+    ``qry_mgmt_plan_history_tracker.csv`` — they
     share a single ``@st.cache_data`` slot (the cached impl is the
     same function, keyed by blob path), so one ``clear()`` call
     invalidates the whole family.

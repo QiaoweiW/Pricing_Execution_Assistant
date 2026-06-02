@@ -133,6 +133,21 @@ _IBP_QTY_CANDIDATES: tuple[str, ...] = (
     "Shipped Qty lbs", "Shipped Qty Lbs", "Shipped Qty", "Shipped Quantity Lbs",
     "Shipped_Qty_lbs",
 )
+_IBP_ORDERED_QTY_CANDIDATES: tuple[str, ...] = (
+    "Ordered Qty lbs", "Ordered Qty Lbs", "Ordered Qty", "Ordered Quantity Lbs",
+    "Ordered_Qty_lbs",
+)
+_IBP_CUSTOMER_NO_CANDIDATES: tuple[str, ...] = (
+    "Customer No", "Customer Number", "Customer No.", "CustomerNo", "Customer_No",
+)
+_IBP_CUSTOMER_NAME_CANDIDATES: tuple[str, ...] = (
+    "Customer Name", "CustomerName", "Customer_Name",
+)
+
+# Tracker (qry_mgmt_plan_history_tracker.csv) — Item Description column.
+# Used as a fallback only; driver tables prefer the PDH description so
+# item naming is consistent across plan + actuals.
+TRK_ITEM_DESCRIPTION: str = "Item Description"
 
 # PDH (qry_pdh.csv).
 _PDH_ITEM_CANDIDATES: tuple[str, ...] = (
@@ -149,6 +164,19 @@ _PDH_PMINOR_CANDIDATES: tuple[str, ...] = (
 )
 _PDH_SFMT_CANDIDATES: tuple[str, ...] = (
     "Supply Format", "Supply_Format", "SupplyFormat", "SFmt",
+)
+
+# dp_dimshiptosites (dbo) — ship-to-site dimension used by the driver
+# tables to translate a Party Site Number into a customer.  Probed from
+# candidate names so an upstream rename is a one-line fix here.
+_DIM_PARTY_SITE_CANDIDATES: tuple[str, ...] = (
+    "party_site_code", "party_site_number", "PartySiteCode", "Party Site Code",
+)
+_DIM_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
+    "customer_num", "customer_number", "CustomerNum", "Customer Num",
+)
+_DIM_ACCOUNT_DESC_CANDIDATES: tuple[str, ...] = (
+    "account_description", "account_desc", "AccountDescription",
 )
 
 # RO Summary Report (RO_Reporting/RO_Summary_Report.csv).
@@ -559,6 +587,15 @@ PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT})
 
 _LBS_PER_MILLION: float = 1_000_000.0
 
+# Prior-Month summary column labels (display contract).
+PMAF_COL_PRIOR_PLAN: str = "Prior Plan"
+PMAF_COL_ORDERED: str = "Ordered"
+PMAF_COL_SHIPPED: str = "Shipped"
+PMAF_COL_ORDERED_DIFF: str = "Ordered Diff."
+PMAF_COL_SHIPPED_DIFF: str = "Shipped Diff."
+PMAF_COL_ORDERED_PCT: str = "Ordered%"
+PMAF_COL_SHIPPED_PCT: str = "Shipped%"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Filters
@@ -636,18 +673,14 @@ def list_tracker_cycles(tracker_df: pd.DataFrame) -> list[str]:
 def list_tracker_months(tracker_df: pd.DataFrame) -> list[date]:
     """Return the distinct, sorted first-of-month dates in the tracker.
 
-    Parses ``Start of Month`` with the shared coercion primitive so
-    Excel serials and string dates both normalise to first-of-month
-    :class:`datetime.date` values.
+    Uses the vectorised coercion path so this scales cleanly on the
+    full 356k-row tracker (used to be the slowest filter-discovery call
+    on a cold render).
     """
     if tracker_df is None or TRK_START_OF_MONTH not in tracker_df.columns:
         return []
-    months = (
-        tracker_df[TRK_START_OF_MONTH]
-        .map(_coerce_start_of_month)
-        .dropna()
-    )
-    return sorted({m for m in months if m is not None})
+    months = _vectorised_start_of_month(tracker_df[TRK_START_OF_MONTH])
+    return sorted({m for m in months.tolist() if m is not None})
 
 
 def validate_filters(filters: ComparisonFilters) -> list[str]:
@@ -695,45 +728,138 @@ class _ItemDims:
     sfmt: str
     pminor: str
     brand: str
+    desc: str = ""
 
 
 def build_item_dim_lookup(pdh_df: Optional[pd.DataFrame]) -> dict[str, _ItemDims]:
     """Return ``{normalised_item_key -> _ItemDims}`` from PDH.
 
-    * Joined on the PDH item-number column (auto-detected).
-    * Brand is derived from the PDH ``Item Description`` (the planner's
-      ``DG`` rule) — always taken from PDH, never the tracker, so the
-      brand split is consistent across plan and actuals.
-    * Last row wins on duplicate items (a planner can audit PDH directly
-      if a multi-row item is surprising — same contract as
-      ``build_supply_format_lookup``).
-
-    Returns an empty dict when PDH is unusable; downstream every item
-    then resolves to blank dimensions and simply won't match any leaf.
+    Kept for backward compatibility with any caller that needs a plain
+    dict; the comparison + driver builders themselves use the faster
+    DataFrame-shaped lookup returned by :func:`build_item_dim_frame`.
     """
-    lookup: dict[str, _ItemDims] = {}
+    frame = build_item_dim_frame(pdh_df)
+    if frame.empty:
+        return {}
+    return {
+        row["__item_key"]: _ItemDims(
+            pmaj=row["pmaj"], sfmt=row["sfmt"], pminor=row["pminor"],
+            brand=row["brand"], desc=row["desc"],
+        )
+        for row in frame.to_dict(orient="records")
+    }
+
+
+def build_item_dim_frame(pdh_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return a vectorised PDH lookup as a DataFrame.
+
+    Columns: ``__item_key, pmaj, sfmt, pminor, brand, desc``.  The
+    ``__item_key`` column is the canonical join key produced by
+    :func:`_vectorised_item_key` so it matches the same coercion used on
+    the tracker / IBP sides.  Last row wins on duplicate items (matches
+    the legacy ``build_item_dim_lookup`` contract).
+
+    Replacing the ``iterrows`` lookup with a vectorised frame turns the
+    PDH preparation from O(n) Python calls into a handful of pandas
+    column operations — the hottest part of the cold-build budget per
+    the diagnose report.
+    """
     if pdh_df is None or pdh_df.empty:
-        return lookup
+        return pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
 
     item_col = _resolve_column(pdh_df, _PDH_ITEM_CANDIDATES)
     if not item_col:
-        return lookup
+        return pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
     desc_col = _resolve_column(pdh_df, _PDH_DESC_CANDIDATES)
     pmaj_col = _resolve_column(pdh_df, _PDH_PMAJ_CANDIDATES)
     pminor_col = _resolve_column(pdh_df, _PDH_PMINOR_CANDIDATES)
     sfmt_col = _resolve_column(pdh_df, _PDH_SFMT_CANDIDATES)
 
-    for _, row in pdh_df.iterrows():
-        key = _normalise_item_key(row.get(item_col))
-        if not key:
-            continue
-        lookup[key] = _ItemDims(
-            pmaj=_clean_str(row.get(pmaj_col)) if pmaj_col else "",
-            sfmt=_clean_str(row.get(sfmt_col)) if sfmt_col else "",
-            pminor=_clean_str(row.get(pminor_col)) if pminor_col else "",
-            brand=derive_brand(row.get(desc_col)) if desc_col else BRAND_PRIVATE,
-        )
-    return lookup
+    n = len(pdh_df)
+    blank = pd.Series([""] * n, index=pdh_df.index, dtype="object")
+    desc_series = _vectorised_clean_str(pdh_df[desc_col]) if desc_col else blank
+    out = pd.DataFrame({
+        "__item_key": _vectorised_item_key(pdh_df[item_col]),
+        "pmaj": _vectorised_clean_str(pdh_df[pmaj_col]) if pmaj_col else blank,
+        "sfmt": _vectorised_clean_str(pdh_df[sfmt_col]) if sfmt_col else blank,
+        "pminor": _vectorised_clean_str(pdh_df[pminor_col]) if pminor_col else blank,
+        "brand": _vectorised_brand(desc_series) if desc_col else pd.Series(
+            [BRAND_PRIVATE] * n, index=pdh_df.index, dtype="object"),
+        "desc": desc_series,
+    })
+    # Drop rows with no item key (would never match anything), then
+    # collapse duplicates keeping the last row (legacy contract).
+    out = out.loc[out["__item_key"] != ""]
+    return out.drop_duplicates(subset="__item_key", keep="last").reset_index(drop=True)
+
+
+# ── Vectorised primitives (used by the enrichment helpers) ──────────────────
+#
+# These are pure functions over ``pd.Series`` — no per-row Python calls,
+# no ``iterrows``.  Keep them tiny + composable so the enrichment paths
+# stay readable: each helper does ONE coercion.
+
+def _vectorised_clean_str(series: pd.Series) -> pd.Series:
+    """Vectorised analogue of :func:`_clean_str` (trim + None/NaN → '')."""
+    s = series.astype("string").str.strip()
+    return s.fillna("").astype("object")
+
+
+def _vectorised_item_key(series: pd.Series) -> pd.Series:
+    """Vectorised analogue of :func:`_normalise_item_key`.
+
+    Mirrors the contract: strip → drop trailing ``.0`` → blank for
+    NaN/None.  Implemented entirely with pandas string ops so 356k-row
+    tracker columns coerce in milliseconds instead of seconds.
+    """
+    s = series.astype("string").str.strip()
+    # Drop a trailing ``.0`` ONLY when the value is an int-like float
+    # literal (matches ``370072.0`` → ``370072`` but leaves ``"P-37.0"``
+    # alone).  Regex anchors so we don't strip mid-string dots.
+    s = s.str.replace(r"^(-?\d+)\.0+$", r"\1", regex=True)
+    return s.fillna("").astype("object")
+
+
+def _vectorised_brand(desc_series: pd.Series) -> pd.Series:
+    """Vectorised analogue of :func:`derive_brand` (first 2 chars ``DG`` → Branded)."""
+    s = desc_series.astype("string").str.strip()
+    is_branded = s.str[:2].str.upper() == "DG"
+    return is_branded.map({True: BRAND_BRANDED, False: BRAND_PRIVATE}).astype("object")
+
+
+def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
+    """Vectorised first-of-month coercion (Excel serials + strings).
+
+    Tries integer-serial parsing first (the source CSV's native shape)
+    then falls back to pandas' generic string parser for any non-numeric
+    survivors.  Anything that still cannot be parsed becomes ``NaT``.
+    The output dtype is ``object`` carrying :class:`datetime.date`
+    values, matching :func:`_coerce_start_of_month` so downstream code
+    that compares against ``date`` objects keeps working unchanged.
+    """
+    s = series
+    # 1. Numeric/serial fast path.
+    as_num = pd.to_numeric(s, errors="coerce")
+    serials_ts = pd.to_datetime(as_num, unit="D", origin="1899-12-30", errors="coerce")
+    # 2. String fallback for survivors.
+    needs_str = serials_ts.isna()
+    if needs_str.any():
+        str_ts = pd.to_datetime(s[needs_str], errors="coerce")
+        serials_ts = serials_ts.copy()
+        serials_ts.loc[needs_str] = str_ts
+    # Snap to first-of-month, return as a Series of ``date`` (object).
+    out = serials_ts.dt.to_period("M").dt.to_timestamp()
+    return out.dt.date.where(out.notna(), other=None)
+
+
+def _vectorised_forecast_type(series: pd.Series) -> pd.Series:
+    """Vectorised forecast-type bucketing (Base Plan / R&O / passthrough)."""
+    s = series.astype("string").str.strip()
+    folded = s.str.casefold()
+    out = s.fillna("").astype("object").copy()
+    out[folded == "base plan"] = FORECAST_BASE_PLAN
+    out[folded.isin({"r&o", "r and o", "ro", "r & o", "r_and_o"})] = FORECAST_R_AND_O
+    return out
 
 
 def _clean_str(value: object) -> str:
@@ -748,62 +874,112 @@ def _clean_str(value: object) -> str:
     return str(value).strip()
 
 
+def _attach_dims(
+    base: pd.DataFrame, item_key_series: pd.Series, dim_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Left-join *base* + the four PDH dim columns on a normalised item key.
+
+    Vectorised pandas ``merge`` — replaces the per-row ``map(dims.get)``
+    lookup that was the dominant cost on 356k-row tracker enrichment.
+    Missing items keep blank dims (and Brand = Private, matching the
+    legacy fallback in the deleted ``_enrich_*`` helpers).
+    """
+    base = base.copy()
+    base["__item_key"] = item_key_series.values
+    if dim_frame is None or dim_frame.empty:
+        for col in ("pmaj", "sfmt", "pminor", "desc"):
+            base[col] = ""
+        base["brand"] = BRAND_PRIVATE
+        return base
+    merged = base.merge(
+        dim_frame[["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"]],
+        on="__item_key", how="left",
+    )
+    for col in ("pmaj", "sfmt", "pminor", "desc"):
+        merged[col] = merged[col].fillna("")
+    merged["brand"] = merged["brand"].fillna(BRAND_PRIVATE)
+    return merged
+
+
 def _enrich_tracker(
-    tracker_df: pd.DataFrame, dims: dict[str, _ItemDims],
+    tracker_df: pd.DataFrame, dims_or_frame,
 ) -> pd.DataFrame:
     """Return a tidy, enriched tracker frame ready for leaf filtering.
 
-    Output columns (one row per source row):
-    ``item_key, month (date), pounds (float), forecast_type (Base/R&O),
-    cycle (str), pmaj, sfmt, pminor, brand``.
+    Output columns: ``item_key, item_desc, party_site, month (date),
+    pounds (float), forecast_type, cycle, pmaj, sfmt, pminor, brand``.
+    Rows with an unparseable month are dropped.
 
-    Rows with an unparseable month are dropped (they can't be bucketed).
+    Accepts either the new vectorised dim frame (preferred) or the
+    legacy ``dict`` lookup (back-compat for external callers).
     """
     if tracker_df is None or tracker_df.empty:
         return _empty_enriched()
 
-    df = tracker_df.copy()
-    item_keys = df[TRK_ITEM].map(_normalise_item_key)
-    resolved = item_keys.map(lambda k: dims.get(k))
+    dim_frame = _coerce_dims_to_frame(dims_or_frame)
+    n = len(tracker_df)
+    item_keys = _vectorised_item_key(tracker_df[TRK_ITEM])
 
-    out = pd.DataFrame({
-        "item_key": item_keys,
-        "month": df[TRK_START_OF_MONTH].map(_coerce_start_of_month),
-        "pounds": pd.to_numeric(
-            df[TRK_DEMAND_LBS].astype(str).str.replace(",", "", regex=False),
-            errors="coerce",
-        ),
-        "forecast_type": df[TRK_FORECAST_TYPE].map(_normalise_forecast_type),
-        "cycle": df[TRK_CYCLE].map(_clean_str),
-        "pmaj": resolved.map(lambda d: d.pmaj if d else ""),
-        "sfmt": resolved.map(lambda d: d.sfmt if d else ""),
-        "pminor": resolved.map(lambda d: d.pminor if d else ""),
-        "brand": resolved.map(lambda d: d.brand if d else BRAND_PRIVATE),
+    pounds = pd.to_numeric(
+        tracker_df[TRK_DEMAND_LBS].astype("string").str.replace(",", "", regex=False),
+        errors="coerce",
+    ).fillna(0.0)
+
+    party_site = (
+        _vectorised_clean_str(tracker_df[TRK_PARTY_SITE])
+        if TRK_PARTY_SITE in tracker_df.columns
+        else pd.Series([""] * n, index=tracker_df.index, dtype="object")
+    )
+    trk_desc = (
+        _vectorised_clean_str(tracker_df[TRK_ITEM_DESCRIPTION])
+        if TRK_ITEM_DESCRIPTION in tracker_df.columns
+        else pd.Series([""] * n, index=tracker_df.index, dtype="object")
+    )
+
+    base = pd.DataFrame({
+        "item_key": item_keys.values,
+        "party_site": party_site.values,
+        "__trk_desc": trk_desc.values,
+        "month": _vectorised_start_of_month(tracker_df[TRK_START_OF_MONTH]).values,
+        "pounds": pounds.values,
+        "forecast_type": _vectorised_forecast_type(tracker_df[TRK_FORECAST_TYPE]).values,
+        "cycle": _vectorised_clean_str(tracker_df[TRK_CYCLE]).values,
     })
-    out["pounds"] = out["pounds"].fillna(0.0)
+    enriched = _attach_dims(base, base["item_key"], dim_frame)
+
+    # Item Description: prefer PDH; fall back to tracker's own column.
+    pdh_desc = enriched["desc"]
+    enriched["item_desc"] = pdh_desc.where(pdh_desc.astype(bool), enriched["__trk_desc"])
+
+    out = enriched[[
+        "item_key", "item_desc", "party_site", "month", "pounds",
+        "forecast_type", "cycle", "pmaj", "sfmt", "pminor", "brand",
+    ]]
     return out.dropna(subset=["month"]).reset_index(drop=True)
 
 
 def _enrich_ibp(
-    ibp_df: pd.DataFrame, dims: dict[str, _ItemDims],
+    ibp_df: pd.DataFrame,
+    dims_or_frame,
+    *,
+    qty_candidates: tuple[str, ...] = _IBP_QTY_CANDIDATES,
 ) -> pd.DataFrame:
     """Return a tidy, enriched IBP Shipments frame for leaf filtering.
 
-    Output columns: ``item_key, month (date), pounds (float), pmaj,
-    sfmt, pminor, brand``.  Column names are auto-detected from the
-    candidate whitelists so a spelling drift in the Delta table is a
-    one-line fix in the constants above.
+    Output columns: ``item_key, item_desc, customer_no, customer_name,
+    month (date), pounds (float), pmaj, sfmt, pminor, brand``.  Source
+    column names are auto-detected from the candidate whitelists.
+
+    Accepts either the new vectorised dim frame (preferred) or the
+    legacy ``dict`` lookup (back-compat for external callers).
     """
     if ibp_df is None or ibp_df.empty:
         return _empty_enriched(actuals=True)
 
     item_col = _resolve_column(ibp_df, _IBP_ITEM_CANDIDATES)
     month_col = _resolve_column(ibp_df, _IBP_MONTH_CANDIDATES)
-    qty_col = _resolve_column(ibp_df, _IBP_QTY_CANDIDATES)
+    qty_col = _resolve_column(ibp_df, qty_candidates)
     if not (item_col and month_col and qty_col):
-        # Missing a required column → no actuals contribute.  The caller
-        # surfaces a warning; we degrade to an empty frame rather than
-        # raising so the (plan-only) columns still render.
         logger.warning(
             "IBP Shipments missing a required column "
             "(item=%r, month=%r, qty=%r); actuals will be zero.",
@@ -811,32 +987,76 @@ def _enrich_ibp(
         )
         return _empty_enriched(actuals=True)
 
-    df = ibp_df.copy()
-    item_keys = df[item_col].map(_normalise_item_key)
-    resolved = item_keys.map(lambda k: dims.get(k))
+    cust_no_col = _resolve_column(ibp_df, _IBP_CUSTOMER_NO_CANDIDATES)
+    cust_name_col = _resolve_column(ibp_df, _IBP_CUSTOMER_NAME_CANDIDATES)
 
-    out = pd.DataFrame({
-        "item_key": item_keys,
-        "month": df[month_col].map(_coerce_start_of_month),
-        "pounds": pd.to_numeric(
-            df[qty_col].astype(str).str.replace(",", "", regex=False),
-            errors="coerce",
-        ),
-        "pmaj": resolved.map(lambda d: d.pmaj if d else ""),
-        "sfmt": resolved.map(lambda d: d.sfmt if d else ""),
-        "pminor": resolved.map(lambda d: d.pminor if d else ""),
-        "brand": resolved.map(lambda d: d.brand if d else BRAND_PRIVATE),
+    dim_frame = _coerce_dims_to_frame(dims_or_frame)
+    n = len(ibp_df)
+    item_keys = _vectorised_item_key(ibp_df[item_col])
+    pounds = pd.to_numeric(
+        ibp_df[qty_col].astype("string").str.replace(",", "", regex=False),
+        errors="coerce",
+    ).fillna(0.0)
+
+    cust_no = (
+        _vectorised_item_key(ibp_df[cust_no_col])
+        if cust_no_col else pd.Series([""] * n, index=ibp_df.index, dtype="object")
+    )
+    cust_name = (
+        _vectorised_clean_str(ibp_df[cust_name_col])
+        if cust_name_col else pd.Series([""] * n, index=ibp_df.index, dtype="object")
+    )
+
+    base = pd.DataFrame({
+        "item_key": item_keys.values,
+        "customer_no": cust_no.values,
+        "customer_name": cust_name.values,
+        "month": _vectorised_start_of_month(ibp_df[month_col]).values,
+        "pounds": pounds.values,
     })
-    out["pounds"] = out["pounds"].fillna(0.0)
+    enriched = _attach_dims(base, base["item_key"], dim_frame)
+    enriched["item_desc"] = enriched["desc"]
+
+    out = enriched[[
+        "item_key", "item_desc", "customer_no", "customer_name", "month",
+        "pounds", "pmaj", "sfmt", "pminor", "brand",
+    ]]
     return out.dropna(subset=["month"]).reset_index(drop=True)
+
+
+def _coerce_dims_to_frame(dims_or_frame) -> pd.DataFrame:
+    """Accept either a legacy ``dict[str, _ItemDims]`` or a dim frame.
+
+    Lets the enrichment helpers stay back-compatible with any caller
+    that still passes :func:`build_item_dim_lookup`'s dict — we lift it
+    into the new frame shape on the fly.  No-op when already a frame.
+    """
+    if dims_or_frame is None:
+        return pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
+    if isinstance(dims_or_frame, pd.DataFrame):
+        return dims_or_frame
+    if isinstance(dims_or_frame, dict):
+        if not dims_or_frame:
+            return pd.DataFrame(
+                columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
+        return pd.DataFrame.from_records([
+            {
+                "__item_key": k, "pmaj": d.pmaj, "sfmt": d.sfmt,
+                "pminor": d.pminor, "brand": d.brand, "desc": d.desc,
+            }
+            for k, d in dims_or_frame.items()
+        ])
+    return pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
 
 
 def _empty_enriched(actuals: bool = False) -> pd.DataFrame:
     """Return an empty enriched frame with the right columns."""
-    cols = ["item_key", "month", "pounds", "pmaj", "sfmt", "pminor", "brand"]
-    if not actuals:
-        cols = ["item_key", "month", "pounds", "forecast_type", "cycle",
-                "pmaj", "sfmt", "pminor", "brand"]
+    if actuals:
+        cols = ["item_key", "item_desc", "customer_no", "customer_name",
+                "month", "pounds", "pmaj", "sfmt", "pminor", "brand"]
+    else:
+        cols = ["item_key", "item_desc", "party_site", "month", "pounds",
+                "forecast_type", "cycle", "pmaj", "sfmt", "pminor", "brand"]
     return pd.DataFrame(columns=cols)
 
 
@@ -935,22 +1155,25 @@ def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
         )
         return {}
 
+    # Vectorise the per-row label + value coercion up-front; only the
+    # stack-walk (inherently sequential — it carries state across rows)
+    # remains in Python.  Cuts the typical 30-row report read from a
+    # full pandas `iterrows` walk to a few microseconds of state update.
+    labels = df[label_col].astype("string").fillna("")
+    indents = (labels.str.len() - labels.str.lstrip(_NBSP).str.len()) // 2
+    cleans = labels.str.replace(_NBSP, "", regex=False).str.strip()
+    values = pd.to_numeric(df[delta_col], errors="coerce").fillna(0.0)
+
     by_path: dict[tuple[str, ...], float] = {}
-    stack: list[str] = []  # stack[i] = label at indent depth i
-    for _, row in df.iterrows():
-        raw_label = row.get(label_col)
-        if raw_label is None or (isinstance(raw_label, float) and pd.isna(raw_label)):
+    stack: list[str] = []
+    for label_text, indent, clean, value in zip(
+        labels.tolist(), indents.tolist(), cleans.tolist(), values.tolist(),
+    ):
+        if not label_text or not clean:
             continue
-        label_text = str(raw_label)
-        indent = _indent_depth(label_text)
-        clean = label_text.replace(_NBSP, "").strip()
-        if not clean:
-            continue
-        # Maintain the path stack: truncate to this row's depth, then set.
-        del stack[indent:]
+        del stack[int(indent):]
         stack.append(clean)
-        value = pd.to_numeric(row.get(delta_col), errors="coerce")
-        by_path[tuple(stack)] = float(value) if pd.notna(value) else 0.0
+        by_path[tuple(stack)] = float(value)
     return by_path
 
 
@@ -965,16 +1188,82 @@ def _indent_depth(indented_label: str) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shared enrichment bundle (built ONCE per render, reused by all builders)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The comparison + the two driver tables all need the same PDH-joined
+# tracker + IBP frames.  Building them three times was the dominant
+# per-render cost; this bundle exists so the page can build them once
+# and inject the result into all three builders.
+
+@dataclass(frozen=True)
+class EnrichedSources:
+    """Frozen bundle of pre-enriched frames shared across builders.
+
+    Attributes
+    ----------
+    tracker
+        Output of :func:`_enrich_tracker` (tidy, dims attached).
+    ibp
+        Output of :func:`_enrich_ibp` (tidy, dims attached).
+    ibp_orders
+        Output of :func:`_enrich_ibp` over IBP Orders (same tidy shape as
+        ``ibp``, but the ``pounds`` column carries *ordered* lbs).
+    pdh_warning
+        Non-fatal advisory when PDH was empty / unusable; the caller
+        surfaces this to the planner.
+    """
+    tracker: pd.DataFrame
+    ibp: pd.DataFrame
+    ibp_orders: pd.DataFrame
+    pdh_warning: Optional[str] = None
+
+
+def build_enriched_sources(
+    tracker_df: pd.DataFrame,
+    ibp_df: Optional[pd.DataFrame],
+    ibp_orders_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+) -> EnrichedSources:
+    """Build the shared enrichment bundle exactly once.
+
+    Performs the PDH dim frame build + vectorised tracker and IBP
+    enrichment in a single pass, so all three downstream builders
+    (comparison + PM Actual drivers + Base Plan drivers) can reuse the
+    output without redoing the work.
+    """
+    dim_frame = build_item_dim_frame(pdh_df)
+    pdh_warning: Optional[str] = None
+    if dim_frame.empty:
+        pdh_warning = (
+            "PDH (qry_pdh.csv) was empty or missing its Item No column — "
+            "Portfolio Major / Supply Format / Brand could not be resolved, "
+            "so every row is zero.  Check the upstream PDH export."
+        )
+    trk = _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched()
+    ibp = _enrich_ibp(ibp_df, dim_frame) if ibp_df is not None else _empty_enriched(actuals=True)
+    ibp_orders = (
+        _enrich_ibp(ibp_orders_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
+        if ibp_orders_df is not None
+        else _empty_enriched(actuals=True)
+    )
+    return EnrichedSources(
+        tracker=trk, ibp=ibp, ibp_orders=ibp_orders, pdh_warning=pdh_warning,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Build
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_demand_plan_comparison(
-    tracker_df: pd.DataFrame,
-    ibp_df: pd.DataFrame,
-    pdh_df: pd.DataFrame,
+    tracker_df: Optional[pd.DataFrame],
+    ibp_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
     filters: ComparisonFilters,
     *,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]] = None,
+    enriched: Optional[EnrichedSources] = None,
 ) -> ComparisonResult:
     """Build the Demand Plan Comparison Summary table.
 
@@ -1004,21 +1293,69 @@ def build_demand_plan_comparison(
 
     Never raises on missing optional inputs — degrades to zeros and a
     warning so the planner always sees the template shape.
+
+    Parameters
+    ----------
+    enriched
+        Optional pre-built :class:`EnrichedSources`.  Pass this when
+        sharing enrichment with the driver-table builders to avoid
+        re-PDH-joining the tracker / IBP frames (the hottest step in a
+        cold build).  When ``None`` the bundle is built internally.
     """
+    artifacts = _build_runtime_artifacts(
+        tracker_df, ibp_df, pdh_df, filters,
+        ro_total_delta_by_path=ro_total_delta_by_path,
+        enriched=enriched,
+    )
+
+    # 4 + 5. Assemble the display frame.
+    table = _assemble_table(artifacts.measures, artifacts.template)
+    return ComparisonResult(
+        table=table,
+        warnings=artifacts.warnings,
+        ro_summary_available=artifacts.ro_summary_available,
+    )
+
+
+@dataclass(frozen=True)
+class _RuntimeBuildArtifacts:
+    """Shared intermediate state for comparison-adjacent tables.
+
+    This captures the expensive once-per-selection work (template
+    realisation + per-row additive measures) so multiple render targets
+    can reuse it without recomputing:
+
+    - Demand Plan Comparison Summary
+    - Prior Month Actual vs Fcst summary
+    """
+    template: tuple[TemplateRow, ...]
+    template_by_id: dict[str, TemplateRow]
+    measures: dict[str, dict[str, float]]
+    warnings: tuple[str, ...]
+    ro_summary_available: bool
+    enriched: EnrichedSources
+    prior_month: date
+
+
+def _build_runtime_artifacts(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
+    enriched: Optional[EnrichedSources],
+) -> _RuntimeBuildArtifacts:
+    """Build reusable runtime artifacts for comparison-style rollups."""
     warnings: list[str] = []
 
-    # 1. Dimensions + enrichment.
-    dims = build_item_dim_lookup(pdh_df)
-    if not dims:
-        warnings.append(
-            "PDH (qry_pdh.csv) was empty or missing its Item No column — "
-            "Portfolio Major / Supply Format / Brand could not be resolved, "
-            "so every row is zero.  Check the upstream PDH export."
-        )
-    trk = _enrich_tracker(tracker_df, dims)
-    ibp = _enrich_ibp(ibp_df, dims)
+    if enriched is None:
+        enriched = build_enriched_sources(tracker_df, ibp_df, None, pdh_df)
+    if enriched.pdh_warning:
+        warnings.append(enriched.pdh_warning)
+    trk = enriched.tracker
+    ibp = enriched.ibp
 
-    # 1b. R&O source (FY27 Total Delta by label path).
     if ro_total_delta_by_path is None:
         ro_total_delta_by_path = fetch_ro_summary_total_delta_by_path()
     ro_available = bool(ro_total_delta_by_path)
@@ -1029,14 +1366,19 @@ def build_demand_plan_comparison(
             "populate it."
         )
 
-    # Precompute the month buckets once (cheap set membership downstream).
     actual_months = _months_in_range(filters.actual_start, filters.actual_end)
     forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
     prior_month = filters.prior_month.replace(day=1)
+    runtime_template = _build_runtime_template_for_filters(
+        trk, ibp, filters,
+        actual_months=actual_months,
+        forecast_months=forecast_months,
+        prior_month=prior_month,
+    )
+    runtime_template_by_id = {row.row_id: row for row in runtime_template}
 
-    # 2. Per-leaf additive measures.
     measures: dict[str, dict[str, float]] = {}
-    for tpl in COMPARISON_TEMPLATE:
+    for tpl in runtime_template:
         if tpl.is_subtotal:
             continue
         measures[tpl.row_id] = _compute_leaf_measures(
@@ -1046,18 +1388,18 @@ def build_demand_plan_comparison(
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
         )
-
-    # 3. Subtotal roll-up (children-first via the id graph).
-    for tpl in COMPARISON_TEMPLATE:
+    for tpl in runtime_template:
         if tpl.is_subtotal:
-            measures[tpl.row_id] = _rollup_subtotal(tpl, measures)
+            measures[tpl.row_id] = _rollup_subtotal(tpl, measures, runtime_template_by_id)
 
-    # 4 + 5. Assemble the display frame.
-    table = _assemble_table(measures)
-    return ComparisonResult(
-        table=table,
+    return _RuntimeBuildArtifacts(
+        template=runtime_template,
+        template_by_id=runtime_template_by_id,
+        measures=measures,
         warnings=tuple(warnings),
         ro_summary_available=ro_available,
+        enriched=enriched,
+        prior_month=prior_month,
     )
 
 
@@ -1136,7 +1478,9 @@ def _compute_leaf_measures(
 
 
 def _rollup_subtotal(
-    tpl: TemplateRow, measures: dict[str, dict[str, float]],
+    tpl: TemplateRow,
+    measures: dict[str, dict[str, float]],
+    template_by_id: dict[str, TemplateRow],
 ) -> dict[str, float]:
     """Return a subtotal's additive measures = Σ of its children.
 
@@ -1147,9 +1491,9 @@ def _rollup_subtotal(
     """
     totals = {col: 0.0 for col in _ADDITIVE_COLS}
     for child_id in tpl.children:
-        child_tpl = TEMPLATE_BY_ID[child_id]
+        child_tpl = template_by_id[child_id]
         child = (
-            _rollup_subtotal(child_tpl, measures)
+            _rollup_subtotal(child_tpl, measures, template_by_id)
             if child_tpl.is_subtotal
             else measures[child_id]
         )
@@ -1158,7 +1502,10 @@ def _rollup_subtotal(
     return totals
 
 
-def _assemble_table(measures: dict[str, dict[str, float]]) -> pd.DataFrame:
+def _assemble_table(
+    measures: dict[str, dict[str, float]],
+    template: tuple[TemplateRow, ...],
+) -> pd.DataFrame:
     """Return the display-ready table from per-row additive measures.
 
     Adds the derived + ratio columns, the indented label, the internal
@@ -1166,7 +1513,7 @@ def _assemble_table(measures: dict[str, dict[str, float]]) -> pd.DataFrame:
     to one decimal, and applies the display column order + labels.
     """
     records: list[dict] = []
-    for tpl in COMPARISON_TEMPLATE:
+    for tpl in template:
         m = measures[tpl.row_id]
 
         # Derived (linear) columns.
@@ -1221,6 +1568,296 @@ def _assemble_table(measures: dict[str, dict[str, float]]) -> pd.DataFrame:
     return df.rename(columns=DISPLAY_LABELS)
 
 
+def build_prior_month_actual_vs_fcst_table(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_shipments_df: Optional[pd.DataFrame],
+    ibp_orders_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    enriched: Optional[EnrichedSources] = None,
+) -> pd.DataFrame:
+    """Build the *Prior Month Actual vs Fcst* summary table.
+
+    Column definitions (all in millions of lbs):
+    - Prior Plan = Prior Month Forecast (from comparison measures)
+    - Ordered = prior-month IBP Orders ordered lbs
+    - Shipped = Prior Month Actual (from comparison measures)
+    - Ordered Diff. = Ordered - Prior Plan
+    - Shipped Diff. = Shipped - Prior Plan
+    - Ordered% = Ordered / Prior Plan - 1
+    - Shipped% = Shipped / Prior Plan - 1
+
+    Row hierarchy intentionally reuses the SAME runtime template as the
+    Demand Plan Comparison Summary (including dynamic Butter detail rows),
+    guaranteeing row-name/indent parity.
+    """
+    if enriched is None:
+        enriched = build_enriched_sources(
+            tracker_df, ibp_shipments_df, ibp_orders_df, pdh_df,
+        )
+
+    # No RO dependency for this table; pass an empty lookup so we can
+    # reuse the exact comparison measure pipeline without extra I/O.
+    artifacts = _build_runtime_artifacts(
+        tracker_df, ibp_shipments_df, pdh_df, filters,
+        ro_total_delta_by_path={},
+        enriched=enriched,
+    )
+    ordered_by_row = _compute_prior_month_ordered_measures(
+        artifacts.template,
+        artifacts.template_by_id,
+        artifacts.enriched.ibp_orders,
+        artifacts.prior_month,
+    )
+    return _assemble_prior_month_actual_vs_fcst_table(
+        artifacts.template,
+        artifacts.measures,
+        ordered_by_row,
+    )
+
+
+def _compute_prior_month_ordered_measures(
+    template: tuple[TemplateRow, ...],
+    template_by_id: dict[str, TemplateRow],
+    ibp_orders: pd.DataFrame,
+    prior_month: date,
+) -> dict[str, float]:
+    """Return ``{row_id -> Ordered (M lbs)}`` for prior month."""
+    ordered_measures: dict[str, float] = {}
+    for tpl in template:
+        if tpl.is_subtotal:
+            continue
+        if ibp_orders is None or ibp_orders.empty:
+            ordered_measures[tpl.row_id] = 0.0
+            continue
+        mask = _leaf_mask(ibp_orders, tpl) & (ibp_orders["month"] == prior_month)
+        ordered_measures[tpl.row_id] = _sum_millions(ibp_orders, mask)
+
+    # Subtotals use the same child graph as the comparison template so
+    # roll-up semantics stay identical (memo rows excluded by design).
+    for tpl in template:
+        if not tpl.is_subtotal:
+            continue
+        ordered_measures[tpl.row_id] = _rollup_subtotal_scalar(
+            tpl, ordered_measures, template_by_id,
+        )
+    return ordered_measures
+
+
+def _rollup_subtotal_scalar(
+    tpl: TemplateRow,
+    values_by_row: dict[str, float],
+    template_by_id: dict[str, TemplateRow],
+) -> float:
+    """Return a scalar subtotal via recursive child traversal."""
+    subtotal = 0.0
+    for child_id in tpl.children:
+        child_tpl = template_by_id[child_id]
+        if child_tpl.is_subtotal:
+            subtotal += _rollup_subtotal_scalar(
+                child_tpl, values_by_row, template_by_id,
+            )
+        else:
+            subtotal += float(values_by_row.get(child_id, 0.0))
+    return subtotal
+
+
+def _assemble_prior_month_actual_vs_fcst_table(
+    template: tuple[TemplateRow, ...],
+    measures: dict[str, dict[str, float]],
+    ordered_by_row: dict[str, float],
+) -> pd.DataFrame:
+    """Assemble the display-ready prior-month summary table."""
+    records: list[dict] = []
+    for tpl in template:
+        m = measures[tpl.row_id]
+        prior_plan = float(m[COL_PRIOR_MONTH_FORECAST])
+        shipped = float(m[COL_PRIOR_MONTH_ACTUAL])
+        ordered = float(ordered_by_row.get(tpl.row_id, 0.0))
+        ordered_diff = ordered - prior_plan
+        shipped_diff = shipped - prior_plan
+        ordered_pct = _safe_ratio(ordered_diff, prior_plan)
+        shipped_pct = _safe_ratio(shipped_diff, prior_plan)
+
+        records.append({
+            COL_ROW_ID: tpl.row_id,
+            COL_INDENT: tpl.indent,
+            COL_IS_SUBTOTAL: tpl.is_subtotal,
+            COL_IS_MEMO: tpl.is_memo,
+            COL_LABEL: _make_indented_label(tpl.label, tpl.indent, tpl.is_memo),
+            PMAF_COL_PRIOR_PLAN: prior_plan,
+            PMAF_COL_ORDERED: ordered,
+            PMAF_COL_SHIPPED: shipped,
+            PMAF_COL_ORDERED_DIFF: ordered_diff,
+            PMAF_COL_SHIPPED_DIFF: shipped_diff,
+            PMAF_COL_ORDERED_PCT: ordered_pct,
+            PMAF_COL_SHIPPED_PCT: shipped_pct,
+        })
+
+    out = pd.DataFrame.from_records(records)
+    value_cols = [
+        PMAF_COL_PRIOR_PLAN, PMAF_COL_ORDERED, PMAF_COL_SHIPPED,
+        PMAF_COL_ORDERED_DIFF, PMAF_COL_SHIPPED_DIFF,
+    ]
+    pct_cols = [PMAF_COL_ORDERED_PCT, PMAF_COL_SHIPPED_PCT]
+    for c in value_cols:
+        out[c] = out[c].round(1)
+    for c in pct_cols:
+        out[c] = out[c].round(4)
+
+    ordered_cols = [
+        *_META_COLS,
+        COL_LABEL,
+        PMAF_COL_PRIOR_PLAN,
+        PMAF_COL_ORDERED,
+        PMAF_COL_SHIPPED,
+        PMAF_COL_ORDERED_DIFF,
+        PMAF_COL_SHIPPED_DIFF,
+        PMAF_COL_ORDERED_PCT,
+        PMAF_COL_SHIPPED_PCT,
+    ]
+    return out.loc[:, ordered_cols].rename(columns={COL_LABEL: "Millions of lbs."})
+
+
+def _build_runtime_template_for_filters(
+    trk: pd.DataFrame,
+    ibp: pd.DataFrame,
+    filters: ComparisonFilters,
+    *,
+    actual_months: set[date],
+    forecast_months: set[date],
+    prior_month: date,
+) -> tuple[TemplateRow, ...]:
+    """Return the table template with dynamic Butter detail rows.
+
+    Planner rule: under the static Butter row, show additional detail rows
+    in this hierarchy:
+
+        Butter
+          Branded
+            <Supply Format 1>
+            <Supply Format 2>
+          Private
+            <Supply Format ...>
+
+    The detail rows are generated dynamically from rows that can
+    contribute to the current selection (actual/forecast/prior windows +
+    selected cycles), keeping the section "clean" (no zero-only stale
+    formats from unrelated periods).
+    """
+    dynamic_rows = _build_dynamic_butter_rows(
+        trk, ibp, filters,
+        actual_months=actual_months,
+        forecast_months=forecast_months,
+        prior_month=prior_month,
+    )
+    if not dynamic_rows:
+        return COMPARISON_TEMPLATE
+
+    out: list[TemplateRow] = []
+    for tpl in COMPARISON_TEMPLATE:
+        out.append(tpl)
+        if tpl.row_id == "butter":
+            out.extend(dynamic_rows)
+    return tuple(out)
+
+
+def _build_dynamic_butter_rows(
+    trk: pd.DataFrame,
+    ibp: pd.DataFrame,
+    filters: ComparisonFilters,
+    *,
+    actual_months: set[date],
+    forecast_months: set[date],
+    prior_month: date,
+) -> tuple[TemplateRow, ...]:
+    """Build dynamic Butter detail rows for the current filter selection."""
+    if trk.empty and ibp.empty:
+        return ()
+
+    def _collect_from_tracker() -> pd.DataFrame:
+        if trk.empty:
+            return pd.DataFrame(columns=["brand", "sfmt"])
+        trk_months = trk["month"]
+        contributes = (
+            trk_months.isin(actual_months | forecast_months | {prior_month})
+            & trk["cycle"].isin((filters.current_cycle, filters.prior_cycle))
+            & trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+        )
+        mask = _leaf_mask(trk, TemplateRow(
+            row_id="__butter_probe",
+            label="__butter_probe",
+            indent=0,
+            pmaj_match=_BUTTER,
+            pminor_match=_BUTTER_PMINOR,
+        ))
+        return trk.loc[contributes & mask, ["brand", "sfmt"]].copy()
+
+    def _collect_from_ibp() -> pd.DataFrame:
+        if ibp.empty:
+            return pd.DataFrame(columns=["brand", "sfmt"])
+        ibp_months = ibp["month"]
+        contributes = ibp_months.isin(actual_months | {prior_month})
+        mask = _leaf_mask(ibp, TemplateRow(
+            row_id="__butter_probe",
+            label="__butter_probe",
+            indent=0,
+            pmaj_match=_BUTTER,
+            pminor_match=_BUTTER_PMINOR,
+        ))
+        return ibp.loc[contributes & mask, ["brand", "sfmt"]].copy()
+
+    candidates = pd.concat([_collect_from_tracker(), _collect_from_ibp()], ignore_index=True)
+    if candidates.empty:
+        return ()
+
+    candidates["brand"] = candidates["brand"].astype(str).str.strip()
+    candidates["sfmt"] = candidates["sfmt"].astype(str).str.strip()
+    candidates = candidates.loc[(candidates["brand"] != "") & (candidates["sfmt"] != "")]
+    if candidates.empty:
+        return ()
+
+    rows: list[TemplateRow] = []
+    for brand in (BRAND_BRANDED, BRAND_PRIVATE):
+        brand_formats = sorted({
+            sf for sf in candidates.loc[candidates["brand"] == brand, "sfmt"].tolist() if sf
+        })
+        if not brand_formats:
+            continue
+        brand_id = f"butter_{brand.casefold()}"
+        child_ids = tuple(_stable_unique_row_ids(brand_id, brand_formats))
+        rows.append(_subtotal(brand_id, brand, 2, child_ids))
+        for sfmt, child_id in zip(brand_formats, child_ids):
+            rows.append(_leaf(
+                child_id, sfmt, 3,
+                pmaj_match=_BUTTER,
+                pminor_match=_BUTTER_PMINOR,
+                brand_match=brand,
+                sfmt_match=sfmt,
+            ))
+    return tuple(rows)
+
+
+def _slugify_for_row_id(text: str) -> str:
+    """Return a safe row-id slug from display text."""
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in text.strip())
+    cleaned = "_".join(part for part in cleaned.split("_") if part)
+    return cleaned or "blank"
+
+
+def _stable_unique_row_ids(prefix: str, labels: list[str]) -> list[str]:
+    """Return deterministic, collision-safe row ids for dynamic labels."""
+    seen: dict[str, int] = {}
+    ids: list[str] = []
+    for label in labels:
+        base = f"{prefix}_sfmt_{_slugify_for_row_id(label)}"
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        ids.append(base if n == 0 else f"{base}_{n+1}")
+    return ids
+
+
 def _safe_ratio(numerator: float, denominator: float) -> float:
     """Return numerator / denominator, or 0.0 when the denominator is ~0."""
     if abs(denominator) < 1e-9:
@@ -1245,6 +1882,285 @@ def _make_indented_label(label: str, indent: int, is_memo: bool) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Download helper
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Driver tables (PM Actual + Base Plan)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Two diagnostic tables that "explain" the comparison's PM Actual and
+# Base Plan columns.  Each is grouped by the raw (Portfolio Major,
+# Supply Format, Brand) dimensions present in the data (NOT the template
+# hierarchy) and, per group, surfaces the top-3 drivers — the buckets
+# whose signed contribution moved the group's value the most.
+#
+#   Portfolio Major │ Supply Format │ Brand │ <metric> │ #1 │ #2 │ #3
+#
+# Both metrics are *deltas* (signed), so a driver's sign tells the
+# planner whether that customer/item pushed the number up or down.
+
+DRV_COL_PMAJ: str = "Portfolio Major"
+DRV_COL_SFMT: str = "Supply Format"
+DRV_COL_BRAND: str = "Brand"
+DRV_BASE_PLAN_VALUE: str = "Base Plan"
+DRV_PM_ACTUAL_VALUE: str = "PM Actual"
+DRV_DRIVER_COLS: tuple[str, str, str] = ("#1 Driver", "#2 Driver", "#3 Driver")
+_DRV_BLANK: str = "(blank)"
+_DRV_TOP_N: int = 3
+
+
+def _format_millions_signed(value_m: float) -> str:
+    """Return a signed, comma-grouped millions string (1 dp), e.g. ``+1.2``."""
+    sign = "+" if value_m >= 0 else "-"
+    return f"{sign}{abs(value_m):,.1f}"
+
+
+def _driver_cell(label: str, value_m: float) -> str:
+    """Render a driver cell: ``"{label}  (+1.2)"`` (value in millions)."""
+    return f"{label}  ({_format_millions_signed(value_m)})"
+
+
+def _join_label(parts: list[str]) -> str:
+    """Join driver-label parts with a spaced en-dash separator."""
+    return " – ".join(p if p else _DRV_BLANK for p in parts)
+
+
+def _empty_driver_table(value_col: str) -> pd.DataFrame:
+    """Return an empty driver table with the canonical column order."""
+    return pd.DataFrame(columns=[
+        DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND, value_col, *DRV_DRIVER_COLS,
+    ])
+
+
+def _build_driver_table(buckets: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """Group *buckets* by (PMaj, SFmt, Brand) → value + top-3 drivers.
+
+    *buckets* must carry columns ``pmaj, sfmt, brand, bucket_label,
+    delta`` where ``delta`` is the signed contribution **in pounds**.
+    Buckets sharing a ``bucket_label`` within a group are summed first
+    (so one customer/item collapses into a single driver), then the top
+    three by ``|Σ delta|`` are reported.  The group value is the net
+    Σ delta in millions, rounded to 1 dp.
+
+    Output rows are sorted alphabetically by Portfolio Major →
+    Supply Format → Brand (planner request, 2026-06).
+    """
+    cols = [DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND, value_col, *DRV_DRIVER_COLS]
+    if buckets is None or buckets.empty:
+        return _empty_driver_table(value_col)
+
+    work = buckets.copy()
+    for c in ("pmaj", "sfmt", "brand"):
+        work[c] = (
+            work[c].astype(str).str.strip()
+            .replace({"": "(Unspecified)", "nan": "(Unspecified)"})
+        )
+    work["bucket_label"] = work["bucket_label"].astype(str)
+    work["delta"] = pd.to_numeric(work["delta"], errors="coerce").fillna(0.0)
+
+    rows: list[dict] = []
+    for (pmaj, sfmt, brand), group in work.groupby(
+        ["pmaj", "sfmt", "brand"], sort=False,
+    ):
+        net_m = float(group["delta"].sum()) / _LBS_PER_MILLION
+
+        agg = (
+            group.groupby("bucket_label", dropna=False)["delta"]
+            .sum().reset_index()
+        )
+        ranked = agg.assign(_abs=agg["delta"].abs()).sort_values(
+            by=["_abs", "bucket_label"], ascending=[False, True],
+            kind="mergesort",
+        )
+        drivers: list[str] = [
+            _driver_cell(str(r["bucket_label"]), float(r["delta"]) / _LBS_PER_MILLION)
+            for _, r in ranked.head(_DRV_TOP_N).iterrows()
+        ]
+        while len(drivers) < _DRV_TOP_N:
+            drivers.append("")
+
+        rows.append({
+            DRV_COL_PMAJ: pmaj, DRV_COL_SFMT: sfmt, DRV_COL_BRAND: brand,
+            value_col: round(net_m, 1),
+            DRV_DRIVER_COLS[0]: drivers[0],
+            DRV_DRIVER_COLS[1]: drivers[1],
+            DRV_DRIVER_COLS[2]: drivers[2],
+        })
+
+    out = pd.DataFrame(rows, columns=cols)
+    out = out.sort_values(
+        by=[DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
+        ascending=[True, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+    return out
+
+
+def _party_site_lookup(
+    dim_df: Optional[pd.DataFrame], value_candidates: tuple[str, ...],
+) -> dict[str, str]:
+    """Return ``{normalised party_site -> value}`` from the dim table.
+
+    *value_candidates* selects which dim column to map to (account
+    description or customer number).  Keys are normalised with
+    :func:`_normalise_item_key` so a numeric/text mismatch between the
+    tracker's Party Site Number and the dim's ``party_site_code`` never
+    silently drops a join.  Last row wins on duplicate party sites.
+    """
+    lookup: dict[str, str] = {}
+    if dim_df is None or dim_df.empty:
+        return lookup
+    ps_col = _resolve_column(dim_df, _DIM_PARTY_SITE_CANDIDATES)
+    val_col = _resolve_column(dim_df, value_candidates)
+    if not ps_col or not val_col:
+        logger.info(
+            "dp_dimshiptosites missing a column (party_site=%r, value=%r); "
+            "driver customer names will be blank.", ps_col, val_col,
+        )
+        return lookup
+    for ps, val in zip(dim_df[ps_col], dim_df[val_col]):
+        key = _normalise_item_key(ps)
+        if key:
+            lookup[key] = _clean_str(val)
+    return lookup
+
+
+def _customer_num_to_name(ibp_enriched: pd.DataFrame) -> dict[str, str]:
+    """Return ``{normalised customer_no -> Customer Name}`` from enriched IBP."""
+    lookup: dict[str, str] = {}
+    if ibp_enriched is None or ibp_enriched.empty:
+        return lookup
+    if "customer_no" not in ibp_enriched.columns:
+        return lookup
+    for no, name in zip(ibp_enriched["customer_no"], ibp_enriched["customer_name"]):
+        key = str(no).strip()
+        if key:
+            lookup[key] = str(name).strip()
+    return lookup
+
+
+def build_base_plan_driver_table(
+    tracker_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    dim_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    enriched: Optional[EnrichedSources] = None,
+) -> pd.DataFrame:
+    """Return the Base Plan driver table.
+
+    Value + driver magnitude = **Base Plan delta** = current-cycle minus
+    prior-cycle ``Base Plan`` pounds over the forecast months (the same
+    quantity as the comparison's *Base Plan* column).  Driver buckets are
+    ``(account_description – Party Site Number – Item Description)``, the
+    customer name resolved via ``Party Site Number → party_site_code``.
+
+    Pass *enriched* to share PDH enrichment with the comparison and the
+    PM Actual driver builder (cuts the dominant cold-build cost).
+    """
+    if enriched is None:
+        enriched = build_enriched_sources(tracker_df, None, None, pdh_df)
+    trk = enriched.tracker
+    if trk.empty:
+        return _empty_driver_table(DRV_BASE_PLAN_VALUE)
+
+    forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
+    sub = trk.loc[
+        (trk["forecast_type"] == FORECAST_BASE_PLAN)
+        & (trk["month"].isin(forecast_months))
+        & (trk["cycle"].isin([filters.current_cycle, filters.prior_cycle]))
+    ].copy()
+    if sub.empty:
+        return _empty_driver_table(DRV_BASE_PLAN_VALUE)
+
+    # Signed pounds: + for current cycle, − for prior cycle → delta.
+    sub["delta"] = sub["pounds"].where(
+        sub["cycle"] == filters.current_cycle, -sub["pounds"])
+
+    ps_to_acct = _party_site_lookup(dim_df, _DIM_ACCOUNT_DESC_CANDIDATES)
+    cust = _vectorised_item_key(sub["party_site"]).map(
+        lambda k: ps_to_acct.get(k, ""))
+    sub["bucket_label"] = [
+        _join_label([c, ps, desc])
+        for c, ps, desc in zip(cust, sub["party_site"], sub["item_desc"])
+    ]
+    return _build_driver_table(
+        sub[["pmaj", "sfmt", "brand", "bucket_label", "delta"]],
+        DRV_BASE_PLAN_VALUE,
+    )
+
+
+def build_pm_actual_driver_table(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    dim_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    enriched: Optional[EnrichedSources] = None,
+) -> pd.DataFrame:
+    """Return the PM Actual driver table.
+
+    Value + driver magnitude = **PM Actual delta** = prior-month IBP
+    actual minus prior-month current-cycle (Base + R&O) tracker forecast
+    (the same quantity as the comparison's *PM Actual* column).  Driver
+    buckets are ``(Customer Name – Item Description)``: the actual side
+    keys on IBP's own ``Customer Name``; the forecast side maps
+    ``Party Site Number → customer_num → Customer Name`` so both sides
+    net within the same bucket.
+
+    Pass *enriched* to share PDH enrichment with the comparison and the
+    Base Plan driver builder (cuts the dominant cold-build cost).
+    """
+    if enriched is None:
+        enriched = build_enriched_sources(tracker_df, ibp_df, None, pdh_df)
+    trk = enriched.tracker
+    ibp = enriched.ibp
+    prior_month = filters.prior_month.replace(day=1)
+
+    parts: list[pd.DataFrame] = []
+
+    # ── Actual side (IBP, prior month): +pounds ──────────────────────
+    if not ibp.empty:
+        act = ibp.loc[ibp["month"] == prior_month].copy()
+        if not act.empty:
+            act["delta"] = act["pounds"]
+            name = act["customer_name"].where(
+                act["customer_name"].astype(bool), act["customer_no"])
+            act["bucket_label"] = [
+                _join_label([c, d]) for c, d in zip(name, act["item_desc"])
+            ]
+            parts.append(act[["pmaj", "sfmt", "brand", "bucket_label", "delta"]])
+
+    # ── Forecast side (tracker, current cycle, Base+R&O, prior month): −pounds ─
+    if not trk.empty:
+        fc = trk.loc[
+            (trk["cycle"] == filters.current_cycle)
+            & (trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O)))
+            & (trk["month"] == prior_month)
+        ].copy()
+        if not fc.empty:
+            fc["delta"] = -fc["pounds"]
+            ps_to_num = _party_site_lookup(dim_df, _DIM_CUSTOMER_NUM_CANDIDATES)
+            num_to_name = _customer_num_to_name(ibp)
+            cust_num = _vectorised_item_key(fc["party_site"]).map(
+                lambda k: ps_to_num.get(k, ""))
+            name = cust_num.map(lambda n: num_to_name.get(n, n))
+            fc["bucket_label"] = [
+                _join_label([c, d]) for c, d in zip(name, fc["item_desc"])
+            ]
+            parts.append(fc[["pmaj", "sfmt", "brand", "bucket_label", "delta"]])
+
+    if not parts:
+        return _empty_driver_table(DRV_PM_ACTUAL_VALUE)
+    return _build_driver_table(pd.concat(parts, ignore_index=True), DRV_PM_ACTUAL_VALUE)
+
+
+def driver_table_to_csv_bytes(table: pd.DataFrame) -> bytes:
+    """Serialise a driver table to UTF-8 CSV bytes for download."""
+    if table is None or table.empty:
+        return b""
+    return table.to_csv(index=False).encode("utf-8")
+
 
 def comparison_to_csv_bytes(result: ComparisonResult) -> bytes:
     """Serialise the comparison table to UTF-8 CSV bytes for download.
@@ -1276,6 +2192,26 @@ __all__ = [
     "list_tracker_months",
     "validate_filters",
     "fetch_ro_summary_total_delta_by_path",
+    "build_enriched_sources",
+    "EnrichedSources",
+    "build_item_dim_frame",
     "build_demand_plan_comparison",
+    "build_prior_month_actual_vs_fcst_table",
     "comparison_to_csv_bytes",
+    "PMAF_COL_PRIOR_PLAN",
+    "PMAF_COL_ORDERED",
+    "PMAF_COL_SHIPPED",
+    "PMAF_COL_ORDERED_DIFF",
+    "PMAF_COL_SHIPPED_DIFF",
+    "PMAF_COL_ORDERED_PCT",
+    "PMAF_COL_SHIPPED_PCT",
+    "build_base_plan_driver_table",
+    "build_pm_actual_driver_table",
+    "driver_table_to_csv_bytes",
+    "DRV_COL_PMAJ",
+    "DRV_COL_SFMT",
+    "DRV_COL_BRAND",
+    "DRV_BASE_PLAN_VALUE",
+    "DRV_PM_ACTUAL_VALUE",
+    "DRV_DRIVER_COLS",
 ]

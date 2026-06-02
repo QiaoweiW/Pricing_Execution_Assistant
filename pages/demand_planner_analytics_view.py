@@ -82,12 +82,32 @@ from data_sources.demand_summary import (
 )
 from data_sources.demand_plan_comparison import (
     ComparisonFilters,
+    ComparisonResult,
     DISPLAY_LABELS as DPC_DISPLAY_LABELS,
     DISPLAY_ORDER as DPC_DISPLAY_ORDER,
     PERCENT_COLS as DPC_PERCENT_COLS,
     COL_LABEL as DPC_COL_LABEL,
+    DRV_COL_PMAJ,
+    DRV_COL_SFMT,
+    DRV_COL_BRAND,
+    DRV_BASE_PLAN_VALUE,
+    DRV_PM_ACTUAL_VALUE,
+    DRV_DRIVER_COLS,
+    PMAF_COL_PRIOR_PLAN,
+    PMAF_COL_ORDERED,
+    PMAF_COL_SHIPPED,
+    PMAF_COL_ORDERED_DIFF,
+    PMAF_COL_SHIPPED_DIFF,
+    PMAF_COL_ORDERED_PCT,
+    PMAF_COL_SHIPPED_PCT,
+    EnrichedSources,
+    build_base_plan_driver_table,
     build_demand_plan_comparison,
+    build_enriched_sources,
+    build_prior_month_actual_vs_fcst_table,
+    build_pm_actual_driver_table,
     comparison_to_csv_bytes,
+    driver_table_to_csv_bytes,
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
     list_tracker_months,
@@ -95,7 +115,12 @@ from data_sources.demand_plan_comparison import (
 )
 from data_sources.ibp_official import (
     IBPOfficialSourceError,
-    fetch_ibp_shipments_df,
+    fetch_ibp_orders_slim_df,
+    fetch_ibp_shipments_slim_df,
+)
+from data_sources.ship_to_sites import (
+    ShipToSitesSourceError,
+    fetch_dimshiptosites_df,
 )
 from data_sources.ro_comparison import (
     ANNUAL_OPP_CHANGE,
@@ -3049,16 +3074,178 @@ def _render_demand_plan_comparison_section() -> None:
     _render_demand_plan_comparison_fragment()
 
 
+# ── Cached build layer ───────────────────────────────────────────────────────
+#
+# Streamlit reruns the entire fragment body on every widget event.  The
+# Fabric *reads* are cached, but the *builds* (PDH-enrich → comparison →
+# drivers) used to recompute every time, costing the bulk of the
+# fragment latency.  The helpers below wrap each build in
+# ``@st.cache_data`` keyed on a lightweight **signature** (etag /
+# row-count tuple + the filters), so two reruns with the same data +
+# selection hit the cache.  The actual DataFrames go through
+# underscore-prefixed args, which Streamlit excludes from hashing — we
+# never pay the cost of hashing a 356k-row tracker.
+#
+# Why ``@st.cache_data`` and not ``@st.cache_resource``: each output is
+# an immutable value (DataFrame + DataFrames) we want copied on read.
+# That's exactly the cache_data contract; cache_resource would risk
+# downstream mutation leaking back into the cached slot.
+
+# Session-state key for the user's "Load comparison" opt-in.  Persisted
+# across reruns so the planner doesn't have to re-click on every
+# interaction once they've expanded the section.
+_DPC_ENABLED_KEY: str = "demand_plan_comparison_enabled"
+
+# TTL for the derived (build) outputs.  60 minutes — matches the bumped
+# raw-CSV TTL so the build cache never out-lives its inputs.  The "🔄
+# Refresh from Fabric" button clears the raw cache (and the page reruns,
+# so the build cache misses cleanly on the next render).
+_CACHE_TTL_SECONDS_OUTPUTS: int = 60 * 60
+
+
+def _signature_for(df: Optional[pd.DataFrame]) -> tuple[int, int]:
+    """Return a cheap ``(rows, cols)`` signature for a DataFrame.
+
+    Skips full hashing — a row-count + column-count change is the
+    overwhelming majority of "data changed" signals on these slow-moving
+    Fabric exports.  The TTL on the underlying cached read covers the
+    long-tail freshness case, and the explicit "Refresh from Fabric"
+    button still busts everything.
+    """
+    if df is None or df.empty:
+        return (0, 0)
+    return (int(len(df)), int(len(df.columns)))
+
+
+# NOTE on the cache decorator choice
+# -----------------------------------
+# * ``@st.cache_resource`` for the **shared enrichment bundle** —
+#   we want the SAME object reference handed to all three builders so
+#   downstream consumers re-use the in-memory DataFrames; pickling would
+#   defeat the share.  ``cache_resource`` also sidesteps the
+#   ``UnserializableReturnValueError`` previously seen on dataclass
+#   return values (the cached object is held by reference, never
+#   round-tripped through pickle).
+# * ``@st.cache_data`` for the **per-filter build outputs** — each
+#   cached return is a value (DataFrame or native tuple) safe to copy
+#   on read.  We return a native tuple from the comparison build and
+#   reconstruct ``ComparisonResult`` outside the cache, mirroring the
+#   defensive pattern already used in ``demand_summary._cached_fetch``.
+
+@st.cache_resource(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_enriched_sources(
+    tracker_sig: tuple, ibp_sig: tuple, ibp_orders_sig: tuple, pdh_sig: tuple,
+    _tracker_df: pd.DataFrame,
+    _ibp_df: Optional[pd.DataFrame],
+    _ibp_orders_df: Optional[pd.DataFrame],
+    _pdh_df: Optional[pd.DataFrame],
+) -> EnrichedSources:
+    """Cache the shared PDH-joined tracker + IBP frames (by reference).
+
+    Built once per unique ``(tracker, ibp, pdh)`` signature, shared by
+    the comparison builder and BOTH driver builders.  Leading-underscore
+    arg names tell Streamlit to skip hashing the DataFrames themselves
+    (we already key on their signature tuples).
+    """
+    return build_enriched_sources(_tracker_df, _ibp_df, _ibp_orders_df, _pdh_df)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_demand_plan_comparison_payload(
+    sig_key: tuple,
+    filters: ComparisonFilters,
+    ro_lookup_key: tuple,
+    _enriched: EnrichedSources,
+    _ro_lookup: dict,
+) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
+    """Cache the comparison build, returning a NATIVE tuple.
+
+    Returns ``(table, warnings_tuple, ro_summary_available)`` so the
+    cache only stores DataFrames + tuples + bool — avoiding the
+    pickle-class-identity hazard with custom dataclasses.  The caller
+    rebuilds the :class:`ComparisonResult` outside the cache.
+
+    ``sig_key`` rolls the enriched-sources signature so a fresh tracker
+    / IBP / PDH read invalidates the cached result; ``ro_lookup_key`` is
+    a tuple summary of the RO Summary lookup so editing the RO Summary
+    Report also invalidates the cached comparison.
+    """
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        ro_total_delta_by_path=_ro_lookup,
+        enriched=_enriched,
+    )
+    return result.table, tuple(result.warnings), bool(result.ro_summary_available)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_prior_month_actual_vs_fcst_table(
+    sig_key: tuple,
+    filters: ComparisonFilters,
+    _enriched: EnrichedSources,
+) -> pd.DataFrame:
+    """Cache the Prior Month Actual vs Fcst table per data/filter signature."""
+    return build_prior_month_actual_vs_fcst_table(
+        None, None, None, None, filters, enriched=_enriched,
+    )
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_base_plan_driver_table(
+    sig_key: tuple, filters: ComparisonFilters, dim_sig: tuple,
+    _enriched: EnrichedSources, _dim_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Cache the Base Plan driver build per ``(data signature, filters, dim)``."""
+    return build_base_plan_driver_table(
+        None, None, _dim_df, filters, enriched=_enriched,
+    )
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_pm_actual_driver_table(
+    sig_key: tuple, filters: ComparisonFilters, dim_sig: tuple,
+    _enriched: EnrichedSources, _dim_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Cache the PM Actual driver build per ``(data signature, filters, dim)``."""
+    return build_pm_actual_driver_table(
+        None, None, None, _dim_df, filters, enriched=_enriched,
+    )
+
+
+def _ro_lookup_signature(ro_lookup: dict) -> tuple:
+    """Return a cheap, hashable summary of the RO Summary lookup.
+
+    Captures total-row count + sum of values — enough to detect any
+    edit/refresh of the underlying RO Summary Report without re-hashing
+    the entire dict on every cached call.
+    """
+    if not ro_lookup:
+        return (0, 0.0)
+    try:
+        return (len(ro_lookup), round(float(sum(ro_lookup.values())), 4))
+    except (TypeError, ValueError):
+        return (len(ro_lookup), 0.0)
+
+
 @st.fragment
 def _render_demand_plan_comparison_fragment() -> None:
     """Load sources, render the pickers, build + render the comparison.
 
-    Wrapped in a ``@st.fragment`` so a picker change reruns only this
-    block (no upstream Fabric re-reads, no MOM-pivot rebuild).  Every
-    Fabric read is wrapped so one missing source degrades gracefully
-    (plan-only or actuals-only) instead of breaking the whole section.
+    Render flow
+    -----------
+    1. Tracker (the spine — used for the pickers too) is loaded first.
+    2. Pickers + validation render before any expensive supporting
+       sources are touched, so an invalid selection short-circuits
+       without an IBP/PDH read.
+    3. The expensive comparison + driver-table builds are gated behind
+       an opt-in toggle stored in :data:`st.session_state` — collapsing
+       the expander or first-paint no longer forces a build.
+    4. PDH / IBP / RO Summary / dim are loaded only when the user opted
+       in; each loader degrades gracefully.
+    5. Shared :class:`EnrichedSources` is cached and reused by all three
+       builders so the PDH-merge cost is paid exactly once per signature.
     """
-    # 1. Load the tracker (the spine of the section — bail if missing).
+    # 1. Tracker (cheap CSV read, lives behind the 60-min cache).
     try:
         with st.spinner("Reading qry_mgmt_plan_history_tracker.csv from Microsoft Fabric…"):
             tracker_snapshot = fetch_mgmt_plan_history_tracker()
@@ -3076,7 +3263,7 @@ def _render_demand_plan_comparison_fragment() -> None:
         )
         return
 
-    # 2. Discover cycles + months for the pickers.
+    # 2. Picker data + selection.
     cycles = list_tracker_cycles(tracker_df)
     months = list_tracker_months(tracker_df)
     if len(cycles) < 2:
@@ -3092,37 +3279,119 @@ def _render_demand_plan_comparison_fragment() -> None:
         )
         return
 
-    # 3. Render the pickers and assemble a filter selection.
     filters = _render_demand_comparison_filters(cycles, months)
-
-    # 4. Validate (disjoint ranges, distinct cycles, ordered bounds).
     errors = validate_filters(filters)
     if errors:
         for msg in errors:
             st.error(f"❌ {msg}")
         return
 
-    # 5. Load the supporting sources (non-fatal — builder degrades).
-    pdh_df = _load_demand_comparison_pdh()
-    ibp_df, ibp_warning = _load_demand_comparison_ibp()
-    ro_lookup = fetch_ro_summary_total_delta_by_path()
-
-    # 6. Build.
-    with st.spinner("Building Demand Plan Comparison Summary…"):
-        result = build_demand_plan_comparison(
-            tracker_df, ibp_df, pdh_df, filters,
-            ro_total_delta_by_path=ro_lookup,
+    # 3. Opt-in gate.  Expensive builds (PDH-merge over the 356k-row
+    #    tracker + IBP slim read + RO Summary read + 3 build passes) only
+    #    happen once the planner explicitly asks for them — and stay
+    #    enabled across reruns so picker changes don't require re-clicking.
+    enabled = st.session_state.get(_DPC_ENABLED_KEY, False)
+    if not enabled:
+        if st.button(
+            "▶ Load Demand Plan Comparison (uses tracker + IBP + PDH)",
+            key="demand_plan_comparison_enable",
+            type="primary",
+            width="stretch",
+            help=(
+                "Pulls the supporting sources and builds the comparison + "
+                "driver tables.  Once loaded, the section stays live for "
+                "the rest of this session — picker changes rebuild only "
+                "the comparison, not the underlying enrichment."
+            ),
+        ):
+            st.session_state[_DPC_ENABLED_KEY] = True
+            st.rerun(scope="fragment")
+        st.caption(
+            "_The Demand Plan Comparison + driver tables are heavy "
+            "(joins the 356k-row tracker against PDH and the IBP Delta "
+            "table).  They're loaded on demand to keep the rest of the "
+            "Demand Summary section snappy._"
         )
+        return
 
-    # 7. Surface advisories (missing IBP column, empty PDH, no RO Summary).
-    warnings = list(result.warnings)
+    # 4. Heavy supporting sources — loaded only post opt-in.  Each
+    #    loader is independent so a single failing source doesn't
+    #    short-circuit the others; the builder degrades gracefully.
+    pdh_df = _load_demand_comparison_pdh()
+    actual_months = _months_in_range_local(
+        filters.actual_start, filters.actual_end)
+    prior_month_set = {filters.prior_month.replace(day=1)}
+    ibp_month_filter = tuple(sorted(actual_months | prior_month_set))
+    ibp_df, ibp_warning = _load_demand_comparison_ibp(months=ibp_month_filter)
+    ibp_orders_df, ibp_orders_warning = _load_demand_comparison_ibp_orders(
+        months=tuple(sorted(prior_month_set)),
+    )
+    ro_lookup = fetch_ro_summary_total_delta_by_path()
+    dim_df, dim_warning = _load_demand_comparison_dim()
+
+    # 5. Build the shared enrichment ONCE, then reuse it across all
+    #    three builders.  Cached on data signatures so repeated reruns
+    #    with the same data + filters are free.
+    tracker_sig = _signature_for(tracker_df)
+    ibp_sig = _signature_for(ibp_df)
+    ibp_orders_sig = _signature_for(ibp_orders_df)
+    pdh_sig = _signature_for(pdh_df)
+    dim_sig = _signature_for(dim_df)
+    ro_sig = _ro_lookup_signature(ro_lookup)
+    enrich_sig = (tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig)
+
+    with st.spinner("Building Demand Plan Comparison Summary…"):
+        enriched = _cached_enriched_sources(
+            tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig,
+            tracker_df, ibp_df, ibp_orders_df, pdh_df,
+        )
+        table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
+            enrich_sig + (ro_sig,), filters, ro_sig, enriched, ro_lookup,
+        )
+        prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
+            enrich_sig + (filters.prior_month,), filters, enriched,
+        )
+    # Reconstruct the dataclass OUTSIDE the cache (the cache stores
+    # native values only — see the decorator-choice note above).
+    result = ComparisonResult(
+        table=table, warnings=build_warnings, ro_summary_available=ro_available,
+    )
+
+    # 6. Surface advisories (missing IBP column, empty PDH, no RO Summary, no dim).
+    warnings = list(build_warnings)
     if ibp_warning:
         warnings.insert(0, ibp_warning)
+    if ibp_orders_warning:
+        warnings.append(ibp_orders_warning)
+    if dim_warning:
+        warnings.append(dim_warning)
     for msg in warnings:
         st.warning(f"⚠️ {msg}")
 
-    # 8. Render the table + download.
+    # 7. Render the comparison table + download / save.
     _render_demand_comparison_table(result)
+
+    # 8. Prior Month Actual vs Fcst summary (between comparison and drivers).
+    _render_prior_month_actual_vs_fcst_table(prior_month_vs_fcst)
+
+    # 9. Driver tables — share the same EnrichedSources + dim signature.
+    _render_demand_comparison_driver_tables_cached(
+        enrich_sig, filters, dim_sig, enriched, dim_df,
+    )
+
+
+def _months_in_range_local(start: date, end: date) -> set[date]:
+    """Return the inclusive first-of-month set covered by [start, end]."""
+    out: set[date] = set()
+    cur = start.replace(day=1)
+    end_norm = end.replace(day=1)
+    while cur <= end_norm:
+        out.add(cur)
+        if cur.month == 12:
+            cur = cur.replace(year=cur.year + 1, month=1)
+        else:
+            cur = cur.replace(month=cur.month + 1)
+    return out
 
 
 def _render_demand_comparison_filters(
@@ -3251,20 +3520,55 @@ def _load_demand_comparison_pdh() -> Optional[pd.DataFrame]:
         return None
 
 
-def _load_demand_comparison_ibp() -> tuple[Optional[pd.DataFrame], Optional[str]]:
-    """Return ``(IBP Shipments frame, warning)`` — warning is ``None`` on success.
+def _load_demand_comparison_ibp(
+    months: Optional[tuple[date, ...]] = None,
+) -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(slim IBP Shipments frame, warning)``.
 
-    Non-fatal: an IBP failure yields an empty-actuals build (plan
-    columns still render) plus a user-facing warning string.
+    Calls the *slim* fetcher with a month predicate pushed into DuckDB
+    so OneLake only returns the few months the comparison actually
+    consumes (was: full table scan, every render).  Non-fatal: an IBP
+    failure yields an empty-actuals build plus a user-facing warning.
     """
     try:
-        df, _meta = fetch_ibp_shipments_df()
+        df = fetch_ibp_shipments_slim_df(months=months)
         return df, None
     except IBPOfficialSourceError as exc:
         logger.info("IBP Shipments unavailable for Demand Plan Comparison: %s", exc)
         return None, (
             "IBP Shipments could not be read, so the Actuals columns are "
             f"zero.  ({exc})"
+        )
+
+
+def _load_demand_comparison_ibp_orders(
+    months: Optional[tuple[date, ...]] = None,
+) -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(slim IBP Orders frame, warning)`` for prior-month summary."""
+    try:
+        df = fetch_ibp_orders_slim_df(months=months)
+        return df, None
+    except IBPOfficialSourceError as exc:
+        logger.info("IBP Orders unavailable for Prior Month summary: %s", exc)
+        return None, (
+            "IBP Orders could not be read, so the Ordered column is zero.  "
+            f"({exc})"
+        )
+
+
+def _load_demand_comparison_dim() -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(dp_dimshiptosites frame, warning)`` for the driver tables.
+
+    Non-fatal: a dim failure leaves the driver-table customer names blank
+    (Party Site Number + Item Description still resolve) plus a warning.
+    """
+    try:
+        return fetch_dimshiptosites_df(), None
+    except ShipToSitesSourceError as exc:
+        logger.info("dp_dimshiptosites unavailable for driver tables: %s", exc)
+        return None, (
+            "Ship-to-site dimension (dp_dimshiptosites) could not be read, so "
+            f"driver customer names may be blank.  ({exc})"
         )
 
 
@@ -3393,6 +3697,258 @@ def _render_demand_comparison_table(result) -> None:
             "_R&O is zero because the RO Summary Report could not be read. "
             "Save the RO Summary Report above to populate it._"
         )
+
+
+def _render_one_driver_table(
+    table: pd.DataFrame, value_col: str, key_prefix: str,
+) -> None:
+    """Render one driver table with sort/search filters + download.
+
+    Filters are intentionally planner-oriented (dimension picks +
+    free-text item/customer search) and are applied client-side to the
+    already-built driver frame — no extra Fabric reads.
+    """
+    if table is None or table.empty:
+        st.info("No driver rows to display for the current selection.")
+        return
+
+    filtered = _render_driver_filters(table, key_prefix)
+    # Enforce deterministic alphabetical ordering requested by planner.
+    filtered = filtered.sort_values(
+        by=[DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
+        ascending=[True, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        label=f"⬇️ Download {value_col} drivers (CSV)",
+        data=driver_table_to_csv_bytes(filtered),
+        file_name=f"{key_prefix}_{today}.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_download",
+        width="stretch",
+    )
+
+    column_config = {
+        DRV_COL_PMAJ: st.column_config.TextColumn(DRV_COL_PMAJ, width="small"),
+        DRV_COL_SFMT: st.column_config.TextColumn(DRV_COL_SFMT, width="small"),
+        DRV_COL_BRAND: st.column_config.TextColumn(DRV_COL_BRAND, width="small"),
+        value_col: st.column_config.NumberColumn(value_col, format="%.1f"),
+    }
+    for col in DRV_DRIVER_COLS:
+        column_config[col] = st.column_config.TextColumn(col, width="large")
+
+    table_height = min(35 * (len(filtered) + 1) + 38, 720)
+    st.dataframe(
+        filtered,
+        width="stretch",
+        hide_index=True,
+        height=table_height,
+        column_config=column_config,
+    )
+
+
+def _render_driver_filters(table: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+    """Render driver-table filters and return the filtered frame.
+
+    Search semantics:
+    - Portfolio Major / Supply Format / Brand are exact-dimension filters.
+    - Item Description / Customer are case-insensitive substring matches
+      against the three driver text cells (#1/#2/#3 Driver), which keeps
+      the UI lightweight while still enabling quick pinpoint search.
+    """
+    pmaj_values = sorted(v for v in table[DRV_COL_PMAJ].dropna().astype(str).str.strip().unique() if v)
+    sfmt_values = sorted(v for v in table[DRV_COL_SFMT].dropna().astype(str).str.strip().unique() if v)
+    brand_values = sorted(v for v in table[DRV_COL_BRAND].dropna().astype(str).str.strip().unique() if v)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        selected_pmaj = st.multiselect(
+            "Portfolio Major",
+            options=pmaj_values,
+            key=f"{key_prefix}_flt_pmaj",
+            placeholder="All",
+        )
+    with c2:
+        selected_sfmt = st.multiselect(
+            "Supply Format",
+            options=sfmt_values,
+            key=f"{key_prefix}_flt_sfmt",
+            placeholder="All",
+        )
+    with c3:
+        selected_brand = st.multiselect(
+            "Brand",
+            options=brand_values,
+            key=f"{key_prefix}_flt_brand",
+            placeholder="All",
+        )
+
+    q1, q2 = st.columns(2)
+    with q1:
+        item_query = st.text_input(
+            "Item Description contains",
+            key=f"{key_prefix}_flt_item",
+            placeholder="e.g. Qtr 1Lb",
+        ).strip().casefold()
+    with q2:
+        customer_query = st.text_input(
+            "Customer contains",
+            key=f"{key_prefix}_flt_customer",
+            placeholder="e.g. Walmart",
+        ).strip().casefold()
+
+    out = table.copy()
+    if selected_pmaj:
+        out = out.loc[out[DRV_COL_PMAJ].isin(selected_pmaj)]
+    if selected_sfmt:
+        out = out.loc[out[DRV_COL_SFMT].isin(selected_sfmt)]
+    if selected_brand:
+        out = out.loc[out[DRV_COL_BRAND].isin(selected_brand)]
+
+    if item_query or customer_query:
+        # Search against driver text cells only (#1/#2/#3) so we don't
+        # need to carry raw driver-bucket columns into the display table.
+        text_blob = (
+            out[list(DRV_DRIVER_COLS)]
+            .fillna("")
+            .astype(str)
+            .agg(" | ".join, axis=1)
+            .str.casefold()
+        )
+        if item_query:
+            out = out.loc[text_blob.str.contains(item_query, regex=False)]
+            text_blob = text_blob.loc[out.index]
+        if customer_query:
+            out = out.loc[text_blob.str.contains(customer_query, regex=False)]
+
+    if out.empty:
+        st.caption("No rows match the current driver filters.")
+    return out.reset_index(drop=True)
+
+
+def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
+    """Render the *Prior Month Actual vs Fcst* summary table.
+
+    This sits below Demand Plan Comparison Summary and above the driver
+    tables.  It reuses the exact same row hierarchy/indent metadata as
+    the comparison table (including dynamic Butter detail rows).
+    """
+    st.markdown("#### 📌 Prior Month Actual vs Fcst")
+    st.caption(
+        "Prior Plan = Prior Month Forecast, Ordered = IBP Orders (Ordered Qty lbs), "
+        "Shipped = Prior Month Actual.  All values are in millions of lbs."
+    )
+    if table is None or table.empty:
+        st.info("No rows available for Prior Month Actual vs Fcst.")
+        return
+
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    out_df = table.drop(
+        columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
+                 if c in table.columns]
+    ).reset_index(drop=True)
+    st.download_button(
+        label="⬇️ Download Prior Month Actual vs Fcst (CSV)",
+        data=out_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"prior_month_actual_vs_fcst_{today}.csv",
+        mime="text/csv",
+        key="dpc_prior_month_vs_fcst_download",
+        width="stretch",
+    )
+
+    subtotal_flags = table["_is_subtotal"].tolist() if "_is_subtotal" in table.columns else []
+    memo_flags = table["_is_memo"].tolist() if "_is_memo" in table.columns else []
+    for pct_col in (PMAF_COL_ORDERED_PCT, PMAF_COL_SHIPPED_PCT):
+        if pct_col in out_df.columns:
+            out_df[pct_col] = out_df[pct_col] * 100.0
+
+    def _style_row(row: pd.Series) -> list[str]:
+        i = int(row.name)
+        if i < len(subtotal_flags) and subtotal_flags[i]:
+            return ["background-color: #fde9d9; font-weight: 600"] * len(row)
+        if i < len(memo_flags) and memo_flags[i]:
+            return ["font-style: italic; color: #555555"] * len(row)
+        return [""] * len(row)
+
+    styled = out_df.style.apply(_style_row, axis=1)
+    column_order = [
+        DPC_COL_LABEL,
+        PMAF_COL_PRIOR_PLAN,
+        PMAF_COL_ORDERED,
+        PMAF_COL_SHIPPED,
+        PMAF_COL_ORDERED_DIFF,
+        PMAF_COL_SHIPPED_DIFF,
+        PMAF_COL_ORDERED_PCT,
+        PMAF_COL_SHIPPED_PCT,
+    ]
+    column_config = {
+        DPC_COL_LABEL: st.column_config.TextColumn(DPC_COL_LABEL, width="large", pinned=True),
+        PMAF_COL_PRIOR_PLAN: st.column_config.NumberColumn(PMAF_COL_PRIOR_PLAN, format="%.1f"),
+        PMAF_COL_ORDERED: st.column_config.NumberColumn(PMAF_COL_ORDERED, format="%.1f"),
+        PMAF_COL_SHIPPED: st.column_config.NumberColumn(PMAF_COL_SHIPPED, format="%.1f"),
+        PMAF_COL_ORDERED_DIFF: st.column_config.NumberColumn(PMAF_COL_ORDERED_DIFF, format="%.1f"),
+        PMAF_COL_SHIPPED_DIFF: st.column_config.NumberColumn(PMAF_COL_SHIPPED_DIFF, format="%.1f"),
+        PMAF_COL_ORDERED_PCT: st.column_config.NumberColumn(PMAF_COL_ORDERED_PCT, format="%.1f%%"),
+        PMAF_COL_SHIPPED_PCT: st.column_config.NumberColumn(PMAF_COL_SHIPPED_PCT, format="%.1f%%"),
+    }
+    table_height = min(35 * (len(out_df) + 1) + 38, 860)
+    st.dataframe(
+        styled,
+        width="stretch",
+        hide_index=True,
+        height=table_height,
+        column_order=[c for c in column_order if c in out_df.columns],
+        column_config=column_config,
+    )
+
+
+def _render_demand_comparison_driver_tables_cached(
+    enrich_sig: tuple,
+    filters: ComparisonFilters,
+    dim_sig: tuple,
+    enriched: EnrichedSources,
+    dim_df: Optional[pd.DataFrame],
+) -> None:
+    """Render the PM Actual + Base Plan driver tables (shared enrichment, cached).
+
+    Both builders consume the same :class:`EnrichedSources` bundle —
+    the PDH-merge happened once upstream — and each build itself is
+    wrapped in :func:`_cached_demand_plan_comparison`-style cache slots,
+    so repeated reruns at the same selection are essentially free.
+
+    Each table breaks the comparison's metric down by
+    (Portfolio Major × Supply Format × Brand) and surfaces the top-3
+    customer/item drivers (signed, in millions of lbs).  Values are
+    *deltas*, matching the comparison's PM Actual / Base Plan columns.
+    """
+    st.markdown("#### 🔍 Drivers")
+    st.caption(
+        "Top-3 movers behind **PM Actual** and **Base Plan**, by "
+        "Portfolio Major × Supply Format × Brand.  Each driver shows its "
+        "signed contribution in millions of lbs."
+    )
+
+    with st.spinner("Building driver tables…"):
+        pm_table = _cached_pm_actual_driver_table(
+            enrich_sig, filters, dim_sig, enriched, dim_df,
+        )
+        bp_table = _cached_base_plan_driver_table(
+            enrich_sig, filters, dim_sig, enriched, dim_df,
+        )
+
+    st.markdown(
+        f"**PM Actual drivers**  —  _driver = Customer Name – Item Description "
+        f"(prior month: {filters.prior_month.strftime('%b %Y')})_"
+    )
+    _render_one_driver_table(pm_table, DRV_PM_ACTUAL_VALUE, "pm_actual_drivers")
+
+    st.markdown(
+        "**Base Plan drivers**  —  _driver = Customer – Party Site – Item "
+        "Description (current vs prior cycle, forecast months)_"
+    )
+    _render_one_driver_table(bp_table, DRV_BASE_PLAN_VALUE, "base_plan_drivers")
 
 
 # ── 3. Entry point ────────────────────────────────────────────────────────────

@@ -338,6 +338,22 @@ def prepare_ibp_base_plan_long(
     """Tidy base-plan rows for Product Line Review joins.
 
     Output columns: ``month, pounds, pmaj, sfmt, pminor, brand, customer``.
+
+    Index discipline
+    ----------------
+    The cycle filter (``work = work.loc[…]``) leaves *work* with a NON-
+    contiguous index.  Mixing those Series with the merged frame's
+    fresh RangeIndex inside a ``pd.DataFrame({…})`` constructor causes
+    pandas to align on the index UNION and NaN-fill the rest — silently
+    producing an all-blank ``pmaj/sfmt/brand`` frame and every base-plan
+    sum collapsing to 0.  Two safeguards prevent that here:
+
+      * ``work = work.reset_index(drop=True)`` AFTER the cycle filter
+        normalises every downstream Series to RangeIndex 0..n-1.
+      * Every Series passed to the final ``out`` constructor is
+        ``.to_numpy()`` first so the result is laid out positionally
+        rather than via index alignment.  Matches the contract already
+        used by :func:`_enrich_ibp` in ``demand_plan_comparison``.
     """
     empty_cols = ["month", "pounds", "pmaj", "sfmt", "pminor", "brand", "customer"]
     if raw is None or raw.empty:
@@ -367,9 +383,12 @@ def prepare_ibp_base_plan_long(
             work = work.loc[
                 work[cycle_col].astype(str).str.strip() == cycles.max()
             ]
+    # CRITICAL — see docstring.  After this point every per-column Series
+    # is positionally aligned with the others.
+    work = work.reset_index(drop=True)
 
     n = len(work)
-    blank = pd.Series([""] * n, index=work.index, dtype="object")
+    blank = pd.Series([""] * n, dtype="object")
     item_keys = _vectorised_item_key(work[item_col])
     pounds = pd.to_numeric(
         work[total_col].astype("string").str.replace(",", "", regex=False),
@@ -377,24 +396,37 @@ def prepare_ibp_base_plan_long(
     ).fillna(0.0)
 
     slim = pd.DataFrame({
-        "item_key": item_keys.values,
-        "month": _vectorised_start_of_month(work[month_col]).values,
-        "pounds": pounds.values,
-        "customer": _vectorised_clean_str(work[cust_col]) if cust_col else blank,
+        "item_key": item_keys.to_numpy(),
+        "month": _vectorised_start_of_month(work[month_col]).to_numpy(),
+        "pounds": pounds.to_numpy(),
+        "customer": (
+            _vectorised_clean_str(work[cust_col]).to_numpy()
+            if cust_col else blank.to_numpy()
+        ),
     })
     dim_frame = build_item_dim_frame(pdh_df)
     merged = _attach_dims(slim, slim["item_key"], dim_frame)
 
     # Portfolio / Product Format / Brand Category on the CSV win for those
     # dims; PDH supplies Portfolio Minor (and fills blanks for the rest).
+    # ``.to_numpy()`` everywhere so the constructor stays positional.
     out = pd.DataFrame({
-        "month": merged["month"],
-        "pounds": merged["pounds"],
-        "pmaj": _vectorised_clean_str(work[port_col]) if port_col else merged["pmaj"],
-        "sfmt": _vectorised_clean_str(work[sfmt_col]) if sfmt_col else merged["sfmt"],
-        "pminor": merged["pminor"],
-        "brand": _vectorised_clean_str(work[brand_col]) if brand_col else merged["brand"],
-        "customer": merged["customer"],
+        "month": merged["month"].to_numpy(),
+        "pounds": merged["pounds"].to_numpy(),
+        "pmaj": (
+            _vectorised_clean_str(work[port_col]).to_numpy()
+            if port_col else merged["pmaj"].to_numpy()
+        ),
+        "sfmt": (
+            _vectorised_clean_str(work[sfmt_col]).to_numpy()
+            if sfmt_col else merged["sfmt"].to_numpy()
+        ),
+        "pminor": merged["pminor"].to_numpy(),
+        "brand": (
+            _vectorised_clean_str(work[brand_col]).to_numpy()
+            if brand_col else merged["brand"].to_numpy()
+        ),
+        "customer": merged["customer"].to_numpy(),
     })
     return out.dropna(subset=["month"]).reset_index(drop=True)
 
@@ -924,25 +956,33 @@ class FullYearChartData:
     series: tuple[FullYearChartSeries, ...]
 
 
-def _enrich_total_item_level_demand(
-    qry_df: Optional[pd.DataFrame],
+def prepare_total_item_level_demand_long(
+    raw: Optional[pd.DataFrame],
     pdh_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
     """Return a tidy ``qry_total_item_level_demand`` frame with PDH dims.
 
-    Columns: ``month, pounds, pmaj, sfmt, brand``.  Items missing from PDH
-    fall through with blank dims (so the PM filter naturally drops them
-    from the chart — same fallback behaviour Demand Plan Comparison uses).
+    Columns: ``month, pounds, pmaj, sfmt, brand``.  Items missing from
+    PDH fall through with blank dims (the PM filter naturally drops them).
+
+    Public + named symmetrically with :func:`prepare_ibp_base_plan_long`
+    so the page can enrich this CSV ONCE before the per-PM chart loop —
+    avoiding O(PM) full-frame enrichments which dominated the prior
+    section's wall-clock latency.
+
+    Same index-discipline contract as :func:`prepare_ibp_base_plan_long`:
+    every Series is converted to a numpy array before the final
+    ``pd.DataFrame`` constructor.
     """
     empty = pd.DataFrame(columns=["month", "pounds", "pmaj", "sfmt", "brand"])
-    if qry_df is None or qry_df.empty:
+    if raw is None or raw.empty:
         return empty
 
     # Use the constants exported by demand_summary so we never drift from
     # the canonical column names this CSV is published with.
-    item_col = COL_ITEM if COL_ITEM in qry_df.columns else None
-    month_col = COL_START_OF_MONTH if COL_START_OF_MONTH in qry_df.columns else None
-    lbs_col = COL_DEMAND_LBS if COL_DEMAND_LBS in qry_df.columns else None
+    item_col = COL_ITEM if COL_ITEM in raw.columns else None
+    month_col = COL_START_OF_MONTH if COL_START_OF_MONTH in raw.columns else None
+    lbs_col = COL_DEMAND_LBS if COL_DEMAND_LBS in raw.columns else None
     if not (item_col and month_col and lbs_col):
         logger.warning(
             "qry_total_item_level_demand missing required columns "
@@ -951,35 +991,107 @@ def _enrich_total_item_level_demand(
         )
         return empty
 
-    item_keys = _vectorised_item_key(qry_df[item_col])
+    work = raw.reset_index(drop=True)
+    item_keys = _vectorised_item_key(work[item_col])
     pounds = pd.to_numeric(
-        qry_df[lbs_col].astype("string").str.replace(",", "", regex=False),
+        work[lbs_col].astype("string").str.replace(",", "", regex=False),
         errors="coerce",
     ).fillna(0.0)
-    months = _vectorised_start_of_month(qry_df[month_col])
+    months = _vectorised_start_of_month(work[month_col])
 
     slim = pd.DataFrame({
-        "item_key": item_keys.values,
-        "month": months.values,
-        "pounds": pounds.values,
+        "item_key": item_keys.to_numpy(),
+        "month": months.to_numpy(),
+        "pounds": pounds.to_numpy(),
     })
     dim_frame = build_item_dim_frame(pdh_df)
     merged = _attach_dims(slim, slim["item_key"], dim_frame)
 
     out = pd.DataFrame({
-        "month": merged["month"],
-        "pounds": merged["pounds"],
-        "pmaj": merged["pmaj"],
-        "sfmt": merged["sfmt"],
-        "brand": merged["brand"],
+        "month": merged["month"].to_numpy(),
+        "pounds": merged["pounds"].to_numpy(),
+        "pmaj": merged["pmaj"].to_numpy(),
+        "sfmt": merged["sfmt"].to_numpy(),
+        "brand": merged["brand"].to_numpy(),
     })
     return out.dropna(subset=["month"]).reset_index(drop=True)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-aggregation helpers — collapse to the minimum-distinct-dim grain
+# the PLR builder + chart actually consume.  Done ONCE in the page (before
+# the per-PM loop) so each PM's mask-and-sum work is essentially instant.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def aggregate_orders_for_plr(orders_enriched: pd.DataFrame) -> pd.DataFrame:
+    """Group enriched IBP Orders by every dim used downstream and sum lbs.
+
+    Columns kept: ``pmaj, sfmt, brand, pminor, customer_name, month, pounds``.
+    Reduces a typical 350k-row enriched frame to a few thousand rows so the
+    per-PM mask + groupby loop is bound by dim cardinality, not raw shape.
+    """
+    if orders_enriched is None or orders_enriched.empty:
+        return pd.DataFrame(columns=[
+            "pmaj", "sfmt", "brand", "pminor", "customer_name", "month", "pounds",
+        ])
+    # ``customer_name`` is the field IBP Orders carries; the customer mask
+    # below probes for it (with ``customer`` as fallback).  Keep both
+    # available so the per-PM customer rows still match cleanly.
+    cust_col = "customer_name" if "customer_name" in orders_enriched.columns else "customer"
+    keep = ["pmaj", "sfmt", "brand", "pminor", cust_col, "month"]
+    grouped = (
+        orders_enriched
+        .groupby(keep, as_index=False, dropna=False)["pounds"]
+        .sum()
+    )
+    if cust_col != "customer_name":
+        grouped = grouped.rename(columns={cust_col: "customer_name"})
+    return grouped
+
+
+def aggregate_base_plan_for_plr(base_long: pd.DataFrame) -> pd.DataFrame:
+    """Group base-plan rows by every dim used downstream and sum lbs.
+
+    Columns kept: ``pmaj, sfmt, brand, pminor, customer, month, pounds``.
+    """
+    if base_long is None or base_long.empty:
+        return pd.DataFrame(columns=[
+            "pmaj", "sfmt", "brand", "pminor", "customer", "month", "pounds",
+        ])
+    keep = ["pmaj", "sfmt", "brand", "pminor", "customer", "month"]
+    return (
+        base_long
+        .groupby(keep, as_index=False, dropna=False)["pounds"]
+        .sum()
+    )
+
+
+def aggregate_total_demand_for_plr(
+    total_demand_long: pd.DataFrame,
+) -> pd.DataFrame:
+    """Group qry_total_item_level_demand rows for the Full-Year chart.
+
+    The chart only filters on ``pmaj / sfmt / brand`` and reports by
+    ``month`` — collapsing to that grain drops every per-item /
+    per-Forecast-Type row from the masking path.
+    """
+    if total_demand_long is None or total_demand_long.empty:
+        return pd.DataFrame(columns=["pmaj", "sfmt", "brand", "month", "pounds"])
+    return (
+        total_demand_long
+        .groupby(["pmaj", "sfmt", "brand", "month"], as_index=False, dropna=False)
+        ["pounds"]
+        .sum()
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart payload assembly (consumes the ALREADY-ENRICHED long frame)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_full_year_chart_data(
     *,
-    qry_df: Optional[pd.DataFrame],
-    pdh_df: Optional[pd.DataFrame],
+    total_demand_long: pd.DataFrame,
     portfolio_major: str,
     sub: ProductLineReviewSubFilters,
     cy_begin_month: date,
@@ -991,35 +1103,46 @@ def build_full_year_chart_data(
 
     Both lines share the **same** fiscal-month axis (Apr = position 1,
     … Mar = position 12) so the planner can visually compare the same
-    month-of-fiscal-year across years.  X-axis labels follow the
-    fiscal-year convention (Apr first) regardless of which calendar
-    month ``cy_begin_month`` actually falls on.
+    month-of-fiscal-year across years.
 
     The chart respects the per-PM Supply Format + Brand sub-filters.
-    Empty multi-select tuples mean "include all".  Items missing from
-    PDH (no PM attribution) are dropped — same fallback the page uses
-    for the table.
+    Empty multi-select tuples mean "include all".
+
+    Performance contract
+    --------------------
+    *total_demand_long* MUST come from
+    :func:`prepare_total_item_level_demand_long` (and ideally
+    :func:`aggregate_total_demand_for_plr`).  The page does that once
+    BEFORE the per-PM loop so the chart's per-PM cost is just a small
+    mask + groupby (no item-level enrichment).
     """
     cy_window = sorted(cy_full_year_months(cy_begin_month))
     ny_window = sorted(ny_full_year_months(cy_begin_month))
 
-    enriched = _enrich_total_item_level_demand(qry_df, pdh_df)
-    if enriched.empty:
+    if total_demand_long is None or total_demand_long.empty:
         return FullYearChartData(
             fy_month_labels=FY_MONTH_LABELS, series=(),
         )
 
-    # Build a single mask once (PM + sub-filters); reuse for both windows.
+    # Single mask once (PM + sub-filters); reuse for both windows.
     pm_cf = portfolio_major.strip().casefold()
-    mask = enriched["pmaj"].astype(str).str.strip().str.casefold() == pm_cf
+    mask = (
+        total_demand_long["pmaj"]
+        .astype(str).str.strip().str.casefold() == pm_cf
+    )
     if sub.supply_formats:
         wanted = {s.strip().casefold() for s in sub.supply_formats if s.strip()}
-        mask &= enriched["sfmt"].astype(str).str.strip().str.casefold().isin(wanted)
+        mask &= (
+            total_demand_long["sfmt"]
+            .astype(str).str.strip().str.casefold().isin(wanted)
+        )
     if sub.brands:
         wanted_b = {b.strip() for b in sub.brands if b.strip()}
-        mask &= enriched["brand"].astype(str).str.strip().isin(wanted_b)
+        mask &= (
+            total_demand_long["brand"].astype(str).str.strip().isin(wanted_b)
+        )
 
-    sliced = enriched.loc[mask, ["month", "pounds"]]
+    sliced = total_demand_long.loc[mask, ["month", "pounds"]]
     if sliced.empty:
         return FullYearChartData(
             fy_month_labels=FY_MONTH_LABELS, series=(),
@@ -1071,6 +1194,10 @@ __all__ = [
     "collect_chart_months",
     # Source normalisation + builders.
     "prepare_ibp_base_plan_long",
+    "prepare_total_item_level_demand_long",
+    "aggregate_orders_for_plr",
+    "aggregate_base_plan_for_plr",
+    "aggregate_total_demand_for_plr",
     "build_product_line_review_table",
     "build_full_year_chart_data",
     # Display surface.

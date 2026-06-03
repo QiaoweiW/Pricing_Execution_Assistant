@@ -26,6 +26,9 @@ from data_sources.product_line_review import (
     ProductLineReviewCommonFilters,
     ProductLineReviewSubFilters,
     add_months,
+    aggregate_base_plan_for_plr,
+    aggregate_orders_for_plr,
+    aggregate_total_demand_for_plr,
     build_display_groups,
     build_full_year_chart_data,
     build_product_line_review_table,
@@ -36,6 +39,7 @@ from data_sources.product_line_review import (
     list_pdh_filter_values_for_pmaj,
     ny_full_year_months,
     prepare_ibp_base_plan_long,
+    prepare_total_item_level_demand_long,
     resolve_filters,
     trailing_months_end_at,
     validate_common_filters,
@@ -357,19 +361,18 @@ def test_chart_sums_demand_pounds_across_forecast_types():
         {"Item": "311042", "Start of Month": "2027-04-01",
          "Forecast Type": "Base Plan", "Demand Plan Pounds": "200"},
     ])
+    total_long = prepare_total_item_level_demand_long(qry_df, pdh)
     data = build_full_year_chart_data(
-        qry_df=qry_df, pdh_df=pdh,
+        total_demand_long=total_long,
         portfolio_major="Butter",
         sub=ProductLineReviewSubFilters(),
         cy_begin_month=date(2026, 4, 1),
     )
     assert len(data.series) == 2
-    # First series = CY FY (FY 2027 — March 2027 is the last month).
     cy_series = data.series[0]
     assert cy_series.label == "FY 2027"
     # FY position 1 = Apr (CY FY starts at Apr 2026) → 1000 + 500 = 1500.
     assert cy_series.values_lbs[0] == 1500.0
-    # NY FY position 1 = Apr 2027 → 200.
     ny_series = data.series[1]
     assert ny_series.label == "FY 2028"
     assert ny_series.values_lbs[0] == 200.0
@@ -390,12 +393,162 @@ def test_chart_applies_sub_filters():
         {"Item": "999999", "Start of Month": "2026-04-01",
          "Forecast Type": "Base Plan", "Demand Plan Pounds": "9000"},
     ])
+    total_long = prepare_total_item_level_demand_long(qry_df, pdh)
     data = build_full_year_chart_data(
-        qry_df=qry_df, pdh_df=pdh,
+        total_demand_long=total_long,
         portfolio_major="Butter",
         sub=ProductLineReviewSubFilters(brands=("Branded",)),
         cy_begin_month=date(2026, 4, 1),
     )
-    # Only the Branded item should contribute (1000); the Private item is dropped.
+    # Only the Branded item should contribute (1000); Private is dropped.
     cy_series = data.series[0]
     assert cy_series.values_lbs[0] == 1000.0
+
+
+def test_chart_consumes_pre_aggregated_frame():
+    """build_full_year_chart_data must work directly on the aggregator output."""
+    pdh = _pdh()
+    qry_df = pd.DataFrame([
+        {"Item": "311042", "Start of Month": "2026-04-01",
+         "Forecast Type": "Base Plan", "Demand Plan Pounds": "100"},
+        {"Item": "311042", "Start of Month": "2026-04-01",
+         "Forecast Type": "R&O",       "Demand Plan Pounds": "50"},
+    ])
+    total_long = prepare_total_item_level_demand_long(qry_df, pdh)
+    total_agg = aggregate_total_demand_for_plr(total_long)
+    # Aggregation must collapse the two Forecast Types into one row.
+    assert len(total_agg) == 1
+    assert float(total_agg["pounds"].iloc[0]) == 150.0
+
+    data = build_full_year_chart_data(
+        total_demand_long=total_agg,
+        portfolio_major="Butter",
+        sub=ProductLineReviewSubFilters(),
+        cy_begin_month=date(2026, 4, 1),
+    )
+    assert data.series[0].values_lbs[0] == 150.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) Regression: index-mismatch bug in prepare_ibp_base_plan_long
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_base_plan_survives_cycle_filter_non_contiguous_index():
+    """Regression for the "Base Plan = 0" bug.
+
+    Before the fix, the cycle filter left ``work`` with a non-contiguous
+    index, and the final ``pd.DataFrame({…})`` constructor aligned the
+    PDH-merged columns against ``work``'s scattered Series indexes — so
+    every ``pmaj/sfmt/brand`` cell became NaN and downstream sums
+    collapsed to 0.  This test seeds an old (C1) and new (C2) cycle so
+    the filter actually drops rows, then asserts the kept rows still
+    carry their dims after the prep.
+    """
+    pdh = _pdh()
+    # 4 rows, 2 cycles → after cycle filter (C2 wins) we keep rows at
+    # indexes 1, 3 (non-contiguous before reset_index).
+    base_raw = pd.DataFrame([
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "OldA",
+         "Total": "1", "Cycle": "C1"},
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "Costco",
+         "Total": "1000000", "Cycle": "C2"},
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "OldB",
+         "Total": "1", "Cycle": "C1"},
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "Sysco",
+         "Total": "2000000", "Total ": None, "Cycle": "C2"},
+    ])
+    base_long = prepare_ibp_base_plan_long(base_raw, pdh)
+
+    # Cycle filter keeps only the two C2 rows.
+    assert len(base_long) == 2
+    # The dim columns MUST survive the index dance.
+    assert set(base_long["pmaj"]) == {"Butter"}
+    assert set(base_long["sfmt"]) == {"Bundled Elgin Quarter"}
+    assert set(base_long["brand"]) == {"Branded"}
+    assert set(base_long["customer"]) == {"Costco", "Sysco"}
+    # And pounds add up to the C2-only total (3 M lbs).
+    assert float(base_long["pounds"].sum()) == 3_000_000.0
+
+
+def test_base_plan_pipeline_produces_non_zero_cm_cy():
+    """End-to-end: a multi-cycle base CSV must yield non-zero cm_cy.
+
+    Direct integration test for the user-visible symptom — `Base Plan –
+    May 2026` (and every other base column) returns 0 when the prep
+    silently drops dim attribution.  After the fix it should report the
+    pre-filter total in millions.
+    """
+    pdh = _pdh()
+    base_raw = pd.DataFrame([
+        # C1 rows (will be dropped by cycle filter).
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "X",
+         "Total": "99999999", "Cycle": "C1"},
+        # C2 rows (kept; force non-contiguous indexes).
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "Costco",
+         "Total": "2000000", "Cycle": "C2"},
+        {"Start of Month": "2025-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "X",
+         "Total": "99999999", "Cycle": "C1"},
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter", "Brand Category": "Branded",
+         "Item": "311042", "Plan To Name": "Sysco",
+         "Total": "1000000", "Cycle": "C2"},
+    ])
+    orders, base = _enrich(pd.DataFrame(), base_raw, pdh)
+
+    result = build_product_line_review_table(
+        orders_enriched=orders, base_long=base,
+        ro_current_plan_by_path={},
+        filters=_filters(),
+    )
+    branded = result.table.loc[
+        result.table["Row Label"] == "Bundled Elgin Quarter"
+    ].iloc[0]
+    # 3 M lbs total across the two C2 rows → 3.0 in display units.
+    assert branded["cm_cy"] == "3.0"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) Pre-aggregation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_aggregate_base_plan_for_plr_collapses_duplicates():
+    """Multiple rows for the same dim-tuple must collapse to a single sum."""
+    df = pd.DataFrame({
+        "month": [date(2026, 5, 1), date(2026, 5, 1)],
+        "pounds": [10.0, 25.0],
+        "pmaj": ["Butter", "Butter"],
+        "sfmt": ["BEQ", "BEQ"],
+        "pminor": ["Packaged Butter", "Packaged Butter"],
+        "brand": ["Branded", "Branded"],
+        "customer": ["Costco", "Costco"],
+    })
+    agg = aggregate_base_plan_for_plr(df)
+    assert len(agg) == 1
+    assert float(agg["pounds"].iloc[0]) == 35.0
+
+
+def test_aggregate_orders_for_plr_preserves_customer_name():
+    """Aggregator must use ``customer_name`` (IBP Orders convention)."""
+    df = pd.DataFrame({
+        "month": [date(2025, 5, 1)],
+        "pounds": [100.0],
+        "pmaj": ["Butter"], "sfmt": ["BEQ"], "pminor": ["Packaged Butter"],
+        "brand": ["Branded"], "customer_name": ["Costco"],
+    })
+    agg = aggregate_orders_for_plr(df)
+    assert "customer_name" in agg.columns
+    assert agg["customer_name"].iloc[0] == "Costco"

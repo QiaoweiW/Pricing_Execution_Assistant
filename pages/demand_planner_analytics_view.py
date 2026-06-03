@@ -146,6 +146,9 @@ from data_sources.product_line_review import (
     ProductLineReviewResult,
     ProductLineReviewSubFilters,
     add_months,
+    aggregate_base_plan_for_plr,
+    aggregate_orders_for_plr,
+    aggregate_total_demand_for_plr,
     build_display_groups,
     build_full_year_chart_data,
     build_product_line_review_table,
@@ -154,6 +157,7 @@ from data_sources.product_line_review import (
     list_pdh_filter_values,
     list_pdh_filter_values_for_pmaj,
     prepare_ibp_base_plan_long,
+    prepare_total_item_level_demand_long,
     resolve_filters,
     validate_common_filters,
 )
@@ -4425,11 +4429,20 @@ def _render_product_line_review_fragment() -> None:
     4. ``RO_Summary_Report.csv``           — FY27 Current Plan → "R&O" column.
     5. ``qry_total_item_level_demand.csv`` — Full-Year chart series.
 
-    All five are fetched ONCE per fragment render; the per-PM loop reuses
-    the enriched frames.  Enrichment (PDH attribution) also happens once.
+    Performance contract
+    --------------------
+    * Sources are fetched ONCE per fragment render (each connector layer
+      memoises further with ``@st.cache_data``).
+    * Enrichment (PDH attribution) also happens ONCE — see
+      :func:`_cached_prepare_plr_inputs`.  Enrichment is the most expensive
+      step (item-key normalisation + merge across 350k+ rows), so caching
+      it on shape-signatures keeps repeat renders sub-second.
+    * Each Portfolio Major section renders inside its OWN ``@st.fragment``
+      (:func:`_render_plr_pm_section`) so a Supply Format / Brand pick on
+      one PM no longer rebuilds every other PM.
     """
-    # 1) Load Fabric sources up-front (parallel-friendly fetches; each is
-    #    cached at the source layer so repeat renders are free).
+    # 1) Load raw sources up-front.  Each fetcher already caches at the
+    #    source layer (TTL + ETag), so the repeated calls here are cheap.
     try:
         with st.spinner("Reading PLR sources from Microsoft Fabric…"):
             base_snap = fetch_ibp_base_plan_current()
@@ -4466,36 +4479,33 @@ def _render_product_line_review_fragment() -> None:
     ibp_months = collect_ibp_months_for_common(common)
     ibp_orders_df, _warn_o = _load_demand_comparison_ibp_orders(months=ibp_months)
 
-    # 4) One-time enrichment so the per-PM loop only does masking + grouping.
-    orders_enriched = enrich_ibp_orders_df(ibp_orders_df, pdh_df)
-    base_long = prepare_ibp_base_plan_long(base_raw, pdh_df)
-    total_demand_df = total_demand_snap.df
+    # 4) One-time enrichment + aggregation.  Cached on shape-signatures so
+    #    a filter rerun that doesn't touch the underlying data short-
+    #    circuits to a microsecond cache hit instead of re-enriching
+    #    every 350k-row source.
+    orders_agg, base_agg, total_demand_agg = _cached_prepare_plr_inputs(
+        _signature_for(ibp_orders_df),
+        _signature_for(base_raw),
+        _signature_for(pdh_df),
+        _signature_for(total_demand_snap.df),
+        _ibp_orders_df=ibp_orders_df,
+        _base_raw=base_raw,
+        _pdh_df=pdh_df,
+        _total_demand_df=total_demand_snap.df,
+    )
 
-    # 5) Per-PM loop — table + chart for each Portfolio Major.
+    # 5) Per-PM render.  Each section is its OWN @st.fragment so changes
+    #    to one PM's sub-filters do not rerun the others.
     for pmaj in pmaj_options:
-        st.markdown("---")
-        st.markdown(f"### Portfolio Major: {pmaj}")
-        sub = _render_plr_pm_sub_filters(pdh_df, pmaj)
-        filters = resolve_filters(common, pmaj, sub)
-
-        result = build_product_line_review_table(
-            orders_enriched=orders_enriched,
-            base_long=base_long,
-            ro_current_plan_by_path=ro_lookup,
-            filters=filters,
-        )
-        for msg in result.warnings:
-            st.warning(msg)
-        _render_plr_table_for_pm(result, filters)
-
-        chart_data = build_full_year_chart_data(
-            qry_df=total_demand_df,
+        _render_plr_pm_section(
+            pmaj=pmaj,
+            common=common,
             pdh_df=pdh_df,
-            portfolio_major=pmaj,
-            sub=sub,
-            cy_begin_month=common.cy_begin_month,
+            orders_agg=orders_agg,
+            base_agg=base_agg,
+            total_demand_agg=total_demand_agg,
+            ro_lookup=ro_lookup,
         )
-        _render_plr_chart_for_pm(chart_data, pmaj)
 
     # 6) Auto-save the in-memory RO Summary + RO Comparison snapshots to Fabric
     #    so the freshly rendered PLR tables reference what's currently saved.
@@ -4503,6 +4513,91 @@ def _render_product_line_review_fragment() -> None:
     #    repeat saves for the same in-memory frames.
     _maybe_autosave_ro_summary_report(trigger="PLR build")
     _maybe_autosave_ro_comparison_output(trigger="PLR build")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLR input prep (enrichment + dim-grain aggregation) — cached
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# These three frames are the per-PM loop's only inputs.  Caching them on
+# shape-signatures means that filter clicks (which don't change the
+# underlying data) hit the cache instead of re-enriching ~350k rows N
+# times.  The aggregation step collapses to dim-grain so each per-PM
+# mask + groupby is essentially O(unique PM/SFmt/Brand/PMinor/Customer)
+# rather than O(raw rows).
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_prepare_plr_inputs(
+    orders_sig: tuple,
+    base_sig: tuple,
+    pdh_sig: tuple,
+    total_demand_sig: tuple,
+    *,
+    _ibp_orders_df: Optional[pd.DataFrame],
+    _base_raw: Optional[pd.DataFrame],
+    _pdh_df: Optional[pd.DataFrame],
+    _total_demand_df: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Enrich + aggregate the three PLR input frames.
+
+    Returns ``(orders_agg, base_agg, total_demand_agg)`` where each frame
+    is grouped to its minimum-distinct-dim grain so the per-PM masking
+    operations stay tiny.  Cache key is shape-signatures of the four
+    inputs — same idea the page already uses for the comparison build.
+    """
+    orders_enriched = enrich_ibp_orders_df(_ibp_orders_df, _pdh_df)
+    base_long = prepare_ibp_base_plan_long(_base_raw, _pdh_df)
+    total_long = prepare_total_item_level_demand_long(_total_demand_df, _pdh_df)
+    return (
+        aggregate_orders_for_plr(orders_enriched),
+        aggregate_base_plan_for_plr(base_long),
+        aggregate_total_demand_for_plr(total_long),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-PM section — its own fragment so sub-filter clicks scope tightly
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.fragment
+def _render_plr_pm_section(
+    *,
+    pmaj: str,
+    common: ProductLineReviewCommonFilters,
+    pdh_df: Optional[pd.DataFrame],
+    orders_agg: pd.DataFrame,
+    base_agg: pd.DataFrame,
+    total_demand_agg: pd.DataFrame,
+    ro_lookup: dict,
+) -> None:
+    """Render one Portfolio Major's header + sub-filters + table + chart.
+
+    Wrapping this in ``@st.fragment`` means a planner toggling the
+    Supply Format multiselect under "Butter" only re-runs **this** call —
+    the other PMs keep their existing renders + filter state.
+    """
+    st.markdown("---")
+    st.markdown(f"### Portfolio Major: {pmaj}")
+    sub = _render_plr_pm_sub_filters(pdh_df, pmaj)
+    filters = resolve_filters(common, pmaj, sub)
+
+    result = build_product_line_review_table(
+        orders_enriched=orders_agg,
+        base_long=base_agg,
+        ro_current_plan_by_path=ro_lookup,
+        filters=filters,
+    )
+    for msg in result.warnings:
+        st.warning(msg)
+    _render_plr_table_for_pm(result, filters)
+
+    chart_data = build_full_year_chart_data(
+        total_demand_long=total_demand_agg,
+        portfolio_major=pmaj,
+        sub=sub,
+        cy_begin_month=common.cy_begin_month,
+    )
+    _render_plr_chart_for_pm(chart_data, pmaj)
 
 
 # ── PLR common filters ────────────────────────────────────────────────────────
@@ -4746,29 +4841,53 @@ def _render_plr_chart_for_pm(
     # the Demand Summary chart so the page reads cohesively.
     palette = ("#1f4e79", "#ed7d31")
     for series, colour in zip(data.series, palette):
+        # Decorate the legend label with the actual calendar span so the
+        # planner can tell the two fiscal years apart at a glance
+        # (otherwise both legends are just "FY 2027" / "FY 2028").
+        span = ""
+        if series.months:
+            span = (
+                f"  ({series.months[0]:%b %Y} – "
+                f"{series.months[-1]:%b %Y})"
+            )
+        legend_label = f"{series.label}{span}"
         fig.add_trace(go.Scatter(
             x=list(data.fy_month_labels),
             y=list(series.values_lbs),
-            name=series.label,
+            name=legend_label,
             mode="lines+markers",
-            line=dict(color=colour, width=2),
-            marker=dict(size=6),
+            line=dict(color=colour, width=2.5),
+            marker=dict(size=7),
             hovertemplate=(
-                "<b>%{x}</b><br>" + series.label + ": %{y:,.0f} lbs<extra></extra>"
+                "<b>%{x}</b><br>" + series.label
+                + ": %{y:,.0f} lbs<extra></extra>"
             ),
         ))
 
     fig.update_layout(
-        title=dict(text="Total Plan LE in Lbs", x=0.02, xanchor="left"),
+        title=dict(
+            text="<b>Total Plan LE in Lbs</b>",
+            x=0.02, xanchor="left", font=dict(size=14),
+        ),
+        # Larger top margin so the legend sits cleanly ABOVE the plot
+        # area where it's always visible (the prior below-chart position
+        # got clipped by the surrounding st.expander on smaller screens).
         height=_PLR_CHART_HEIGHT,
-        margin=dict(l=40, r=20, t=40, b=40),
+        margin=dict(l=50, r=20, t=70, b=40),
         legend=dict(
             orientation="h",
-            yanchor="bottom", y=-0.30,
-            xanchor="center", x=0.5,
+            yanchor="bottom", y=1.02,   # sits above the plotting area
+            xanchor="left", x=0.0,
+            font=dict(size=13),         # bumped from default ~10
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#cccccc",
+            borderwidth=1,
         ),
-        xaxis=dict(title="Fiscal year month", tickangle=0),
-        yaxis=dict(title="Lbs", rangemode="tozero", tickformat=","),
+        xaxis=dict(title=None, tickangle=0, tickfont=dict(size=12)),
+        yaxis=dict(
+            title="Lbs", rangemode="tozero",
+            tickformat=",", tickfont=dict(size=11),
+        ),
         hovermode="x unified",
     )
     st.plotly_chart(

@@ -15,19 +15,23 @@ Page layout
 -----------
 1. Page header + Instructions block.
 2. ── divider ──
-3. Foldable: "Demand Planning BI Dashboard" — embeds the SharePoint
-   ``.pbix`` file so the user can interact with the live model.
-4. ── divider ──
-5. Foldable: "New Distribution Tracker" — embeds the SharePoint Excel
+3. Foldable: "New Distribution Tracker" — embeds the SharePoint Excel
    workbook in Office-Online read-mode.
+4. ── divider ──
+5. Foldable: "RO Comparison" — upload + month pickers + nested foldable
+   "RO Comparison & Drivers & Start Date Validation" (editor, drivers,
+   Early-Start programs) + RO Summary Report.
 6. ── divider ──
-7. Foldable: "RO Comparison" — month-over-month RO comparison editor +
-   per-Format driver table + Early-Start-Date programs + Summary Report.
+7. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
+   Demand Pivot Summary + Demand Plan Comparison (drivers in nested
+   foldable) + Base + RO chart.
 8. ── divider ──
-9. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
-   Demand Pivot Summary + Base + RO chart with Total Budget overlay.
-10. Foldable: "Product Line Review" — brand / minor / format + customer
-    table (IBP Orders + base plan + RO Summary Current Plan).
+9. Foldable: "Product Line Review" — one table + chart per Portfolio
+   Major (Bulk Fluid / Cheese / Milk Powders / Whey Powders last).
+10. ── divider ──
+11. Foldable: "Demand Planning BI Dashboard" — last on the page; embeds
+    the SharePoint ``.pbix`` file so the user can interact with the live
+    model without slowing the operational sections above.
 
 Why every external resource gets its own foldable section
 ---------------------------------------------------------
@@ -560,26 +564,26 @@ def _render_ro_comparison() -> None:
         # 5. Warnings.
         _render_warnings_banner(warnings)
 
-        # 6-9. Filters + editor + subtotal + per-Format summary + Save.
-        #      All wrapped in a single ``@st.fragment`` so a filter
-        #      change / cell edit / Save click re-runs ONLY this block
-        #      — no Fabric I/O, no comparison rebuild, no warnings
-        #      banner re-render.  Filter latency drops from O(seconds)
-        #      to sub-second.
-        _render_filtered_editor_fragment(prior_month, le_month)
+        # 6-10. RO_Comparison_Output editor, per-Format drivers, and
+        #       Early-Start programs — grouped in one foldable subsection
+        #       so planners can collapse the heavy validation block while
+        #       keeping upload / month pickers visible above.
+        with st.expander(
+            "📋 RO Comparison & Drivers & Start Date Validation",
+            expanded=True,
+        ):
+            # Filters + editor + subtotal + per-Format summary + Save.
+            # Wrapped in a single ``@st.fragment`` so a filter change /
+            # cell edit / Save click re-runs ONLY this block — no Fabric
+            # I/O, no comparison rebuild, no warnings banner re-render.
+            _render_filtered_editor_fragment(prior_month, le_month)
 
-        # 10. Early-Start-Date Programs — drilldown of the published
-        #     ``RO_Comparison_Output.csv``.  Sits between the per-
-        #     Format driver table (last thing in the editor fragment)
-        #     and the RO Summary Report below.  Reads from Fabric
-        #     directly (not from ``_SS_SUMMARY_DF``) so it always
-        #     reflects the planner's last *saved* baseline — the
-        #     same "approved view" semantics the Summary Report uses
-        #     for its Fabric snapshot.  Wrapped in its own fragment
-        #     so the Format / cutoff-date widgets rerun only this
-        #     section.
-        st.markdown("---")
-        _render_early_start_programs_section()
+            # Early-Start-Date Programs — drilldown of the published
+            # ``RO_Comparison_Output.csv``.  Reads from Fabric directly
+            # (not from ``_SS_SUMMARY_DF``) so it reflects the last
+            # *saved* baseline.  Own fragment for widget isolation.
+            st.markdown("---")
+            _render_early_start_programs_section()
 
         # 11. RO Summary Report — hierarchical roll-up of the
         #     **in-memory** comparison frame (``_SS_SUMMARY_DF``).
@@ -889,25 +893,31 @@ def _render_post_upload_guidance() -> None:
     bundle.  We surface the canonical hard-refresh shortcuts so the
     planner can self-serve in those rare cases without us needing a
     code-side "force refresh" hack.
+
+    Collapsed by default so the upload control stays above the fold;
+    expand when troubleshooting stale data after an upload.
     """
-    st.info(
-        "✅ **Changes auto-refresh.**  Once Fabric ingests your upload "
-        "(usually within a few minutes), this page detects the new "
-        "`RO_History_Tracker.csv` ETag on the next render and "
-        "automatically rebuilds the RO Comparison table, the driver "
-        "breakdown, the Early-Start-Date Programs table, and the "
-        "RO Summary Report — no button click required.\n\n"
-        "**If you still don't see your changes after a few minutes:**\n"
-        "1. Wait one more minute, then reload the page tab.\n"
-        "2. If the table is still stale, do a **hard refresh** to clear "
-        "your browser's local cache:\n"
-        "   - **Windows / Linux:** `Ctrl` + `Shift` + `R` (or `Ctrl` + `F5`)\n"
-        "   - **macOS:** `⌘` + `Shift` + `R`\n"
-        "3. As a last resort, sign out of Microsoft Fabric (top of the "
-        "sidebar) and sign back in — this drops every cached token and "
-        "forces a fresh read.",
-        icon="ℹ️",
-    )
+    with st.expander(
+        "ℹ️ Changes auto-refresh after upload — troubleshooting",
+        expanded=False,
+    ):
+        st.markdown(
+            "✅ **Changes auto-refresh.**  Once Fabric ingests your upload "
+            "(usually within a few minutes), this page detects the new "
+            "`RO_History_Tracker.csv` ETag on the next render and "
+            "automatically rebuilds the RO Comparison table, the driver "
+            "breakdown, the Early-Start-Date Programs table, and the "
+            "RO Summary Report — no button click required.\n\n"
+            "**If you still don't see your changes after a few minutes:**\n"
+            "1. Wait one more minute, then reload the page tab.\n"
+            "2. If the table is still stale, do a **hard refresh** to clear "
+            "your browser's local cache:\n"
+            "   - **Windows / Linux:** `Ctrl` + `Shift` + `R` (or `Ctrl` + `F5`)\n"
+            "   - **macOS:** `⌘` + `Shift` + `R`\n"
+            "3. As a last resort, sign out of Microsoft Fabric (top of the "
+            "sidebar) and sign back in — this drops every cached token and "
+            "forces a fresh read."
+        )
 
 
 def _render_auto_regen_banner_once() -> None:
@@ -3577,9 +3587,15 @@ def _render_demand_plan_comparison_fragment() -> None:
     _render_prior_month_actual_vs_fcst_table(prior_month_vs_fcst)
 
     # 9. Driver tables — share the same EnrichedSources + dim signature.
-    _render_demand_comparison_driver_tables_cached(
-        enrich_sig, filters, dim_sig, enriched, dim_df,
-    )
+    #    Foldable so the comparison + Prior-Month tables stay visible
+    #    while the heavy driver drill-downs stay tucked away until needed.
+    with st.expander(
+        "📋 Demand Plan Comparison & Drivers Validation",
+        expanded=False,
+    ):
+        _render_demand_comparison_driver_tables_cached(
+            enrich_sig, filters, dim_sig, enriched, dim_df,
+        )
 
 
 def _months_in_range_local(start: date, end: date) -> set[date]:
@@ -4244,6 +4260,10 @@ def _render_demand_comparison_driver_tables_cached(
 ) -> None:
     """Render the PM Actual + Base Plan driver tables (shared enrichment, cached).
 
+    Called from inside the foldable
+    ``Demand Plan Comparison & Drivers Validation`` expander in
+    :func:`_render_demand_plan_comparison_fragment`.
+
     Both builders consume the same :class:`EnrichedSources` bundle —
     the PDH-merge happened once upstream — and each build itself is
     wrapped in :func:`_cached_demand_plan_comparison`-style cache slots,
@@ -4254,7 +4274,6 @@ def _render_demand_comparison_driver_tables_cached(
     customer/account drivers (signed, in millions of lbs).  Values are
     *deltas*, matching the comparison's PM Actual / Base Plan columns.
     """
-    st.markdown("#### 🔍 Drivers")
     st.caption(
         "Top-5 movers behind **PM Actual** and **Base Plan**, by "
         "Portfolio Major × Supply Format × Brand.  Each driver shows "
@@ -4394,6 +4413,23 @@ def _maybe_autosave_ro_comparison_output(*, trigger: str) -> None:
 
 # ── Product Line Review ───────────────────────────────────────────────────────
 #
+# Portfolio Majors listed here render last (tables + charts) so the
+# higher-traffic Butter / Cultured / etc. sections stay near the top.
+_PLR_PORTFOLIO_MAJOR_LAST: frozenset[str] = frozenset({
+    "Bulk Fluid",
+    "Cheese",
+    "Milk Powders",
+    "Whey Powders",
+})
+
+
+def _sort_plr_portfolio_majors(pmaj_options: list[str]) -> list[str]:
+    """Return *pmaj_options* with deprioritized Portfolio Majors at the end."""
+    primary = sorted(p for p in pmaj_options if p not in _PLR_PORTFOLIO_MAJOR_LAST)
+    trailing = sorted(p for p in pmaj_options if p in _PLR_PORTFOLIO_MAJOR_LAST)
+    return primary + trailing
+
+
 # Per-Portfolio-Major hierarchical table + Full-Year chart.  The section is
 # available as soon as the underlying Fabric sources exist — there is **no**
 # Generate gate and **no** dependency on the Demand Summary load above.  The
@@ -4644,8 +4680,10 @@ def _render_product_line_review_fragment() -> None:
         return
 
     # 8) Per-PM render.  Each section is its OWN @st.fragment so changes
-    #    to one PM's sub-filters do not rerun the others.
-    for pmaj in pmaj_options:
+    #    to one PM's sub-filters do not rerun the others.  Bulk Fluid,
+    #    Cheese, Milk Powders, and Whey Powders render last (tables +
+    #    charts) per planner preference.
+    for pmaj in _sort_plr_portfolio_majors(pmaj_options):
         _render_plr_pm_section(
             pmaj=pmaj,
             common=common,
@@ -5176,11 +5214,11 @@ def render() -> None:
     Flow
     ----
     1. Page header + Instructions
-    2. Demand Planning BI Dashboard (collapsible, collapsed by default)
-    3. New Distribution Tracker     (collapsible, collapsed by default)
-    4. RO Comparison                (collapsible, expanded by default)
-    5. Demand Summary               (collapsible, collapsed by default)
-    6. Product Line Review          (collapsible, collapsed by default)
+    2. New Distribution Tracker     (collapsible, collapsed by default)
+    3. RO Comparison                (collapsible, expanded by default)
+    4. Demand Summary               (collapsible, collapsed by default)
+    5. Product Line Review          (collapsible, collapsed by default)
+    6. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -5189,9 +5227,6 @@ def render() -> None:
     )
 
     _render_instructions()
-    st.markdown("---")
-
-    _render_demand_planning_dashboard()
     st.markdown("---")
 
     _render_distribution_tracker()
@@ -5204,3 +5239,6 @@ def render() -> None:
     st.markdown("---")
 
     _render_product_line_review()
+    st.markdown("---")
+
+    _render_demand_planning_dashboard()

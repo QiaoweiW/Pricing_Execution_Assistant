@@ -15,20 +15,20 @@ Page layout
 -----------
 1. Page header + Instructions block.
 2. ── divider ──
-3. Foldable: "Sales Distribution Tracker (RO Details)" — embeds the
-   SharePoint Excel
-   workbook in Office-Online read-mode.
-4. ── divider ──
-5. Foldable: "RO Comparison" — month pickers + nested foldable (collapsed)
+3. Foldable: "RO Comparison" — month pickers + nested foldable (collapsed)
    "RO Comparison & Drivers & Start Date Validation" (Customer Input
    upload, editor, drivers, Early-Start programs) + RO Summary Report.
-6. ── divider ──
-7. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
+4. ── divider ──
+5. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
    Demand Pivot Summary + Demand Plan Comparison (drivers in nested
    foldable) + Base + RO chart.
-8. ── divider ──
-9. Foldable: "Product Line Review" — one table + chart per Portfolio
+6. ── divider ──
+7. Foldable: "Product Line Review" — one table + chart per Portfolio
    Major (Bulk Fluid / Cheese / Milk Powders / Whey Powders last).
+8. ── divider ──
+9. Foldable: "🚚 Sales Distribution Tracker (RO Details)" — SharePoint
+   Excel workbook in Office-Online read-mode; sits after PLR and before
+   the BI dashboard so operational Fabric sections load first.
 10. ── divider ──
 11. Foldable: "Demand Planning BI Dashboard" — last on the page; embeds
     the SharePoint ``.pbix`` file so the user can interact with the live
@@ -315,8 +315,12 @@ def _render_demand_planning_dashboard() -> None:
 
 
 def _render_distribution_tracker() -> None:
-    """Embed the SharePoint Excel workbook (Office-Online read-mode)."""
-    with st.expander("Sales Distribution Tracker (RO Details)", expanded=False):
+    """Embed the SharePoint Excel workbook (Office-Online read-mode).
+
+    Icon: 🚚 — distribution / route-to-market; distinct from 📊 (BI
+    dashboard) and 📋 (Product Line Review) elsewhere on this page.
+    """
+    with st.expander("🚚 Sales Distribution Tracker (RO Details)", expanded=False):
         render_embedded_resource(
             url=_DISTRIBUTION_TRACKER_URL,
             title="Sales Distribution Tracker (RO Details)",
@@ -5214,10 +5218,10 @@ def render() -> None:
     Flow
     ----
     1. Page header + Instructions
-    2. Sales Distribution Tracker (RO Details) (collapsible, collapsed)
-    3. RO Comparison                (collapsible, expanded by default)
-    4. Demand Summary               (collapsible, collapsed by default)
-    5. Product Line Review          (collapsible, collapsed by default)
+    2. RO Comparison                (collapsible, expanded by default)
+    3. Demand Summary               (collapsible, collapsed by default)
+    4. Product Line Review          (collapsible, collapsed by default)
+    5. Sales Distribution Tracker   (🚚, collapsible, collapsed)
     6. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
@@ -5229,9 +5233,6 @@ def render() -> None:
     _render_instructions()
     st.markdown("---")
 
-    _render_distribution_tracker()
-    st.markdown("---")
-
     _render_ro_comparison()
     st.markdown("---")
 
@@ -5239,6 +5240,9 @@ def render() -> None:
     st.markdown("---")
 
     _render_product_line_review()
+    st.markdown("---")
+
+    _render_distribution_tracker()
     st.markdown("---")
 
     _render_demand_planning_dashboard()

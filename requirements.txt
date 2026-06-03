@@ -26,3 +26,9 @@ azure-storage-file-datalake>=12.14.0
 # no system deps, deterministic text extraction.
 pdfplumber>=0.11.0
 
+# Fuzzy string matching for customer-name -> corporate-group resolution in
+# the Product Line Review pipeline. RapidFuzz is a drop-in replacement for
+# fuzzywuzzy with a fully-C scorer (token_set_ratio + process.extractOne),
+# ~10x faster and MIT-licensed (no GPL footprint from python-Levenshtein).
+rapidfuzz>=3.5.0
+

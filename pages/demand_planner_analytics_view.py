@@ -78,7 +78,6 @@ from data_sources.demand_summary import (
     fetch_static_budget_monthly,
     fetch_static_budget_ro,
     fetch_total_item_level_demand,
-    fetch_ibp_base_plan_current,
     list_available_filter_values,
     mgmt_plan_full_blob_path,
     pivot_for_download,
@@ -123,7 +122,6 @@ from data_sources.demand_plan_comparison import (
     enrich_ibp_orders_df,
     list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
-    fetch_ro_summary_current_plan_by_path,
     list_tracker_cycles,
     list_tracker_months,
     validate_filters,
@@ -154,16 +152,31 @@ from data_sources.product_line_review import (
     build_product_line_review_table,
     collect_ibp_months_for_common,
     eligible_cy_begin_months,
-    list_pdh_filter_values,
     list_pdh_filter_values_for_pmaj,
-    prepare_ibp_base_plan_long,
-    prepare_total_item_level_demand_long,
     resolve_filters,
     validate_common_filters,
+)
+from data_sources.demand_item_customer import (
+    DemandItemCustomerError,
+    attach_corporate_group_to_orders,
+    build_demand_order_item_customer,
+    compute_cy_actual_months,
+    fetch_demand_item_customer_detail,
+    list_filter_values_for_pmaj_from_demand,
+    list_filter_values_from_demand,
+    prepare_demand_long_for_plr,
+    save_demand_order_item_customer,
+)
+from data_sources.customer_dims import (
+    CustomerDimsError,
+    fetch_dp_dimcustomernames_df,
 )
 from data_sources.ship_to_sites import (
     ShipToSitesSourceError,
     fetch_dimshiptosites_df,
+)
+from data_sources.product_line_review import (
+    cy_full_year_months as _plr_cy_full_year_months,
 )
 from data_sources.ro_comparison import (
     ANNUAL_OPP_CHANGE,
@@ -4404,12 +4417,19 @@ def _render_product_line_review() -> None:
         st.caption(
             "**One table + one chart per Portfolio Major.**  Hierarchical "
             "**Brand → Portfolio Minor → Supply Format** roll-up with "
-            "customer detail rows; volumes in **millions of lbs**.  "
-            "Run-rate columns use IBP Orders trailing windows ending at "
-            "**CY Month** (PY L3/L6/L12).  Chart series come from "
-            "`qry_total_item_level_demand.csv`, summed across every "
-            "Forecast Type.  "
-            "Save the **RO Summary Report** above before relying on **R&O**."
+            "customer-detail rows (light blue) aggregated by **Corporate "
+            "Group**; volumes in **millions of lbs**.  Run-rate columns "
+            "still use IBP **Orders** trailing windows ending at **CY "
+            "Month**.  The unified source `demand_order_item_customer.csv` "
+            "is rebuilt on every render by (1) keeping the Base Plan + "
+            "R&O rows from `qry_demand_item_customer_detail.csv` outside "
+            "the CY-Actual months, (2) replacing those CY-Actual months "
+            "with IBP **Shipments** as `Forecast Type = \"Actual\"`, and "
+            "(3) stamping `Customer No` + `Corporate Group` per row: "
+            "Base Plan via `dp_dimshiptosites` → `dp_dimcustomernames`, "
+            "Actual via shipments' Customer No → `dp_dimcustomernames`, "
+            "R&O via fuzzy match against `dp_dimcustomernames`.  The "
+            "rebuilt CSV is re-published to Fabric on every render."
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             fabric_signin_widget.render()
@@ -4417,100 +4437,228 @@ def _render_product_line_review() -> None:
         _render_product_line_review_fragment()
 
 
+# Session keys for the demand-order-item-customer auto-save signature guard.
+_SS_AUTOSAVE_DOIC_SIG: str = "_autosave_demand_order_item_customer_sig"
+
+
+def _maybe_autosave_demand_order_item_customer(
+    df: pd.DataFrame, *, trigger: str,
+) -> None:
+    """Save ``demand_order_item_customer.csv`` to Fabric (idempotent).
+
+    Mirrors :func:`_maybe_autosave_ro_summary_report` — the signature
+    guard short-circuits repeated writes of the same enriched frame so
+    a normal filter-click rerun never re-uploads to Fabric.  The save
+    only fires when the in-memory frame's shape signature changes
+    (planner spec: "save whenever a new file is created").
+    """
+    if df is None or df.empty:
+        return
+    sig = _signature_for(df)
+    if st.session_state.get(_SS_AUTOSAVE_DOIC_SIG) == sig:
+        return
+    try:
+        with st.spinner(
+            "Auto-saving `demand_order_item_customer.csv` to Microsoft "
+            f"Fabric ({trigger})…"
+        ):
+            blob_path = save_demand_order_item_customer(df)
+    except DemandItemCustomerError as exc:
+        # Soft fail — same playbook as the other PLR auto-saves so a
+        # transient Fabric blip doesn't make the rest of the page look
+        # broken.  Planners can re-trigger by changing a filter.
+        logger.warning(
+            "Auto-save of demand_order_item_customer.csv failed: %s", exc,
+        )
+        return
+    except Exception:  # noqa: BLE001 — last-resort safety net
+        logger.exception(
+            "Unexpected error auto-saving demand_order_item_customer.csv."
+        )
+        return
+
+    st.session_state[_SS_AUTOSAVE_DOIC_SIG] = sig
+    logger.info(
+        "Auto-saved demand_order_item_customer.csv → Files/%s (trigger=%s)",
+        blob_path, trigger,
+    )
+
+
 @st.fragment
 def _render_product_line_review_fragment() -> None:
     """Eagerly load Fabric sources + render one table+chart per PM.
 
-    Sourcing model
-    --------------
-    1. ``ibp_base_plan_current.csv``       — base plan totals (CY).
-    2. ``qry_pdh.csv``                     — dim attribution (joined on Item No).
-    3. ``dbo.IBP Orders``                  — Ordered Qty lbs (months derived from filters).
-    4. ``RO_Summary_Report.csv``           — FY27 Current Plan → "R&O" column.
-    5. ``qry_total_item_level_demand.csv`` — Full-Year chart series.
+    Sourcing model (planner spec, June 2026 cycle)
+    ----------------------------------------------
+    1. ``qry_demand_item_customer_detail.csv``  — wide month × item ×
+       customer detail (Base Plan / R&O / placeholder rows).
+    2. ``qry_pdh.csv``                          — dim attribution
+       (joined on Item No).
+    3. ``dbo.IBP Shipments``                    — Shipped Qty lbs;
+       months derived from the CY Actual Months (months in CY Full
+       Year but outside CY YTG).  These rows REPLACE the detail-CSV
+       rows in the same months and are emitted as
+       ``Forecast Type = "Actual"``.
+    4. ``dbo.IBP Orders``                       — Ordered Qty lbs;
+       months derived from the common filters; feeds the run-rate /
+       PY columns ONLY (not the unified CSV).
+    5. ``dbo.dp_dimshiptosites``                — translates a Base
+       Plan row's Party Site Number into a ``customer_num`` so the
+       Corporate Group attach can hit ``dp_dimcustomernames``.
+    6. ``dbo.dp_dimcustomernames``              — single source of
+       truth for Corporate Group.  Exact ``customer_num`` join for
+       Actual + Base Plan rows; fuzzy ``Customer Name`` match for
+       R&O rows; exact ``customer_num`` join for the IBP Orders
+       run-rate side.
+
+    Output
+    ------
+    The enriched frame is saved to
+    ``Files/RO Tracking/Demand Plan/demand_order_item_customer.csv``
+    on every render (idempotent — only writes when the in-memory frame
+    signature changes).  All filter dropdowns, hierarchy leaves and
+    chart series read from that same in-memory frame.
 
     Performance contract
     --------------------
-    * Sources are fetched ONCE per fragment render (each connector layer
-      memoises further with ``@st.cache_data``).
-    * Enrichment (PDH attribution) also happens ONCE — see
-      :func:`_cached_prepare_plr_inputs`.  Enrichment is the most expensive
-      step (item-key normalisation + merge across 350k+ rows), so caching
-      it on shape-signatures keeps repeat renders sub-second.
+    * Each fetcher caches at the source layer (TTL + ETag); the repeated
+      calls here are cheap.
+    * Enrichment + fuzzy join + aggregation happen ONCE per render via
+      :func:`_cached_prepare_plr_inputs`, keyed on shape signatures so
+      filter clicks that don't touch the underlying data short-circuit
+      to a microsecond cache hit.
     * Each Portfolio Major section renders inside its OWN ``@st.fragment``
-      (:func:`_render_plr_pm_section`) so a Supply Format / Brand pick on
-      one PM no longer rebuilds every other PM.
+      (:func:`_render_plr_pm_section`) so a Supply Format / Brand pick
+      on one PM no longer rebuilds every other PM.
     """
-    # 1) Load raw sources up-front.  Each fetcher already caches at the
-    #    source layer (TTL + ETag), so the repeated calls here are cheap.
+    # 1) Load raw sources up-front.  Each fetcher caches at the source
+    #    layer (60 min for CSVs, 15 min for dim tables) so repeat fragment
+    #    runs reuse the cached payloads.
     try:
         with st.spinner("Reading PLR sources from Microsoft Fabric…"):
-            base_snap = fetch_ibp_base_plan_current()
-            total_demand_snap = fetch_total_item_level_demand()
-    except DemandSummaryError as exc:
+            detail_df = fetch_demand_item_customer_detail()
+    except DemandItemCustomerError as exc:
         st.error(f"❌ Could not load Product Line Review sources.\n\n{exc}")
         return
 
-    base_raw = base_snap.df
-    if base_raw is None or base_raw.empty:
-        st.info("ℹ️ `ibp_base_plan_current.csv` is empty — nothing to render.")
-        return
-
-    pdh_df = _load_demand_comparison_pdh()
-    ro_lookup = fetch_ro_summary_current_plan_by_path()
-    pdh_values = list_pdh_filter_values(pdh_df)
-    pmaj_options = pdh_values.get("portfolio_major", [])
-    if not pmaj_options:
-        st.warning(
-            "No Portfolio Major values found in `qry_pdh.csv` — cannot "
-            "build any Product Line Review section."
+    if detail_df is None or detail_df.empty:
+        st.info(
+            "ℹ️ `qry_demand_item_customer_detail.csv` is empty — nothing "
+            "to render."
         )
         return
 
-    # 2) Common filters (apply to every PM table & chart).
-    common = _render_plr_common_filters(base_raw)
+    pdh_df = _load_demand_comparison_pdh()
+
+    # Customer-names dim is the single source of truth for Corporate
+    # Group as of the June 2026 planner spec.  Ship-to-sites is the
+    # bridge that lets Base Plan rows (Party Site Number only) reach
+    # that lookup.  Both fetchers are independently cached; failures
+    # are non-fatal — the build helpers fall back to Customer Name
+    # so a temporary auth blip never bricks the section.
+    try:
+        customer_names_dim = fetch_dp_dimcustomernames_df()
+    except CustomerDimsError as exc:
+        logger.warning("dp_dimcustomernames load failed: %s", exc)
+        customer_names_dim = None
+    try:
+        ship_to_sites_dim = fetch_dimshiptosites_df()
+    except ShipToSitesSourceError as exc:
+        logger.warning("dp_dimshiptosites load failed: %s", exc)
+        ship_to_sites_dim = None
+
+    # 2) Common filters (apply to every PM table & chart).  Months come
+    #    from the detail CSV's ``Start of Month`` so the planner can only
+    #    pick months that actually have rows.
+    common = _render_plr_common_filters(detail_df)
     errors = validate_common_filters(common)
     if errors:
         for msg in errors:
             st.error(f"❌ {msg}")
         return
 
-    # 3) IBP Orders pull — months depend only on common filters.
+    # 3) IBP pulls — month union covers BOTH the enrichment (CY Actual
+    #    months sourced from SHIPMENTS) AND the table's PY / run-rate /
+    #    FY columns (sourced from ORDERS).  Done ONCE per render;
+    #    cached per month set in the slim fetcher.
     ibp_months = collect_ibp_months_for_common(common)
     ibp_orders_df, _warn_o = _load_demand_comparison_ibp_orders(months=ibp_months)
+    ibp_shipments_df, _warn_s = _load_demand_comparison_ibp(months=ibp_months)
 
-    # 4) One-time enrichment + aggregation.  Cached on shape-signatures so
-    #    a filter rerun that doesn't touch the underlying data short-
-    #    circuits to a microsecond cache hit instead of re-enriching
-    #    every 350k-row source.
-    orders_agg, base_agg, total_demand_agg = _cached_prepare_plr_inputs(
-        _signature_for(ibp_orders_df),
-        _signature_for(base_raw),
-        _signature_for(pdh_df),
-        _signature_for(total_demand_snap.df),
-        _ibp_orders_df=ibp_orders_df,
-        _base_raw=base_raw,
-        _pdh_df=pdh_df,
-        _total_demand_df=total_demand_snap.df,
+    # 4) CY Actual Months (months in CY Full Year but outside CY YTG)
+    #    drive the enrichment swap — these get sourced from IBP
+    #    Shipments instead of the detail CSV.
+    cy_actual_months = compute_cy_actual_months(
+        cy_full_year_months=_plr_cy_full_year_months(common.cy_begin_month),
+        cy_ytg_start=common.cy_ytg_start,
+        cy_ytg_end=common.cy_ytg_end,
     )
 
-    # 5) Per-PM render.  Each section is its OWN @st.fragment so changes
+    # 5) Enrich + aggregate the four PLR input frames.  Cached on
+    #    shape-signatures + the CY Actual Months tuple so filter reruns
+    #    that don't touch the underlying data short-circuit to a cache
+    #    hit instead of re-running the fuzzy join.
+    (
+        enriched_df, orders_agg, demand_agg, chart_agg,
+        orders_stats, plr_warnings,
+    ) = _cached_prepare_plr_inputs(
+        _signature_for(detail_df),
+        _signature_for(ibp_orders_df),
+        _signature_for(ibp_shipments_df),
+        _signature_for(pdh_df),
+        _signature_for(customer_names_dim),
+        _signature_for(ship_to_sites_dim),
+        cy_actual_months,
+        _detail_df=detail_df,
+        _ibp_orders_df=ibp_orders_df,
+        _ibp_shipments_df=ibp_shipments_df,
+        _pdh_df=pdh_df,
+        _customer_names_dim=customer_names_dim,
+        _ship_to_sites_dim=ship_to_sites_dim,
+    )
+
+    for msg in plr_warnings:
+        st.warning(msg)
+
+    # Planner spec: always show how many IBP Orders rows were dropped
+    # during PDH enrichment (variable mismatch / unparseable month) so
+    # data-quality regressions surface immediately.  The banner is
+    # informational when zero rows dropped, otherwise a yellow warning.
+    _render_orders_drop_banner(orders_stats)
+
+    # 6) Auto-save the enriched CSV to Fabric (idempotent — guarded by
+    #    the in-memory frame signature).  Planner spec: "the output
+    #    should always be automatically saved whenever a new file is
+    #    created".
+    _maybe_autosave_demand_order_item_customer(enriched_df, trigger="PLR build")
+
+    # 7) PM dropdown options come from the saved CSV (planner spec).
+    fv = list_filter_values_from_demand(enriched_df)
+    pmaj_options = fv.get("portfolio_major", [])
+    if not pmaj_options:
+        st.warning(
+            "No Portfolio Major values found in "
+            "`demand_order_item_customer.csv` — cannot build any "
+            "Product Line Review section."
+        )
+        return
+
+    # 8) Per-PM render.  Each section is its OWN @st.fragment so changes
     #    to one PM's sub-filters do not rerun the others.
     for pmaj in pmaj_options:
         _render_plr_pm_section(
             pmaj=pmaj,
             common=common,
             pdh_df=pdh_df,
+            enriched_df=enriched_df,
             orders_agg=orders_agg,
-            base_agg=base_agg,
-            total_demand_agg=total_demand_agg,
-            ro_lookup=ro_lookup,
+            demand_agg=demand_agg,
+            chart_agg=chart_agg,
         )
 
-    # 6) Auto-save the in-memory RO Summary + RO Comparison snapshots to Fabric
-    #    so the freshly rendered PLR tables reference what's currently saved.
-    #    Idempotent within a session — the signature guards short-circuit
-    #    repeat saves for the same in-memory frames.
+    # 9) Auto-save the in-memory RO Summary + RO Comparison snapshots to
+    #    Fabric so the freshly rendered PLR tables reference what's
+    #    currently saved.  Idempotent within a session.
     _maybe_autosave_ro_summary_report(trigger="PLR build")
     _maybe_autosave_ro_comparison_output(trigger="PLR build")
 
@@ -4519,39 +4667,138 @@ def _render_product_line_review_fragment() -> None:
 # PLR input prep (enrichment + dim-grain aggregation) — cached
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# These three frames are the per-PM loop's only inputs.  Caching them on
-# shape-signatures means that filter clicks (which don't change the
-# underlying data) hit the cache instead of re-enriching ~350k rows N
-# times.  The aggregation step collapses to dim-grain so each per-PM
-# mask + groupby is essentially O(unique PM/SFmt/Brand/PMinor/Customer)
-# rather than O(raw rows).
+# The four output frames below are the per-PM loop's only inputs.
+# Caching on shape-signatures means filter clicks (which don't change
+# the underlying data) hit the cache instead of re-running the fuzzy
+# join across the whole frame.  The aggregation step collapses to dim-
+# grain so each per-PM mask + groupby is bound by dim cardinality, not
+# raw shape.
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_prepare_plr_inputs(
+    detail_sig: tuple,
     orders_sig: tuple,
-    base_sig: tuple,
+    shipments_sig: tuple,
     pdh_sig: tuple,
-    total_demand_sig: tuple,
+    customer_names_sig: tuple,
+    ship_to_sites_sig: tuple,
+    cy_actual_months: tuple,
     *,
+    _detail_df: Optional[pd.DataFrame],
     _ibp_orders_df: Optional[pd.DataFrame],
-    _base_raw: Optional[pd.DataFrame],
+    _ibp_shipments_df: Optional[pd.DataFrame],
     _pdh_df: Optional[pd.DataFrame],
-    _total_demand_df: Optional[pd.DataFrame],
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Enrich + aggregate the three PLR input frames.
+    _customer_names_dim: Optional[pd.DataFrame],
+    _ship_to_sites_dim: Optional[pd.DataFrame],
+) -> tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
+    tuple[int, int], tuple[str, ...],
+]:
+    """Build the enriched demand frame + every aggregated frame the PLR uses.
 
-    Returns ``(orders_agg, base_agg, total_demand_agg)`` where each frame
-    is grouped to its minimum-distinct-dim grain so the per-PM masking
-    operations stay tiny.  Cache key is shape-signatures of the four
-    inputs — same idea the page already uses for the comparison build.
+    Returns
+    -------
+    enriched_df
+        Saved-CSV-shape frame (one row per detail row OR synthesised
+        Actual row), with the per-forecast-type-resolved ``Corporate
+        Group`` column attached.  This is the file written to Fabric.
+    orders_agg
+        IBP Orders + PDH dims + Corporate Group, used for the
+        PY / run-rate columns on the table.  Already grouped to
+        dim-grain.
+    demand_agg
+        The enriched CSV in long shape, grouped to the dim-grain the
+        table builder consumes for the Current-Cycle-Plan columns.
+    chart_agg
+        The same long frame aggregated to ``(pmaj, sfmt, brand, month)``
+        for the Full-Year chart.
+    orders_stats
+        ``(n_orders_in, n_orders_enriched)`` — surfaced as a visible
+        banner so the planner sees drops due to variable mismatches
+        in the IBP Orders enrichment immediately.
+    warnings
+        Soft warnings produced by the enrichment (dim table missing,
+        no fuzzy matches, etc.) — surfaced as captions on the page
+        outside the cached call.
+
+    A plain tuple is returned (not a dataclass) for the same reason
+    the rest of the page uses tuples in ``@st.cache_data`` callers:
+    the cache value is pickled on round-trip, and a custom class can
+    get bound to a stale class object when Streamlit's file watcher
+    reloads the module.
     """
+    # 1. Enrich the saved-CSV frame.  Flow (planner spec, June 2026
+    #    cycle):
+    #       filter detail (drop CY-Actual months)
+    #         ⊕ synthesise Actual rows from IBP SHIPMENTS
+    #         → back-fill Customer No on Base Plan rows via
+    #           dp_dimshiptosites
+    #         → resolve Corporate Group per row by Forecast Type
+    #           (exact customer_num for Actual + Base Plan; fuzzy
+    #           Customer Name for R&O).
+    #    This is the file written to Fabric.
+    build = build_demand_order_item_customer(
+        detail_df=_detail_df,
+        shipments_df=_ibp_shipments_df,
+        pdh_df=_pdh_df,
+        customer_names_dim=_customer_names_dim,
+        ship_to_sites_dim=_ship_to_sites_dim,
+        cy_actual_months=cy_actual_months,
+    )
+
+    # 2. Orders side: PDH-enrich + attach Corporate Group via the
+    #    same dp_dimcustomernames table (planner spec retired the
+    #    legacy dp_dimcorporategroup).  We track row counts before
+    #    and after enrichment so the page can render a visible drop
+    #    banner — `enrich_ibp_orders_df` silently drops rows whose
+    #    Month is unparseable or whose required columns are missing.
+    n_orders_in = int(len(_ibp_orders_df)) if _ibp_orders_df is not None else 0
     orders_enriched = enrich_ibp_orders_df(_ibp_orders_df, _pdh_df)
-    base_long = prepare_ibp_base_plan_long(_base_raw, _pdh_df)
-    total_long = prepare_total_item_level_demand_long(_total_demand_df, _pdh_df)
+    n_orders_enriched = int(len(orders_enriched))
+    orders_with_cg = attach_corporate_group_to_orders(
+        orders_enriched, _customer_names_dim,
+    )
+
+    # 3. Long-format saved-CSV frame for the table builder.
+    demand_long = prepare_demand_long_for_plr(build.df, _pdh_df)
+
     return (
-        aggregate_orders_for_plr(orders_enriched),
-        aggregate_base_plan_for_plr(base_long),
-        aggregate_total_demand_for_plr(total_long),
+        build.df,
+        aggregate_orders_for_plr(orders_with_cg),
+        aggregate_base_plan_for_plr(demand_long),
+        aggregate_total_demand_for_plr(demand_long),
+        (n_orders_in, n_orders_enriched),
+        build.warnings,
+    )
+
+
+def _render_orders_drop_banner(orders_stats: tuple[int, int]) -> None:
+    """Render the always-visible IBP Orders enrichment drop banner.
+
+    *orders_stats* = ``(n_in, n_enriched)``.  Per planner spec (Q3),
+    the banner is shown unconditionally so data-quality regressions
+    surface immediately — yellow when drops > 0, informational caption
+    otherwise.  The most common drop reasons (per the inner
+    ``_enrich_ibp`` helper) are: missing required columns (Item No /
+    Month / Ordered Qty lbs), or rows with an unparseable Month value.
+    """
+    n_in, n_enriched = orders_stats
+    n_dropped = max(0, n_in - n_enriched)
+    if n_in == 0:
+        st.caption("ℹ️ IBP Orders not pulled — run-rate columns will be zero.")
+        return
+    if n_dropped == 0:
+        st.caption(
+            f"ℹ️ IBP Orders enrichment: {n_enriched:,} of {n_in:,} rows "
+            "kept (0 dropped — clean variable match)."
+        )
+        return
+    pct = (n_dropped / n_in) * 100.0 if n_in else 0.0
+    st.warning(
+        f"⚠️ IBP Orders enrichment dropped **{n_dropped:,} of {n_in:,}** rows "
+        f"({pct:.1f}%) due to variable mismatch.  Most common causes: missing "
+        f"`Item No` / `Month` / `Ordered Qty lbs`, or an unparseable `Month` "
+        f"value.  The remaining {n_enriched:,} rows feed the Orders columns."
     )
 
 
@@ -4565,10 +4812,10 @@ def _render_plr_pm_section(
     pmaj: str,
     common: ProductLineReviewCommonFilters,
     pdh_df: Optional[pd.DataFrame],
+    enriched_df: pd.DataFrame,
     orders_agg: pd.DataFrame,
-    base_agg: pd.DataFrame,
-    total_demand_agg: pd.DataFrame,
-    ro_lookup: dict,
+    demand_agg: pd.DataFrame,
+    chart_agg: pd.DataFrame,
 ) -> None:
     """Render one Portfolio Major's header + sub-filters + table + chart.
 
@@ -4578,13 +4825,12 @@ def _render_plr_pm_section(
     """
     st.markdown("---")
     st.markdown(f"### Portfolio Major: {pmaj}")
-    sub = _render_plr_pm_sub_filters(pdh_df, pmaj)
+    sub = _render_plr_pm_sub_filters(enriched_df, pdh_df, pmaj)
     filters = resolve_filters(common, pmaj, sub)
 
     result = build_product_line_review_table(
         orders_enriched=orders_agg,
-        base_long=base_agg,
-        ro_current_plan_by_path=ro_lookup,
+        base_long=demand_agg,
         filters=filters,
     )
     for msg in result.warnings:
@@ -4592,7 +4838,7 @@ def _render_plr_pm_section(
     _render_plr_table_for_pm(result, filters)
 
     chart_data = build_full_year_chart_data(
-        total_demand_long=total_demand_agg,
+        total_demand_long=chart_agg,
         portfolio_major=pmaj,
         sub=sub,
         cy_begin_month=common.cy_begin_month,
@@ -4603,23 +4849,26 @@ def _render_plr_pm_section(
 # ── PLR common filters ────────────────────────────────────────────────────────
 
 def _render_plr_common_filters(
-    base_raw: pd.DataFrame,
+    detail_df: pd.DataFrame,
 ) -> ProductLineReviewCommonFilters:
     """Render the four filters shared across every Portfolio Major table.
 
-    *base_raw* is consulted only to seed sensible default month indexes —
-    the four pickers themselves are always populated from the union of
-    base-plan months + a generous look-ahead window (so the planner can
-    pick a CY Month that hasn't been baselined yet).
+    *detail_df* is consulted only to seed the dropdown month list — every
+    distinct ``Start of Month`` in the detail CSV is offered, so the
+    planner can pick any month that actually has rows.  PY counterparts
+    are always derived (CY − 12) and never picked.
     """
     from data_sources.demand_plan_comparison import _vectorised_start_of_month
     from data_sources.demand_summary import _resolve_column
 
     month_col = _resolve_column(
-        base_raw, ("Start of Month", "Start Of Month", "Month"),
+        detail_df, ("Start of Month", "Start Of Month", "Month"),
     )
     if not month_col:
-        st.warning("Base plan file has no parseable **Start of Month** column.")
+        st.warning(
+            "Detail file has no parseable **Start of Month** column — "
+            "falling back to today's month for every picker."
+        )
         return ProductLineReviewCommonFilters(
             cy_month=date.today().replace(day=1),
             cy_begin_month=date.today().replace(day=1),
@@ -4628,11 +4877,11 @@ def _render_plr_common_filters(
         )
 
     months = sorted({
-        m for m in _vectorised_start_of_month(base_raw[month_col]).tolist()
+        m for m in _vectorised_start_of_month(detail_df[month_col]).tolist()
         if m is not None
     })
     if not months:
-        st.warning("No parseable months in `ibp_base_plan_current.csv`.")
+        st.warning("No parseable months in `qry_demand_item_customer_detail.csv`.")
         return ProductLineReviewCommonFilters(
             cy_month=date.today().replace(day=1),
             cy_begin_month=date.today().replace(day=1),
@@ -4714,19 +4963,28 @@ def _render_plr_common_filters(
 # ── PLR per-PM sub-filters (Supply Format + Brand, multi-select) ─────────────
 
 def _render_plr_pm_sub_filters(
+    enriched_df: pd.DataFrame,
     pdh_df: Optional[pd.DataFrame],
     portfolio_major: str,
 ) -> ProductLineReviewSubFilters:
     """Render the two per-PM multiselects.  Empty selection = include all.
 
-    Supply Format options are CASCADED on the active Portfolio Major
-    (planner never sees a format that doesn't apply to this section).
-    Brand options are likewise PM-scoped — the same item-description
-    Branded/Private rule the rest of the page uses.
+    Sources (planner spec, June 2026):
+    * **Supply Format** options come from the enriched
+      ``demand_order_item_customer`` frame, cascaded on Portfolio
+      Major — so the planner only sees formats that actually have rows
+      in the current cycle.
+    * **Brand** options come from PDH (the saved CSV has no Brand
+      column).  Same item-description Branded/Private rule the rest of
+      the page uses.
     """
-    fv = list_pdh_filter_values_for_pmaj(pdh_df, portfolio_major)
-    sfmt_options = fv.get("supply_format", [])
-    brand_options = fv.get("brand", []) or [BRAND_BRANDED, BRAND_PRIVATE]
+    sfmt_options = list_filter_values_for_pmaj_from_demand(
+        enriched_df, portfolio_major,
+    ).get("supply_format", [])
+    brand_options = (
+        list_pdh_filter_values_for_pmaj(pdh_df, portfolio_major).get("brand", [])
+        or [BRAND_BRANDED, BRAND_PRIVATE]
+    )
 
     # Per-PM widget keys so each section keeps its OWN selection — picking
     # "Print" under Butter must not bleed into the Cultured table.
@@ -4741,8 +4999,9 @@ def _render_plr_pm_sub_filters(
             key=f"plr_sfmt_{pm_key}",
             help=(
                 "Leave empty to include every Supply Format in this "
-                "Portfolio Major.  Options come from `qry_pdh.csv` "
-                f"filtered to **{portfolio_major}**."
+                "Portfolio Major.  Options come from "
+                "`demand_order_item_customer.csv` filtered to "
+                f"**{portfolio_major}**."
             ),
         ))
     with cols[1]:
@@ -4803,12 +5062,14 @@ def _render_plr_table_for_pm(
 
     def _style_row(row: pd.Series) -> list[str]:
         idx = int(row.name)
-        # Greyed-out customer rows — same visual treatment as before.
-        grey = (
-            "background-color: #f0f0f0; color: #888888"
-            if is_customer[idx] else ""
-        )
-        return [grey] * len(row)
+        # Customer-detail rows (now keyed on Corporate Group, planner
+        # spec) — light blue background so they read as a distinct band
+        # below the brand / pminor / sfmt hierarchy.  Colour:
+        # Material Design "Light Blue 50" (#e3f2fd) — high enough
+        # contrast to register at a glance, low enough to keep the
+        # cell text readable without forcing a colour change there.
+        blue = "background-color: #e3f2fd" if is_customer[idx] else ""
+        return [blue] * len(row)
 
     st.dataframe(
         display.style.apply(_style_row, axis=1),

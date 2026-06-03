@@ -3,18 +3,24 @@
 Pure build logic for the Demand Planner Analytics page.  Consumes:
 
 * ``dbo.IBP Orders``                            (``Ordered Qty lbs``)
-* ``ibp_base_plan_current.csv``                 (``Total`` by ``Start of Month``)
-* Saved ``RO_Summary_Report.csv``               (``FY27 Probabilized | Current Plan``)
-* ``qry_total_item_level_demand.csv``           (Full-Year chart)
+* ``demand_order_item_customer.csv``            (Current Cycle Plan = Base Plan
+                                                 + R&O futures + CY-Actual
+                                                 orders; built per-render by
+                                                 :mod:`data_sources.demand_item_customer`)
+* ``qry_total_item_level_demand.csv``           (Full-Year chart fallback; the
+                                                 current page sources the chart
+                                                 from the same enriched frame
+                                                 above)
 * ``qry_pdh.csv``                               (item-level dims for every join)
 
 Layout
 ------
 The Demand Planner Analytics page renders **one table + one chart per
-Portfolio Major** (looped from PDH).  This module owns:
+Portfolio Major** (looped from the saved CSV).  This module owns:
 
 * The filter dataclasses (common picks + per-PM sub-filters).
-* The hierarchical table builder (brand → pminor → sfmt → customers).
+* The hierarchical table builder (brand → pminor → sfmt → corporate-group
+  customers).
 * The Full-Year chart data builder (CY FY vs NY FY).
 * The dynamic display-group spec (column labels echo the active filters).
 
@@ -42,9 +48,7 @@ from data_sources.demand_plan_comparison import (
     _vectorised_item_key,
     _vectorised_start_of_month,
     build_item_dim_frame,
-    enrich_ibp_orders_df,
     months_in_range,
-    resolve_ro_summary_path,
 )
 from data_sources.demand_summary import (
     COL_DEMAND_LBS,
@@ -86,25 +90,30 @@ COL_FY_PY = "fy_py"
 COL_FY_LE = "fy_le"
 COL_FY_PCT = "fy_pct"
 COL_FY_LBS = "fy_lbs"
-COL_FY_RO = "fy_ro"
-COL_FY_TOTAL = "fy_total"
 
 # Ordered tuple of (group, ((col_key, label_template), ...)) used to drive
 # the rename + column-order pipeline.  Labels containing ``{py}`` / ``{cy}``
 # placeholders are formatted from the active filters at display time via
 # :func:`build_display_groups`.
+#
+# Planner-requested label rule: wherever the column previously read
+# "Base Plan" it now reads "Current Cycle Plan" — the source is no longer
+# pure base plan; it's the per-render unified view (Base Plan + R&O for
+# the YTG horizon + Actual orders for the CY-actual months).  Final two
+# columns (R&O + Forecast Total) have been removed at planner request:
+# the R&O view lives in the RO Summary Report section directly above.
 _DISPLAY_GROUPS_TEMPLATE: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
     ("Current Month", (
         (COL_CM_PY,  "Orders – {py}"),
-        (COL_CM_CY,  "Base Plan – {cy}"),
-        (COL_CM_PCT, "Base Plan vs PY Orders (%)"),
-        (COL_CM_LBS, "Base Plan vs PY Orders (Mlbs)"),
+        (COL_CM_CY,  "Current Cycle Plan – {cy}"),
+        (COL_CM_PCT, "Current Cycle Plan vs PY Orders (%)"),
+        (COL_CM_LBS, "Current Cycle Plan vs PY Orders (Mlbs)"),
     )),
     ("Year-to-Go", (
         (COL_YTG_PY,  "PY Orders – YTG"),
-        (COL_YTG_CY,  "Base Plan – CY YTG"),
-        (COL_YTG_PCT, "Base Plan vs PY Orders – YTG (%)"),
-        (COL_YTG_LBS, "Base Plan vs PY Orders – YTG (Mlbs)"),
+        (COL_YTG_CY,  "Current Cycle Plan – CY YTG"),
+        (COL_YTG_PCT, "Current Cycle Plan vs PY Orders – YTG (%)"),
+        (COL_YTG_LBS, "Current Cycle Plan vs PY Orders – YTG (Mlbs)"),
     )),
     ("Annualized Run Rate", (
         (COL_RR_L3,  "Annualized Run Rate L3 (Orders)"),
@@ -113,11 +122,9 @@ _DISPLAY_GROUPS_TEMPLATE: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = 
     )),
     ("Full Year", (
         (COL_FY_PY,    "PFY Orders – Full Year"),
-        (COL_FY_LE,    "CFY Base Plan – Full Year"),
-        (COL_FY_PCT,   "CFY Base Plan vs PFY Orders (%)"),
-        (COL_FY_LBS,   "CFY Base Plan vs PFY Orders (Mlbs)"),
-        (COL_FY_RO,    "Full Year R&O (Mlbs)"),
-        (COL_FY_TOTAL, "Full Year Forecast Total (Base + R&O)"),
+        (COL_FY_LE,    "CFY Current Cycle Plan – Full Year"),
+        (COL_FY_PCT,   "CFY Current Cycle Plan vs PFY Orders (%)"),
+        (COL_FY_LBS,   "CFY Current Cycle Plan vs PFY Orders (Mlbs)"),
     )),
 )
 
@@ -225,7 +232,12 @@ class ProductLineReviewResult:
 
 @dataclass(frozen=True)
 class _Measures:
-    """Numeric measures for one row (millions of lbs except percents)."""
+    """Numeric measures for one row (millions of lbs except percents).
+
+    The R&O columns (and their dependent Full-Year Forecast Total) have
+    been removed from the display table at planner request; the saved
+    RO Summary Report above the section is the canonical R&O surface.
+    """
     cm_py: float = 0.0
     cm_cy: float = 0.0
     ytg_py: float = 0.0
@@ -235,7 +247,6 @@ class _Measures:
     rr_l12: float = 0.0
     fy_py: float = 0.0
     fy_le: float = 0.0
-    fy_ro: Optional[float] = None  # ``None`` → display em-dash (customer rows)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,11 +497,13 @@ def _compute_measures(
     brand: str,
     pminor: str,
     sfmt: str,
-    customer: Optional[str],
     month_sets: dict[str, set[date]],
-    ro_lookup: dict[tuple[str, ...], float],
 ) -> _Measures:
-    """Compute the 9 numeric measures for one (brand, pminor, sfmt) leaf."""
+    """Compute the 9 numeric measures for one (brand, pminor, sfmt) leaf.
+
+    Customer-row measures use the separate :func:`_compute_customer_measures`
+    helper — this function is for the hierarchical aggregate rows only.
+    """
     def _slice_mask(df: pd.DataFrame) -> pd.Series:
         m = _apply_dim_filters(df, filters)
         m &= df["brand"].astype(str).str.strip() == brand.strip()
@@ -502,8 +515,6 @@ def _compute_measures(
             df["sfmt"].astype(str).str.strip().str.casefold()
             == sfmt.strip().casefold()
         )
-        if customer is not None:
-            m &= df["customer"].astype(str).str.strip() == customer.strip()
         return m
 
     om = _slice_mask(orders)
@@ -528,31 +539,20 @@ def _compute_measures(
     fy_py = _sum_millions(orders, om & orders["month"].isin(month_sets["py_fy"]))
     fy_le = _sum_millions(base, bm & base["month"].isin(month_sets["cy_fy"]))
 
-    fy_ro: Optional[float] = None
-    if customer is None:
-        path = resolve_ro_summary_path(
-            pmaj=filters.portfolio_major,
-            sfmt=sfmt, brand=brand, pminor=pminor,
-        )
-        if path is not None:
-            fy_ro = float(ro_lookup.get(path, 0.0))
-
     return _Measures(
         cm_py=cm_py, cm_cy=cm_cy,
         ytg_py=ytg_py, ytg_cy=ytg_cy,
         rr_l3=l3 * 4.0,
         rr_l6=l6 * 2.0,
         rr_l12=l12,
-        fy_py=fy_py, fy_le=fy_le, fy_ro=fy_ro,
+        fy_py=fy_py, fy_le=fy_le,
     )
 
 
 def _rollup_measures(children: list[_Measures]) -> _Measures:
-    """Aggregate child measures.  R&O sums only defined (non-``None``) values."""
+    """Aggregate child measures by summing each numeric field."""
     if not children:
         return _Measures()
-    fy_ro_vals = [c.fy_ro for c in children if c.fy_ro is not None]
-    fy_ro = sum(fy_ro_vals) if fy_ro_vals else None
     return _Measures(
         cm_py=sum(c.cm_py for c in children),
         cm_cy=sum(c.cm_cy for c in children),
@@ -563,7 +563,6 @@ def _rollup_measures(children: list[_Measures]) -> _Measures:
         rr_l12=sum(c.rr_l12 for c in children),
         fy_py=sum(c.fy_py for c in children),
         fy_le=sum(c.fy_le for c in children),
-        fy_ro=fy_ro,
     )
 
 
@@ -585,12 +584,6 @@ def _fmt_delta(cy: float, py: float) -> str:
     return _fmt_millions(cy - py)
 
 
-def _fmt_optional_millions(value: Optional[float]) -> str:
-    if value is None:
-        return "–"
-    return _fmt_millions(value)
-
-
 def _measures_to_display_row(
     label: str,
     indent: int,
@@ -599,16 +592,6 @@ def _measures_to_display_row(
     is_customer: bool,
 ) -> dict[str, object]:
     """Turn numeric measures into formatted strings for the UI table."""
-    # Customer rows show ``–`` for R&O and Full-Year Total (planner rule:
-    # R&O is only meaningful at the aggregate / template level).
-    fy_ro_disp: Optional[float] = None if is_customer else m.fy_ro
-    if is_customer:
-        fy_total: Optional[float] = None
-    elif m.fy_ro is None and m.fy_le == 0.0:
-        fy_total = None
-    else:
-        fy_total = m.fy_le + (m.fy_ro or 0.0)
-
     return {
         COL_ROW_LABEL: label,
         COL_INDENT: indent,
@@ -628,8 +611,6 @@ def _measures_to_display_row(
         COL_FY_LE: _fmt_millions(m.fy_le),
         COL_FY_PCT: _fmt_pct(m.fy_le, m.fy_py),
         COL_FY_LBS: _fmt_delta(m.fy_le, m.fy_py),
-        COL_FY_RO: _fmt_optional_millions(fy_ro_disp),
-        COL_FY_TOTAL: _fmt_optional_millions(fy_total),
     }
 
 
@@ -743,25 +724,35 @@ def build_product_line_review_table(
     *,
     orders_enriched: pd.DataFrame,
     base_long: pd.DataFrame,
-    ro_current_plan_by_path: dict[tuple[str, ...], float],
     filters: ProductLineReviewFilters,
 ) -> ProductLineReviewResult:
     """Build one Portfolio Major's hierarchical table.
 
-    Inputs are **already enriched** — :func:`enrich_ibp_orders_df` for
-    orders and :func:`prepare_ibp_base_plan_long` for base plan — so the
-    per-PM loop in the page can enrich once and reuse the frames.
+    Inputs are **already enriched** — :func:`enrich_ibp_orders_df` (plus
+    optionally :func:`attach_corporate_group_to_orders`) for orders, and
+    either :func:`prepare_ibp_base_plan_long` (legacy) or
+    :func:`prepare_demand_long_for_plr` (current) for the Current
+    Cycle Plan side — so the per-PM loop in the page can enrich once
+    and reuse the frames.
+
+    Customer-row resolution
+    -----------------------
+    The bottom rows of the table aggregate by **corporate group** rather
+    than raw Plan-To name when both frames carry a
+    ``customer_corp_group`` column (the planner spec — driven by the
+    fuzzy join in :mod:`data_sources.demand_item_customer`).  When the
+    column is absent (legacy call path with ``ibp_base_plan_current``),
+    the function falls back to the older ``customer`` / ``customer_name``
+    behaviour so existing tests and callers keep working.
 
     Parameters
     ----------
     orders_enriched
         IBP Orders frame with PDH dims attached.
     base_long
-        Base-plan frame in the long shape produced by
-        :func:`prepare_ibp_base_plan_long`.
-    ro_current_plan_by_path
-        ``{label_path → FY27 Current Plan Mlbs}`` map from the saved
-        RO Summary Report.  Empty map → R&O FY = 0 with a soft warning.
+        "Current Cycle Plan" frame in the long shape produced by either
+        :func:`prepare_demand_long_for_plr` (preferred) or
+        :func:`prepare_ibp_base_plan_long` (legacy).
     filters
         Per-PM filter set — PM label, common windows, per-PM sub-filters.
     """
@@ -777,12 +768,6 @@ def build_product_line_review_table(
         return ProductLineReviewResult(
             table=pd.DataFrame(),
             warnings=(f"No data for Portfolio Major '{pmaj}'.",),
-        )
-
-    if not ro_current_plan_by_path:
-        warnings.append(
-            "RO Summary Report is missing or lacks "
-            "'FY27 Probabilized | Current Plan' — R&O FY will be zero."
         )
 
     cy_m = filters.common.cy_month.replace(day=1)
@@ -849,9 +834,7 @@ def build_product_line_review_table(
                 m = _compute_measures(
                     orders_enriched, base_long, filters,
                     brand=brand, pminor=pminor, sfmt=sfmt,
-                    customer=None,
                     month_sets=month_sets,
-                    ro_lookup=ro_current_plan_by_path,
                 )
                 sfmt_rollups.append(m)
                 sfmt_rows.append((sfmt, m, 2))
@@ -874,15 +857,21 @@ def build_product_line_review_table(
         "Grand Total", indent=0, m=grand, is_customer=False,
     ))
 
-    # Customers from base plan (Plan To Name), sorted asc.
-    if not base_long.empty:
+    # Customer-detail rows — corporate-group-driven when available
+    # (planner spec), with a graceful fall-back to the legacy "customer"
+    # column so the existing ibp_base_plan_current path still renders.
+    base_cust_col, orders_cust_col = _resolve_customer_columns(
+        base_long, orders_enriched,
+    )
+    if not base_long.empty and base_cust_col:
         cust_sub = base_long.loc[dim_mask_base]
         customers = sorted({
-            c for c in cust_sub["customer"].astype(str).str.strip() if c
+            c for c in cust_sub[base_cust_col].astype(str).str.strip() if c
         })
         for customer in customers:
             m = _compute_customer_measures(
                 orders_enriched, base_long, filters, customer, month_sets,
+                base_cust_col=base_cust_col, orders_cust_col=orders_cust_col,
             )
             rows.append(_measures_to_display_row(
                 customer, indent=0, m=m, is_customer=True,
@@ -894,29 +883,69 @@ def build_product_line_review_table(
     )
 
 
+def _resolve_customer_columns(
+    base: pd.DataFrame, orders: pd.DataFrame,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(base_col, orders_col)`` for the customer-row dimension.
+
+    Preferred path: ``customer_corp_group`` on both sides (planner
+    spec, populated by the demand-item-customer enrichment +
+    :func:`attach_corporate_group_to_orders`).  Legacy fallback:
+    ``customer`` on base / ``customer_name`` on orders.  Returns
+    ``(None, None)`` when neither side carries a usable column so the
+    caller silently skips customer rows.
+    """
+    if "customer_corp_group" in base.columns and "customer_corp_group" in orders.columns:
+        return "customer_corp_group", "customer_corp_group"
+    # Permit either side to be empty (orders-only or base-only path).
+    base_col: Optional[str] = (
+        "customer_corp_group" if "customer_corp_group" in base.columns
+        else ("customer" if "customer" in base.columns else None)
+    )
+    if "customer_corp_group" in orders.columns:
+        orders_col: Optional[str] = "customer_corp_group"
+    elif "customer_name" in orders.columns:
+        orders_col = "customer_name"
+    elif "customer" in orders.columns:
+        orders_col = "customer"
+    else:
+        orders_col = None
+    return base_col, orders_col
+
+
 def _compute_customer_measures(
     orders: pd.DataFrame,
     base: pd.DataFrame,
     filters: ProductLineReviewFilters,
     customer: str,
     month_sets: dict[str, set[date]],
+    *,
+    base_cust_col: str,
+    orders_cust_col: Optional[str],
 ) -> _Measures:
-    """Aggregate all rows for one ``Plan To Name`` (ignores pminor/sfmt).
+    """Aggregate all rows for one customer-side dimension key.
 
-    Base plan matches on ``customer``; IBP Orders matches on
-    ``customer_name`` (same label when the upstream export aligns).
+    *base_cust_col* and *orders_cust_col* are resolved by
+    :func:`_resolve_customer_columns` — typically both
+    ``customer_corp_group`` (new flow) but falling back to
+    ``customer`` / ``customer_name`` for the legacy
+    ``ibp_base_plan_current`` path.  Each side is matched only when its
+    column is present (so an empty orders frame doesn't blow up).
     """
     cust_cf = customer.strip().casefold()
 
     def _cust_mask_base(df: pd.DataFrame) -> pd.Series:
         m = _apply_dim_filters(df, filters)
-        m &= df["customer"].astype(str).str.strip().str.casefold() == cust_cf
+        m &= df[base_cust_col].astype(str).str.strip().str.casefold() == cust_cf
         return m
 
     def _cust_mask_orders(df: pd.DataFrame) -> pd.Series:
         m = _apply_dim_filters(df, filters)
-        name_col = "customer_name" if "customer_name" in df.columns else "customer"
-        m &= df[name_col].astype(str).str.strip().str.casefold() == cust_cf
+        if orders_cust_col is None or orders_cust_col not in df.columns:
+            # No way to identify customers on the orders side — match nothing.
+            m &= False
+            return m
+        m &= df[orders_cust_col].astype(str).str.strip().str.casefold() == cust_cf
         return m
 
     cy_m = filters.common.cy_month.replace(day=1)
@@ -933,7 +962,6 @@ def _compute_customer_measures(
         rr_l12=_sum_millions(orders, om & orders["month"].isin(month_sets["l12"])),
         fy_py=_sum_millions(orders, om & orders["month"].isin(month_sets["py_fy"])),
         fy_le=_sum_millions(base, bm & base["month"].isin(month_sets["cy_fy"])),
-        fy_ro=None,
     )
 
 
@@ -1026,9 +1054,11 @@ def prepare_total_item_level_demand_long(
 def aggregate_orders_for_plr(orders_enriched: pd.DataFrame) -> pd.DataFrame:
     """Group enriched IBP Orders by every dim used downstream and sum lbs.
 
-    Columns kept: ``pmaj, sfmt, brand, pminor, customer_name, month, pounds``.
-    Reduces a typical 350k-row enriched frame to a few thousand rows so the
-    per-PM mask + groupby loop is bound by dim cardinality, not raw shape.
+    Columns kept: ``pmaj, sfmt, brand, pminor, customer_name, month, pounds``,
+    plus ``customer_corp_group`` whenever it is present (so the corporate-
+    group customer rows survive the aggregation).  Reduces a typical 350k-row
+    enriched frame to a few thousand rows so the per-PM mask + groupby loop
+    is bound by dim cardinality, not raw shape.
     """
     if orders_enriched is None or orders_enriched.empty:
         return pd.DataFrame(columns=[
@@ -1037,8 +1067,15 @@ def aggregate_orders_for_plr(orders_enriched: pd.DataFrame) -> pd.DataFrame:
     # ``customer_name`` is the field IBP Orders carries; the customer mask
     # below probes for it (with ``customer`` as fallback).  Keep both
     # available so the per-PM customer rows still match cleanly.
-    cust_col = "customer_name" if "customer_name" in orders_enriched.columns else "customer"
+    cust_col = (
+        "customer_name" if "customer_name" in orders_enriched.columns
+        else "customer"
+    )
     keep = ["pmaj", "sfmt", "brand", "pminor", cust_col, "month"]
+    # Preserve ``customer_corp_group`` through the aggregation — the
+    # corporate-group-driven customer rows on the PLR table read it.
+    if "customer_corp_group" in orders_enriched.columns:
+        keep.append("customer_corp_group")
     grouped = (
         orders_enriched
         .groupby(keep, as_index=False, dropna=False)["pounds"]
@@ -1052,13 +1089,17 @@ def aggregate_orders_for_plr(orders_enriched: pd.DataFrame) -> pd.DataFrame:
 def aggregate_base_plan_for_plr(base_long: pd.DataFrame) -> pd.DataFrame:
     """Group base-plan rows by every dim used downstream and sum lbs.
 
-    Columns kept: ``pmaj, sfmt, brand, pminor, customer, month, pounds``.
+    Columns kept: ``pmaj, sfmt, brand, pminor, customer, month, pounds``,
+    plus ``customer_corp_group`` when present so the new corporate-group
+    customer-row flow keeps its key after aggregation.
     """
     if base_long is None or base_long.empty:
         return pd.DataFrame(columns=[
             "pmaj", "sfmt", "brand", "pminor", "customer", "month", "pounds",
         ])
     keep = ["pmaj", "sfmt", "brand", "pminor", "customer", "month"]
+    if "customer_corp_group" in base_long.columns:
+        keep.append("customer_corp_group")
     return (
         base_long
         .groupby(keep, as_index=False, dropna=False)["pounds"]

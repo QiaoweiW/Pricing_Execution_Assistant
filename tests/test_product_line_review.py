@@ -232,12 +232,10 @@ def test_build_table_current_month_and_run_rate():
         "Total": "2,000,000",
         "Cycle": "C1",
     }])
-    ro_lookup = {("Total B2C", "Butter", "Bundled Elgin Quarter"): 0.5}
 
     orders, base = _enrich(orders_raw, base_raw, pdh)
     result = build_product_line_review_table(
         orders_enriched=orders, base_long=base,
-        ro_current_plan_by_path=ro_lookup,
         filters=_filters(),
     )
     assert not result.table.empty
@@ -249,12 +247,11 @@ def test_build_table_current_month_and_run_rate():
     assert branded["cm_cy"] == "2.0"
     assert branded["cm_pct"] == "100%"
     assert branded["rr_l3"] == "6.0"           # 1.5 Mlbs × 4
-    assert branded["fy_ro"] == "0.5"
-    assert branded["fy_total"] == "2.5"
-
-    costco = result.table.loc[result.table["Row Label"] == "Costco"].iloc[0]
-    assert costco["fy_ro"] == "–"
-    assert costco["fy_total"] == "–"
+    # R&O + Full-Year Forecast Total columns are no longer emitted
+    # (planner spec — they live in the RO Summary Report above the
+    # section now).
+    assert "fy_ro" not in branded.index
+    assert "fy_total" not in branded.index
 
 
 def test_build_table_respects_multi_select_supply_format():
@@ -283,7 +280,6 @@ def test_build_table_respects_multi_select_supply_format():
     # Narrow to ONLY the "Print" format — the other leaf must disappear.
     result = build_product_line_review_table(
         orders_enriched=orders, base_long=base,
-        ro_current_plan_by_path={},
         filters=_filters(supply_formats=("Print",)),
     )
     labels = set(result.table["Row Label"])
@@ -305,8 +301,7 @@ def test_customer_row_uses_plan_to_name():
     }])
     orders, base = _enrich(orders_raw, base_raw, pdh)
     result = build_product_line_review_table(
-        orders_enriched=orders, base_long=base,
-        ro_current_plan_by_path={}, filters=_filters(),
+        orders_enriched=orders, base_long=base, filters=_filters(),
     )
     costco = result.table.loc[result.table["Row Label"] == "Costco"].iloc[0]
     assert costco["cm_py"] == "2.0"
@@ -327,14 +322,22 @@ def test_resolve_ro_summary_path_butter_format():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_display_groups_inject_dates_and_stay_unique():
-    """``Orders – {Mon YYYY}`` / ``Base Plan – {Mon YYYY}`` are dynamic; the
-    full set of column labels must remain globally unique so ``st.dataframe``
-    can apply per-row styling without colliding on duplicate headers."""
+    """``Orders – {Mon YYYY}`` / ``Current Cycle Plan – {Mon YYYY}`` are
+    dynamic; the full set of column labels must remain globally unique
+    so ``st.dataframe`` can apply per-row styling without colliding on
+    duplicate headers."""
     f = _filters()  # CY=May 2026 → PY=May 2025
     groups = build_display_groups(f)
     labels = [label for _g, cols in groups for _k, label in cols]
     assert "Orders – May 2025" in labels
-    assert "Base Plan – May 2026" in labels
+    assert "Current Cycle Plan – May 2026" in labels
+    # Planner spec: every "Base Plan" header was renamed to "Current
+    # Cycle Plan" (the source is no longer pure base plan).
+    assert not any("Base Plan" in lbl for lbl in labels)
+    # Planner spec: the last two columns (Full Year R&O + Forecast
+    # Total) were dropped — they live in the RO Summary Report above.
+    assert "Full Year R&O (Mlbs)" not in labels
+    assert "Full Year Forecast Total (Base + R&O)" not in labels
     assert len(labels) == len(set(labels))
 
 
@@ -511,7 +514,6 @@ def test_base_plan_pipeline_produces_non_zero_cm_cy():
 
     result = build_product_line_review_table(
         orders_enriched=orders, base_long=base,
-        ro_current_plan_by_path={},
         filters=_filters(),
     )
     branded = result.table.loc[
@@ -552,3 +554,78 @@ def test_aggregate_orders_for_plr_preserves_customer_name():
     agg = aggregate_orders_for_plr(df)
     assert "customer_name" in agg.columns
     assert agg["customer_name"].iloc[0] == "Costco"
+
+
+def test_aggregate_orders_for_plr_preserves_customer_corp_group():
+    """When the enriched frame carries ``customer_corp_group`` the
+    aggregator MUST keep it so the corporate-group customer rows in the
+    PLR table can mask on it."""
+    df = pd.DataFrame({
+        "month": [date(2025, 5, 1), date(2025, 5, 1)],
+        "pounds": [10.0, 20.0],
+        "pmaj": ["Butter", "Butter"], "sfmt": ["BEQ", "BEQ"],
+        "pminor": ["P", "P"], "brand": ["Branded", "Branded"],
+        "customer_name": ["Albertsons LLC", "Safeway Inc"],
+        "customer_corp_group": ["Albertsons-Safeway", "Albertsons-Safeway"],
+    })
+    agg = aggregate_orders_for_plr(df)
+    assert "customer_corp_group" in agg.columns
+    # The two customer names roll up under the same corporate group
+    # but the aggregator keeps customer_name in the group key, so two
+    # rows survive — that's fine, the table builder masks on the corp
+    # group and sums what survives.
+    assert set(agg["customer_corp_group"]) == {"Albertsons-Safeway"}
+
+
+def test_aggregate_base_plan_for_plr_preserves_customer_corp_group():
+    """Same guarantee for the base/demand side."""
+    df = pd.DataFrame({
+        "month": [date(2026, 5, 1), date(2026, 5, 1)],
+        "pounds": [50.0, 100.0],
+        "pmaj": ["Butter", "Butter"], "sfmt": ["BEQ", "BEQ"],
+        "pminor": ["P", "P"], "brand": ["Branded", "Branded"],
+        "customer": ["Albertsons", "Safeway"],
+        "customer_corp_group": ["Albertsons-Safeway", "Albertsons-Safeway"],
+    })
+    agg = aggregate_base_plan_for_plr(df)
+    assert "customer_corp_group" in agg.columns
+
+
+def test_build_table_customer_row_keys_on_corporate_group():
+    """Two distinct Customer Names that share a Corporate Group must
+    appear as ONE customer row in the table (planner spec)."""
+    pdh = _pdh()
+    # Two customers, two distinct Customer Names, same Corporate Group.
+    orders_raw = pd.DataFrame([
+        {"Item No": "311042", "Customer No": "1", "Customer Name": "Albertsons",
+         "Month": "2025-05-01", "Ordered Qty lbs": 1_000_000},
+        {"Item No": "311042", "Customer No": "2", "Customer Name": "Safeway",
+         "Month": "2025-05-01", "Ordered Qty lbs": 500_000},
+    ])
+    base_raw = pd.DataFrame([
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "Albertsons", "Total": "1000000", "Cycle": "C1"},
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "Safeway", "Total": "500000", "Cycle": "C1"},
+    ])
+    orders, base = _enrich(orders_raw, base_raw, pdh)
+    # Stamp the same corp group on every row of both frames.
+    orders["customer_corp_group"] = "Albertsons-Safeway"
+    base["customer_corp_group"] = "Albertsons-Safeway"
+
+    result = build_product_line_review_table(
+        orders_enriched=orders, base_long=base,
+        filters=_filters(),
+    )
+    customer_rows = result.table.loc[result.table["_is_customer"]]
+    # ONE corporate-group row (not two customer rows).
+    assert len(customer_rows) == 1
+    assert customer_rows.iloc[0]["Row Label"] == "Albertsons-Safeway"
+    # Both orders rows roll up: 1.0 + 0.5 = 1.5 Mlbs PY.
+    assert customer_rows.iloc[0]["cm_py"] == "1.5"
+    # Both base rows roll up: 1.0 + 0.5 = 1.5 Mlbs CY.
+    assert customer_rows.iloc[0]["cm_cy"] == "1.5"

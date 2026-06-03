@@ -15,7 +15,8 @@ Page layout
 -----------
 1. Page header + Instructions block.
 2. ── divider ──
-3. Foldable: "New Distribution Tracker" — embeds the SharePoint Excel
+3. Foldable: "Sales Distribution Tracker (RO Details)" — embeds the
+   SharePoint Excel
    workbook in Office-Online read-mode.
 4. ── divider ──
 5. Foldable: "RO Comparison" — month pickers + nested foldable (collapsed)
@@ -270,7 +271,7 @@ _DEMAND_PLANNING_PBIX_URL = (
     "?csf=1&web=1&e=cOv634"
 )
 
-# SharePoint-hosted Excel workbook — New Distribution Tracker.
+# SharePoint-hosted Excel workbook — Sales Distribution Tracker (RO Details).
 _DISTRIBUTION_TRACKER_URL = (
     "https://darigold1com.sharepoint.com/:x:/r/sites/CategoryCMM/"
     "_layouts/15/Doc.aspx?sourcedoc=%7B327C9520-28F4-41E7-A08A-7FD616FABB99%7D"
@@ -315,19 +316,19 @@ def _render_demand_planning_dashboard() -> None:
 
 def _render_distribution_tracker() -> None:
     """Embed the SharePoint Excel workbook (Office-Online read-mode)."""
-    with st.expander("📦 New Distribution Tracker (Corporate Group)", expanded=False):
+    with st.expander("Sales Distribution Tracker (RO Details)", expanded=False):
         render_embedded_resource(
             url=_DISTRIBUTION_TRACKER_URL,
-            title="New Distribution Tracker — Corporate Group",
+            title="Sales Distribution Tracker (RO Details)",
             # Rewrite ``action=default`` → ``action=embedview`` so Office
             # Online renders a chrome-less, read-only embed.
             embed_url=to_sharepoint_excel_embed_url(_DISTRIBUTION_TRACKER_URL),
             height=820,
             fallback_note=(
-                "This is the live New Distribution Tracker workbook hosted "
-                "in SharePoint, rendered through Office Online in read-only "
-                "embed mode. Use the button below to open it in Excel "
-                "Online with full editing rights."
+                "This is the live Sales Distribution Tracker (RO Details) "
+                "workbook hosted in SharePoint, rendered through Office "
+                "Online in read-only embed mode. Use the button below to "
+                "open it in Excel Online with full editing rights."
             ),
         )
 
@@ -5213,7 +5214,7 @@ def render() -> None:
     Flow
     ----
     1. Page header + Instructions
-    2. New Distribution Tracker     (collapsible, collapsed by default)
+    2. Sales Distribution Tracker (RO Details) (collapsible, collapsed)
     3. RO Comparison                (collapsible, expanded by default)
     4. Demand Summary               (collapsible, collapsed by default)
     5. Product Line Review          (collapsible, collapsed by default)

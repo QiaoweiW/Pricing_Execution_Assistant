@@ -50,9 +50,11 @@ from data_sources.demand_item_customer import (
     FORECAST_TYPE_BASE_PLAN,
     OUTPUT_COLUMNS,
     _normalise_for_fuzzy,
+    apply_corp_group_canonical_map,
     attach_corporate_group_by_forecast_type,
     attach_corporate_group_to_orders,
     attach_customer_no_from_ship_to_sites,
+    build_corp_group_canonical_map,
     build_demand_order_item_customer,
     compute_cy_actual_months,
     list_filter_values_for_pmaj_from_demand,
@@ -640,3 +642,159 @@ def test_forecast_type_base_plan_constant_matches_detail_csv():
     constant must match (case-sensitively) so the dispatch's
     case-insensitive comparison still works on the canonical form."""
     assert FORECAST_TYPE_BASE_PLAN == "Base Plan"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8) Corporate-group canonicalisation (casing-drift de-duplication)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_corp_group_canonical_map_picks_most_frequent_casing():
+    """Multiple casings under the same casefold key → most-frequent wins.
+    Ties broken by longest then first-seen.  A warning is emitted."""
+    dim = pd.DataFrame({
+        "customer_num": ["1", "2", "3", "4"],
+        "customer_name": ["A", "B", "C", "D"],
+        # 3× "Associated Foods" vs 1× "ASSOCIATED FOODS"  → mixed-case wins.
+        "corporate_group": [
+            "Associated Foods", "Associated Foods", "Associated Foods",
+            "ASSOCIATED FOODS",
+        ],
+    })
+    canonical, warnings = build_corp_group_canonical_map(dim)
+    assert canonical["associated foods"] == "Associated Foods"
+    assert warnings, "casing drift in the dim must surface a warning"
+    assert "Associated Foods" in warnings[0]
+
+
+def test_build_corp_group_canonical_map_clean_dim_yields_no_warnings():
+    """A clean dim (1 surface form per casefold key) → no warning."""
+    dim = pd.DataFrame({
+        "customer_num": ["1", "2"],
+        "customer_name": ["A", "B"],
+        "corporate_group": ["Albertsons Safeway", "Costco"],
+    })
+    canonical, warnings = build_corp_group_canonical_map(dim)
+    assert canonical == {
+        "albertsons safeway": "Albertsons Safeway",
+        "costco": "Costco",
+    }
+    assert warnings == ()
+
+
+def test_build_corp_group_canonical_map_handles_missing_dim():
+    """Returns an empty map + no warnings when the dim is unusable."""
+    assert build_corp_group_canonical_map(None) == ({}, ())
+    assert build_corp_group_canonical_map(pd.DataFrame()) == ({}, ())
+
+
+def test_apply_corp_group_canonical_map_collapses_unknown_casefold_keys():
+    """When ``extend_with_unknowns=True``, the first-seen surface form of
+    a casefold key not already in the map wins for the entire Series.
+    Subsequent casefold-equivalent values rewrite onto that first-seen
+    form — which is exactly how the unified frame collapses fallback
+    values that came from raw Customer Name."""
+    s = pd.Series([
+        "Far West Distributing",
+        "FAR WEST DISTRIBUTING",
+        "far west distributing",
+    ])
+    canonical = {}
+    out, ext = apply_corp_group_canonical_map(
+        s, canonical, extend_with_unknowns=True,
+    )
+    assert out.nunique() == 1
+    assert out.iloc[0] == "Far West Distributing"
+    assert ext["far west distributing"] == "Far West Distributing"
+
+
+def test_apply_corp_group_canonical_map_strict_mode_leaves_unknowns_alone():
+    """``extend_with_unknowns=False`` short-circuits — unknown casefold
+    keys stay verbatim.  Useful for the page wanting to enforce ONLY
+    the dim-seeded map without growing it further."""
+    s = pd.Series(["UNKNOWN", "Unknown"])
+    out, _ = apply_corp_group_canonical_map(
+        s, {}, extend_with_unknowns=False,
+    )
+    assert out.tolist() == ["UNKNOWN", "Unknown"]
+
+
+def test_build_emits_canonical_map_that_collapses_unified_frame_casings():
+    """Mixed casing across detail (Base Plan) + shipments (Actual) must
+    collapse to a single surface form in the unified frame so the PLR
+    table's customer-row iteration stops double-counting."""
+    # Detail has "Albertsons Safeway"; shipments has "ALBERTSONS SAFEWAY"
+    # for the same customer_num.  Dim entry uses "Albertsons Safeway"
+    # → that's the canonical winner.
+    detail = pd.DataFrame([{
+        COL_START_OF_MONTH: "2026-09-01", COL_ITEM: "310180",
+        COL_ITEM_DESC: "DG Btr Qtr 1Lb 30cs",
+        COL_CUSTOMER_NO: "", COL_CUSTOMER_NAME: "Albertsons Safeway",
+        COL_PARTY_SITE_NUMBER: "10244", COL_DEMAND_LBS: 100.0,
+        COL_FORECAST_TYPE: FORECAST_TYPE_BASE_PLAN,
+        COL_PORTFOLIO_MAJOR: "Butter", COL_PORTFOLIO_MINOR: "Packaged Butter",
+        COL_SUPPLY_FORMAT: "Western Quarters",
+    }])
+    shipments = pd.DataFrame([{
+        "Item No": "310180", "Customer No": "C42",
+        "Customer Name": "ALBERTSONS SAFEWAY",      # all-caps drift.
+        "Month": "2026-04-01", "Shipped Qty lbs": 250.0,
+    }])
+    customer_dim = pd.DataFrame({
+        "customer_num": ["C42"], "customer_name": ["Albertsons Safeway"],
+        "corporate_group": ["Albertsons Safeway"],
+    })
+    ship_to = pd.DataFrame({
+        "party_site_code": ["10244"], "customer_num": ["C42"],
+    })
+    build = build_demand_order_item_customer(
+        detail_df=detail, shipments_df=shipments, pdh_df=_pdh(),
+        customer_names_dim=customer_dim, ship_to_sites_dim=ship_to,
+        cy_actual_months=(date(2026, 4, 1),),
+    )
+    # Both rows now carry the single canonical surface form.
+    assert set(build.df[COL_CORPORATE_GROUP]) == {"Albertsons Safeway"}
+    # The canonical map is exposed so the page can hand it to the
+    # orders-side attach.
+    assert build.canonical_corp_group_map["albertsons safeway"] == "Albertsons Safeway"
+
+
+def test_attach_corporate_group_to_orders_applies_canonical_map():
+    """The orders-side attach must adopt the same surface form the
+    unified frame uses for the same casefold key — otherwise the PLR
+    customer-row mask still splits the parent into duplicate rows."""
+    orders = pd.DataFrame({
+        "customer_no": ["C1", "C2"],
+        "customer_name": ["KROGER COMPANY", "C&S WHOLESALE"],
+    })
+    dim = pd.DataFrame({
+        "customer_num": ["C1"],
+        "customer_name": ["Kroger Company"],
+        "corporate_group": ["KROGER COMPANY"],     # dim happens to be UPPER.
+    })
+    canonical_map = {"kroger company": "Kroger Company"}  # unified-CSV's choice.
+    out = attach_corporate_group_to_orders(
+        orders, dim, canonical_map=canonical_map,
+    )
+    # First row: matched dim → rewritten by the canonical map.
+    # Second row: dim miss → fallback to Customer Name → canonical
+    # extension fixes a casing on first seen, but since it's a brand
+    # new casefold key there's nothing to collapse to — verbatim.
+    assert out["customer_corp_group"].tolist() == [
+        "Kroger Company", "C&S WHOLESALE",
+    ]
+
+
+def test_attach_corporate_group_to_orders_without_map_falls_back_to_dim_casing():
+    """Backwards-compat: when no canonical map is supplied (e.g. tests),
+    the attach behaves as it did before the canonicalisation refactor —
+    it adopts the dim's surface form verbatim."""
+    orders = pd.DataFrame({
+        "customer_no": ["C1"], "customer_name": ["whatever"],
+    })
+    dim = pd.DataFrame({
+        "customer_num": ["C1"],
+        "customer_name": ["Kroger Company"],
+        "corporate_group": ["KROGER COMPANY"],
+    })
+    out = attach_corporate_group_to_orders(orders, dim, canonical_map=None)
+    assert out["customer_corp_group"].iloc[0] == "KROGER COMPANY"

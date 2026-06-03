@@ -111,7 +111,8 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Iterable, Optional
 
@@ -244,17 +245,31 @@ class DemandItemCustomerError(RuntimeError):
 class DemandOrderItemCustomerBuild:
     """Output of :func:`build_demand_order_item_customer`.
 
-    ``df``         — the saved-CSV-shape frame (one row per detail row
-                     OR synthesised Actual row), with ``Corporate Group``
-                     attached.
-    ``warnings``   — soft warnings to surface in the page (e.g. dim
-                     table missing).  Empty tuple means everything went
-                     fine.
-    ``stats``      — small dict for the page's debug caption.
+    ``df``
+        The saved-CSV-shape frame (one row per detail row OR
+        synthesised Actual row), with ``Corporate Group`` attached
+        and canonicalised (single surface form per casefold key).
+    ``warnings``
+        Soft warnings to surface in the page (e.g. dim table missing,
+        dim casing inconsistencies).  Empty tuple means everything
+        went fine.
+    ``stats``
+        Small dict for the page's debug caption.
+    ``canonical_corp_group_map``
+        ``casefold(corporate_group) → preferred_display`` map produced
+        as a side-effect of the build.  Seeded from
+        ``dp_dimcustomernames`` and extended with first-seen surface
+        forms encountered while resolving each row's Corporate Group
+        (fallback paths included).  The page passes this same map to
+        :func:`attach_corporate_group_to_orders` so the IBP-Orders
+        side ends up with the same canonical strings the unified CSV
+        uses — guaranteeing that the PLR table's customer-row groupby
+        no longer splits "Associated Foods" from "ASSOCIATED FOODS".
     """
     df: pd.DataFrame
     warnings: tuple[str, ...]
     stats: dict[str, int]
+    canonical_corp_group_map: dict[str, str] = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -671,6 +686,141 @@ def _build_fuzzy_name_to_corp_group_lookup(
     return out
 
 
+def build_corp_group_canonical_map(
+    customer_names_dim: Optional[pd.DataFrame],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Return ``(casefold_corp_group → preferred_display, warnings)``.
+
+    Why this exists
+    ---------------
+    Without this map the PLR table can split the same conceptual
+    parent into two visible rows (e.g. "Associated Foods" alongside
+    "ASSOCIATED FOODS") whenever the dim or the upstream Customer
+    Name has casing drift.  The downstream customer-row groupby is
+    case-insensitive on its mask but iterates over distinct surface
+    forms, which causes BOTH rows to catch the same casefold-
+    equivalent data → double-counted totals → the customer-row sum
+    no longer matches the Grand Total.
+
+    What it does
+    ------------
+    Scans ``dp_dimcustomernames.corporate_group`` and emits ONE
+    canonical surface form per ``casefold()`` key.  When the dim
+    itself has multiple distinct surface forms under the same
+    casefold key, the winner is picked deterministically by:
+
+        1. highest occurrence count in the dim (most "voted-for"),
+        2. longest string (mixed-case beats UPPER for the same name),
+        3. first-seen (stable tiebreak).
+
+    Every offender is also reported as a warning so planners can
+    fix the dim upstream rather than relying on our band-aid forever.
+
+    Returns
+    -------
+    (canonical_map, warnings)
+        *canonical_map* is empty when the dim is unusable; callers
+        then extend it on the fly via
+        :func:`apply_corp_group_canonical_map` so at least the input
+        frame's own values still collapse onto a single spelling.
+    """
+    if customer_names_dim is None or customer_names_dim.empty:
+        return {}, ()
+    cg_col = _resolve_column(customer_names_dim, CORPORATE_GROUP_CANDIDATES)
+    if not cg_col:
+        return {}, ()
+
+    # Bucket each surface form by its casefold key, counting occurrences.
+    by_key: dict[str, Counter] = {}
+    for raw in customer_names_dim[cg_col].astype(str).tolist():
+        stripped = raw.strip()
+        if not stripped or _looks_blank(stripped):
+            continue
+        key = stripped.casefold()
+        by_key.setdefault(key, Counter())[stripped] += 1
+
+    canonical: dict[str, str] = {}
+    inconsistencies: list[str] = []
+    for key, counts in by_key.items():
+        if len(counts) == 1:
+            canonical[key] = next(iter(counts))
+            continue
+        # Tie-break: most occurrences, then longest, then first-seen.
+        winner = sorted(
+            counts.items(),
+            key=lambda kv: (-kv[1], -len(kv[0])),
+        )[0][0]
+        canonical[key] = winner
+        variants = ", ".join(f"{repr(v)} x{c}" for v, c in counts.most_common())
+        inconsistencies.append(
+            f"`{winner}`  ← canonicalised from {{{variants}}}"
+        )
+
+    warnings: tuple[str, ...] = ()
+    if inconsistencies:
+        warnings = (
+            "`dp_dimcustomernames.corporate_group` has multiple casings "
+            "for the same parent — collapsed to one display string per "
+            "row.  Please clean these up in the dim:\n• "
+            + "\n• ".join(inconsistencies),
+        )
+    return canonical, warnings
+
+
+def apply_corp_group_canonical_map(
+    values: pd.Series,
+    canonical_map: dict[str, str],
+    *,
+    extend_with_unknowns: bool = True,
+) -> tuple[pd.Series, dict[str, str]]:
+    """Rewrite every ``values`` entry to its canonical surface form.
+
+    For each value:
+
+    * normalise to ``casefold().strip()``;
+    * if the resulting key is in *canonical_map*, return that map's
+      preferred display;
+    * else, when ``extend_with_unknowns`` is True, extend the map
+      with the first-seen surface form for this key (so subsequent
+      casefold-equivalents collapse onto it) and return that
+      first-seen form;
+    * else, leave the value verbatim.
+
+    Empty / NaN values pass through unchanged.
+
+    Returns ``(canonicalised_series, possibly_extended_map)``.  The
+    map is mutated in place when *extend_with_unknowns* is True so
+    repeated calls on different Series accumulate a single global
+    canonical map.
+    """
+    out = values.copy()
+    if out.empty:
+        return out, canonical_map
+
+    raw = out.astype("string").fillna("")
+    keys = raw.str.strip().str.casefold()
+
+    canonicalised: list[object] = []
+    for raw_val, key in zip(raw.tolist(), keys.tolist()):
+        if not key:
+            canonicalised.append(raw_val)
+            continue
+        preferred = canonical_map.get(key)
+        if preferred is not None:
+            canonicalised.append(preferred)
+            continue
+        if extend_with_unknowns:
+            # First-seen wins.  ``.strip()`` matches the map's
+            # convention so the extended entries look the same as
+            # dim-seeded entries.
+            preferred = raw_val.strip()
+            canonical_map[key] = preferred
+            canonicalised.append(preferred)
+        else:
+            canonicalised.append(raw_val)
+    return pd.Series(canonicalised, index=values.index, dtype="object"), canonical_map
+
+
 def attach_corporate_group_by_forecast_type(
     unified_df: pd.DataFrame,
     customer_names_dim: Optional[pd.DataFrame],
@@ -844,26 +994,11 @@ def attach_customer_no_from_ship_to_sites(
 # Orders-side corporate-group attach (exact join on Customer No)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
-class OrdersEnrichmentStats:
-    """Audit counts surfaced to the page when enriching IBP Orders.
-
-    ``n_in`` is the row count of the slim Orders frame as fetched from
-    Fabric; ``n_enriched`` is the row count after the PDH + dim enrich
-    pipeline.  Any difference is a "drop due to variable mismatch" —
-    planner-specified visible warning trigger.
-    """
-    n_in: int
-    n_enriched: int
-
-    @property
-    def n_dropped(self) -> int:
-        return max(0, self.n_in - self.n_enriched)
-
-
 def attach_corporate_group_to_orders(
     orders_df: Optional[pd.DataFrame],
     customer_names_dim: Optional[pd.DataFrame],
+    *,
+    canonical_map: Optional[dict[str, str]] = None,
 ) -> pd.DataFrame:
     """Add ``Corporate Group`` to an enriched IBP Orders frame.
 
@@ -878,6 +1013,15 @@ def attach_corporate_group_to_orders(
     ``customer_name``).  This way the page can attach the corporate
     group either before or after the PDH-dim enrichment without
     juggling intermediate frames.
+
+    *canonical_map* — when provided (typically the one stashed on
+    :class:`DemandOrderItemCustomerBuild`), every assigned
+    ``customer_corp_group`` value is rewritten to its canonical surface
+    form.  This guarantees the IBP-Orders side ends up with the same
+    spelling the unified CSV uses, so the PLR table's per-corp-group
+    customer rows don't split "Associated Foods" vs "ASSOCIATED FOODS".
+    The map is extended in place with first-seen values from this
+    frame so subsequent calls (if any) inherit the same canonical set.
 
     Returns a NEW frame with the original columns plus
     ``customer_corp_group``.  When *orders_df* already carries that
@@ -901,12 +1045,23 @@ def attach_corporate_group_to_orders(
         if cust_name_col else pd.Series([""] * len(out), dtype="object")
     )
 
+    def _canonicalise(series: pd.Series) -> pd.Series:
+        """Apply *canonical_map* (if any) so the orders side ends up
+        with the SAME spellings the unified frame uses.  The map is
+        extended in place with first-seen values from this frame."""
+        if canonical_map is None:
+            return series
+        canonicalised, _ = apply_corp_group_canonical_map(
+            series, canonical_map, extend_with_unknowns=True,
+        )
+        return canonicalised
+
     if (
         cust_no_col is None
         or customer_names_dim is None
         or customer_names_dim.empty
     ):
-        out["customer_corp_group"] = fallback.to_numpy()
+        out["customer_corp_group"] = _canonicalise(fallback).to_numpy()
         return out
 
     # Build the customer_num → corporate_group lookup from
@@ -915,13 +1070,15 @@ def attach_corporate_group_to_orders(
     # used by the unified frame keeps the two attach paths in lock-step.
     lookup = _build_customer_num_to_corp_group_lookup(customer_names_dim)
     if not lookup:
-        out["customer_corp_group"] = fallback.to_numpy()
+        out["customer_corp_group"] = _canonicalise(fallback).to_numpy()
         return out
 
     keys = out[cust_no_col].astype(str).str.strip()
     found = keys.map(lookup).fillna("").astype("object")
     final = np.where(found.to_numpy() == "", fallback.to_numpy(), found.to_numpy())
-    out["customer_corp_group"] = final
+    out["customer_corp_group"] = _canonicalise(
+        pd.Series(final, index=out.index, dtype="object")
+    ).to_numpy()
     return out
 
 
@@ -1011,6 +1168,19 @@ def build_demand_order_item_customer(
         unified, customer_names_dim, fuzzy_threshold=fuzzy_threshold,
     )
 
+    # ── Canonicalise Corporate Group surface forms ────────────────────
+    # Build a casefold → preferred-display map seeded by the dim, then
+    # extend it with first-seen values from the unified frame itself.
+    # The same map will be handed to the orders-side attach in the page
+    # so both frames agree on a single spelling per parent
+    # (fixes "Associated Foods" vs "ASSOCIATED FOODS" duplicate rows).
+    canonical_map, dim_casing_warnings = build_corp_group_canonical_map(
+        customer_names_dim,
+    )
+    annotated[COL_CORPORATE_GROUP], canonical_map = apply_corp_group_canonical_map(
+        annotated[COL_CORPORATE_GROUP], canonical_map, extend_with_unknowns=True,
+    )
+
     # Soft warnings the page renders verbatim under the section header.
     if customer_names_dim is None or customer_names_dim.empty:
         warnings.append(
@@ -1032,6 +1202,7 @@ def build_demand_order_item_customer(
                 f"{fuzzy_threshold}).  Their Corporate Group falls back "
                 "to Customer Name."
             )
+    warnings.extend(dim_casing_warnings)
     if ship_to_sites_dim is None or ship_to_sites_dim.empty:
         warnings.append(
             "Customer No back-fill skipped — `dbo.dp_dimshiptosites` is "
@@ -1051,6 +1222,7 @@ def build_demand_order_item_customer(
     }
     return DemandOrderItemCustomerBuild(
         df=annotated, warnings=tuple(warnings), stats=stats,
+        canonical_corp_group_map=canonical_map,
     )
 
 
@@ -1259,7 +1431,6 @@ __all__ = [
     # Errors + types.
     "DemandItemCustomerError",
     "DemandOrderItemCustomerBuild",
-    "OrdersEnrichmentStats",
     # Constants the page imports for headers / paths.
     "DETAIL_BLOB_PATH",
     "DEMAND_ORDER_ITEM_CUSTOMER_BLOB_PATH",
@@ -1288,6 +1459,10 @@ __all__ = [
     "attach_corporate_group_by_forecast_type",
     "attach_customer_no_from_ship_to_sites",
     "attach_corporate_group_to_orders",
+    # Canonicalisation helpers (kept public so the page + tests can
+    # build / apply the same casefold-canonical map independently).
+    "build_corp_group_canonical_map",
+    "apply_corp_group_canonical_map",
     # PLR consumer.
     "prepare_demand_long_for_plr",
     "list_filter_values_from_demand",

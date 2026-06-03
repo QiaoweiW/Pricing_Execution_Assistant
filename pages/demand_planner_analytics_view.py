@@ -4752,11 +4752,20 @@ def _cached_prepare_plr_inputs(
     #    and after enrichment so the page can render a visible drop
     #    banner — `enrich_ibp_orders_df` silently drops rows whose
     #    Month is unparseable or whose required columns are missing.
+    #
+    #    The canonical map produced by the unified-CSV build is
+    #    passed through so the Orders side ends up with the SAME
+    #    spelling per Corporate Group casefold key as the unified
+    #    frame.  This is what stops the table from splitting
+    #    "Associated Foods" and "ASSOCIATED FOODS" into two customer
+    #    rows that each double-count the same casefold-equivalent
+    #    Orders pounds.
     n_orders_in = int(len(_ibp_orders_df)) if _ibp_orders_df is not None else 0
     orders_enriched = enrich_ibp_orders_df(_ibp_orders_df, _pdh_df)
     n_orders_enriched = int(len(orders_enriched))
     orders_with_cg = attach_corporate_group_to_orders(
         orders_enriched, _customer_names_dim,
+        canonical_map=dict(build.canonical_corp_group_map),
     )
 
     # 3. Long-format saved-CSV frame for the table builder.

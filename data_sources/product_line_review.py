@@ -860,22 +860,39 @@ def build_product_line_review_table(
     # Customer-detail rows — corporate-group-driven when available
     # (planner spec), with a graceful fall-back to the legacy "customer"
     # column so the existing ibp_base_plan_current path still renders.
+    #
+    # The iteration list is built from the casefold-deduplicated UNION
+    # of Corporate Groups present in both the Base Plan (=
+    # ``base_long``) AND the Orders frames after the PM-level dim
+    # filter.  Without the union, customers that show up only in
+    # orders (e.g. R&O-only parents) would silently disappear from
+    # the customer-row section even though their values are still
+    # rolled into the Grand Total.  Without casefold dedup, casing
+    # drift in the upstream Corporate Group column produces duplicate
+    # iterations that BOTH mask the same casefold-equivalent rows —
+    # the resulting customer-row sums then exceed the Grand Total.
+    #
+    # Display ordering: descending by CFY Current Cycle Plan – Full
+    # Year (= sum of ``base_long.pounds`` over ``cy_fy`` months for
+    # that Corporate Group, regardless of forecast type).  Alphabetic
+    # within ties for determinism.
     base_cust_col, orders_cust_col = _resolve_customer_columns(
         base_long, orders_enriched,
     )
-    if not base_long.empty and base_cust_col:
-        cust_sub = base_long.loc[dim_mask_base]
-        customers = sorted({
-            c for c in cust_sub[base_cust_col].astype(str).str.strip() if c
-        })
-        for customer in customers:
-            m = _compute_customer_measures(
-                orders_enriched, base_long, filters, customer, month_sets,
-                base_cust_col=base_cust_col, orders_cust_col=orders_cust_col,
-            )
-            rows.append(_measures_to_display_row(
-                customer, indent=0, m=m, is_customer=True,
-            ))
+    customers = _ordered_customer_iteration(
+        base_long=base_long, orders=orders_enriched,
+        base_cust_col=base_cust_col, orders_cust_col=orders_cust_col,
+        dim_mask_base=dim_mask_base, dim_mask_orders=dim_mask_orders,
+        month_sets=month_sets,
+    )
+    for customer in customers:
+        m = _compute_customer_measures(
+            orders_enriched, base_long, filters, customer, month_sets,
+            base_cust_col=base_cust_col, orders_cust_col=orders_cust_col,
+        )
+        rows.append(_measures_to_display_row(
+            customer, indent=0, m=m, is_customer=True,
+        ))
 
     return ProductLineReviewResult(
         table=pd.DataFrame(rows),
@@ -911,6 +928,86 @@ def _resolve_customer_columns(
     else:
         orders_col = None
     return base_col, orders_col
+
+
+def _ordered_customer_iteration(
+    *,
+    base_long: pd.DataFrame,
+    orders: pd.DataFrame,
+    base_cust_col: Optional[str],
+    orders_cust_col: Optional[str],
+    dim_mask_base: pd.Series,
+    dim_mask_orders: pd.Series,
+    month_sets: dict[str, set[date]],
+) -> list[str]:
+    """Build the ordered Corporate-Group iteration for customer rows.
+
+    The list is the casefold-deduplicated UNION of Corporate Groups
+    visible in *base_long* and *orders* after the PM-level dim filter
+    has been applied (``dim_mask_*``).  Casefold dedup is essential —
+    upstream casing drift would otherwise produce duplicate iterations
+    that both catch the same data, inflating the customer-row sum
+    above the Grand Total.
+
+    Sort key (descending): per-Corporate-Group sum of ``pounds`` on
+    *base_long* over the Cy FY months — i.e. the same number the
+    "CFY Current Cycle Plan – Full Year" column displays.  Customers
+    with no CY-FY base-plan activity get a score of zero and sort
+    alphabetically at the bottom.
+
+    Returns the canonical (first-seen) surface form per casefold key,
+    so the iteration label matches what the user sees in the table.
+    Returns an empty list when neither side carries a customer column.
+    """
+    candidates: list[str] = []
+
+    def _collect(df: pd.DataFrame, mask: pd.Series, col: Optional[str]) -> None:
+        if col is None or df.empty or col not in df.columns:
+            return
+        sub = df.loc[mask, col].astype(str).str.strip()
+        candidates.extend(v for v in sub.tolist() if v)
+
+    _collect(base_long, dim_mask_base, base_cust_col)
+    _collect(orders, dim_mask_orders, orders_cust_col)
+    if not candidates:
+        return []
+
+    # Casefold-dedupe while remembering the first-seen surface form
+    # (the corp-group canonicalisation in demand_item_customer has
+    # already collapsed casing across both frames; this is the second
+    # line of defence for the ibp_base_plan_current legacy path).
+    canonical_by_key: dict[str, str] = {}
+    for label in candidates:
+        key = label.casefold()
+        canonical_by_key.setdefault(key, label)
+
+    # Sort key — Cy FY pounds from base_long, descending.  We compute
+    # one groupby pass over the filtered base subset (cheap; the
+    # alternative would be 1 mask + sum per customer, which is O(N×k)).
+    fy_score: dict[str, float] = {}
+    if (
+        not base_long.empty
+        and base_cust_col is not None
+        and base_cust_col in base_long.columns
+    ):
+        cy_fy = month_sets.get("cy_fy") or set()
+        base_sub = base_long.loc[
+            dim_mask_base & base_long["month"].isin(cy_fy),
+            [base_cust_col, "pounds"],
+        ]
+        if not base_sub.empty:
+            base_sub = base_sub.copy()
+            base_sub["__cf"] = (
+                base_sub[base_cust_col].astype(str).str.strip().str.casefold()
+            )
+            grouped = base_sub.groupby("__cf", dropna=False)["pounds"].sum()
+            fy_score = {k: float(v) for k, v in grouped.items()}
+
+    def _order_key(key: str) -> tuple[float, str]:
+        # Negative score → descending pounds; label.casefold() → A→Z tie-break.
+        return (-fy_score.get(key, 0.0), canonical_by_key[key].casefold())
+
+    return [canonical_by_key[k] for k in sorted(canonical_by_key, key=_order_key)]
 
 
 def _compute_customer_measures(

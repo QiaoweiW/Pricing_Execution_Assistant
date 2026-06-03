@@ -629,3 +629,114 @@ def test_build_table_customer_row_keys_on_corporate_group():
     assert customer_rows.iloc[0]["cm_py"] == "1.5"
     # Both base rows roll up: 1.0 + 0.5 = 1.5 Mlbs CY.
     assert customer_rows.iloc[0]["cm_cy"] == "1.5"
+
+
+def test_build_table_customer_rows_dedupe_casefold_equivalents():
+    """Casing drift in ``customer_corp_group`` — "Associated Foods" vs
+    "ASSOCIATED FOODS" — must collapse to a single customer row, not
+    iterate twice (otherwise the customer-row mask catches the same
+    casefold-equivalent rows on each iteration and double-counts the
+    total)."""
+    pdh = _pdh()
+    orders_raw = pd.DataFrame([
+        {"Item No": "311042", "Customer No": "1", "Customer Name": "X",
+         "Month": "2025-05-01", "Ordered Qty lbs": 1_000_000},
+    ])
+    base_raw = pd.DataFrame([
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "X-row-1", "Total": "1000000", "Cycle": "C1"},
+        {"Start of Month": "2026-05-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "X-row-2", "Total": "500000", "Cycle": "C1"},
+    ])
+    orders, base = _enrich(orders_raw, base_raw, pdh)
+    # Two different surface forms that casefold-equate → without the
+    # casefold dedupe in `_ordered_customer_iteration`, both would
+    # iterate AND both would mask the same rows.
+    orders["customer_corp_group"] = "Associated Foods"
+    base["customer_corp_group"] = ["Associated Foods", "ASSOCIATED FOODS"]
+
+    result = build_product_line_review_table(
+        orders_enriched=orders, base_long=base, filters=_filters(),
+    )
+    customer_rows = result.table.loc[result.table["_is_customer"]]
+    assert len(customer_rows) == 1, (
+        "Casefold-equivalent corporate group values must produce ONE "
+        "customer row, not duplicates."
+    )
+    # The combined CY total is 1.5 Mlbs (1.0 + 0.5).  No double counting.
+    assert customer_rows.iloc[0]["cm_cy"] == "1.5"
+
+
+def test_build_table_customer_rows_sort_by_fy_current_cycle_plan_desc():
+    """Customer rows must come out sorted by the CFY Current Cycle Plan
+    (= Cy FY sum of base pounds), descending — alphabetical only as a
+    tiebreak."""
+    pdh = _pdh()
+    # Three corp groups with distinct CY-FY base totals (50 / 200 / 100).
+    base_raw = pd.DataFrame([
+        # Same Cy-FY (Apr 2026 → Mar 2027); cy_begin_month=4/1/2026.
+        {"Start of Month": "2026-09-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "A-Co", "Total": "50000000", "Cycle": "C1"},
+        {"Start of Month": "2026-09-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "B-Co", "Total": "200000000", "Cycle": "C1"},
+        {"Start of Month": "2026-09-01", "Portfolio": "Butter",
+         "Product Format": "Bundled Elgin Quarter",
+         "Brand Category": "Branded", "Item": "311042",
+         "Plan To Name": "C-Co", "Total": "100000000", "Cycle": "C1"},
+    ])
+    orders_raw = pd.DataFrame([
+        {"Item No": "311042", "Customer No": "1", "Customer Name": "x",
+         "Month": "2025-05-01", "Ordered Qty lbs": 1},
+    ])
+    orders, base = _enrich(orders_raw, base_raw, pdh)
+    base["customer_corp_group"] = ["A-Co", "B-Co", "C-Co"]
+    orders["customer_corp_group"] = "irrelevant"  # not in base ⇒ won't sort.
+
+    result = build_product_line_review_table(
+        orders_enriched=orders, base_long=base, filters=_filters(),
+    )
+    customer_rows = result.table.loc[result.table["_is_customer"]]
+    # Expected order: B-Co (200 Mlbs) > C-Co (100 Mlbs) > A-Co (50 Mlbs) >
+    # "irrelevant" (orders-only, sort score = 0).
+    assert customer_rows["Row Label"].tolist() == [
+        "B-Co", "C-Co", "A-Co", "irrelevant",
+    ]
+
+
+def test_build_table_includes_orders_only_corporate_groups():
+    """A corporate group that exists ONLY on the Orders side (e.g.
+    historical R&O customers not present in the Base Plan) must still
+    appear as a customer row — otherwise the IBP Orders run-rate
+    columns disappear from the table even though the Grand Total
+    still includes them."""
+    pdh = _pdh()
+    base_raw = pd.DataFrame([{
+        "Start of Month": "2026-05-01", "Portfolio": "Butter",
+        "Product Format": "Bundled Elgin Quarter",
+        "Brand Category": "Branded", "Item": "311042",
+        "Plan To Name": "Base-Only", "Total": "1000000", "Cycle": "C1",
+    }])
+    orders_raw = pd.DataFrame([
+        # PY May 2025 — populates cm_py for the iteration sort step.
+        {"Item No": "311042", "Customer No": "1", "Customer Name": "x",
+         "Month": "2025-05-01", "Ordered Qty lbs": 9_000_000},
+    ])
+    orders, base = _enrich(orders_raw, base_raw, pdh)
+    base["customer_corp_group"] = "Base-Only"
+    orders["customer_corp_group"] = "Orders-Only"
+
+    result = build_product_line_review_table(
+        orders_enriched=orders, base_long=base, filters=_filters(),
+    )
+    customer_labels = result.table.loc[
+        result.table["_is_customer"], "Row Label"
+    ].tolist()
+    assert set(customer_labels) == {"Base-Only", "Orders-Only"}

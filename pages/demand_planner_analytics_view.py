@@ -18,9 +18,9 @@ Page layout
 3. Foldable: "New Distribution Tracker" — embeds the SharePoint Excel
    workbook in Office-Online read-mode.
 4. ── divider ──
-5. Foldable: "RO Comparison" — upload + month pickers + nested foldable
-   "RO Comparison & Drivers & Start Date Validation" (editor, drivers,
-   Early-Start programs) + RO Summary Report.
+5. Foldable: "RO Comparison" — month pickers + nested foldable (collapsed)
+   "RO Comparison & Drivers & Start Date Validation" (Customer Input
+   upload, editor, drivers, Early-Start programs) + RO Summary Report.
 6. ── divider ──
 7. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
    Demand Pivot Summary + Demand Plan Comparison (drivers in nested
@@ -462,12 +462,6 @@ def _render_ro_comparison() -> None:
 
         _render_ro_item_master_download_button()
 
-        # 1. Upload control — fully independent of the comparison flow
-        #    below so a planner can drop a new Customer Input CSV even
-        #    if there is a downstream Fabric outage.  The Save action
-        #    itself surfaces its own auth error if sign-in is missing.
-        _render_customer_input_uploader()
-
         # 1b. "How to see your changes after upload" guidance.
         #     Replaces the old "🔄 Refresh from Fabric" button.  The
         #     auto-refresh path is now ETag-driven (see
@@ -564,14 +558,19 @@ def _render_ro_comparison() -> None:
         # 5. Warnings.
         _render_warnings_banner(warnings)
 
-        # 6-10. RO_Comparison_Output editor, per-Format drivers, and
-        #       Early-Start programs — grouped in one foldable subsection
-        #       so planners can collapse the heavy validation block while
-        #       keeping upload / month pickers visible above.
+        # 6-10. Customer Input upload, RO_Comparison_Output editor,
+        #       per-Format drivers, and Early-Start programs — grouped in
+        #       one foldable subsection (collapsed by default) so month
+        #       pickers + warnings stay visible above.
         with st.expander(
             "📋 RO Comparison & Drivers & Start Date Validation",
-            expanded=True,
+            expanded=False,
         ):
+            # Distribution_Tracker.csv upload — top of the validation
+            # block so the ingest path sits next to the tables it feeds.
+            _render_customer_input_uploader()
+            st.markdown("")  # breathing room before the editor
+
             # Filters + editor + subtotal + per-Format summary + Save.
             # Wrapped in a single ``@st.fragment`` so a filter change /
             # cell edit / Save click re-runs ONLY this block — no Fabric
@@ -689,8 +688,8 @@ def _render_customer_input_uploader() -> None:
     )
     st.caption(
         "Optional — uploading here only affects the Append_New_History drop "
-        "zone.  The summary table below loads from RO_History_Tracker.csv "
-        "independently and is always visible."
+        "zone.  After Fabric ingests the file, the RO Comparison table and "
+        "driver breakdown in this subsection refresh automatically."
     )
     uploaded = st.file_uploader(
         "Save the 'Customer Input' table as a Distribution_Tracker.csv file "

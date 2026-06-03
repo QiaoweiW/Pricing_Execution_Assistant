@@ -7,12 +7,13 @@ Sections
                                    _render_demand_planning_dashboard,
                                    _render_distribution_tracker,
                                    _render_ro_comparison,
-                                   _render_demand_summary)
+                                   _render_demand_summary,
+                                   _render_product_line_review)
 3. Entry point                    (render)
 
 Page layout
 -----------
-1. Page header + Instructions block (placeholder content "TBD").
+1. Page header + Instructions block.
 2. ── divider ──
 3. Foldable: "Demand Planning BI Dashboard" — embeds the SharePoint
    ``.pbix`` file so the user can interact with the live model.
@@ -25,6 +26,8 @@ Page layout
 8. ── divider ──
 9. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
    Demand Pivot Summary + Base + RO chart with Total Budget overlay.
+10. Foldable: "Product Line Review" — brand / minor / format + customer
+    table (IBP Orders + base plan + RO Summary Current Plan).
 
 Why every external resource gets its own foldable section
 ---------------------------------------------------------
@@ -75,6 +78,7 @@ from data_sources.demand_summary import (
     fetch_static_budget_monthly,
     fetch_static_budget_ro,
     fetch_total_item_level_demand,
+    fetch_ibp_base_plan_current,
     list_available_filter_values,
     mgmt_plan_full_blob_path,
     pivot_for_download,
@@ -116,8 +120,10 @@ from data_sources.demand_plan_comparison import (
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
+    enrich_ibp_orders_df,
     list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
+    fetch_ro_summary_current_plan_by_path,
     list_tracker_cycles,
     list_tracker_months,
     validate_filters,
@@ -126,6 +132,30 @@ from data_sources.ibp_official import (
     IBPOfficialSourceError,
     fetch_ibp_orders_slim_df,
     fetch_ibp_shipments_slim_df,
+)
+from data_sources.product_line_review import (
+    BRAND_BRANDED,
+    BRAND_PRIVATE,
+    COL_INDENT,
+    COL_IS_CUSTOMER,
+    COL_ROW_LABEL,
+    FY_MONTH_LABELS,
+    FullYearChartData,
+    ProductLineReviewCommonFilters,
+    ProductLineReviewFilters,
+    ProductLineReviewResult,
+    ProductLineReviewSubFilters,
+    add_months,
+    build_display_groups,
+    build_full_year_chart_data,
+    build_product_line_review_table,
+    collect_ibp_months_for_common,
+    eligible_cy_begin_months,
+    list_pdh_filter_values,
+    list_pdh_filter_values_for_pmaj,
+    prepare_ibp_base_plan_long,
+    resolve_filters,
+    validate_common_filters,
 )
 from data_sources.ship_to_sites import (
     ShipToSitesSourceError,
@@ -162,6 +192,7 @@ from data_sources.ro_comparison import (
     list_months,
     regenerate_comparison_output,
     ro_item_master_blob_path,
+    save_ro_comparison_output,
     upload_customer_input,
 )
 from data_sources.ro_early_start_programs import (
@@ -232,7 +263,7 @@ _DISTRIBUTION_TRACKER_URL = (
 def _render_instructions() -> None:
     """Render the static instructions block at the top of the page."""
     st.markdown("### 📋 Instructions")
-    st.markdown("TBD")
+    st.markdown("Enable real-time demand insights")
 
 
 def _render_demand_planning_dashboard() -> None:
@@ -921,6 +952,61 @@ def _ensure_summary_in_session(
     st.session_state[_SS_WARNINGS] = warnings
     st.session_state[_SS_MONTHS_SIG] = months_sig
     st.session_state[_SS_DIMITEMS_ERROR] = dimitems_err
+    # Republish the freshly built comparison to Fabric.  This keeps the
+    # downstream consumers (Summary Report, PLR R&O, drill-downs) reading
+    # the CURRENT (Prior, LE) view rather than whatever the last
+    # ``RO_History_Tracker.csv`` change-detect path wrote.  Idempotent via
+    # signature guard — repeat reruns within the same session don't write.
+    _maybe_autosave_ro_comparison_output(trigger="comparison rebuild")
+
+
+def _render_ro_comparison_save_button(summary_df: pd.DataFrame) -> None:
+    """Render the manual "Save to Fabric" button for RO_Comparison_Output.csv.
+
+    Bypasses the signature-guard in :func:`_maybe_autosave_ro_comparison_output`
+    so an explicit click ALWAYS writes, even when an identical save already
+    happened in this session (the planner may have just edited a cell —
+    the editor edits land in :data:`_SS_SUMMARY_DF` but don't change the
+    Prior/LE signature, so the auto-save guard would otherwise skip them).
+    """
+    if summary_df is None or summary_df.empty:
+        return
+
+    if not st.button(
+        "💾 Save `RO_Comparison_Output.csv` to Fabric",
+        key="ro_cmp_output_save",
+        type="primary",
+        help=(
+            "Republishes the current comparison view (including any in-tab "
+            "cell edits) to "
+            "`Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`. "
+            "The Auto-save path covers Prior/LE month changes — use this "
+            "button after editing cells in the table above."
+        ),
+    ):
+        return
+
+    try:
+        with st.spinner("Saving RO_Comparison_Output.csv to Microsoft Fabric…"):
+            blob_path = save_ro_comparison_output(summary_df)
+    except RoComparisonError as exc:
+        st.error(f"❌ Save failed.\n\n{exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected error saving RO_Comparison_Output.csv.")
+        st.error(
+            "❌ Save failed unexpectedly — the file was not written.\n\n"
+            f"{type(exc).__name__}: {exc}"
+        )
+        return
+
+    # Stamp the guard so the auto-save flow doesn't re-write the same frame
+    # on the very next rerun.  Mirror the key the auto-save path uses.
+    st.session_state[_SS_AUTOSAVE_RO_CMP_SIG] = (
+        st.session_state.get(_SS_MONTHS_SIG),
+        _signature_for(summary_df),
+    )
+    st.success(f"✅ Saved to `Files/{blob_path}` ({len(summary_df):,} rows).")
 
 
 def _render_warnings_banner(w: ComparisonWarnings) -> None:
@@ -1068,13 +1154,18 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     # filters at the top of the section.
     _render_per_format_summary(summary_df)
 
-    # No manual Save button: the auto-regen path republishes
-    # ``RO_Comparison_Output.csv`` to Fabric automatically whenever
-    # the upstream ``RO_History_Tracker.csv`` ETag advances (see
-    # ``_maybe_auto_regenerate_comparison_output``).  Planner edits
-    # in the table above are session-scoped — useful for in-tab
-    # exploration / driver inspection, intentionally not persisted
-    # to Fabric (that's the upstream pipeline's job).
+    # Manual Save button — republishes the in-memory comparison frame
+    # (including any planner cell edits) to
+    # ``Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv``.  Sits
+    # alongside the existing auto-save hooks:
+    #   * Auto-regen path (history-fingerprint change)  → upstream pipeline.
+    #   * Auto-save on every Prior/LE rebuild           → see
+    #     :func:`_maybe_autosave_ro_comparison_output` in
+    #     :func:`_ensure_summary_in_session`.
+    #   * Auto-save at the end of every PLR render     → see PLR fragment.
+    # The button is the explicit escape hatch for planner edits, which the
+    # other paths cannot detect on their own.
+    _render_ro_comparison_save_button(summary_df)
 
 
 # Sentinel option surfaced inside every filter multiselect — picking
@@ -1864,6 +1955,11 @@ def _render_summary_report_fragment() -> None:
         st.session_state[_SS_SUMMARY_REPORT_LOADED_AT] = datetime.now()
         st.session_state[_SS_SUMMARY_REPORT_RAW_DF]    = summary_df.copy()
         st.session_state[_SS_SUMMARY_REPORT_SIG]       = months_sig
+        # Republish the freshly built template to Fabric.  The manual Save
+        # button below remains available; this auto-save is the planner's
+        # safety net so downstream consumers (PLR R&O, Demand Plan
+        # Comparison) always read the CURRENT in-memory view.
+        _maybe_autosave_ro_summary_report(trigger="RO Summary rebuild")
 
     # ── Toolbar: status + Show-empty-rows toggle ──────────────────
     show_empty = st.session_state.setdefault(_SS_SUMMARY_REPORT_SHOW_ZERO, False)
@@ -3377,6 +3473,10 @@ def _render_demand_plan_comparison_fragment() -> None:
     #    enabled across reruns so picker changes don't require re-clicking.
     enabled = st.session_state.get(_DPC_ENABLED_KEY, False)
     if not enabled:
+        st.warning(
+            "Hit the saving the RO_Summary_Report Button ABOVE Before "
+            "Generate this Summary"
+        )
         if st.button(
             "▶ Load Demand Plan Comparison (uses tracker + IBP + PDH)",
             key="demand_plan_comparison_enable",
@@ -4166,6 +4266,518 @@ def _render_demand_comparison_driver_tables_cached(
     _render_one_driver_table(bp_result, DRV_BASE_PLAN_VALUE, "base_plan_drivers")
 
 
+# ── Auto-save hooks (RO Summary + RO Comparison Output) ──────────────────────
+#
+# Two soft, idempotent helpers that republish the in-memory RO Summary
+# Report and RO Comparison Output to Fabric.  Wired into BOTH the relevant
+# build sites (Summary Report fragment rebuild, ``_ensure_summary_in_session``
+# rebuild) AND the Product Line Review fragment, so the saved CSVs always
+# reflect what the planner is currently seeing.  Idempotent — the signature
+# guard skips the Fabric write when the in-memory frame hasn't changed.
+#
+# Each helper soft-fails (warning log, no UI banner) so the manual Save
+# buttons in the respective sections remain the user-facing fallback when
+# Fabric is temporarily unreachable.
+
+# Session keys for the auto-save signature guards.  Kept distinct from the
+# manual-Save flow so a manual click never short-circuits a later auto-save.
+_SS_AUTOSAVE_RO_SR_SIG: str = "_autosave_ro_summary_sig"
+_SS_AUTOSAVE_RO_CMP_SIG: str = "_autosave_ro_comparison_sig"
+
+
+def _maybe_autosave_ro_summary_report(*, trigger: str) -> None:
+    """Save the in-memory RO Summary Report frame to Fabric (idempotent).
+
+    Reads :data:`_SS_SUMMARY_REPORT_DF` — the full 30-row template the
+    Summary Report fragment builds in-place.  Signature guard combines
+    the build-time signature with the current frame shape so planner
+    edits also re-trigger a save.
+
+    Called from:
+      * :func:`_render_summary_report_fragment` — right after each rebuild.
+      * :func:`_render_product_line_review_fragment` — at the end of every
+        PLR render, so PLR's ``R&O`` column reads the *current* report.
+    """
+    report_df: pd.DataFrame | None = st.session_state.get(_SS_SUMMARY_REPORT_DF)
+    if report_df is None or report_df.empty:
+        return
+    sig = (
+        st.session_state.get(_SS_SUMMARY_REPORT_SIG),
+        _signature_for(report_df),
+    )
+    if st.session_state.get(_SS_AUTOSAVE_RO_SR_SIG) == sig:
+        return
+
+    try:
+        with st.spinner(
+            f"Auto-saving `RO_Summary_Report.csv` to Microsoft Fabric ({trigger})…"
+        ):
+            blob_path = save_ro_summary_report(report_df)
+    except RoSummaryReportError as exc:
+        # Soft fail — log + leave the in-session manual Save button as the
+        # explicit fallback.  We deliberately do NOT throw a red banner so
+        # transient Fabric blips don't make the rest of the page look broken.
+        logger.warning("Auto-save of RO_Summary_Report failed: %s", exc)
+        return
+    except Exception as exc:  # noqa: BLE001 — last-resort safety net
+        logger.exception("Unexpected error auto-saving RO_Summary_Report.")
+        return
+
+    st.session_state[_SS_AUTOSAVE_RO_SR_SIG] = sig
+    logger.info(
+        "Auto-saved RO_Summary_Report.csv → Files/%s (trigger=%s)",
+        blob_path, trigger,
+    )
+
+
+def _maybe_autosave_ro_comparison_output(*, trigger: str) -> None:
+    """Save the in-memory comparison frame to Fabric (idempotent).
+
+    Reads :data:`_SS_SUMMARY_DF` — the comparison summary the editor /
+    Summary Report / PLR all consume.  The history fingerprint sidecar is
+    deliberately NOT touched here (only :func:`regenerate_comparison_output`
+    writes that): this hook republishes the **current view**, which may
+    differ from RO_History after a Prior/LE month change.
+
+    Called from:
+      * :func:`_ensure_summary_in_session` — right after each rebuild.
+      * :func:`_render_product_line_review_fragment` — at the end of every
+        PLR render, so downstream consumers see the same frame.
+      * The manual "💾 Save" button in the RO Comparison section.
+    """
+    summary_df: pd.DataFrame | None = st.session_state.get(_SS_SUMMARY_DF)
+    if summary_df is None or summary_df.empty:
+        return
+    sig = (
+        st.session_state.get(_SS_MONTHS_SIG),
+        _signature_for(summary_df),
+    )
+    if st.session_state.get(_SS_AUTOSAVE_RO_CMP_SIG) == sig:
+        return
+
+    try:
+        with st.spinner(
+            f"Auto-saving `RO_Comparison_Output.csv` to Microsoft Fabric "
+            f"({trigger})…"
+        ):
+            blob_path = save_ro_comparison_output(summary_df)
+    except RoComparisonError as exc:
+        logger.warning("Auto-save of RO_Comparison_Output failed: %s", exc)
+        return
+    except Exception as exc:  # noqa: BLE001 — last-resort safety net
+        logger.exception("Unexpected error auto-saving RO_Comparison_Output.")
+        return
+
+    st.session_state[_SS_AUTOSAVE_RO_CMP_SIG] = sig
+    logger.info(
+        "Auto-saved RO_Comparison_Output.csv → Files/%s (trigger=%s)",
+        blob_path, trigger,
+    )
+
+
+# ── Product Line Review ───────────────────────────────────────────────────────
+#
+# Per-Portfolio-Major hierarchical table + Full-Year chart.  The section is
+# available as soon as the underlying Fabric sources exist — there is **no**
+# Generate gate and **no** dependency on the Demand Summary load above.  The
+# planner picks four common date filters once, then each Portfolio Major
+# table gets its own (cascaded, multi-select) Supply Format / Brand picker.
+#
+# Auto-save hooks live further up the file:
+#   * RO Summary Report             — :func:`_maybe_autosave_ro_summary_report`
+#   * RO Comparison Output          — :func:`_maybe_autosave_ro_comparison_output`
+# Both are called whenever their corresponding "table" is rebuilt; both keep
+# their existing manual Save buttons + warnings (planner request).
+
+_PLR_FMT_MONTH = lambda d: d.strftime("%b %Y")  # noqa: E731
+_PLR_CHART_HEIGHT = 320
+_PLR_CY_BEGIN_KEY = "plr_cy_begin_month"
+
+
+def _render_product_line_review() -> None:
+    """Foldable Product Line Review section (bottom of page)."""
+    with st.expander("📋 Product Line Review", expanded=False):
+        st.caption(
+            "**One table + one chart per Portfolio Major.**  Hierarchical "
+            "**Brand → Portfolio Minor → Supply Format** roll-up with "
+            "customer detail rows; volumes in **millions of lbs**.  "
+            "Run-rate columns use IBP Orders trailing windows ending at "
+            "**CY Month** (PY L3/L6/L12).  Chart series come from "
+            "`qry_total_item_level_demand.csv`, summed across every "
+            "Forecast Type.  "
+            "Save the **RO Summary Report** above before relying on **R&O**."
+        )
+        if not fabric_signin_widget.is_fabric_signed_in():
+            fabric_signin_widget.render()
+            return
+        _render_product_line_review_fragment()
+
+
+@st.fragment
+def _render_product_line_review_fragment() -> None:
+    """Eagerly load Fabric sources + render one table+chart per PM.
+
+    Sourcing model
+    --------------
+    1. ``ibp_base_plan_current.csv``       — base plan totals (CY).
+    2. ``qry_pdh.csv``                     — dim attribution (joined on Item No).
+    3. ``dbo.IBP Orders``                  — Ordered Qty lbs (months derived from filters).
+    4. ``RO_Summary_Report.csv``           — FY27 Current Plan → "R&O" column.
+    5. ``qry_total_item_level_demand.csv`` — Full-Year chart series.
+
+    All five are fetched ONCE per fragment render; the per-PM loop reuses
+    the enriched frames.  Enrichment (PDH attribution) also happens once.
+    """
+    # 1) Load Fabric sources up-front (parallel-friendly fetches; each is
+    #    cached at the source layer so repeat renders are free).
+    try:
+        with st.spinner("Reading PLR sources from Microsoft Fabric…"):
+            base_snap = fetch_ibp_base_plan_current()
+            total_demand_snap = fetch_total_item_level_demand()
+    except DemandSummaryError as exc:
+        st.error(f"❌ Could not load Product Line Review sources.\n\n{exc}")
+        return
+
+    base_raw = base_snap.df
+    if base_raw is None or base_raw.empty:
+        st.info("ℹ️ `ibp_base_plan_current.csv` is empty — nothing to render.")
+        return
+
+    pdh_df = _load_demand_comparison_pdh()
+    ro_lookup = fetch_ro_summary_current_plan_by_path()
+    pdh_values = list_pdh_filter_values(pdh_df)
+    pmaj_options = pdh_values.get("portfolio_major", [])
+    if not pmaj_options:
+        st.warning(
+            "No Portfolio Major values found in `qry_pdh.csv` — cannot "
+            "build any Product Line Review section."
+        )
+        return
+
+    # 2) Common filters (apply to every PM table & chart).
+    common = _render_plr_common_filters(base_raw)
+    errors = validate_common_filters(common)
+    if errors:
+        for msg in errors:
+            st.error(f"❌ {msg}")
+        return
+
+    # 3) IBP Orders pull — months depend only on common filters.
+    ibp_months = collect_ibp_months_for_common(common)
+    ibp_orders_df, _warn_o = _load_demand_comparison_ibp_orders(months=ibp_months)
+
+    # 4) One-time enrichment so the per-PM loop only does masking + grouping.
+    orders_enriched = enrich_ibp_orders_df(ibp_orders_df, pdh_df)
+    base_long = prepare_ibp_base_plan_long(base_raw, pdh_df)
+    total_demand_df = total_demand_snap.df
+
+    # 5) Per-PM loop — table + chart for each Portfolio Major.
+    for pmaj in pmaj_options:
+        st.markdown("---")
+        st.markdown(f"### Portfolio Major: {pmaj}")
+        sub = _render_plr_pm_sub_filters(pdh_df, pmaj)
+        filters = resolve_filters(common, pmaj, sub)
+
+        result = build_product_line_review_table(
+            orders_enriched=orders_enriched,
+            base_long=base_long,
+            ro_current_plan_by_path=ro_lookup,
+            filters=filters,
+        )
+        for msg in result.warnings:
+            st.warning(msg)
+        _render_plr_table_for_pm(result, filters)
+
+        chart_data = build_full_year_chart_data(
+            qry_df=total_demand_df,
+            pdh_df=pdh_df,
+            portfolio_major=pmaj,
+            sub=sub,
+            cy_begin_month=common.cy_begin_month,
+        )
+        _render_plr_chart_for_pm(chart_data, pmaj)
+
+    # 6) Auto-save the in-memory RO Summary + RO Comparison snapshots to Fabric
+    #    so the freshly rendered PLR tables reference what's currently saved.
+    #    Idempotent within a session — the signature guards short-circuit
+    #    repeat saves for the same in-memory frames.
+    _maybe_autosave_ro_summary_report(trigger="PLR build")
+    _maybe_autosave_ro_comparison_output(trigger="PLR build")
+
+
+# ── PLR common filters ────────────────────────────────────────────────────────
+
+def _render_plr_common_filters(
+    base_raw: pd.DataFrame,
+) -> ProductLineReviewCommonFilters:
+    """Render the four filters shared across every Portfolio Major table.
+
+    *base_raw* is consulted only to seed sensible default month indexes —
+    the four pickers themselves are always populated from the union of
+    base-plan months + a generous look-ahead window (so the planner can
+    pick a CY Month that hasn't been baselined yet).
+    """
+    from data_sources.demand_plan_comparison import _vectorised_start_of_month
+    from data_sources.demand_summary import _resolve_column
+
+    month_col = _resolve_column(
+        base_raw, ("Start of Month", "Start Of Month", "Month"),
+    )
+    if not month_col:
+        st.warning("Base plan file has no parseable **Start of Month** column.")
+        return ProductLineReviewCommonFilters(
+            cy_month=date.today().replace(day=1),
+            cy_begin_month=date.today().replace(day=1),
+            cy_ytg_start=date.today().replace(day=1),
+            cy_ytg_end=date.today().replace(day=1),
+        )
+
+    months = sorted({
+        m for m in _vectorised_start_of_month(base_raw[month_col]).tolist()
+        if m is not None
+    })
+    if not months:
+        st.warning("No parseable months in `ibp_base_plan_current.csv`.")
+        return ProductLineReviewCommonFilters(
+            cy_month=date.today().replace(day=1),
+            cy_begin_month=date.today().replace(day=1),
+            cy_ytg_start=date.today().replace(day=1),
+            cy_ytg_end=date.today().replace(day=1),
+        )
+
+    def _idx(target: date, fallback: int) -> int:
+        return months.index(target) if target in months else fallback
+
+    last = len(months) - 1
+    cy_m_idx = _idx(date(2026, 5, 1), last)
+    cy_ytg_s_idx = _idx(date(2026, 5, 1), cy_m_idx)
+    cy_ytg_e_idx = _idx(date(2027, 3, 1), last)
+
+    st.markdown("**Common filters** _(apply to every Portfolio Major table below)_")
+
+    row_a = st.columns(2)
+    with row_a[0]:
+        cy_month = st.selectbox(
+            "CY Month", options=months, index=cy_m_idx,
+            key="plr_cy_month", format_func=_PLR_FMT_MONTH,
+            help="PY Month is derived automatically (CY Month − 12 months).",
+        )
+
+    # CY Begin options derive from CY Month — a 12-month arithmetic window
+    # ``[CY Month − 11, CY Month]`` so the dropdown always has 12 entries.
+    cy_begin_options = eligible_cy_begin_months(cy_month)
+    if (
+        _PLR_CY_BEGIN_KEY in st.session_state
+        and st.session_state[_PLR_CY_BEGIN_KEY] not in cy_begin_options
+    ):
+        # Planner's previous pick fell out of the new window — reset rather
+        # than throw a Streamlit "default not in options" warning.
+        del st.session_state[_PLR_CY_BEGIN_KEY]
+    with row_a[1]:
+        cy_begin = st.selectbox(
+            "CY Begin Month", options=cy_begin_options,
+            index=0,  # oldest month in the window → forward-looking FY view
+            key=_PLR_CY_BEGIN_KEY, format_func=_PLR_FMT_MONTH,
+            help=(
+                f"First month of the 12-month Full Year window — selectable "
+                f"between {_PLR_FMT_MONTH(cy_begin_options[0])} and "
+                f"{_PLR_FMT_MONTH(cy_begin_options[-1])}."
+            ),
+        )
+
+    st.caption("**CY YTG** (base plan; PY YTG is automatically CY YTG − 12 months)")
+    row_b = st.columns(2)
+    with row_b[0]:
+        cy_ytg_start = st.selectbox(
+            "CY YTG Begin", options=months, index=cy_ytg_s_idx,
+            key="plr_cy_ytg_start", format_func=_PLR_FMT_MONTH,
+        )
+    with row_b[1]:
+        cy_ytg_end = st.selectbox(
+            "CY YTG End", options=months, index=cy_ytg_e_idx,
+            key="plr_cy_ytg_end", format_func=_PLR_FMT_MONTH,
+        )
+
+    common = ProductLineReviewCommonFilters(
+        cy_month=cy_month,
+        cy_begin_month=cy_begin,
+        cy_ytg_start=cy_ytg_start,
+        cy_ytg_end=cy_ytg_end,
+    )
+    # Derived caption — gives the planner a one-line confirmation of the
+    # PY windows in play (since they're not pickable).
+    py_month = add_months(cy_month, -12)
+    py_ytg_start = add_months(cy_ytg_start, -12)
+    py_ytg_end = add_months(cy_ytg_end, -12)
+    st.caption(
+        f"📌 Derived · PY Month **{_PLR_FMT_MONTH(py_month)}**  ·  "
+        f"PY YTG **{_PLR_FMT_MONTH(py_ytg_start)} – {_PLR_FMT_MONTH(py_ytg_end)}**"
+    )
+    return common
+
+
+# ── PLR per-PM sub-filters (Supply Format + Brand, multi-select) ─────────────
+
+def _render_plr_pm_sub_filters(
+    pdh_df: Optional[pd.DataFrame],
+    portfolio_major: str,
+) -> ProductLineReviewSubFilters:
+    """Render the two per-PM multiselects.  Empty selection = include all.
+
+    Supply Format options are CASCADED on the active Portfolio Major
+    (planner never sees a format that doesn't apply to this section).
+    Brand options are likewise PM-scoped — the same item-description
+    Branded/Private rule the rest of the page uses.
+    """
+    fv = list_pdh_filter_values_for_pmaj(pdh_df, portfolio_major)
+    sfmt_options = fv.get("supply_format", [])
+    brand_options = fv.get("brand", []) or [BRAND_BRANDED, BRAND_PRIVATE]
+
+    # Per-PM widget keys so each section keeps its OWN selection — picking
+    # "Print" under Butter must not bleed into the Cultured table.
+    pm_key = portfolio_major.lower().replace(" ", "_")
+
+    cols = st.columns(2)
+    with cols[0]:
+        supply_formats = tuple(st.multiselect(
+            "Supply Format",
+            options=sfmt_options,
+            default=[],
+            key=f"plr_sfmt_{pm_key}",
+            help=(
+                "Leave empty to include every Supply Format in this "
+                "Portfolio Major.  Options come from `qry_pdh.csv` "
+                f"filtered to **{portfolio_major}**."
+            ),
+        ))
+    with cols[1]:
+        brands = tuple(st.multiselect(
+            "Brand",
+            options=brand_options,
+            default=[],
+            key=f"plr_brand_{pm_key}",
+            help=(
+                "Leave empty to include both Branded and Private.  "
+                "Source: first two characters of `Item Description` "
+                "in `qry_pdh.csv`."
+            ),
+        ))
+
+    return ProductLineReviewSubFilters(
+        supply_formats=supply_formats, brands=brands,
+    )
+
+
+# ── PLR table renderer ────────────────────────────────────────────────────────
+
+def _render_plr_table_for_pm(
+    result: ProductLineReviewResult,
+    filters: ProductLineReviewFilters,
+) -> None:
+    """Render one PM's hierarchical table with dynamic column headers."""
+    table = result.table
+    if table is None or table.empty:
+        st.info(
+            f"No rows for Portfolio Major **{filters.portfolio_major}** "
+            "under the current Supply Format / Brand selection."
+        )
+        return
+
+    indents = table[COL_INDENT].tolist()
+    labels = table[COL_ROW_LABEL].tolist()
+    is_customer = table[COL_IS_CUSTOMER].tolist()
+
+    display = table.drop(columns=[COL_INDENT, COL_IS_CUSTOMER]).copy()
+    display[COL_ROW_LABEL] = [
+        ("\u00a0\u00a0" * indent) + label
+        for indent, label in zip(indents, labels)
+    ]
+
+    # Build the rename map FROM the dynamic display groups so the CM headers
+    # echo the active PY / CY month (e.g. ``Orders – May 2025``).
+    display_groups = build_display_groups(filters)
+    rename: dict[str, str] = {COL_ROW_LABEL: "Pounds in millions"}
+    col_order: list[str] = ["Pounds in millions"]
+    for _group, cols in display_groups:
+        for col_id, label in cols:
+            rename[col_id] = label
+            col_order.append(label)
+    display = display.rename(columns=rename)
+    display = display.loc[:, [c for c in col_order if c in display.columns]]
+    display = display.reset_index(drop=True)
+
+    def _style_row(row: pd.Series) -> list[str]:
+        idx = int(row.name)
+        # Greyed-out customer rows — same visual treatment as before.
+        grey = (
+            "background-color: #f0f0f0; color: #888888"
+            if is_customer[idx] else ""
+        )
+        return [grey] * len(row)
+
+    st.dataframe(
+        display.style.apply(_style_row, axis=1),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+# ── PLR Full-Year chart renderer ─────────────────────────────────────────────
+
+def _render_plr_chart_for_pm(
+    data: FullYearChartData, portfolio_major: str,
+) -> None:
+    """Render the CY FY + NY FY Plotly line chart for one Portfolio Major.
+
+    Y-axis units are **raw lbs** (per planner request — matches the
+    ``qry_total_item_level_demand`` viewer the screenshot was taken from).
+    X-axis is the fiscal-year month position (Apr = 1 … Mar = 12) shared
+    by both series so the planner can compare same-month-of-FY YoY.
+    """
+    if not data.series:
+        st.caption(
+            f"_No `qry_total_item_level_demand` rows for "
+            f"**{portfolio_major}** under the current sub-filters._"
+        )
+        return
+
+    fig = go.Figure()
+    # Two-series palette — same dark-blue / orange pairing as the rest of
+    # the Demand Summary chart so the page reads cohesively.
+    palette = ("#1f4e79", "#ed7d31")
+    for series, colour in zip(data.series, palette):
+        fig.add_trace(go.Scatter(
+            x=list(data.fy_month_labels),
+            y=list(series.values_lbs),
+            name=series.label,
+            mode="lines+markers",
+            line=dict(color=colour, width=2),
+            marker=dict(size=6),
+            hovertemplate=(
+                "<b>%{x}</b><br>" + series.label + ": %{y:,.0f} lbs<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        title=dict(text="Total Plan LE in Lbs", x=0.02, xanchor="left"),
+        height=_PLR_CHART_HEIGHT,
+        margin=dict(l=40, r=20, t=40, b=40),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=-0.30,
+            xanchor="center", x=0.5,
+        ),
+        xaxis=dict(title="Fiscal year month", tickangle=0),
+        yaxis=dict(title="Lbs", rangemode="tozero", tickformat=","),
+        hovermode="x unified",
+    )
+    st.plotly_chart(
+        fig, use_container_width=True, theme=None,
+        # Stable key so re-renders don't churn the chart widget.
+        key=f"plr_chart_{portfolio_major}",
+    )
+
+
 # ── 3. Entry point ────────────────────────────────────────────────────────────
 
 
@@ -4179,6 +4791,7 @@ def render() -> None:
     3. New Distribution Tracker     (collapsible, collapsed by default)
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
+    6. Product Line Review          (collapsible, collapsed by default)
     """
     apply_custom_css()
     st.markdown(
@@ -4199,3 +4812,6 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
+    st.markdown("---")
+
+    _render_product_line_review()

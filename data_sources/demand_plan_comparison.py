@@ -198,6 +198,11 @@ _RO_SUMMARY_TOTAL_DELTA_CANDIDATES: tuple[str, ...] = (
     "FY27 Probabilized|Total Delta",
     "FY27 Probabilized  | Total Delta",
 )
+_RO_SUMMARY_CURRENT_PLAN_CANDIDATES: tuple[str, ...] = (
+    "FY27 Probabilized | Current Plan",
+    "FY27 Probabilized|Current Plan",
+    "FY27 Probabilized  | Current Plan",
+)
 # Non-breaking space used by the RO Summary exporter to indent the tree.
 _NBSP: str = "\u00A0"
 
@@ -1121,48 +1126,40 @@ def _sum_millions(df: pd.DataFrame, mask: pd.Series) -> float:
 # RO Summary Report — R&O lookup (FY27 Total Delta, matched by path)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
-    """Return ``{label_path -> FY27 Total Delta}`` from the saved RO Summary.
+def _fetch_ro_summary_metric_by_path(
+    metric_candidates: tuple[str, ...],
+) -> dict[tuple[str, ...], float]:
+    """Return ``{label_path -> metric}`` from the saved RO Summary Report.
 
-    The RO Summary Report CSV stores an indented tree in its
-    ``Millions of lbs.`` column (two NBSPs per level) plus the metric
-    column ``FY27 Probabilized | Total Delta``.  We rebuild each row's
-    full label path (e.g. ``("Total B2C", "Cultured", "Large Tub")``)
-    by tracking the most-recent label seen at each shallower indent, and
-    map it to the row's Total Delta.
-
-    Returns an empty dict when the file is missing / unreadable / lacks
-    the expected columns — the caller treats that as "R&O = 0 for every
-    row" and surfaces a soft warning.  Never raises on a missing file.
+    Shared parser for any single metric column (Total Delta, Current
+    Plan, etc.).  Returns an empty dict when the file is missing /
+    unreadable / lacks the expected columns — callers treat that as zero
+    and surface a soft warning.  Never raises on a missing file.
     """
     try:
         df, _etag = read_csv(_RO_SUMMARY_SECRETS_SECTION, _RO_SUMMARY_REPORT_BLOB_PATH)
     except LakehouseIOError as exc:
-        logger.info("RO Summary Report read failed (R&O will be 0): %s", exc)
+        logger.info("RO Summary Report read failed: %s", exc)
         return {}
 
     if df is None or df.empty:
-        logger.info("RO Summary Report is missing or empty (R&O will be 0).")
+        logger.info("RO Summary Report is missing or empty.")
         return {}
 
     label_col = _resolve_column(df, _RO_SUMMARY_LABEL_CANDIDATES)
-    delta_col = _resolve_column(df, _RO_SUMMARY_TOTAL_DELTA_CANDIDATES)
-    if not label_col or not delta_col:
+    metric_col = _resolve_column(df, metric_candidates)
+    if not label_col or not metric_col:
         logger.info(
             "RO Summary Report present but expected columns not found "
-            "(label=%r, total_delta=%r).  Available columns: %r.  R&O will be 0.",
-            label_col, delta_col, list(df.columns),
+            "(label=%r, metric=%r).  Available columns: %r.",
+            label_col, metric_col, list(df.columns),
         )
         return {}
 
-    # Vectorise the per-row label + value coercion up-front; only the
-    # stack-walk (inherently sequential — it carries state across rows)
-    # remains in Python.  Cuts the typical 30-row report read from a
-    # full pandas `iterrows` walk to a few microseconds of state update.
     labels = df[label_col].astype("string").fillna("")
     indents = (labels.str.len() - labels.str.lstrip(_NBSP).str.len()) // 2
     cleans = labels.str.replace(_NBSP, "", regex=False).str.strip()
-    values = pd.to_numeric(df[delta_col], errors="coerce").fillna(0.0)
+    values = pd.to_numeric(df[metric_col], errors="coerce").fillna(0.0)
 
     by_path: dict[tuple[str, ...], float] = {}
     stack: list[str] = []
@@ -1175,6 +1172,90 @@ def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
         stack.append(clean)
         by_path[tuple(stack)] = float(value)
     return by_path
+
+
+def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
+    """Return ``{label_path -> FY27 Total Delta}`` from the saved RO Summary."""
+    return _fetch_ro_summary_metric_by_path(_RO_SUMMARY_TOTAL_DELTA_CANDIDATES)
+
+
+def fetch_ro_summary_current_plan_by_path() -> dict[tuple[str, ...], float]:
+    """Return ``{label_path -> FY27 Current Plan}`` from the saved RO Summary.
+
+    Used by Product Line Review for the **R&O FY** column (millions of
+    lbs, already on the report's display scale).
+    """
+    return _fetch_ro_summary_metric_by_path(_RO_SUMMARY_CURRENT_PLAN_CANDIDATES)
+
+
+def months_in_range(start: date, end: date) -> set[date]:
+    """Inclusive first-of-month set from *start* through *end*."""
+    return _months_in_range(start, end)
+
+
+def enrich_ibp_orders_df(
+    ibp_orders_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Return tidy IBP Orders with PDH dims attached (pmaj, sfmt, pminor, brand)."""
+    dim_frame = build_item_dim_frame(pdh_df)
+    if ibp_orders_df is None or ibp_orders_df.empty:
+        return _empty_enriched(actuals=True)
+    return _enrich_ibp(
+        ibp_orders_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES,
+    )
+
+
+def resolve_ro_summary_path(
+    *,
+    pmaj: str,
+    sfmt: str,
+    brand: str,
+    pminor: str = "",
+) -> Optional[tuple[str, ...]]:
+    """Map PDH dimensions to an RO Summary label path for metric lookup.
+
+    Mirrors the ``ro_summary_path`` wiring on the Demand Plan Comparison
+    template so Product Line Review reads the same saved report leaves.
+    Returns ``None`` when no RO counterpart exists for the slice.
+    """
+    pm = pmaj.strip().casefold()
+    sf = sfmt.strip()
+    br = brand.strip()
+    pmin_cf = pminor.strip().casefold()
+
+    if pm in {x.casefold() for x in _BUTTER}:
+        if pmin_cf and pmin_cf != _BUTTER_PMINOR.casefold():
+            return None
+        if not sf:
+            return (_RO_TOTAL, "Butter")
+        return (_RO_TOTAL, "Butter", sf)
+
+    if pm in {x.casefold() for x in _ESL}:
+        if sf.casefold() == "aseptic":
+            if br == BRAND_BRANDED:
+                return (_RO_TOTAL, _RO_ASEPTIC, _RO_BRANDED)
+            if br == BRAND_PRIVATE:
+                return (_RO_TOTAL, _RO_ASEPTIC, _RO_PRIVATE)
+            return None
+        if br == BRAND_BRANDED:
+            return (_RO_TOTAL, _RO_ESL, sf, _RO_BRANDED)
+        if br == BRAND_PRIVATE:
+            return (_RO_TOTAL, _RO_ESL, sf, _RO_PRIVATE)
+        return None
+
+    if pm in {x.casefold() for x in _CULTURED}:
+        if not sf:
+            return None
+        return (_RO_TOTAL, _RO_CULTURED, sf)
+
+    if pm in {x.casefold() for x in _FRESH_MILK}:
+        if not sf:
+            return None
+        ro_sfmt = "Totes" if sf.casefold() == "dispenser" else sf
+        return (_RO_TOTAL, _RO_FRESH_MILK, ro_sfmt)
+
+    return None
 
 
 def _indent_depth(indented_label: str) -> int:
@@ -2363,6 +2444,10 @@ __all__ = [
     "list_tracker_months",
     "validate_filters",
     "fetch_ro_summary_total_delta_by_path",
+    "fetch_ro_summary_current_plan_by_path",
+    "months_in_range",
+    "enrich_ibp_orders_df",
+    "resolve_ro_summary_path",
     "build_enriched_sources",
     "EnrichedSources",
     "build_item_dim_frame",

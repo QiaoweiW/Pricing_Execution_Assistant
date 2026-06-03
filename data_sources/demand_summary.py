@@ -102,6 +102,11 @@ _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH: str = (
 _DEMAND_PLAN_COMPARISON_BLOB_PATH: str = (
     "RO Tracking/Demand Plan/qry_demand_plan_comparison_summary.csv"
 )
+# Current-cycle IBP base plan export — backs Product Line Review CY columns
+# (``Total`` by ``Start of Month``) and the customer list (``Plan To Name``).
+_IBP_BASE_PLAN_CURRENT_BLOB_PATH: str = (
+    "RO Tracking/Demand Plan/Append New Plan/ibp_base_plan_current.csv"
+)
 
 # Monthly bundled (Base + R&O) budget for the Demand Pivot Summary's
 # dynamic-subtotal "Total Budget" row and the Base+RO chart overlay.
@@ -221,6 +226,7 @@ class DemandSummarySnapshot:
 # typed its columns.
 _READ_CSV_KWARGS_BY_BLOB: dict[str, dict] = {
     _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH: {"dtype": str},
+    _IBP_BASE_PLAN_CURRENT_BLOB_PATH: {"thousands": ","},
 }
 
 
@@ -378,6 +384,20 @@ def fetch_pdh(*, force_refresh: bool = False) -> DemandSummarySnapshot:
     if force_refresh:
         _cached_fetch.clear()
     return _fetch_snapshot(_PDH_BLOB_PATH)
+
+
+def fetch_ibp_base_plan_current(
+    *, force_refresh: bool = False,
+) -> DemandSummarySnapshot:
+    """Return the latest ``ibp_base_plan_current.csv`` as a snapshot.
+
+    Used by Product Line Review for CY base-plan volumes (``Total``) and
+    the customer dimension (``Plan To Name``).  See
+    :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
+    """
+    if force_refresh:
+        _cached_fetch.clear()
+    return _fetch_snapshot(_IBP_BASE_PLAN_CURRENT_BLOB_PATH)
 
 
 def fetch_mgmt_plan_history_tracker(
@@ -1838,6 +1858,7 @@ __all__ = [
     "fetch_mgmt_plan_full",
     "fetch_total_item_level_demand",
     "fetch_pdh",
+    "fetch_ibp_base_plan_current",
     "fetch_static_budget_base",
     "fetch_static_budget_ro",
     "fetch_static_budget_monthly",

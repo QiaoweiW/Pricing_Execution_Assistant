@@ -1,4 +1,4 @@
-"""Bid Asset Intelligence page view.
+"""Bid Assistant page view.
 
 The page pulls bid-asset CSVs directly from the Microsoft Fabric Lakehouse,
 renders four analytical sections, and lets operators edit the Item-level
@@ -38,6 +38,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from data_sources import bid_asset_store as _bid_store
+from data_sources import rfp_pnl_store as _rfp_pnl_store
 from data_sources.bid_asset_store import BidAssetStoreError
 from utils import fabric_signin_widget
 from utils.ui_helpers import apply_custom_css
@@ -1107,52 +1108,936 @@ def _render_program_tracker(raw_df: pd.DataFrame) -> None:
     )
 
 
-# ── 8. Entry point ────────────────────────────────────────────────────────────
+# ── 8. RFP P&L Analysis (new section) ─────────────────────────────────────────
 
-def render() -> None:
-    """Render the Bid Asset Intelligence page.
+_RFP_SECTION_ROWS: list[tuple[str, bool]] = [
+    ("Month", False),
+    ("Plant", False),
+    ("Target SKU Name", False),
+    ("Target SKU lbs per Each", False),
+    ("Target SKU Volume (units)", False),
+    ("Target SKU Volume (pounds)", False),
+    ("Reference SKUs", True),
+    ("Milk Reference SKU", False),
+    ("Ingredient Reference SKU", False),
+    ("Packaging Reference SKU", False),
+    ("Conversion Reference SKU", False),
+    ("Reference SKU UOMs", True),
+    ("Milk Reference SKU lbs per Each", False),
+    ("Ingredient Reference SKU lbs per Each", False),
+    ("Packaging Reference SKU lbs per Each", False),
+    ("Conversion Reference SKU lbs per Each", False),
+    ("Category", False),
+    ("PCM ($/lbs) - Input Required", True),
+    ("PCM $/lbs", False),
+    ("Target SKU P&L ($/EA)", True),
+    ("FOB Price", False),
+    ("Milk", False),
+    ("Ingredient", False),
+    ("Packaging", False),
+    ("Conversion Cost", False),
+    ("Cost of Quality", False),
+    ("Internal Logistics (Shuttling & WHSE)", False),
+    ("Other Cost", False),
+    ("Total Costs", False),
+    ("PCM", False),
+    ("PCM%", False),
+    ("GP", False),
+    ("GP $/lbs", False),
+    ("GP%", False),
+]
 
-    Data is pulled automatically from the Fabric Lakehouse (``Files/Program_Bid_Management``).
-    No file upload is required; users must be signed in to Microsoft Fabric via the
-    Home & Fabric Sign-in page.
+_RFP_NEW_SCENARIO_TOKEN = "__new__"
+_RFP_ITEMS_KEY = "_rfp_pnl_items"
+_RFP_PATH_KEY = "_rfp_pnl_path"
+_RFP_ETAG_KEY = "_rfp_pnl_etag"
+_RFP_NAME_KEY = "rfp_pnl_scenario_name"
+_RFP_INPUT_PREFIX = "rfp_in_"
+_RFP_INPUT_SEEDED_FLAG = "_rfp_pnl_inputs_seeded"
 
-    Orchestrates the four analysis sections in order.  Each section is self-contained:
-    it reads Streamlit widget state, computes its own data slice, and renders its own UI.
-    render() itself carries no business logic beyond routing the loaded DataFrame.
-    """
-    apply_custom_css()
+# Field groups used by the per-item input panel.
+# A "field" is a metric collected from the user (free text, number, or
+# dropdown) — only strict calculated metrics (PCM, PCM%, GP, GP%, GP $/lbs,
+# Total Costs, FOB Price, Target SKU Volume (pounds)) are excluded.
+_RFP_INPUT_DROPDOWN_MONTH_PLANT: tuple[str, ...] = ("Month", "Plant")
+_RFP_INPUT_REF_SKU_FIELDS: tuple[str, ...] = (
+    "Milk Reference SKU",
+    "Ingredient Reference SKU",
+    "Packaging Reference SKU",
+    "Conversion Reference SKU",
+)
+_RFP_INPUT_TEXT_FIELDS: tuple[str, ...] = ("Target SKU Name", "Category")
+_RFP_INPUT_NUMERIC_FIELDS: tuple[str, ...] = (
+    "Target SKU lbs per Each",
+    "Target SKU Volume (units)",
+    "Milk Reference SKU lbs per Each",
+    "Ingredient Reference SKU lbs per Each",
+    "Packaging Reference SKU lbs per Each",
+    "Conversion Reference SKU lbs per Each",
+    "PCM $/lbs",
+    # Cost overrides — analyst-supplied $/EA values that win over the
+    # BOM/Budget default whenever non-blank. The displayed cost cell
+    # itself is strictly recomputed (see STRICT_CALC_METRICS) so saved
+    # values can never silently mask the calculation.
+    "Milk Override",
+    "Ingredient Override",
+    "Packaging Override",
+    "Conversion Cost Override",
+    "Cost of Quality Override",
+    "Internal Logistics (Shuttling & WHSE) Override",
+    # Other Cost has no BOM/Budget calc — its value IS the analyst input.
+    "Other Cost",
+)
+_RFP_INPUT_FIELDS: tuple[str, ...] = (
+    *_RFP_INPUT_DROPDOWN_MONTH_PLANT,
+    *_RFP_INPUT_TEXT_FIELDS,
+    *_RFP_INPUT_NUMERIC_FIELDS,
+    *_RFP_INPUT_REF_SKU_FIELDS,
+)
 
-    st.markdown(
-        '<h1 class="main-header">Bid Asset Intelligence</h1>',
-        unsafe_allow_html=True,
+# Display-only formatting per metric on the rendered scenario table.
+# Per analyst preference, every numeric value is rendered with four
+# decimal places so spot-checks against the source CSVs are unambiguous.
+_RFP_DECIMALS = 4
+
+
+def _fmt_money(v) -> str:
+    f = _rfp_pnl_store._to_float(v)  # noqa: SLF001 — shared parsing helper
+    if f is None:
+        return ""
+    return (
+        f"$({abs(f):,.{_RFP_DECIMALS}f})"
+        if f < 0
+        else f"${f:,.{_RFP_DECIMALS}f}"
     )
 
-    st.markdown("""
-### Welcome
 
-Use this page to analyze historical trends since December 2025. These insights drive post-mortem analysis
-and sharpen future bid strategies. Key resources include:
+def _fmt_number(v) -> str:
+    f = _rfp_pnl_store._to_float(v)  # noqa: SLF001
+    return "" if f is None else f"{f:,.{_RFP_DECIMALS}f}"
 
-- **Visualizations:** Charts for bid comparisons.
-- **RFP Program-level Table:** High-level tracking of program size, status and key financials.
-- **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
 
-Data is loaded automatically from the **Fabric Lakehouse** (`Files/Program_Bid_Management`).
-Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data does not appear.
-""")
+def _fmt_pct(v) -> str:
+    f = _rfp_pnl_store._to_float(v)  # noqa: SLF001
+    return "" if f is None else f"{f * 100:,.{_RFP_DECIMALS}f}%"
+
+
+def _fmt_passthrough(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and pd.isna(v):
+        return ""
+    return str(v)
+
+
+# Display formatter for each non-section metric row. Anything not listed
+# here falls back to passthrough (e.g. Month, Plant, SKU descriptions).
+_RFP_METRIC_FORMATTERS: dict[str, callable] = {
+    "Target SKU lbs per Each": _fmt_number,
+    "Target SKU Volume (units)": _fmt_number,
+    "Target SKU Volume (pounds)": _fmt_number,
+    "Milk Reference SKU lbs per Each": _fmt_number,
+    "Ingredient Reference SKU lbs per Each": _fmt_number,
+    "Packaging Reference SKU lbs per Each": _fmt_number,
+    "Conversion Reference SKU lbs per Each": _fmt_number,
+    "PCM $/lbs": _fmt_money,
+    "FOB Price": _fmt_money,
+    "Milk": _fmt_money,
+    "Ingredient": _fmt_money,
+    "Packaging": _fmt_money,
+    "Conversion Cost": _fmt_money,
+    "Cost of Quality": _fmt_money,
+    "Internal Logistics (Shuttling & WHSE)": _fmt_money,
+    "Other Cost": _fmt_money,
+    "Total Costs": _fmt_money,
+    "PCM": _fmt_money,
+    "PCM%": _fmt_pct,
+    "GP": _fmt_money,
+    "GP $/lbs": _fmt_money,
+    "GP%": _fmt_pct,
+}
+
+
+def _rfp_input_key(idx: int, field: str) -> str:
+    """Stable session-state key for one item-level input widget."""
+    slug = field.lower().replace(" ", "_").replace("$", "dlr").replace("/", "_per_").replace("(", "").replace(")", "").replace(",", "")
+    return f"{_RFP_INPUT_PREFIX}{idx}__{slug}"
+
+
+def _rfp_options_with_current(options: tuple[str, ...], current: object) -> list[str]:
+    """Return dropdown options (with a leading blank), preserving custom values."""
+    cur = str(current or "").strip()
+    out = ["", *options]
+    if cur and cur not in out:
+        out.append(cur)
+    return out
+
+
+def _rfp_clear_input_state() -> None:
+    """Drop every per-item input widget value from session_state."""
+    for key in list(st.session_state.keys()):
+        if key.startswith(_RFP_INPUT_PREFIX):
+            del st.session_state[key]
+
+
+def _rfp_stringify(value: object) -> str:
+    """Coerce any cell value to a clean string for use as a widget value.
+
+    Streamlit ``st.text_input`` and ``st.selectbox`` reject non-string state,
+    so every seeded input must be a string. Floats whose fractional part is
+    zero are rendered without the trailing ``.0`` for cleaner UX.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if pd.isna(value):
+            return ""
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.6g}"
+    s = str(value).strip()
+    return "" if s.lower() in {"nan", "none"} else s
+
+
+def _rfp_seed_inputs_from_items(items_df: pd.DataFrame) -> None:
+    """Initialise widget state for each item row from the committed scenario."""
+    _rfp_clear_input_state()
+    for idx, row in items_df.iterrows():
+        for field in _RFP_INPUT_FIELDS:
+            st.session_state[_rfp_input_key(idx, field)] = _rfp_stringify(row.get(field, ""))
+
+
+_RFP_REF_SKU_INHERITANCE = {
+    "Ingredient Reference SKU",
+    "Packaging Reference SKU",
+    "Conversion Reference SKU",
+}
+
+
+def _rfp_collect_inputs_from_state(item_count: int) -> pd.DataFrame:
+    """Build a fresh items DataFrame from current widget state.
+
+    Notes
+    -----
+    * Ingredient / Packaging / Conversion Reference SKUs default to the Milk
+      Reference SKU when blank (mirrors the snapshot's default rule).
+    * Strict calculated metrics are intentionally left blank — they are
+      always overwritten by ``recompute_items``.
+    * Every other metric is taken verbatim from widget state (or "" if
+      unset) so that clearing an override field re-instates the BOM /
+      Budget default on the next recompute.
+    """
+    rows: list[dict[str, object]] = []
+    for idx in range(item_count):
+        milk_ref = _rfp_stringify(st.session_state.get(_rfp_input_key(idx, "Milk Reference SKU")))
+
+        row: dict[str, object] = {_rfp_pnl_store.ITEM_COL: f"Item {idx + 1}"}
+        for field in _RFP_INPUT_FIELDS:
+            value = _rfp_stringify(st.session_state.get(_rfp_input_key(idx, field)))
+            if field in _RFP_REF_SKU_INHERITANCE and not value:
+                value = milk_ref
+            row[field] = value
+
+        # Strict calc metrics are placeholders — recompute_items overwrites.
+        for metric in _rfp_pnl_store.METRIC_COLS:
+            row.setdefault(metric, "")
+
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=[_rfp_pnl_store.ITEM_COL, *_rfp_pnl_store.METRIC_COLS])
+
+
+def _rfp_render_item_inputs(idx: int, sources: _rfp_pnl_store.RfpPnlSources) -> None:
+    """Render the foldable input panel for one Target SKU item.
+
+    The panel exposes every manually-editable metric from the snapshot.
+    Strict calculated metrics (Volume in lbs, FOB Price, Total Costs, PCM,
+    GP, %s) are NOT collected here — they are derived on Refresh.
+
+    Defaults used by the recompute engine:
+        * Reference SKU lbs per Each → PDH Item Net Weight Lbs.
+        * Category → PDH Portfolio Major.
+        * Milk / Ingredient / Packaging / Conversion costs → BOM lookup.
+        * Cost of Quality / Internal Logistics → Budget by Category.
+    Each of these stays editable so an analyst can override the model
+    output for sensitivity / what-if work.
+    """
+    name_key = _rfp_input_key(idx, "Target SKU Name")
+    item_title = _rfp_stringify(st.session_state.get(name_key)) or f"Item {idx + 1}"
+
+    # ``expanded=True`` for every item: when a saved scenario is loaded,
+    # ``_rfp_seed_inputs_from_items`` rehydrates widget state for *every*
+    # item, so the analyst should see all inputs at once and not have to
+    # hunt through collapsed panels. Streamlit preserves user-driven
+    # collapse state across reruns within the same session, so an analyst
+    # who explicitly collapses a panel keeps it collapsed.
+    with st.expander(f"📦 Item {idx + 1} — {item_title}", expanded=True):
+        # ── Identification ────────────────────────────────────────────────
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox(
+                "Month",
+                options=_rfp_options_with_current(sources.month_options, st.session_state.get(_rfp_input_key(idx, "Month"))),
+                key=_rfp_input_key(idx, "Month"),
+                help="Matches BOM `Per Beg`.",
+            )
+        with c2:
+            st.selectbox(
+                "Plant",
+                options=_rfp_options_with_current(sources.plant_options, st.session_state.get(_rfp_input_key(idx, "Plant"))),
+                key=_rfp_input_key(idx, "Plant"),
+                help="Matches BOM `Plant`.",
+            )
+        st.text_input("Target SKU Name", key=name_key, placeholder="e.g. Cream Whipping 40% HVY")
+
+        # ── Volume / unit definition ──────────────────────────────────────
+        st.markdown("**Target SKU sizing**")
+        n1, n2 = st.columns(2)
+        with n1:
+            st.text_input(
+                "Target SKU lbs per Each",
+                key=_rfp_input_key(idx, "Target SKU lbs per Each"),
+                help="Numbers only.",
+            )
+        with n2:
+            st.text_input(
+                "Target SKU Volume (units)",
+                key=_rfp_input_key(idx, "Target SKU Volume (units)"),
+                help="Numbers only. Volume (pounds) is calculated.",
+            )
+
+        # ── Reference SKUs ─────────────────────────────────────────────────
+        st.markdown(
+            "**Reference SKUs**  ·  "
+            "*Ingredient / Packaging / Conversion default to the Milk Reference SKU when left blank.*"
+        )
+        ref1, ref2 = st.columns(2)
+        with ref1:
+            st.selectbox(
+                "Milk Reference SKU",
+                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Milk Reference SKU"))),
+                key=_rfp_input_key(idx, "Milk Reference SKU"),
+            )
+            st.selectbox(
+                "Ingredient Reference SKU",
+                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Ingredient Reference SKU"))),
+                key=_rfp_input_key(idx, "Ingredient Reference SKU"),
+                help="Leave blank to inherit Milk Reference SKU.",
+            )
+        with ref2:
+            st.selectbox(
+                "Packaging Reference SKU",
+                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Packaging Reference SKU"))),
+                key=_rfp_input_key(idx, "Packaging Reference SKU"),
+                help="Leave blank to inherit Milk Reference SKU.",
+            )
+            st.selectbox(
+                "Conversion Reference SKU",
+                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Conversion Reference SKU"))),
+                key=_rfp_input_key(idx, "Conversion Reference SKU"),
+                help="Leave blank to inherit Milk Reference SKU.",
+            )
+
+        # ── Reference SKU UOMs (manual entry only) ────────────────────────
+        st.markdown(
+            "**Reference SKU UOMs**  ·  "
+            "*Enter lbs/Each for each Reference SKU. These drive the Milk, "
+            "Ingredient, Packaging and Conversion cost formulas. "
+            "Ingredient / Packaging / Conversion lbs/Each default to "
+            "**Milk Ref lbs/Each** when left blank.*"
+        )
+        u1, u2, u3, u4 = st.columns(4)
+        with u1:
+            st.text_input(
+                "Milk Ref lbs/Each",
+                key=_rfp_input_key(idx, "Milk Reference SKU lbs per Each"),
+                help="Required for Milk and Ingredient cost. Numbers only.",
+            )
+        with u2:
+            st.text_input(
+                "Ingredient Ref lbs/Each",
+                key=_rfp_input_key(idx, "Ingredient Reference SKU lbs per Each"),
+                help="Numbers only. Leave blank to inherit Milk Ref lbs/Each.",
+            )
+        with u3:
+            st.text_input(
+                "Packaging Ref lbs/Each",
+                key=_rfp_input_key(idx, "Packaging Reference SKU lbs per Each"),
+                help="Numbers only. Leave blank to inherit Milk Ref lbs/Each.",
+            )
+        with u4:
+            st.text_input(
+                "Conversion Ref lbs/Each",
+                key=_rfp_input_key(idx, "Conversion Reference SKU lbs per Each"),
+                help="Numbers only. Leave blank to inherit Milk Ref lbs/Each.",
+            )
+
+        # ── Category & PCM ────────────────────────────────────────────────
+        st.markdown("**Category & PCM**")
+        cat_col, pcm_col = st.columns(2)
+        with cat_col:
+            st.text_input(
+                "Category",
+                key=_rfp_input_key(idx, "Category"),
+                help="Leave blank to inherit PDH `Portfolio Major` for the Milk Reference SKU.",
+            )
+        with pcm_col:
+            st.text_input(
+                "PCM $/lbs",
+                key=_rfp_input_key(idx, "PCM $/lbs"),
+                help="Required for FOB Price. Numbers only.",
+            )
+
+        # ── Cost overrides ────────────────────────────────────────────────
+        # Each cost component has a dedicated override input. The
+        # corresponding display row in the scenario table below is
+        # ``override if non-blank else BOM/Budget default``. Override
+        # values bind to ``<Component> Override`` keys (NOT to the
+        # display column itself) so the displayed cell can stay strictly
+        # calculated — which means Refresh always reflects the live calc
+        # engine and saved values can never silently mask it. Other Cost
+        # has no calculated default so its widget IS the value.
+        st.markdown(
+            "**Cost overrides**  ·  "
+            "*Leave blank to use the BOM/Budget default; type a value to override.*"
+        )
+        co1, co2, co3, co4 = st.columns(4)
+        with co1:
+            st.text_input(
+                "Milk Override",
+                key=_rfp_input_key(idx, "Milk Override"),
+                help="$/EA. Leave blank to use BOM-derived Milk cost.",
+            )
+        with co2:
+            st.text_input(
+                "Ingredient Override",
+                key=_rfp_input_key(idx, "Ingredient Override"),
+                help="$/EA. Leave blank to use BOM-derived Ingredient cost.",
+            )
+        with co3:
+            st.text_input(
+                "Packaging Override",
+                key=_rfp_input_key(idx, "Packaging Override"),
+                help="$/EA. Leave blank to use BOM-derived Packaging cost.",
+            )
+        with co4:
+            st.text_input(
+                "Conversion Cost Override",
+                key=_rfp_input_key(idx, "Conversion Cost Override"),
+                help="$/EA. Leave blank to use BOM-derived Conversion cost.",
+            )
+        bo1, bo2, bo3 = st.columns(3)
+        with bo1:
+            st.text_input(
+                "Cost of Quality Override",
+                key=_rfp_input_key(idx, "Cost of Quality Override"),
+                help="$/EA. Leave blank to use Budget-by-Category default.",
+            )
+        with bo2:
+            st.text_input(
+                "Internal Logistics Override",
+                key=_rfp_input_key(idx, "Internal Logistics (Shuttling & WHSE) Override"),
+                help="$/EA. Leave blank to use Budget-by-Category default.",
+            )
+        with bo3:
+            st.text_input(
+                "Other Cost",
+                key=_rfp_input_key(idx, "Other Cost"),
+                help="$/EA. Direct input — defaults to 0.",
+            )
+
+
+def _rfp_build_display_table(items_df: pd.DataFrame) -> pd.DataFrame:
+    """Render-friendly matrix: metric rows × item columns, formatted for display."""
+    out = pd.DataFrame({"Metric": [label for label, _ in _RFP_SECTION_ROWS]})
+
+    item_labels: list[str] = []
+    used: set[str] = set()
+    for idx, raw in enumerate(items_df.get("Target SKU Name", pd.Series([""] * len(items_df))).tolist(), start=1):
+        base = str(raw).strip() or f"Item {idx}"
+        label = base
+        suffix = 2
+        while label in used:
+            label = f"{base} ({suffix})"
+            suffix += 1
+        used.add(label)
+        item_labels.append(label)
+
+    for col_idx, label in enumerate(item_labels):
+        col_vals: list[str] = []
+        row = items_df.iloc[col_idx] if col_idx < len(items_df) else pd.Series(dtype=object)
+        for metric, is_section in _RFP_SECTION_ROWS:
+            if is_section:
+                col_vals.append("")
+                continue
+            raw_value = row.get(metric, "")
+            formatter = _RFP_METRIC_FORMATTERS.get(metric, _fmt_passthrough)
+            col_vals.append(formatter(raw_value))
+        out[label] = col_vals
+    return out
+
+
+def _rfp_style_display(display_df: pd.DataFrame):
+    """Apply mild row-level styling so section headers stand out."""
+    section_metrics = {label for label, is_section in _RFP_SECTION_ROWS if is_section}
+
+    def _row_style(row: pd.Series) -> list[str]:
+        if row.get("Metric") in section_metrics:
+            base = "background-color: #f4f6fb; color: #1f2d3d; font-weight: 600;"
+        else:
+            base = ""
+        return [base] * len(row)
+
+    return display_df.style.apply(_row_style, axis=1)
+
+
+def _render_rfp_pnl_analysis() -> None:
+    """Render the scenario-based RFP P&L Analysis section.
+
+    Layout
+    ------
+    1. Scenario picker (existing CSV under New_Bids/ or new empty scenario).
+    2. Per-item input expanders: dropdowns + text inputs only.
+    3. "Refresh Scenario" button — commits inputs and recomputes the table.
+    4. Scenario table (read-only display, formatted).
+    5. Save / Download controls.
+    """
+    # ── Introduction (collapsed by default — analysts only need this
+    #    when reviewing the data-source rules or onboarding) ──────────────
+    with st.expander("📘 Introduction & data sources", expanded=False):
+        st.markdown(
+            """
+This builder mirrors the Excel "P&L View (Scenario A)" worksheet so an
+analyst can model a Target SKU's $/EA economics before committing to a
+bid. Each scenario column is one Target SKU; rows fall into four groups
+mirroring the snapshot: identification, reference SKUs, cost overrides,
+and computed P&L. Use **Refresh Scenario** to (re)compute the table
+after editing inputs.
+
+**Data sources** (all pulled from the Microsoft Fabric Lakehouse,
+`Files/`):
+
+- **`BOM/BOM_History_Tracker_tagged.csv`** — drives the per-month, per-plant
+  Milk / Ingredient / Packaging / Conversion line items via the tagged
+  BOM rules. Cost aggregation uses the per-resource `Ext Cost.1` column.
+
+  *Milk / Ingredient cost rule (2-step):* **Step 1** finds the milk-component
+  anchor row — `Per Beg` = Month, `Plant` = Plant, `Rule Item Desc` =
+  Milk (or Ingredient) Reference SKU, `Level` = 1, `Tag` = `Milk Component`
+  — and captures `Ing-Rsrc Desc` (chain key), `Qty.1` and `Top Recipe`.
+  **Step 2** sums the sub-recipe lines: `Per Beg` = Month, `Plant` = Plant,
+  `Rule Item Desc` = chain key, `Level` contains "2", `Tag` = `Milk` /
+  `Ingredient`, scoped to the same `Top Recipe` so a sibling SKU sharing
+  the same sub-recipe doesn't double-count.
+  Cost = Σ `Ext Cost.1` × `Qty.1` × Target lbs/Each ÷ Reference SKU
+  lbs/Each.
+
+  *Conversion cost rule (1-step):* `Per Beg` = Month, `Plant` = Plant,
+  `Rule Item Desc` = Conversion Reference SKU, `Level` = 1, `Tag` is
+  not blank, and `Tag` ∉ {`Milk Component`, `Ingredient`, `Milk`,
+  `Packaging`, `Depreciation`}; sum `Ext Cost.1`, then × Target lbs/Each
+  ÷ Conversion Ref lbs/Each.
+
+  *Reference SKU lbs/Each:* Milk Ref lbs/Each is required; Ingredient /
+  Packaging / Conversion all inherit Milk Ref lbs/Each when blank.
+- **`BOM/Budget/Budget_Update.csv`** — based on the **current fiscal year
+  financial budget**. Cost of Quality and Internal Logistics
+  (Shuttling & WHSE) are aggregated by `Category` and multiplied by
+  Target SKU lbs per Each.
+- **`RO Tracking/Demand Plan/qry_pdh.csv`** — provides the Reference SKU
+  dropdown list (Item Description) and the default `Category`
+  (Portfolio Major) for the Milk Reference SKU.
+
+**Cost overrides:** every cost component (Milk, Ingredient, Packaging,
+Conversion Cost, Cost of Quality, Internal Logistics) supports a manual
+override. Type a number into the override field to replace the
+BOM/Budget default; leave it blank to use the calculated value. Override
+values are persisted alongside the scenario and rehydrated on load.
+
+Saved scenarios live under
+`Files/Program_Bid_Management/New_Bids/<scenario>.csv`.
+            """.strip()
+        )
     st.markdown("---")
 
-    # ── Fabric auth gate ──────────────────────────────────────────────────────
-    # If the user is not signed in, show a concise redirect warning and stop.
-    # The actual sign-in UI lives exclusively on the Home & Fabric Sign-in page.
-    if not fabric_signin_widget.is_fabric_signed_in():
-        st.warning(
-            "🔒 **Microsoft Fabric is not connected.**\n\n"
-            "Please visit **Home & Fabric Sign-in** in the sidebar to sign in. "
-            "Once signed in, return here — bid data will load automatically."
+    st.caption(
+        "Build one scenario at a time. Each Target SKU is one column. "
+        "Defaults are pulled from BOM + Budget + PDH. "
+        "Scenarios are saved as CSV under `Files/Program_Bid_Management/New_Bids`."
+    )
+
+    try:
+        sources = _rfp_pnl_store.load_sources()
+        saved = _rfp_pnl_store.list_scenarios()
+    except _rfp_pnl_store.RfpPnlStoreError as exc:
+        st.error(f"Could not load RFP P&L source data: {exc}")
+        return
+
+    # ── Scenario picker ───────────────────────────────────────────────────────
+    options: dict[str, str] = {_RFP_NEW_SCENARIO_TOKEN: "➕ New empty scenario"}
+    for f in saved:
+        options[f.full_path] = f"{f.name}  ({f.last_modified or 'unknown date'})"
+
+    current_path = st.session_state.get(_RFP_PATH_KEY)
+    selected_default = current_path if current_path in options else _RFP_NEW_SCENARIO_TOKEN
+    selected_path = st.selectbox(
+        "Scenario",
+        options=list(options.keys()),
+        index=list(options.keys()).index(selected_default),
+        format_func=lambda x: options[x],
+        key="rfp_pnl_scenario_picker",
+    )
+
+    if _RFP_ITEMS_KEY not in st.session_state:
+        st.session_state[_RFP_ITEMS_KEY] = _rfp_pnl_store.build_empty_scenario(item_count=1)
+        st.session_state[_RFP_PATH_KEY] = None
+        st.session_state[_RFP_ETAG_KEY] = None
+        st.session_state[_RFP_NAME_KEY] = ""
+        st.session_state[_RFP_INPUT_SEEDED_FLAG] = False
+
+    if selected_path == _RFP_NEW_SCENARIO_TOKEN:
+        if st.session_state.get(_RFP_PATH_KEY) is not None:
+            st.session_state[_RFP_ITEMS_KEY] = _rfp_pnl_store.build_empty_scenario(item_count=1)
+            st.session_state[_RFP_PATH_KEY] = None
+            st.session_state[_RFP_ETAG_KEY] = None
+            st.session_state[_RFP_NAME_KEY] = ""
+            st.session_state[_RFP_INPUT_SEEDED_FLAG] = False
+            st.rerun()
+    elif st.session_state.get(_RFP_PATH_KEY) != selected_path:
+        try:
+            loaded_items, loaded_etag = _rfp_pnl_store.read_scenario(selected_path)
+        except _rfp_pnl_store.RfpPnlStoreError as exc:
+            st.error(f"Could not load scenario: {exc}")
+            return
+        st.session_state[_RFP_ITEMS_KEY] = loaded_items
+        st.session_state[_RFP_PATH_KEY] = selected_path
+        st.session_state[_RFP_ETAG_KEY] = loaded_etag
+        st.session_state[_RFP_NAME_KEY] = selected_path.rsplit("/", 1)[-1].removesuffix(".csv")
+        st.session_state[_RFP_INPUT_SEEDED_FLAG] = False
+        st.rerun()
+
+    committed_items: pd.DataFrame = st.session_state[_RFP_ITEMS_KEY]
+    if not st.session_state.get(_RFP_INPUT_SEEDED_FLAG):
+        _rfp_seed_inputs_from_items(committed_items)
+        st.session_state[_RFP_INPUT_SEEDED_FLAG] = True
+
+    # ── Item input panel ──────────────────────────────────────────────────────
+    st.markdown("#### Item-level Inputs")
+    # Surface the loaded-scenario name right next to the inputs so the
+    # connection between the picker above and the panels below is
+    # immediately obvious when the analyst comes back to re-edit.
+    loaded_name = st.session_state.get(_RFP_NAME_KEY, "") or ""
+    if st.session_state.get(_RFP_PATH_KEY) and str(loaded_name).strip():
+        st.caption(
+            f"✏️ Editing scenario `{loaded_name}` "
+            f"({len(committed_items)} item{'s' if len(committed_items) != 1 else ''}). "
+            "Update inputs below and click **Refresh Scenario** to recompute."
+        )
+    item_count = len(committed_items)
+
+    # Add / remove controls (these reset widget state to keep keys aligned with
+    # the new row count; user inputs collected up to this point are persisted
+    # via `_RFP_ITEMS_KEY` only after the explicit Refresh click below).
+    add_col, remove_col, _spacer = st.columns([1, 2, 5])
+    with add_col:
+        if st.button("➕ Add Item", key="rfp_pnl_add_item", use_container_width=True):
+            new_row = _rfp_pnl_store.build_empty_scenario(item_count=1).iloc[0].to_dict()
+            st.session_state[_RFP_ITEMS_KEY] = pd.concat(
+                [committed_items, pd.DataFrame([new_row])],
+                ignore_index=True,
+            )
+            st.session_state[_RFP_INPUT_SEEDED_FLAG] = False
+            st.rerun()
+    with remove_col:
+        if item_count > 1:
+            remove_idx = st.selectbox(
+                "Remove item",
+                options=list(range(item_count)),
+                format_func=lambda i: f"Item {i + 1}",
+                key="rfp_pnl_remove_idx",
+            )
+            if st.button("🗑 Remove selected item", key="rfp_pnl_remove_btn", use_container_width=True):
+                kept = committed_items.drop(index=int(remove_idx)).reset_index(drop=True)
+                st.session_state[_RFP_ITEMS_KEY] = kept
+                st.session_state[_RFP_INPUT_SEEDED_FLAG] = False
+                st.rerun()
+
+    for idx in range(item_count):
+        _rfp_render_item_inputs(idx, sources)
+
+    # ── Refresh: commit inputs → recompute scenario ───────────────────────────
+    refresh_col, hint_col = st.columns([1, 4])
+    with refresh_col:
+        refresh_clicked = st.button(
+            "🔄 Refresh Scenario",
+            key="rfp_pnl_refresh",
+            type="primary",
+            use_container_width=True,
+            help="Apply all current inputs and recalculate the scenario table below.",
+        )
+    with hint_col:
+        st.caption(
+            "Inputs above don't affect the scenario table until you click **Refresh Scenario**."
+        )
+
+    if refresh_clicked:
+        gathered = _rfp_collect_inputs_from_state(item_count)
+        st.session_state[_RFP_ITEMS_KEY] = _rfp_pnl_store.recompute_items(gathered, sources)
+        st.success("Scenario refreshed.")
+
+    # ── Scenario display (read-only, full height — no internal scroll) ───────
+    st.markdown("#### Scenario Table")
+    current_items: pd.DataFrame = st.session_state[_RFP_ITEMS_KEY]
+    display_df = _rfp_build_display_table(current_items)
+    # Streamlit's default-height ``st.dataframe`` clips after ~10 rows. We
+    # size the frame to ``rows × ~35px + header`` so every metric row is
+    # visible without an internal scrollbar.
+    full_height = max(400, 36 * (len(display_df) + 1) + 4)
+    st.dataframe(
+        _rfp_style_display(display_df),
+        use_container_width=True,
+        hide_index=True,
+        height=full_height,
+    )
+
+    # ── Save / Download controls ──────────────────────────────────────────────
+    st.markdown("#### Save & Export")
+    save_name = st.text_input(
+        "Scenario name",
+        key=_RFP_NAME_KEY,
+        placeholder="e.g. Sysco_FY26Q4",
+    )
+
+    target_path = ""
+    path_exists = False
+    if str(save_name).strip():
+        try:
+            target_path = _rfp_pnl_store.scenario_path_from_name(save_name)
+            path_exists = _rfp_pnl_store.scenario_exists(target_path)
+        except _rfp_pnl_store.RfpPnlStoreError:
+            target_path = ""
+            path_exists = False
+
+    overwrite_ok = st.checkbox(
+        "Overwrite existing scenario file (if name already exists)",
+        value=False,
+        key="rfp_pnl_overwrite",
+    )
+
+    save_col, dl_col = st.columns([1, 1])
+    with save_col:
+        if st.button("💾 Save Scenario", key="rfp_pnl_save", type="primary", use_container_width=True):
+            if not str(save_name).strip():
+                st.error("Please provide a scenario name before saving.")
+            else:
+                same_target = target_path and (target_path == st.session_state.get(_RFP_PATH_KEY))
+                if path_exists and not overwrite_ok and not same_target:
+                    st.error("Scenario already exists. Enable overwrite or choose another name.")
+                else:
+                    try:
+                        write_etag = st.session_state.get(_RFP_ETAG_KEY) if same_target else None
+                        written_path, new_etag = _rfp_pnl_store.save_scenario(
+                            save_name,
+                            current_items,
+                            etag=write_etag,
+                        )
+                    except _rfp_pnl_store.RfpPnlStoreError as exc:
+                        st.error(f"Could not save scenario: {exc}")
+                    else:
+                        st.session_state[_RFP_PATH_KEY] = written_path
+                        st.session_state[_RFP_ETAG_KEY] = new_etag
+                        st.success(f"Saved scenario to `Files/{written_path}`")
+    with dl_col:
+        file_stub = str(save_name).strip() or "scenario"
+        if not file_stub.lower().endswith(".csv"):
+            file_stub = f"{file_stub}.csv"
+        st.download_button(
+            label="⬇️ Download Scenario",
+            data=_to_csv_bytes(current_items),
+            file_name=file_stub,
+            mime="text/csv",
+            use_container_width=True,
+            key="rfp_pnl_download",
+        )
+
+    # ── Multi-Scenario Summary ────────────────────────────────────────────────
+    st.markdown("---")
+    _render_rfp_pnl_summary(sources, saved)
+
+
+# ── 8b. Multi-Scenario Summary ────────────────────────────────────────────────
+
+# Cell formatters for the long-format summary frame. Volume is rendered
+# as a thousands-separated number (lbs); Revenue / GP as $ with two
+# decimals (totals get large fast); FOB as $ with four decimals to keep
+# parity with the per-item scenario table; PCM% / GP% as percentages.
+_SUMMARY_METRIC_FORMATTERS: dict[str, callable] = {
+    "Volume": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
+        else f"{_rfp_pnl_store._to_float(v):,.0f}",  # noqa: SLF001
+    "FOB Price": _fmt_money,
+    "Revenue": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
+        else f"${_rfp_pnl_store._to_float(v):,.2f}",  # noqa: SLF001
+    "GP": lambda v: (
+        ""
+        if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
+        else (
+            f"$({abs(_rfp_pnl_store._to_float(v)):,.2f})"  # noqa: SLF001
+            if _rfp_pnl_store._to_float(v) < 0  # noqa: SLF001
+            else f"${_rfp_pnl_store._to_float(v):,.2f}"  # noqa: SLF001
+        )
+    ),
+    "PCM%": _fmt_pct,
+    "GP%": _fmt_pct,
+}
+
+
+def _format_summary_cell(metric: str, value: object) -> str:
+    formatter = _SUMMARY_METRIC_FORMATTERS.get(metric, _fmt_passthrough)
+    return formatter(value)
+
+
+def _render_rfp_pnl_summary(
+    sources: _rfp_pnl_store.RfpPnlSources,
+    saved: list[_rfp_pnl_store.ScenarioFile],
+) -> None:
+    """Render the Multi-Scenario Summary section.
+
+    Lets the analyst pick any subset of saved scenarios, optionally
+    filter by Item / Category, and view a side-by-side comparison with
+    a Total roll-up at the bottom (volume-weighted PCM% / GP%).
+    """
+    st.markdown("### 📊 Multi-Scenario Summary")
+    st.caption(
+        "Compare any combination of saved scenarios side-by-side. "
+        "Each scenario is fully recomputed before aggregation, so the "
+        "summary always reflects the live calc engine."
+    )
+
+    if not saved:
+        st.info(
+            "No saved scenarios found in "
+            f"`Files/{_rfp_pnl_store.SCENARIO_FOLDER}`. Save a scenario "
+            "above to start building the multi-scenario summary."
         )
         return
 
+    # ── Scenario picker ───────────────────────────────────────────────────
+    scenario_label_to_path: dict[str, str] = {}
+    for s in saved:
+        # Display the scenario stem (filename without .csv) — matches
+        # the label used by the single-scenario picker above so the
+        # analyst sees consistent names across the page.
+        label = s.full_path.rsplit("/", 1)[-1].removesuffix(".csv")
+        scenario_label_to_path[label] = s.full_path
+
+    selected_labels: list[str] = st.multiselect(
+        "Scenarios",
+        options=list(scenario_label_to_path.keys()),
+        default=[],
+        key="rfp_pnl_summary_scenarios",
+        help="Pick the scenarios you want to compare. Order is preserved.",
+    )
+
+    if not selected_labels:
+        st.caption("Select at least one scenario to render the summary.")
+        return
+
+    # ── Load & recompute each selected scenario ───────────────────────────
+    # We materialize a small dict[label → items_df] up front so that the
+    # filter dropdowns can offer the union of items / categories across
+    # the selection without re-loading.
+    loaded: dict[str, pd.DataFrame] = {}
+    for label in selected_labels:
+        path = scenario_label_to_path[label]
+        try:
+            items_df, _etag = _rfp_pnl_store.read_scenario(path)
+        except _rfp_pnl_store.RfpPnlStoreError as exc:
+            st.error(f"Could not load scenario `{label}`: {exc}")
+            return
+        loaded[label] = items_df
+
+    # ── Filter options derived from the loaded scenarios ──────────────────
+    item_options: list[str] = sorted({
+        str(v).strip()
+        for df in loaded.values()
+        for v in df.get("Target SKU Name", pd.Series(dtype=str)).fillna("").tolist()
+        if str(v).strip()
+    })
+    category_options: list[str] = sorted({
+        str(v).strip()
+        for df in loaded.values()
+        for v in df.get("Category", pd.Series(dtype=str)).fillna("").tolist()
+        if str(v).strip()
+    })
+
+    f_col1, f_col2 = st.columns(2)
+    with f_col1:
+        items_filter = st.multiselect(
+            "Items (empty = all)",
+            options=item_options,
+            default=[],
+            key="rfp_pnl_summary_items_filter",
+        )
+    with f_col2:
+        categories_filter = st.multiselect(
+            "Categories (empty = all)",
+            options=category_options,
+            default=[],
+            key="rfp_pnl_summary_categories_filter",
+        )
+
+    # ── Build & display ───────────────────────────────────────────────────
+    summary_df = _rfp_pnl_store.summarize_scenarios(
+        loaded,
+        sources,
+        items_filter=items_filter or None,
+        categories_filter=categories_filter or None,
+    )
+
+    if summary_df.empty:
+        st.info("No items match the current filters.")
+        return
+
+    # Apply per-metric formatting to scenario columns; leave Item /
+    # Category / Metric as plain strings.
+    formatted = summary_df.copy()
+    for label in selected_labels:
+        if label not in formatted.columns:
+            continue
+        formatted[label] = [
+            _format_summary_cell(metric, val)
+            for metric, val in zip(formatted["Metric"], formatted[label])
+        ]
+
+    # Highlight the Total band so it visually separates from per-item rows.
+    def _row_style(row: pd.Series) -> list[str]:
+        if row.get("Item") == _rfp_pnl_store.SUMMARY_TOTAL_LABEL:
+            return ["background-color: rgba(255, 193, 7, 0.18); font-weight: 600"] * len(row)
+        return [""] * len(row)
+
+    height = max(400, 36 * (len(formatted) + 1) + 4)
+    st.dataframe(
+        formatted.style.apply(_row_style, axis=1),
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+    )
+
+    # CSV export of the *unformatted* numeric summary so analysts can pull
+    # it into Excel / Tableau without re-parsing the rendered strings.
+    st.download_button(
+        label="⬇️ Download Summary (CSV)",
+        data=_to_csv_bytes(summary_df),
+        file_name="rfp_pnl_multi_scenario_summary.csv",
+        mime="text/csv",
+        key="rfp_pnl_summary_download",
+    )
+
+
+# ── 9. Bid Asset wrapper section ───────────────────────────────────────────────
+
+def _render_bid_asset_section() -> None:
+    """Render the original Bid Asset section exactly as before."""
     # ── List CSV files in the Lakehouse folder ────────────────────────────────
     # Show a spinner during the directory listing (first render or after cache
     # expiry); subsequent reruns within the 5-minute TTL use the cached result.
@@ -1223,7 +2108,6 @@ Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data do
             st.rerun()
 
     df_key = _session_df_key(selected_file.full_path)
-    etag_key = _session_etag_key(selected_file.full_path)
     if df_key not in st.session_state:
         try:
             source_df, source_etag = _bid_store.read_bid_file(selected_file.full_path)
@@ -1269,3 +2153,55 @@ Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data do
     _render_program_tracker(raw_df)
     st.markdown("---")
     _render_editable_item_details(selected_file.full_path)
+
+
+# ── 10. Entry point ───────────────────────────────────────────────────────────
+
+def render() -> None:
+    """Render the Bid Assistant page.
+
+    The page now exposes two foldable sections:
+    1) RFP P&L Analysis (scenario builder)
+    2) Bid Asset (legacy Bid Asset Intelligence workflows)
+    """
+    apply_custom_css()
+
+    st.markdown(
+        '<h1 class="main-header">Bid Assistant</h1>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("""
+### Welcome
+
+Use this page to analyze historical trends since December 2025. These insights drive post-mortem analysis
+and sharpen future bid strategies. Key resources include:
+
+- **RFP P&L Analysis:** Build scenario-based P&L tables using BOM, Budget and PDH references.
+- **Visualizations:** Charts for bid comparisons.
+- **RFP Program-level Table:** High-level tracking of program size, status and key financials.
+- **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
+
+Data is loaded automatically from the **Fabric Lakehouse** (`Files/Program_Bid_Management`).
+Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data does not appear.
+""")
+    st.markdown("---")
+
+    # ── Fabric auth gate ──────────────────────────────────────────────────────
+    # If the user is not signed in, show a concise redirect warning and stop.
+    # The actual sign-in UI lives exclusively on the Home & Fabric Sign-in page.
+    if not fabric_signin_widget.is_fabric_signed_in():
+        st.warning(
+            "🔒 **Microsoft Fabric is not connected.**\n\n"
+            "Please visit **Home & Fabric Sign-in** in the sidebar to sign in. "
+            "Once signed in, return here — bid data will load automatically."
+        )
+        return
+
+    with st.expander("RFP P&L Analysis", expanded=False):
+        _render_rfp_pnl_analysis()
+
+    st.markdown("---")
+
+    with st.expander("Bid Asset", expanded=False):
+        _render_bid_asset_section()

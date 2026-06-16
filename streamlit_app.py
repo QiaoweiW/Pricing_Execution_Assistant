@@ -43,7 +43,7 @@ PAGES_DIR = Path(__file__).parent / "pages"
 # Only views listed here are eligible for sidebar navigation.
 VIEW_NAME_MAPPING = {
     "home_view":                          "Home & Fabric Sign-in",
-    "bid_asset_intelligence_view":        "Bid Asset Intelligence",
+    "bid_asset_intelligence_view":        "Bid Assistant",
     "htst_activity_monitor_view":         "Shipment Monitor & HTST Requote",
     "new_price_quote_view":               "New Price Quote",
     "market_barometer_view":              "Market Barometer",

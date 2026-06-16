@@ -52,7 +52,6 @@ VIEW_NAME_MAPPING = {
     "unit_economics_view":                "Unit Economics",
     "demand_view":                        "Demand Insight",
     "demand_planner_analytics_view":      "Demand Planner Analytics",
-    "rfp_financial_analysis_view":        "RFP Financial Analysis",
 }
 
 # Views temporarily hidden from the sidebar without being deleted.

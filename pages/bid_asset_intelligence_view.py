@@ -41,7 +41,18 @@ from data_sources import bid_asset_store as _bid_store
 from data_sources import rfp_pnl_store as _rfp_pnl_store
 from data_sources.bid_asset_store import BidAssetStoreError
 from utils import fabric_signin_widget
+from utils.embed_helpers import render_embedded_resource, to_powerbi_embed_url
 from utils.ui_helpers import apply_custom_css
+
+# Finance P&L Power BI report URL. Kept as a module-level constant so
+# it can be updated in one place if Finance ever republishes the report
+# under a new ID. Migrated from the now-removed RFP Financial Analysis
+# view so the embed continues to live inside the Bid Assistant.
+_FINANCE_PNL_REPORT_URL = (
+    "https://app.powerbi.com/groups/me/reports/"
+    "ff2d4ea3-d3e4-4a14-945d-998bb7a7f03d/ef0f92c30868546c301b"
+    "?ctid=c9a55ced-3b88-408c-ab99-8db8b9b90286&experience=power-bi"
+)
 
 # ── 1. Types & constants ──────────────────────────────────────────────────────
 
@@ -2208,12 +2219,40 @@ def _render_bid_asset_section() -> None:
 
 # ── 10. Entry point ───────────────────────────────────────────────────────────
 
+def _render_finance_pnl_dashboard() -> None:
+    """Embed the Finance P&L Power BI report at the bottom of the page.
+
+    The Power BI service serves its viewer URL with an X-Frame-Options
+    header that blocks embedding from arbitrary origins. We rewrite the
+    URL into the ``reportEmbed`` form via :func:`to_powerbi_embed_url`,
+    which appends ``autoAuth=true`` so the embedded frame silently
+    completes the Entra-ID handshake for users with an active tenant
+    session.
+    """
+    with st.expander("💰 Finance P&L", expanded=False):
+        render_embedded_resource(
+            url=_FINANCE_PNL_REPORT_URL,
+            title="Finance P&L (Power BI)",
+            embed_url=to_powerbi_embed_url(_FINANCE_PNL_REPORT_URL),
+            height=900,
+            fallback_note=(
+                "This is the live Finance P&L Power BI report. The frame "
+                "below uses Power BI's embed mode with Entra-ID auto-auth, "
+                "but tenant SSO policy may still require an interactive "
+                "sign-in. If the frame is blank, use the button below to "
+                "open the report directly in Power BI."
+            ),
+        )
+
+
 def render() -> None:
     """Render the Bid Assistant page.
 
-    The page now exposes two foldable sections:
+    The page now exposes three foldable sections:
     1) RFP P&L Analysis (scenario builder)
     2) Bid Asset (legacy Bid Asset Intelligence workflows)
+    3) Finance P&L (embedded Power BI report — migrated from the
+       retired RFP Financial Analysis view)
     """
     apply_custom_css()
 
@@ -2256,3 +2295,7 @@ Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data do
 
     with st.expander("Bid Asset", expanded=False):
         _render_bid_asset_section()
+
+    st.markdown("---")
+
+    _render_finance_pnl_dashboard()

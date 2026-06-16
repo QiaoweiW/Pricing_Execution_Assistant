@@ -48,7 +48,6 @@ automation.
 | **New Price Quote** | Generate rapid, on-demand price quotes for HTST products. |
 | **Pricing Execution Automation** | Generate VBCS files for Oracle upload. |
 | **Demand Planner Analytics** | Embedded Demand Planning BI dashboard, New Distribution Tracker, and an opt-in pull of the IBP Orders / Shipments Delta tables from the Microsoft Fabric Lakehouse. |
-| **RFP Financial Analysis** | Embedded Finance P&L Power BI report for interactive RFP financial review. |
 
 Select a page from the sidebar to get started.
 """)
@@ -76,7 +75,7 @@ Select a page from the sidebar to get started.
 - **Reviewing demand plans or IBP Orders/Shipments?**
   → **Demand Planner Analytics**
 - **Looking at the Finance P&L for an RFP?**
-  → **RFP Financial Analysis**
+  → **Bid Assistant** (Finance P&L is at the bottom of the page)
 """)
 
     with col2:

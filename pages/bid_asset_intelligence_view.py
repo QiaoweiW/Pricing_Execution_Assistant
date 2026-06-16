@@ -1145,6 +1145,12 @@ _RFP_SECTION_ROWS: list[tuple[str, bool]] = [
     ("GP", False),
     ("GP $/lbs", False),
     ("GP%", False),
+    # Retail-side block: Retail Price echoes the user input;
+    # Delivered Price = FOB + Freight; Retailer's Margin% closes the
+    # loop on retail economics.
+    ("Delivered Price", False),
+    ("Retail Price", False),
+    ("Retailer's Margin%", False),
 ]
 
 _RFP_NEW_SCENARIO_TOKEN = "__new__"
@@ -1175,6 +1181,10 @@ _RFP_INPUT_NUMERIC_FIELDS: tuple[str, ...] = (
     "Packaging Reference SKU lbs per Each",
     "Conversion Reference SKU lbs per Each",
     "PCM $/lbs",
+    # Retail-side inputs (drive Delivered Price + Retailer's Margin%).
+    # Freight may be blank — treated as $0/EA by the calc engine.
+    "Retail Price",
+    "Freight Cost",
     # Cost overrides — analyst-supplied $/EA values that win over the
     # BOM/Budget default whenever non-blank. The displayed cost cell
     # itself is strictly recomputed (see STRICT_CALC_METRICS) so saved
@@ -1255,6 +1265,9 @@ _RFP_METRIC_FORMATTERS: dict[str, callable] = {
     "GP": _fmt_money,
     "GP $/lbs": _fmt_money,
     "GP%": _fmt_pct,
+    "Retail Price": _fmt_money,
+    "Delivered Price": _fmt_money,
+    "Retailer's Margin%": _fmt_pct,
 }
 
 
@@ -1390,8 +1403,13 @@ def _rfp_render_item_inputs(idx: int, sources: _rfp_pnl_store.RfpPnlSources) -> 
             )
         st.text_input("Target SKU Name", key=name_key, placeholder="e.g. Cream Whipping 40% HVY")
 
-        # ── Volume / unit definition ──────────────────────────────────────
-        st.markdown("**Target SKU sizing**")
+        # ── Target SKU (sizing + retail-side inputs) ──────────────────────
+        # Retail Price feeds the Retailer's Margin% calc; Freight Cost
+        # feeds Delivered Price. Freight is allowed to be blank — the
+        # calc treats blank freight as $0/EA so analysts who don't have
+        # a freight rate yet can still see a valid Delivered Price that
+        # equals FOB.
+        st.markdown("**Target SKU**")
         n1, n2 = st.columns(2)
         with n1:
             st.text_input(
@@ -1404,6 +1422,20 @@ def _rfp_render_item_inputs(idx: int, sources: _rfp_pnl_store.RfpPnlSources) -> 
                 "Target SKU Volume (units)",
                 key=_rfp_input_key(idx, "Target SKU Volume (units)"),
                 help="Numbers only. Volume (pounds) is calculated.",
+            )
+        n3, n4 = st.columns(2)
+        with n3:
+            st.text_input(
+                "Target SKU Retail Price ($/EA)",
+                key=_rfp_input_key(idx, "Retail Price"),
+                help="Manual input. Drives Retailer's Margin%.",
+            )
+        with n4:
+            st.text_input(
+                "Target SKU Freight Cost ($/EA)",
+                key=_rfp_input_key(idx, "Freight Cost"),
+                help="Manual input. Optional — blank is treated as $0/EA. "
+                     "Delivered Price = FOB + Freight.",
             )
 
         # ── Reference SKUs ─────────────────────────────────────────────────
@@ -1788,6 +1820,25 @@ Saved scenarios live under
     # ── Scenario display (read-only, full height — no internal scroll) ───────
     st.markdown("#### Scenario Table")
     current_items: pd.DataFrame = st.session_state[_RFP_ITEMS_KEY]
+
+    # Prompt the analyst to fill in any required input that's blank. Pure
+    # data check — see ``find_missing_required_inputs`` for the rule. We
+    # still render the table below so the partially-computed cells are
+    # visible (helps confirm what *did* compute when only one item is
+    # missing inputs).
+    missing_issues = _rfp_pnl_store.find_missing_required_inputs(current_items)
+    if missing_issues:
+        bullets = "\n".join(
+            f"- **{label}** — fill in: {', '.join(f'`{f}`' for f in fields)}"
+            for label, fields in missing_issues
+        )
+        st.warning(
+            "⚠️ Some items are missing required inputs — the scenario "
+            "table below will show blank cells for FOB / PCM / GP / "
+            "Delivered Price / Retailer's Margin% until you fill them "
+            "in and click **Refresh Scenario**.\n\n" + bullets
+        )
+
     display_df = _rfp_build_display_table(current_items)
     # Streamlit's default-height ``st.dataframe`` clips after ~10 rows. We
     # size the frame to ``rows × ~35px + header`` so every metric row is
@@ -1875,7 +1926,7 @@ _SUMMARY_METRIC_FORMATTERS: dict[str, callable] = {
     "Volume": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
         else f"{_rfp_pnl_store._to_float(v):,.0f}",  # noqa: SLF001
     "FOB Price": _fmt_money,
-    "Revenue": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
+    "FOB Revenue": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
         else f"${_rfp_pnl_store._to_float(v):,.2f}",  # noqa: SLF001
     "GP": lambda v: (
         ""

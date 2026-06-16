@@ -87,6 +87,15 @@ METRIC_COLS: tuple[str, ...] = (
     "GP",
     "GP $/lbs",
     "GP%",
+    # Retail-side rows: Retail Price and Freight Cost are user inputs;
+    # Delivered Price and Retailer's Margin% are strictly recomputed
+    # (override-style overrides not supported here — no calculated
+    # default exists for either input). Freight is allowed to be blank
+    # (treated as $0/EA).
+    "Retail Price",
+    "Freight Cost",
+    "Delivered Price",
+    "Retailer's Margin%",
 )
 
 # Maps each user-overridable cost component (display column) to the
@@ -125,6 +134,8 @@ STRICT_CALC_METRICS = {
     "GP",
     "GP $/lbs",
     "GP%",
+    "Delivered Price",
+    "Retailer's Margin%",
 }
 
 # Auto-derived defaults that remain editable: value is filled only when blank.
@@ -822,6 +833,20 @@ def _calc_for_item(row: pd.Series, sources: RfpPnlSources) -> dict[str, Optional
     gp_lbs = _safe_div(gp, target_lbs)
     gp_pct = _safe_div(gp, fob)
 
+    # Retail-side metrics. Freight defaults to $0/EA when blank (per
+    # spec); Delivered Price is therefore well-defined whenever FOB is.
+    # Retailer's Margin% requires a non-zero Retail Price; otherwise the
+    # division would be undefined and we surface a blank cell.
+    retail = _to_float(row.get("Retail Price"))
+    freight = _to_float(row.get("Freight Cost"))
+    freight_for_calc = 0.0 if freight is None else freight
+    delivered = None if fob is None else fob + freight_for_calc
+    retailer_margin = (
+        None
+        if delivered is None or retail is None or retail == 0
+        else (retail - delivered) / retail
+    )
+
     return {
         "Target SKU Volume (pounds)": volume_pounds,
         "Ingredient Reference SKU": ingredient_ref,
@@ -841,7 +866,46 @@ def _calc_for_item(row: pd.Series, sources: RfpPnlSources) -> dict[str, Optional
         "GP": gp,
         "GP $/lbs": gp_lbs,
         "GP%": gp_pct,
+        "Delivered Price": delivered,
+        "Retailer's Margin%": retailer_margin,
     }
+
+
+# Inputs that the user *must* supply — without them the calc engine
+# cannot produce FOB / PCM% / GP / Delivered Price / Retailer's
+# Margin%. The page surfaces missing values as a warning above the
+# scenario table so the analyst is prompted before they spot blank
+# cells. Ingredient / Packaging / Conversion lbs/Each are NOT required
+# because they inherit Milk Reference SKU lbs/Each when blank.
+REQUIRED_INPUT_FIELDS: tuple[str, ...] = (
+    "Milk Reference SKU lbs per Each",
+    "PCM $/lbs",
+)
+
+
+def find_missing_required_inputs(
+    items_df: pd.DataFrame,
+) -> list[tuple[str, list[str]]]:
+    """Return a list of ``(item_label, [missing_field, ...])`` pairs.
+
+    ``item_label`` falls back to ``"Item N"`` when the row's
+    ``Target SKU Name`` is blank, mirroring the labelling convention
+    used by the per-item input panel. Items with no missing required
+    inputs are omitted, so the caller can simply check truthiness of
+    the return value to decide whether to render the prompt.
+    """
+    coerced = _coerce_scenario_df(items_df)
+    issues: list[tuple[str, list[str]]] = []
+    for idx, row in coerced.iterrows():
+        missing = [
+            field for field in REQUIRED_INPUT_FIELDS
+            if _to_float(row.get(field)) is None
+        ]
+        if missing:
+            label = str(row.get("Target SKU Name", "") or "").strip() \
+                or f"Item {idx + 1}"
+            issues.append((label, missing))
+    return issues
 
 
 def recompute_items(items_df: pd.DataFrame, sources: RfpPnlSources) -> pd.DataFrame:
@@ -874,15 +938,17 @@ def recompute_items(items_df: pd.DataFrame, sources: RfpPnlSources) -> pd.DataFr
 # formula change.
 
 #: Per-item summary rows shown for every (scenario, item) pair.
+#: ``FOB Revenue`` makes it explicit that the figure is FOB-based and
+#: doesn't include freight / retailer markup.
 SUMMARY_PER_ITEM_METRICS: tuple[str, ...] = (
-    "Volume", "FOB Price", "Revenue", "PCM%", "GP%",
+    "Volume", "FOB Price", "FOB Revenue", "PCM%", "GP%",
 )
 
-#: Total roll-up rows. Volume / Revenue / GP are summed across items;
+#: Total roll-up rows. Volume / FOB Revenue / GP are summed across items;
 #: PCM% and GP% are volume-weighted (lbs) so they reflect the realized
 #: portfolio profitability, not a misleading equal-weighted average.
 SUMMARY_TOTAL_METRICS: tuple[str, ...] = (
-    "Volume", "Revenue", "GP", "PCM%", "GP%",
+    "Volume", "FOB Revenue", "GP", "PCM%", "GP%",
 )
 
 SUMMARY_TOTAL_LABEL = "Total"
@@ -907,7 +973,7 @@ def _summary_per_item_values(item_row: pd.Series) -> dict[str, Optional[float]]:
     return {
         "Volume": volume_lbs,
         "FOB Price": fob,
-        "Revenue": revenue,
+        "FOB Revenue": revenue,
         "PCM%": pcm_pct,
         "GP%": gp_pct,
     }
@@ -930,12 +996,12 @@ def _weighted_average(values: list[float], weights: list[float]) -> Optional[flo
 def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[float]]:
     """Aggregate the per-item records into the Total row metrics.
 
-    Volume / Revenue / GP are simple sums across items. PCM% and GP%
-    are weighted by ``Volume`` (lbs) so the portfolio rate reflects
+    Volume / FOB Revenue / GP are simple sums across items. PCM% and
+    GP% are weighted by ``Volume`` (lbs) so the portfolio rate reflects
     revenue/profit-mix rather than item count.
     """
     volumes = [r.get("Volume") for r in per_item_records]
-    revenues = [r.get("Revenue") for r in per_item_records]
+    revenues = [r.get("FOB Revenue") for r in per_item_records]
     gps = [r.get("GP") for r in per_item_records]
     pcm_pcts = [r.get("PCM%") for r in per_item_records]
     gp_pcts = [r.get("GP%") for r in per_item_records]
@@ -947,7 +1013,7 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
     weights = [v if v is not None else 0.0 for v in volumes]
     return {
         "Volume": _sum(volumes),
-        "Revenue": _sum(revenues),
+        "FOB Revenue": _sum(revenues),
         "GP": _sum(gps),
         "PCM%": _weighted_average(pcm_pcts, weights),
         "GP%": _weighted_average(gp_pcts, weights),

@@ -18,10 +18,13 @@ import pytest
 from data_sources.rfp_pnl_store import (
     COST_OVERRIDE_FOR,
     METRIC_COLS,
+    REQUIRED_INPUT_FIELDS,
+    STRICT_CALC_METRICS,
     SUMMARY_PER_ITEM_METRICS,
     SUMMARY_TOTAL_LABEL,
     SUMMARY_TOTAL_METRICS,
     _calc_for_item,
+    find_missing_required_inputs,
     recompute_items,
     summarize_scenarios,
 )
@@ -371,3 +374,170 @@ def test_summary_recomputes_each_scenario():
     # Item A: Milk=1.00 + Ing=0.10 + Pkg=0.20 + PCM=PCM$/lb*lbs/EA=0.50*2=1.00
     # → FOB = 1.00 + 0.10 + 0.20 + 1.00 = 2.30
     assert fob_a == pytest.approx(2.30)
+
+
+# ─── Retail-side metrics (Delivered Price + Retailer's Margin%) ──────────────
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_delivered_price_equals_fob_plus_freight():
+    """Delivered Price = FOB + Freight; rounding-tolerant equality."""
+    sources = _live_sources()
+    row = _live_input(plant="Portland", sku="DG Hvy Whip Hg UP",
+                      target_lbs=4.30, ref_lbs=4.30)
+    row["PCM $/lbs"] = "0.26"
+    row["Freight Cost"] = "0.50"
+    metrics = _calc_for_item(row, sources)
+    assert metrics["FOB Price"] is not None
+    assert metrics["Delivered Price"] == pytest.approx(metrics["FOB Price"] + 0.50)
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_delivered_price_treats_blank_freight_as_zero():
+    """Blank Freight → Delivered Price equals FOB exactly (no NaN leak)."""
+    sources = _live_sources()
+    row = _live_input(plant="Portland", sku="DG Hvy Whip Hg UP",
+                      target_lbs=4.30, ref_lbs=4.30)
+    row["PCM $/lbs"] = "0.26"
+    row["Freight Cost"] = ""  # blank
+    metrics = _calc_for_item(row, sources)
+    assert metrics["Delivered Price"] == pytest.approx(metrics["FOB Price"])
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_retailer_margin_formula():
+    """Retailer's Margin% = (Retail - Delivered) / Retail."""
+    sources = _live_sources()
+    row = _live_input(plant="Portland", sku="DG Hvy Whip Hg UP",
+                      target_lbs=4.30, ref_lbs=4.30)
+    row["PCM $/lbs"] = "0.26"
+    row["Freight Cost"] = "0.50"
+    row["Retail Price"] = "8.00"
+    metrics = _calc_for_item(row, sources)
+    expected = (8.00 - metrics["Delivered Price"]) / 8.00
+    assert metrics["Retailer's Margin%"] == pytest.approx(expected)
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_retailer_margin_blank_when_retail_missing_or_zero():
+    """No Retail Price (or Retail = 0) → Retailer's Margin% is None."""
+    sources = _live_sources()
+    row = _live_input(plant="Portland", sku="DG Hvy Whip Hg UP",
+                      target_lbs=4.30, ref_lbs=4.30)
+    row["PCM $/lbs"] = "0.26"
+    row["Retail Price"] = ""  # blank
+    metrics_blank = _calc_for_item(row, sources)
+    assert metrics_blank["Retailer's Margin%"] is None
+    # Delivered Price is still well-defined.
+    assert metrics_blank["Delivered Price"] is not None
+
+    row["Retail Price"] = "0"  # zero divisor
+    metrics_zero = _calc_for_item(row, sources)
+    assert metrics_zero["Retailer's Margin%"] is None
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_delivered_and_margin_blank_when_fob_missing():
+    """If FOB can't be computed (e.g. PCM $/lbs blank), the retail-side
+    metrics propagate as None rather than partial / NaN values.
+    """
+    sources = _live_sources()
+    row = _live_input(plant="Portland", sku="DG Hvy Whip Hg UP",
+                      target_lbs=4.30, ref_lbs=4.30)
+    row["PCM $/lbs"] = ""  # blanks FOB
+    row["Freight Cost"] = "0.50"
+    row["Retail Price"] = "8.00"
+    metrics = _calc_for_item(row, sources)
+    assert metrics["FOB Price"] is None
+    assert metrics["Delivered Price"] is None
+    assert metrics["Retailer's Margin%"] is None
+
+
+def test_retail_side_metrics_are_strict():
+    """Both calculated retail-side metrics live in STRICT_CALC_METRICS so
+    a stale persisted value can never mask a recomputation (same fix
+    pattern as the cost cells).
+    """
+    assert "Delivered Price" in STRICT_CALC_METRICS
+    assert "Retailer's Margin%" in STRICT_CALC_METRICS
+
+
+def test_retail_side_columns_in_metric_cols():
+    for col in ("Retail Price", "Freight Cost",
+                "Delivered Price", "Retailer's Margin%"):
+        assert col in METRIC_COLS, f"{col!r} missing from METRIC_COLS"
+
+
+# ─── Required-input prompt helper ────────────────────────────────────────────
+
+def test_find_missing_required_inputs_flags_milk_lbs_and_pcm():
+    """Both Milk Reference SKU lbs/Each and PCM $/lbs are required."""
+    assert "Milk Reference SKU lbs per Each" in REQUIRED_INPUT_FIELDS
+    assert "PCM $/lbs" in REQUIRED_INPUT_FIELDS
+
+    items = pd.DataFrame([{
+        "Target SKU Name": "Item A",
+        "Milk Reference SKU lbs per Each": "",
+        "PCM $/lbs": "0.26",
+    }, {
+        "Target SKU Name": "",
+        "Milk Reference SKU lbs per Each": "2.15",
+        "PCM $/lbs": "",
+    }])
+    issues = find_missing_required_inputs(items)
+    assert len(issues) == 2
+    label_a, missing_a = issues[0]
+    label_b, missing_b = issues[1]
+    assert label_a == "Item A"
+    assert "Milk Reference SKU lbs per Each" in missing_a
+    assert "PCM $/lbs" not in missing_a
+    # Blank Target SKU Name → falls back to "Item N" (1-indexed).
+    assert label_b == "Item 2"
+    assert missing_b == ["PCM $/lbs"]
+
+
+def test_find_missing_required_inputs_returns_empty_when_all_filled():
+    items = pd.DataFrame([{
+        "Target SKU Name": "Item A",
+        "Milk Reference SKU lbs per Each": "2.15",
+        "PCM $/lbs": "0.26",
+    }])
+    assert find_missing_required_inputs(items) == []
+
+
+def test_find_missing_required_inputs_handles_nan_floats():
+    """pandas-loaded blanks come back as NaN floats — must still flag."""
+    import math
+    items = pd.DataFrame([{
+        "Target SKU Name": "Item A",
+        "Milk Reference SKU lbs per Each": math.nan,
+        "PCM $/lbs": math.nan,
+    }])
+    issues = find_missing_required_inputs(items)
+    assert len(issues) == 1
+    label, missing = issues[0]
+    assert set(missing) == {"Milk Reference SKU lbs per Each", "PCM $/lbs"}
+
+
+# ─── Summary "Revenue" → "FOB Revenue" rename ────────────────────────────────
+
+def test_summary_uses_fob_revenue_label():
+    """Both per-item and Total metric tuples expose 'FOB Revenue', not 'Revenue'."""
+    assert "FOB Revenue" in SUMMARY_PER_ITEM_METRICS
+    assert "FOB Revenue" in SUMMARY_TOTAL_METRICS
+    assert "Revenue" not in SUMMARY_PER_ITEM_METRICS
+    assert "Revenue" not in SUMMARY_TOTAL_METRICS
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_summary_emits_fob_revenue_rows():
+    sources = _live_sources()
+    df = summarize_scenarios({"S": _scenario_with_two_items()}, sources)
+    metric_values = set(df["Metric"])
+    assert "FOB Revenue" in metric_values
+    assert "Revenue" not in metric_values

@@ -1922,9 +1922,82 @@ Saved scenarios live under
             key="rfp_pnl_download",
         )
 
+    # ── Download Source Data ──────────────────────────────────────────────────
+    st.markdown("---")
+    _render_source_data_download(current_items, sources)
+
     # ── Multi-Scenario Summary ────────────────────────────────────────────────
     st.markdown("---")
     _render_rfp_pnl_summary(sources, saved)
+
+
+# ── 8a. Download Source Data ──────────────────────────────────────────────────
+
+# One CSV download per cost component. The store's ``extract_source_rows``
+# replicates the calc engine's filters so the download reconciles to the
+# scenario table — see the ``test_extract_*_filter_parity`` tests.
+
+def _render_source_data_download(
+    current_items: pd.DataFrame,
+    sources: _rfp_pnl_store.RfpPnlSources,
+) -> None:
+    """Foldable panel offering a CSV per cost-component source slice.
+
+    For each component we extract only the source rows actually
+    referenced by the items in the current scenario:
+
+    * Milk / Ingredient → step-1 anchor + step-2 sub-recipe rows from
+      ``BOM_History_Tracker_tagged.csv`` (combined into one CSV with a
+      ``Step`` column).
+    * Packaging / Conversion → single-step BOM lookup rows.
+    * Cost of Quality / Internal Logistics → matching rows from
+      ``Budget_Update.csv`` filtered by the item's Category.
+
+    The expander stays collapsed by default to keep the page compact.
+    """
+    with st.expander("📥 Download Source Data", expanded=False):
+        st.markdown(
+            "Each download below contains the **exact source rows** the "
+            "calc engine referenced for the items in this scenario — the "
+            "same filters used to populate the cost cells in the scenario "
+            "table, deduped across items.\n\n"
+            "*Use these to reconcile a scenario's costs against the BOM "
+            "and Budget files in Fabric. Empty CSVs (just headers) mean "
+            "no source rows matched the current item inputs.*"
+        )
+
+        try:
+            extracts = _rfp_pnl_store.extract_source_rows(current_items, sources)
+        except Exception as exc:  # noqa: BLE001 — surfaced to the user
+            st.error(f"Could not extract source rows: {exc}")
+            return
+
+        # Two columns of three buttons each — keeps the layout compact.
+        cols = st.columns(2)
+        for i, category in enumerate(_rfp_pnl_store.SOURCE_EXTRACT_CATEGORIES):
+            df = extracts.get(category, pd.DataFrame())
+            with cols[i % 2]:
+                # ``key`` must be unique per button; slug the category.
+                key_slug = (
+                    category.lower()
+                    .replace(" ", "_").replace("(", "").replace(")", "")
+                    .replace("&", "and").replace("/", "_per_")
+                )
+                file_stub = f"rfp_source_{key_slug}.csv"
+                st.download_button(
+                    label=f"⬇️ {category} ({len(df):,} rows)",
+                    data=_to_csv_bytes(df),
+                    file_name=file_stub,
+                    mime="text/csv",
+                    use_container_width=True,
+                    key=f"rfp_pnl_src_{key_slug}",
+                    help=(
+                        "Source: BOM_History_Tracker_tagged.csv"
+                        if category in {"Milk", "Ingredient",
+                                        "Packaging", "Conversion"}
+                        else "Source: Budget_Update.csv"
+                    ),
+                )
 
 
 # ── 8b. Multi-Scenario Summary ────────────────────────────────────────────────
@@ -1934,7 +2007,7 @@ Saved scenarios live under
 # decimals (totals get large fast); FOB as $ with four decimals to keep
 # parity with the per-item scenario table; PCM% / GP% as percentages.
 _SUMMARY_METRIC_FORMATTERS: dict[str, callable] = {
-    "Volume": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
+    "Volume (pounds)": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001
         else f"{_rfp_pnl_store._to_float(v):,.0f}",  # noqa: SLF001
     "FOB Price": _fmt_money,
     "FOB Revenue": lambda v: "" if _rfp_pnl_store._to_float(v) is None  # noqa: SLF001

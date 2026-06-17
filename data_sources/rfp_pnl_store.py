@@ -939,16 +939,19 @@ def recompute_items(items_df: pd.DataFrame, sources: RfpPnlSources) -> pd.DataFr
 
 #: Per-item summary rows shown for every (scenario, item) pair.
 #: ``FOB Revenue`` makes it explicit that the figure is FOB-based and
-#: doesn't include freight / retailer markup.
+#: doesn't include freight / retailer markup. ``Volume (pounds)``
+#: spells out the unit so it's not confused with units / cases.
 SUMMARY_PER_ITEM_METRICS: tuple[str, ...] = (
-    "Volume", "FOB Price", "FOB Revenue", "PCM%", "GP%",
+    "Volume (pounds)", "FOB Price", "FOB Revenue", "PCM%", "GP%",
 )
 
-#: Total roll-up rows. Volume / FOB Revenue / GP are summed across items;
-#: PCM% and GP% are volume-weighted (lbs) so they reflect the realized
-#: portfolio profitability, not a misleading equal-weighted average.
+#: Total roll-up rows. Volume (pounds) / FOB Revenue / GP are SUMS
+#: across items in *dollars* (Total GP = Σ GP $/EA × units, NOT a sum
+#: of per-EA values). PCM% and GP% are volume-weighted (lbs) so they
+#: reflect the realized portfolio profitability, not a misleading
+#: equal-weighted average.
 SUMMARY_TOTAL_METRICS: tuple[str, ...] = (
-    "Volume", "FOB Revenue", "GP", "PCM%", "GP%",
+    "Volume (pounds)", "FOB Revenue", "GP", "PCM%", "GP%",
 )
 
 SUMMARY_TOTAL_LABEL = "Total"
@@ -970,12 +973,16 @@ def _summary_per_item_values(item_row: pd.Series) -> dict[str, Optional[float]]:
 
     volume_lbs = None if units is None or lbs_each is None else units * lbs_each
     revenue = None if fob is None or units is None else fob * units
+    # ``_units`` is preserved on the per-item record (not displayed) so
+    # the Total roll-up can compute Total GP = Σ (GP $/EA × units), i.e.
+    # actual GP dollars, rather than mistakenly summing per-EA values.
     return {
-        "Volume": volume_lbs,
+        "Volume (pounds)": volume_lbs,
         "FOB Price": fob,
         "FOB Revenue": revenue,
         "PCM%": pcm_pct,
         "GP%": gp_pct,
+        "_units": units,
     }
 
 
@@ -996,13 +1003,17 @@ def _weighted_average(values: list[float], weights: list[float]) -> Optional[flo
 def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[float]]:
     """Aggregate the per-item records into the Total row metrics.
 
-    Volume / FOB Revenue / GP are simple sums across items. PCM% and
-    GP% are weighted by ``Volume`` (lbs) so the portfolio rate reflects
-    revenue/profit-mix rather than item count.
+    Volume (pounds) / FOB Revenue are simple sums. **Total GP** is the
+    sum of *dollar* GP across items: ``Σ (GP $/EA × units)``. Summing
+    the per-EA GP values directly would mix items of different sizes
+    and hide the portfolio's actual profit. PCM% and GP% are weighted
+    by Volume (lbs) so the portfolio rate reflects revenue/profit-mix
+    rather than item count.
     """
-    volumes = [r.get("Volume") for r in per_item_records]
+    volumes = [r.get("Volume (pounds)") for r in per_item_records]
     revenues = [r.get("FOB Revenue") for r in per_item_records]
-    gps = [r.get("GP") for r in per_item_records]
+    gp_per_each = [r.get("GP") for r in per_item_records]
+    units = [r.get("_units") for r in per_item_records]
     pcm_pcts = [r.get("PCM%") for r in per_item_records]
     gp_pcts = [r.get("GP%") for r in per_item_records]
 
@@ -1010,11 +1021,18 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
         clean = [x for x in xs if x is not None]
         return sum(clean) if clean else None
 
+    gp_dollars = [
+        gp * u
+        for gp, u in zip(gp_per_each, units)
+        if gp is not None and u is not None
+    ]
+    total_gp_dollars = sum(gp_dollars) if gp_dollars else None
+
     weights = [v if v is not None else 0.0 for v in volumes]
     return {
-        "Volume": _sum(volumes),
+        "Volume (pounds)": _sum(volumes),
         "FOB Revenue": _sum(revenues),
-        "GP": _sum(gps),
+        "GP": total_gp_dollars,
         "PCM%": _weighted_average(pcm_pcts, weights),
         "GP%": _weighted_average(gp_pcts, weights),
     }
@@ -1023,6 +1041,296 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
 def _enrich_with_gp_dollars(item_row: pd.Series) -> Optional[float]:
     """Per-item GP $ used by the Total roll-up (not displayed per item)."""
     return _to_float(item_row.get("GP"))
+
+
+# ─── Source-data extractor (powers the "Download Source Data" UI) ───────────
+#
+# Returns one DataFrame per cost component listing exactly the source
+# rows that the calc engine *referenced* for the items in the supplied
+# scenario. Two design rules:
+#
+# 1.  Filter parity. The row-selection logic must mirror ``_two_step_cost``
+#     and ``_one_step_cost`` exactly — otherwise the downloaded data
+#     wouldn't reconcile to the displayed cost. We share filter
+#     primitives (``_norm`` / level predicates) directly, and a
+#     regression test (``test_extract_milk_step1_filter_parity``)
+#     pins a known item's filter result to the calc engine output.
+#
+# 2.  Dedupe across items. Two items in the same scenario can share an
+#     anchor (e.g. same Plant + Month + Reference SKU). We dedupe by
+#     the BOM row index so the analyst doesn't see the same source row
+#     twice in the download.
+
+#: Mapping of category label → display columns in the order the analyst
+#: expects to see them. We include the BOM/Budget native column set,
+#: not the normalized helper columns (``_norm_*``) added by
+#: :func:`load_sources` for matching.
+_BOM_OUTPUT_COLS_ORDER: tuple[str, ...] = (
+    "Step",  # synthetic — only used for Milk / Ingredient
+    "Cldr", "Period", "Per Beg",
+    "Plant", "Top Recipe",
+    "Level", "Recipe", "Rule Item Desc", "Item Desc",
+    "Ing-Rsrc Desc",
+    "Qty", "UM.1", "Qty.1", "UM.2",
+    "Unit Cost", "Ext Cost",
+    "Unit Cost.1", "Ext Cost.1",
+    "Tag",
+)
+
+
+def _project_bom_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Return only the analyst-relevant BOM columns, in canonical order."""
+    cols = [c for c in _BOM_OUTPUT_COLS_ORDER if c in df.columns]
+    return df.loc[:, cols].copy()
+
+
+def _bom_rows_one_step(
+    sources: RfpPnlSources,
+    *,
+    month: object,
+    plant: object,
+    rule_item_desc: object,
+    level_match: Callable[[object], bool],
+    tag_include: Optional[set[str]] = None,
+    tag_exclude: Optional[set[str]] = None,
+    require_non_empty_tag: bool = False,
+) -> pd.DataFrame:
+    """Row-selection twin of :func:`_one_step_cost`.
+
+    Returns the matching BOM rows (full DataFrame slice, not a sum). If
+    any required key (month, plant, rule item desc) is blank we return
+    an empty frame — same short-circuit as the cost engine.
+    """
+    m_norm = _norm(month)
+    p_norm = _norm(plant)
+    rule_norm = _norm(rule_item_desc)
+    if not (m_norm and p_norm and rule_norm):
+        return sources.bom_df.iloc[0:0]
+
+    bom = sources.bom_df
+    base = bom[
+        (bom["_norm_month"] == m_norm)
+        & (bom["_norm_plant"] == p_norm)
+        & (bom["_norm_rule_item_desc"] == rule_norm)
+        & (bom["Level"].map(level_match))
+    ]
+    if tag_include:
+        wanted = {_norm(t) for t in tag_include}
+        base = base[base["_norm_tag"].isin(wanted)]
+    if tag_exclude:
+        blocked = {_norm(t) for t in tag_exclude}
+        base = base[~base["_norm_tag"].isin(blocked)]
+    if require_non_empty_tag:
+        base = base[base["_norm_tag"].astype(str).str.len() > 0]
+    return base
+
+
+def _bom_rows_two_step(
+    sources: RfpPnlSources,
+    *,
+    month: object,
+    plant: object,
+    step1_rule_item_desc: object,
+    step2_tag: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Row-selection twin of :func:`_two_step_cost`.
+
+    Returns ``(step1_rows, step2_rows)``. Step 2 is scoped to the same
+    ``Top Recipe`` as each step-1 anchor (same anti-double-count rule).
+    """
+    bom = sources.bom_df
+    m_norm = _norm(month)
+    p_norm = _norm(plant)
+    step1_rule = _norm(step1_rule_item_desc)
+    if not (m_norm and p_norm and step1_rule):
+        empty = bom.iloc[0:0]
+        return empty, empty
+
+    step1 = bom[
+        (bom["_norm_month"] == m_norm)
+        & (bom["_norm_plant"] == p_norm)
+        & (bom["_norm_rule_item_desc"] == step1_rule)
+        & (bom["_norm_tag"] == "milk component")
+        & (bom["Level"].map(_LEVEL_EQUALS_1))
+    ]
+    if step1.empty:
+        return step1, bom.iloc[0:0]
+
+    # Collect step-2 row indices across every step-1 anchor so we can
+    # dedupe even when multiple anchors point to the same sub-recipe.
+    step2_indices: set = set()
+    tag_norm = _norm(step2_tag)
+    for _, row in step1.iterrows():
+        chain_desc = _norm(row.get("Ing-Rsrc Desc"))
+        anchor_top_recipe = _norm(row.get("Top Recipe"))
+        if not chain_desc:
+            continue
+        s2 = bom[
+            (bom["_norm_month"] == m_norm)
+            & (bom["_norm_plant"] == p_norm)
+            & (bom["_norm_rule_item_desc"] == chain_desc)
+            & (bom["_norm_tag"] == tag_norm)
+            & (bom["Level"].map(_LEVEL_CONTAINS_2))
+        ]
+        if anchor_top_recipe and "_norm_top_recipe" in bom.columns:
+            s2 = s2[s2["_norm_top_recipe"] == anchor_top_recipe]
+        step2_indices.update(s2.index.tolist())
+
+    step2 = bom.loc[sorted(step2_indices)] if step2_indices else bom.iloc[0:0]
+    return step1, step2
+
+
+#: Public list of categories the extractor produces. Drives the page UI.
+SOURCE_EXTRACT_CATEGORIES: tuple[str, ...] = (
+    "Milk", "Ingredient", "Packaging", "Conversion",
+    "Cost of Quality", "Internal Logistics (Shuttling & WHSE)",
+)
+
+
+def extract_source_rows(
+    items_df: pd.DataFrame,
+    sources: RfpPnlSources,
+) -> dict[str, pd.DataFrame]:
+    """Return source-of-truth rows referenced by each cost component.
+
+    For each item in ``items_df`` we replicate the same filters that
+    the calc engine uses:
+
+    * **Milk / Ingredient** — both step 1 (the Milk Component anchor)
+      and step 2 (the matching sub-recipe rows). Step is recorded in
+      a ``Step`` column (``"1"`` / ``"2"``) so a single CSV per
+      component covers both lookups, as requested.
+    * **Packaging / Conversion** — single-step BOM lookup, same
+      Level / Tag rules as ``_one_step_cost``.
+    * **Cost of Quality / Internal Logistics** — Budget rows whose
+      ``Tag`` matches the component name and whose ``Category``
+      matches the item's Category (after applying the same Category
+      auto-fill from PDH that ``_calc_for_item`` uses).
+
+    Rows are deduped by their original BOM/Budget index so the same
+    underlying source row never appears twice in a single download.
+    Returns one DataFrame per :data:`SOURCE_EXTRACT_CATEGORIES` entry;
+    empty frames preserve column order so a "no rows matched" download
+    still has headers.
+    """
+    coerced = _coerce_scenario_df(items_df)
+
+    # Per-component row-index collectors. We use sets keyed on the
+    # source DataFrame's index so dedupe is automatic.
+    milk_step1_idx: set = set()
+    milk_step2_idx: set = set()
+    ing_step1_idx: set = set()
+    ing_step2_idx: set = set()
+    pkg_idx: set = set()
+    conv_idx: set = set()
+    coq_idx: set = set()
+    logistics_idx: set = set()
+
+    bom = sources.bom_df
+    budget = sources.budget_df
+
+    for _, row in coerced.iterrows():
+        month = row.get("Month", "")
+        plant = row.get("Plant", "")
+        milk_ref = row.get("Milk Reference SKU", "")
+        ingredient_ref = row.get("Ingredient Reference SKU", "") or milk_ref
+        packaging_ref = row.get("Packaging Reference SKU", "") or milk_ref
+        conversion_ref = row.get("Conversion Reference SKU", "") or milk_ref
+
+        # Milk: 2-step.
+        s1, s2 = _bom_rows_two_step(
+            sources, month=month, plant=plant,
+            step1_rule_item_desc=milk_ref, step2_tag="Milk",
+        )
+        milk_step1_idx.update(s1.index.tolist())
+        milk_step2_idx.update(s2.index.tolist())
+
+        # Ingredient: 2-step.
+        s1, s2 = _bom_rows_two_step(
+            sources, month=month, plant=plant,
+            step1_rule_item_desc=ingredient_ref, step2_tag="Ingredient",
+        )
+        ing_step1_idx.update(s1.index.tolist())
+        ing_step2_idx.update(s2.index.tolist())
+
+        # Packaging: 1-step.
+        pkg = _bom_rows_one_step(
+            sources, month=month, plant=plant,
+            rule_item_desc=packaging_ref,
+            level_match=_LEVEL_EQUALS_1,
+            tag_include={"Packaging"},
+        )
+        pkg_idx.update(pkg.index.tolist())
+
+        # Conversion: 1-step (excludes Milk Component / Ingredient /
+        # Milk / Packaging / Depreciation; non-blank Tag required).
+        conv = _bom_rows_one_step(
+            sources, month=month, plant=plant,
+            rule_item_desc=conversion_ref,
+            level_match=_LEVEL_EQUALS_1,
+            tag_exclude=_CONVERSION_TAG_EXCLUDE,
+            require_non_empty_tag=True,
+        )
+        conv_idx.update(conv.index.tolist())
+
+        # Budget categories. Apply the same Category auto-fill the calc
+        # engine uses (PDH lookup off Milk Reference SKU when blank) so
+        # the download matches what was actually summed.
+        category = row.get("Category", "")
+        if not str(category or "").strip():
+            category = _lookup_category(sources, milk_ref)
+        cat_norm = _norm(category)
+        if cat_norm and not budget.empty and "_norm_category" in budget.columns:
+            coq_rows = budget[
+                (budget["_norm_category"] == cat_norm)
+                & (budget["_norm_tag"] == _norm("Cost of Quality"))
+            ]
+            log_rows = budget[
+                (budget["_norm_category"] == cat_norm)
+                & (budget["_norm_tag"] == _norm("Internal Logistics (Shuttling & WHSE)"))
+            ]
+            coq_idx.update(coq_rows.index.tolist())
+            logistics_idx.update(log_rows.index.tolist())
+
+    # Materialize. For Milk and Ingredient we tag rows with the Step
+    # column then concatenate so a single download covers both steps.
+    def _bom_with_step(idx: set, step_label: str) -> pd.DataFrame:
+        if not idx:
+            return _project_bom_cols(bom.iloc[0:0]).assign(Step=pd.Series(dtype=str))
+        out = _project_bom_cols(bom.loc[sorted(idx)])
+        out.insert(0, "Step", step_label)
+        return out
+
+    milk_df = pd.concat(
+        [_bom_with_step(milk_step1_idx, "1"), _bom_with_step(milk_step2_idx, "2")],
+        ignore_index=True,
+    )
+    ingredient_df = pd.concat(
+        [_bom_with_step(ing_step1_idx, "1"), _bom_with_step(ing_step2_idx, "2")],
+        ignore_index=True,
+    )
+    packaging_df = _project_bom_cols(bom.loc[sorted(pkg_idx)] if pkg_idx else bom.iloc[0:0])
+    conversion_df = _project_bom_cols(bom.loc[sorted(conv_idx)] if conv_idx else bom.iloc[0:0])
+
+    # Budget projection: keep only user-facing columns (drop the
+    # ``_norm_*`` and ``_budget_value`` helpers added by load_sources).
+    budget_cols = [
+        c for c in budget.columns
+        if not c.startswith("_norm_") and not c.startswith("_budget_")
+    ]
+    coq_df = (budget.loc[sorted(coq_idx), budget_cols].copy()
+              if coq_idx else budget.loc[:, budget_cols].iloc[0:0])
+    log_df = (budget.loc[sorted(logistics_idx), budget_cols].copy()
+              if logistics_idx else budget.loc[:, budget_cols].iloc[0:0])
+
+    return {
+        "Milk": milk_df,
+        "Ingredient": ingredient_df,
+        "Packaging": packaging_df,
+        "Conversion": conversion_df,
+        "Cost of Quality": coq_df,
+        "Internal Logistics (Shuttling & WHSE)": log_df,
+    }
 
 
 def summarize_scenarios(

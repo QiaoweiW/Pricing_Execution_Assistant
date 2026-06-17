@@ -19,11 +19,13 @@ from data_sources.rfp_pnl_store import (
     COST_OVERRIDE_FOR,
     METRIC_COLS,
     REQUIRED_INPUT_FIELDS,
+    SOURCE_EXTRACT_CATEGORIES,
     STRICT_CALC_METRICS,
     SUMMARY_PER_ITEM_METRICS,
     SUMMARY_TOTAL_LABEL,
     SUMMARY_TOTAL_METRICS,
     _calc_for_item,
+    extract_source_rows,
     find_missing_required_inputs,
     recompute_items,
     summarize_scenarios,
@@ -246,7 +248,7 @@ def test_summary_totals_use_volume_weighting():
     # Item A: lbs/EA=2, units=100 → Volume_lbs = 200
     # Item B: lbs/EA=1, units=200 → Volume_lbs = 200
     total_volume = df.loc[
-        (df["Item"] == SUMMARY_TOTAL_LABEL) & (df["Metric"] == "Volume"), "S"
+        (df["Item"] == SUMMARY_TOTAL_LABEL) & (df["Metric"] == "Volume (pounds)"), "S"
     ].iloc[0]
     assert total_volume == pytest.approx(400.0)
 
@@ -287,11 +289,11 @@ def test_summary_filters_by_item_and_category():
     assert (
         only_a.loc[
             (only_a["Item"] == SUMMARY_TOTAL_LABEL)
-            & (only_a["Metric"] == "Volume"), "S"
+            & (only_a["Metric"] == "Volume (pounds)"), "S"
         ].iloc[0]
         != full.loc[
             (full["Item"] == SUMMARY_TOTAL_LABEL)
-            & (full["Metric"] == "Volume"), "S"
+            & (full["Metric"] == "Volume (pounds)"), "S"
         ].iloc[0]
     )
 
@@ -541,3 +543,189 @@ def test_summary_emits_fob_revenue_rows():
     metric_values = set(df["Metric"])
     assert "FOB Revenue" in metric_values
     assert "Revenue" not in metric_values
+
+
+# ─── Volume (pounds) rename ──────────────────────────────────────────────────
+
+def test_summary_metric_tuples_use_volume_pounds_label():
+    assert "Volume (pounds)" in SUMMARY_PER_ITEM_METRICS
+    assert "Volume (pounds)" in SUMMARY_TOTAL_METRICS
+    assert "Volume" not in SUMMARY_PER_ITEM_METRICS
+    assert "Volume" not in SUMMARY_TOTAL_METRICS
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_summary_emits_volume_pounds_rows():
+    sources = _live_sources()
+    df = summarize_scenarios({"S": _scenario_with_two_items()}, sources)
+    metric_values = set(df["Metric"])
+    assert "Volume (pounds)" in metric_values
+    assert "Volume" not in metric_values
+
+
+# ─── Total GP = Σ (GP $/EA × units), not Σ per-EA ────────────────────────────
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_total_gp_is_dollar_sum_not_per_each_sum():
+    """Total GP must scale with units, not with item count.
+
+    Build a 1-item scenario, then a 2-item duplicate of it. Per-EA GP
+    is identical in both, but Total GP $ must double when units double.
+    """
+    sources = _live_sources()
+    one = _scenario_with_two_items().iloc[[0]].copy()
+    two = pd.concat([one, one.copy()], ignore_index=True)
+    two.loc[1, "Item"] = "Item 2"
+    two.loc[1, "Target SKU Name"] = "Item A copy"
+
+    df_one = summarize_scenarios({"S": one}, sources)
+    df_two = summarize_scenarios({"S": two}, sources)
+
+    total_gp_one = df_one.loc[
+        (df_one["Item"] == SUMMARY_TOTAL_LABEL) & (df_one["Metric"] == "GP"), "S"
+    ].iloc[0]
+    total_gp_two = df_two.loc[
+        (df_two["Item"] == SUMMARY_TOTAL_LABEL) & (df_two["Metric"] == "GP"), "S"
+    ].iloc[0]
+    assert total_gp_two == pytest.approx(2 * total_gp_one)
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_total_gp_matches_manual_dollar_sum():
+    """Total GP equals Σ (per-item GP $/EA × per-item units)."""
+    sources = _live_sources()
+    items = _scenario_with_two_items()
+    refreshed = recompute_items(items, sources)
+
+    expected = 0.0
+    for _, row in refreshed.iterrows():
+        gp = float(row["GP"])
+        units = float(row["Target SKU Volume (units)"])
+        expected += gp * units
+
+    df = summarize_scenarios({"S": items}, sources)
+    total_gp = df.loc[
+        (df["Item"] == SUMMARY_TOTAL_LABEL) & (df["Metric"] == "GP"), "S"
+    ].iloc[0]
+    assert total_gp == pytest.approx(expected)
+
+
+# ─── extract_source_rows ─────────────────────────────────────────────────────
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_extract_source_rows_returns_all_categories():
+    """Every advertised category appears in the result, even if empty."""
+    sources = _live_sources()
+    extracts = extract_source_rows(_scenario_with_two_items(), sources)
+    assert set(extracts.keys()) == set(SOURCE_EXTRACT_CATEGORIES)
+    for cat, df in extracts.items():
+        assert isinstance(df, pd.DataFrame), f"{cat} not a DataFrame"
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_extract_milk_and_ingredient_have_step_column_with_both_steps():
+    """Milk / Ingredient downloads include both step 1 and step 2 rows
+    distinguished by a ``Step`` column.
+    """
+    sources = _live_sources()
+    items = pd.DataFrame([{
+        col: "" for col in METRIC_COLS
+    }])
+    items.loc[0, "Item"] = "Item 1"
+    items.loc[0, "Month"] = "1-Jun-26"
+    items.loc[0, "Plant"] = "Portland"
+    items.loc[0, "Target SKU Name"] = "DG Hvy Whip Hg UP"
+    items.loc[0, "Milk Reference SKU"] = "DG Hvy Whip Hg UP"
+    items.loc[0, "Milk Reference SKU lbs per Each"] = 4.30
+    items.loc[0, "Target SKU lbs per Each"] = 4.30
+
+    extracts = extract_source_rows(items, sources)
+    milk = extracts["Milk"]
+    assert "Step" in milk.columns
+    assert not milk.empty
+    assert set(milk["Step"]) <= {"1", "2"}
+    assert "1" in set(milk["Step"]), "Milk extract missing step-1 anchor"
+    assert "2" in set(milk["Step"]), "Milk extract missing step-2 sub-recipe rows"
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_extract_filter_parity_with_calc_engine():
+    """Extracted rows reconcile to the calc-engine cost.
+
+    For Packaging (a 1-step lookup), Σ Ext Cost.1 × target_lbs / ref_lbs
+    over the extracted rows must equal the cost surfaced in the
+    recomputed scenario table.
+    """
+    from data_sources.rfp_pnl_store import _to_float as to_float
+    sources = _live_sources()
+    items = pd.DataFrame([{
+        col: "" for col in METRIC_COLS
+    }])
+    items.loc[0, "Item"] = "Item 1"
+    items.loc[0, "Month"] = "1-Jun-26"
+    items.loc[0, "Plant"] = "Portland"
+    items.loc[0, "Target SKU Name"] = "DG Hvy Whip Hg UP"
+    items.loc[0, "Milk Reference SKU"] = "DG Hvy Whip Hg UP"
+    items.loc[0, "Packaging Reference SKU"] = "DG Hvy Whip Hg UP"
+    items.loc[0, "Milk Reference SKU lbs per Each"] = 4.30
+    items.loc[0, "Packaging Reference SKU lbs per Each"] = 4.30
+    items.loc[0, "Target SKU lbs per Each"] = 4.30
+    items.loc[0, "Target SKU Volume (units)"] = 1
+    items.loc[0, "PCM $/lbs"] = 0.26
+
+    refreshed = recompute_items(items, sources)
+    expected_pkg = float(refreshed.iloc[0]["Packaging"])
+
+    extracts = extract_source_rows(items, sources)
+    pkg = extracts["Packaging"]
+    if pkg.empty:
+        pytest.skip("Live BOM has no Packaging rows for this anchor")
+
+    ext_sum = pd.to_numeric(pkg["Ext Cost.1"], errors="coerce").fillna(0.0).sum()
+    # ref_lbs == target_lbs == 4.30 → scaling factor is 1.
+    assert float(ext_sum) == pytest.approx(expected_pkg)
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_extract_handles_blank_inputs_without_raising():
+    """An empty / placeholder scenario yields header-only frames, never an exception."""
+    sources = _live_sources()
+    blank = pd.DataFrame([{col: "" for col in METRIC_COLS}])
+    blank.loc[0, "Item"] = "Item 1"
+    extracts = extract_source_rows(blank, sources)
+    assert all(df.empty for df in extracts.values())
+    # Headers preserved so the downloaded CSV isn't an empty file.
+    for df in extracts.values():
+        assert len(df.columns) > 0
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_extract_dedupes_across_items():
+    """Two items pointing at the same anchor must not duplicate rows."""
+    sources = _live_sources()
+    item_template = {col: "" for col in METRIC_COLS}
+    item_template.update({
+        "Month": "1-Jun-26", "Plant": "Portland",
+        "Target SKU Name": "X", "Milk Reference SKU": "DG Hvy Whip Hg UP",
+        "Packaging Reference SKU": "DG Hvy Whip Hg UP",
+        "Milk Reference SKU lbs per Each": 4.30,
+        "Packaging Reference SKU lbs per Each": 4.30,
+        "Target SKU lbs per Each": 4.30,
+    })
+    one = pd.DataFrame([{"Item": "Item 1", **item_template}])
+    two = pd.DataFrame([
+        {"Item": "Item 1", **item_template},
+        {"Item": "Item 2", **item_template},
+    ])
+    pkg_one = extract_source_rows(one, sources)["Packaging"]
+    pkg_two = extract_source_rows(two, sources)["Packaging"]
+    assert len(pkg_one) == len(pkg_two), \
+        "Duplicate items inflated the extracted row count — dedupe broken"

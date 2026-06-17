@@ -1292,8 +1292,12 @@ def extract_source_rows(
             coq_idx.update(coq_rows.index.tolist())
             logistics_idx.update(log_rows.index.tolist())
 
-    # Materialize. For Milk and Ingredient we tag rows with the Step
-    # column then concatenate so a single download covers both steps.
+    # Materialize. For Milk and Ingredient we tag rows with the
+    # ``Step`` column then concatenate so a single download covers both
+    # lookups. Labels are descriptive so an analyst opening the CSV
+    # immediately sees which row is the step-1 anchor (Tag = "Milk
+    # Component") vs the step-2 cost rows (Tag = "Milk" / "Ingredient")
+    # without having to remember the lookup convention.
     def _bom_with_step(idx: set, step_label: str) -> pd.DataFrame:
         if not idx:
             return _project_bom_cols(bom.iloc[0:0]).assign(Step=pd.Series(dtype=str))
@@ -1302,11 +1306,17 @@ def extract_source_rows(
         return out
 
     milk_df = pd.concat(
-        [_bom_with_step(milk_step1_idx, "1"), _bom_with_step(milk_step2_idx, "2")],
+        [
+            _bom_with_step(milk_step1_idx, "1 - Anchor (Tag=Milk Component)"),
+            _bom_with_step(milk_step2_idx, "2 - Cost rows (Tag=Milk)"),
+        ],
         ignore_index=True,
     )
     ingredient_df = pd.concat(
-        [_bom_with_step(ing_step1_idx, "1"), _bom_with_step(ing_step2_idx, "2")],
+        [
+            _bom_with_step(ing_step1_idx, "1 - Anchor (Tag=Milk Component)"),
+            _bom_with_step(ing_step2_idx, "2 - Cost rows (Tag=Ingredient)"),
+        ],
         ignore_index=True,
     )
     packaging_df = _project_bom_cols(bom.loc[sorted(pkg_idx)] if pkg_idx else bom.iloc[0:0])

@@ -628,9 +628,11 @@ def test_extract_source_rows_returns_all_categories():
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
                     reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
-def test_extract_milk_and_ingredient_have_step_column_with_both_steps():
-    """Milk / Ingredient downloads include both step 1 and step 2 rows
-    distinguished by a ``Step`` column.
+def test_extract_milk_and_ingredient_have_descriptive_step_labels():
+    """Milk / Ingredient downloads include both step-1 anchor rows and
+    step-2 cost rows, with the ``Step`` column carrying descriptive
+    labels (not bare ``"1"`` / ``"2"``) so an analyst opening the CSV
+    can immediately tell anchors from cost rows.
     """
     sources = _live_sources()
     items = pd.DataFrame([{
@@ -648,9 +650,18 @@ def test_extract_milk_and_ingredient_have_step_column_with_both_steps():
     milk = extracts["Milk"]
     assert "Step" in milk.columns
     assert not milk.empty
-    assert set(milk["Step"]) <= {"1", "2"}
-    assert "1" in set(milk["Step"]), "Milk extract missing step-1 anchor"
-    assert "2" in set(milk["Step"]), "Milk extract missing step-2 sub-recipe rows"
+    milk_steps = set(milk["Step"])
+    assert any("Anchor" in s for s in milk_steps), \
+        f"Milk extract missing step-1 anchor label, got {milk_steps}"
+    assert any("Tag=Milk)" in s for s in milk_steps), \
+        f"Milk extract missing step-2 'Tag=Milk' cost rows, got {milk_steps}"
+
+    ingredient = extracts["Ingredient"]
+    ingredient_steps = set(ingredient["Step"])
+    assert any("Anchor" in s for s in ingredient_steps), \
+        f"Ingredient extract missing step-1 anchor label, got {ingredient_steps}"
+    assert any("Tag=Ingredient)" in s for s in ingredient_steps), \
+        f"Ingredient extract missing step-2 'Tag=Ingredient' cost rows, got {ingredient_steps}"
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),

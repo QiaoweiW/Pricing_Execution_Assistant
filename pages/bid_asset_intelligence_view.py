@@ -1961,9 +1961,19 @@ def _render_source_data_download(
             "calc engine referenced for the items in this scenario — the "
             "same filters used to populate the cost cells in the scenario "
             "table, deduped across items.\n\n"
-            "*Use these to reconcile a scenario's costs against the BOM "
-            "and Budget files in Fabric. Empty CSVs (just headers) mean "
-            "no source rows matched the current item inputs.*"
+            "**Milk / Ingredient** use a two-step BOM lookup:\n"
+            "1. **Anchor** (Tag = `Milk Component`) — the parent recipe row "
+            "that points at a sub-recipe.\n"
+            "2. **Cost rows** (Tag = `Milk` for Milk, `Tag = Ingredient` for "
+            "Ingredient) — the sub-recipe lines that drive the actual cost.\n"
+            "\n"
+            "Both steps are included in the downloads, distinguished by the "
+            "`Step` column. If a Milk or Ingredient download contains only "
+            "the step-1 anchor, the BOM has no matching step-2 rows for "
+            "that recipe — which is also why the corresponding cost cell "
+            "shows $0 in the scenario table above.\n\n"
+            "*Empty CSVs (just headers) mean no source rows matched the "
+            "current item inputs.*"
         )
 
         try:

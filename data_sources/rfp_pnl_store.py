@@ -39,6 +39,11 @@ _PDH_PATH = "RO Tracking/Demand Plan/qry_pdh.csv"
 # Scenario persistence location
 SCENARIO_FOLDER = "Program_Bid_Management/New_Bids"
 
+# Drop-folder for analyst-uploaded BOM Indented Recipe files. A downstream
+# pipeline merges these into ``BOM_History_Tracker_tagged.csv``; the page only
+# needs to land the raw upload here. See :func:`save_bom_append`.
+BOM_APPEND_FOLDER = "BOM/BOM_Append"
+
 # Canonical item table schema (one row per target SKU item).
 ITEM_COL = "Item"
 METRIC_COLS: tuple[str, ...] = (
@@ -208,7 +213,11 @@ class RfpPnlSources:
     cost_col: str
     month_options: tuple[str, ...]
     plant_options: tuple[str, ...]
-    reference_sku_options: tuple[str, ...]
+    # Normalized set of every PDH ``Item Description``. The Reference SKU
+    # dropdowns are sourced from the BOM (Level-1 ``Rule Item Desc``) but
+    # restricted to values that also appear here, since each Reference SKU
+    # must resolve to a PDH Category. See :func:`reference_sku_options`.
+    pdh_item_desc_set: frozenset[str]
     category_by_desc: dict[str, str]
     budget_sum_by_cat_tag: dict[tuple[str, str], float]
 
@@ -406,11 +415,13 @@ def load_sources() -> RfpPnlSources:
         if not cats.empty:
             category_by_desc[norm_desc] = str(cats.iloc[0]).strip()
 
-    reference_sku_options = tuple(
-        sorted(
-            [str(v).strip() for v in pdh["Item Description"].dropna().astype(str).tolist() if str(v).strip()],
-            key=lambda x: x.casefold(),
-        )
+    # Reference SKU dropdowns now derive from the BOM (Level-1 per plant +
+    # month) rather than PDH; we only need PDH as a membership filter, so a
+    # normalized set is sufficient. See :func:`reference_sku_options`.
+    pdh_item_desc_set = frozenset(
+        norm
+        for norm in (_norm(v) for v in pdh["Item Description"].dropna().astype(str).tolist())
+        if norm
     )
 
     for col in ("Category", "Tag", "Budget Value"):
@@ -430,7 +441,7 @@ def load_sources() -> RfpPnlSources:
         cost_col=cost_col,
         month_options=month_options,
         plant_options=plant_options,
-        reference_sku_options=reference_sku_options,
+        pdh_item_desc_set=pdh_item_desc_set,
         category_by_desc=category_by_desc,
         budget_sum_by_cat_tag=budget_sum_by_cat_tag,
     )
@@ -530,6 +541,29 @@ def save_scenario(
 def scenario_exists(file_path: str) -> bool:
     """Return True when a scenario file already exists in New_Bids."""
     return any(s.full_path == file_path for s in list_scenarios())
+
+
+def save_bom_append(file_name: str, payload: bytes) -> str:
+    """Upload a raw BOM Indented Recipe file to ``Files/BOM/BOM_Append``.
+
+    The file is stored verbatim under its (sanitized) original name so a
+    downstream pipeline can pick it up and merge it into the tagged BOM
+    tracker. Returns the full lakehouse path it was written to. The
+    original extension is preserved; an existing file of the same name is
+    overwritten (the drop-folder is keyed by the analyst-supplied name).
+    """
+    name = str(file_name).strip().replace("\\", "_").replace("/", "_")
+    if not name:
+        raise RfpPnlStoreError("Upload file name cannot be empty.")
+    if not payload:
+        raise RfpPnlStoreError("Upload is empty — nothing to save.")
+
+    file_path = f"{BOM_APPEND_FOLDER}/{name}"
+    try:
+        _io.write_bytes(_SECRETS_SECTION, file_path, payload)
+    except _io.LakehouseIOError as exc:
+        raise RfpPnlStoreError(str(exc)) from exc
+    return file_path
 
 
 def _lookup_category(sources: RfpPnlSources, item_desc: object) -> str:
@@ -1043,36 +1077,31 @@ def _enrich_with_gp_dollars(item_row: pd.Series) -> Optional[float]:
     return _to_float(item_row.get("GP"))
 
 
-# ─── Source-data extractor (powers the "Download Source Data" UI) ───────────
+# ─── BOM Search (powers the "BOM Search" UI) ─────────────────────────────────
 #
-# Returns one DataFrame per cost component listing exactly the source
-# rows that the calc engine *referenced* for the items in the supplied
-# scenario. Two design rules:
+# A standalone browser over ``BOM_History_Tracker_tagged.csv``. Given a
+# Month + Plant + Level-1 Item Description the analyst gets two extracts:
 #
-# 1.  Filter parity. The row-selection logic must mirror ``_two_step_cost``
-#     and ``_one_step_cost`` exactly — otherwise the downloaded data
-#     wouldn't reconcile to the displayed cost. We share filter
-#     primitives (``_norm`` / level predicates) directly, and a
-#     regression test (``test_extract_milk_step1_filter_parity``)
-#     pins a known item's filter result to the calc engine output.
+#   * Level 1 — the matching Level-1 rows for that Item Description.
+#   * Level 2 — the chained sub-recipe rows, reached by following each
+#     Level-1 row's ``Ing-Rsrc Desc`` into ``Rule Item Desc`` at a level
+#     containing "2", scoped to the same ``Top Recipe`` as the anchor so a
+#     sibling finished good that shares the sub-recipe isn't pulled in.
 #
-# 2.  Dedupe across items. Two items in the same scenario can share an
-#     anchor (e.g. same Plant + Month + Reference SKU). We dedupe by
-#     the BOM row index so the analyst doesn't see the same source row
-#     twice in the download.
+# Unlike the cost engine, the search applies NO Tag filter — it is a raw
+# data-browsing aid, not a cost lookup.
 
-#: Mapping of category label → display columns in the order the analyst
-#: expects to see them. We include the BOM/Budget native column set,
-#: not the normalized helper columns (``_norm_*``) added by
-#: :func:`load_sources` for matching.
+#: BOM columns surfaced by the search, in the order an analyst expects.
+#: Normalized helper columns (``_norm_*`` / ``_level_text``) added by
+#: :func:`load_sources` are intentionally excluded.
 _BOM_OUTPUT_COLS_ORDER: tuple[str, ...] = (
-    "Step",  # synthetic — only used for Milk / Ingredient
     "Cldr", "Period", "Per Beg",
     "Plant", "Top Recipe",
     "Level", "Recipe", "Rule Item Desc", "Item Desc",
     "Ing-Rsrc Desc",
     "Qty", "UM.1", "Qty.1", "UM.2",
     "Unit Cost", "Ext Cost",
+    "Scrap Factor",
     "Unit Cost.1", "Ext Cost.1",
     "Tag",
 )
@@ -1084,263 +1113,122 @@ def _project_bom_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, cols].copy()
 
 
-def _bom_rows_one_step(
+def _level1_item_descs(
     sources: RfpPnlSources,
     *,
     month: object,
     plant: object,
-    rule_item_desc: object,
-    level_match: Callable[[object], bool],
-    tag_include: Optional[set[str]] = None,
-    tag_exclude: Optional[set[str]] = None,
-    require_non_empty_tag: bool = False,
-) -> pd.DataFrame:
-    """Row-selection twin of :func:`_one_step_cost`.
+    require_in_pdh: bool,
+) -> tuple[str, ...]:
+    """Unique Level-1 ``Rule Item Desc`` values for a Month + Plant.
 
-    Returns the matching BOM rows (full DataFrame slice, not a sum). If
-    any required key (month, plant, rule item desc) is blank we return
-    an empty frame — same short-circuit as the cost engine.
+    Powers two cascading dropdowns:
+
+    * **Reference SKU** dropdowns (``require_in_pdh=True``) — restricted to
+      values that also exist in the PDH ``Item Description`` column, since
+      every Reference SKU must resolve to a PDH Category.
+    * **BOM Search** Item Description dropdown (``require_in_pdh=False``) —
+      the full Level-1 list, as the search is a raw BOM browser.
+
+    Returns an empty tuple when either Month or Plant is blank so the
+    dependent dropdown stays empty until both parents are chosen.
     """
     m_norm = _norm(month)
     p_norm = _norm(plant)
-    rule_norm = _norm(rule_item_desc)
-    if not (m_norm and p_norm and rule_norm):
-        return sources.bom_df.iloc[0:0]
+    if not (m_norm and p_norm):
+        return ()
 
     bom = sources.bom_df
-    base = bom[
+    mask = (
+        (bom["_norm_month"] == m_norm)
+        & (bom["_norm_plant"] == p_norm)
+        & (bom["Level"].map(_LEVEL_EQUALS_1))
+    )
+    descs = [
+        str(v).strip()
+        for v in bom.loc[mask, "Rule Item Desc"].tolist()
+        if str(v).strip()
+    ]
+    # ``dict.fromkeys`` dedupes while preserving first-seen order; we then
+    # sort case-insensitively for a stable, analyst-friendly dropdown.
+    unique = list(dict.fromkeys(descs))
+    if require_in_pdh:
+        unique = [d for d in unique if _norm(d) in sources.pdh_item_desc_set]
+    return tuple(sorted(unique, key=lambda x: x.casefold()))
+
+
+def reference_sku_options(
+    sources: RfpPnlSources, *, month: object, plant: object
+) -> tuple[str, ...]:
+    """Reference SKU dropdown values: Level-1 BOM items present in PDH."""
+    return _level1_item_descs(
+        sources, month=month, plant=plant, require_in_pdh=True
+    )
+
+
+def bom_search_item_options(
+    sources: RfpPnlSources, *, month: object, plant: object
+) -> tuple[str, ...]:
+    """BOM Search Item Description dropdown values: all Level-1 BOM items."""
+    return _level1_item_descs(
+        sources, month=month, plant=plant, require_in_pdh=False
+    )
+
+
+def bom_search(
+    sources: RfpPnlSources,
+    *,
+    month: object,
+    plant: object,
+    item_desc: object,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return ``(level1_rows, level2_rows)`` for the BOM Search filters.
+
+    Level 1 = ``Per Beg`` = month, ``Plant`` = plant, ``Rule Item Desc`` =
+    ``item_desc``, ``Level`` == 1. Level 2 follows each Level-1 row's
+    ``Ing-Rsrc Desc`` chain key into ``Rule Item Desc`` at a level
+    containing "2", scoped to the anchor's ``Top Recipe``; rows are deduped
+    by their BOM index. Any blank filter yields header-only frames so a
+    download still carries column headers.
+    """
+    bom = sources.bom_df
+    empty = _project_bom_cols(bom.iloc[0:0])
+
+    m_norm = _norm(month)
+    p_norm = _norm(plant)
+    rule_norm = _norm(item_desc)
+    if not (m_norm and p_norm and rule_norm):
+        return empty, empty
+
+    level1 = bom[
         (bom["_norm_month"] == m_norm)
         & (bom["_norm_plant"] == p_norm)
         & (bom["_norm_rule_item_desc"] == rule_norm)
-        & (bom["Level"].map(level_match))
-    ]
-    if tag_include:
-        wanted = {_norm(t) for t in tag_include}
-        base = base[base["_norm_tag"].isin(wanted)]
-    if tag_exclude:
-        blocked = {_norm(t) for t in tag_exclude}
-        base = base[~base["_norm_tag"].isin(blocked)]
-    if require_non_empty_tag:
-        base = base[base["_norm_tag"].astype(str).str.len() > 0]
-    return base
-
-
-def _bom_rows_two_step(
-    sources: RfpPnlSources,
-    *,
-    month: object,
-    plant: object,
-    step1_rule_item_desc: object,
-    step2_tag: str,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Row-selection twin of :func:`_two_step_cost`.
-
-    Returns ``(step1_rows, step2_rows)``. Step 2 is scoped to the same
-    ``Top Recipe`` as each step-1 anchor (same anti-double-count rule).
-    """
-    bom = sources.bom_df
-    m_norm = _norm(month)
-    p_norm = _norm(plant)
-    step1_rule = _norm(step1_rule_item_desc)
-    if not (m_norm and p_norm and step1_rule):
-        empty = bom.iloc[0:0]
-        return empty, empty
-
-    step1 = bom[
-        (bom["_norm_month"] == m_norm)
-        & (bom["_norm_plant"] == p_norm)
-        & (bom["_norm_rule_item_desc"] == step1_rule)
-        & (bom["_norm_tag"] == "milk component")
         & (bom["Level"].map(_LEVEL_EQUALS_1))
     ]
-    if step1.empty:
-        return step1, bom.iloc[0:0]
+    if level1.empty:
+        return empty, empty
 
-    # Collect step-2 row indices across every step-1 anchor so we can
-    # dedupe even when multiple anchors point to the same sub-recipe.
-    step2_indices: set = set()
-    tag_norm = _norm(step2_tag)
-    for _, row in step1.iterrows():
+    # Walk each Level-1 anchor into its Level-2 sub-recipe rows. Collect
+    # indices in a set so anchors that share a sub-recipe don't duplicate.
+    level2_idx: set = set()
+    for _, row in level1.iterrows():
         chain_desc = _norm(row.get("Ing-Rsrc Desc"))
         anchor_top_recipe = _norm(row.get("Top Recipe"))
         if not chain_desc:
             continue
-        s2 = bom[
+        step2 = bom[
             (bom["_norm_month"] == m_norm)
             & (bom["_norm_plant"] == p_norm)
             & (bom["_norm_rule_item_desc"] == chain_desc)
-            & (bom["_norm_tag"] == tag_norm)
             & (bom["Level"].map(_LEVEL_CONTAINS_2))
         ]
         if anchor_top_recipe and "_norm_top_recipe" in bom.columns:
-            s2 = s2[s2["_norm_top_recipe"] == anchor_top_recipe]
-        step2_indices.update(s2.index.tolist())
+            step2 = step2[step2["_norm_top_recipe"] == anchor_top_recipe]
+        level2_idx.update(step2.index.tolist())
 
-    step2 = bom.loc[sorted(step2_indices)] if step2_indices else bom.iloc[0:0]
-    return step1, step2
-
-
-#: Public list of categories the extractor produces. Drives the page UI.
-SOURCE_EXTRACT_CATEGORIES: tuple[str, ...] = (
-    "Milk", "Ingredient", "Packaging", "Conversion",
-    "Cost of Quality", "Internal Logistics (Shuttling & WHSE)",
-)
-
-
-def extract_source_rows(
-    items_df: pd.DataFrame,
-    sources: RfpPnlSources,
-) -> dict[str, pd.DataFrame]:
-    """Return source-of-truth rows referenced by each cost component.
-
-    For each item in ``items_df`` we replicate the same filters that
-    the calc engine uses:
-
-    * **Milk / Ingredient** — both step 1 (the Milk Component anchor)
-      and step 2 (the matching sub-recipe rows). Step is recorded in
-      a ``Step`` column (``"1"`` / ``"2"``) so a single CSV per
-      component covers both lookups, as requested.
-    * **Packaging / Conversion** — single-step BOM lookup, same
-      Level / Tag rules as ``_one_step_cost``.
-    * **Cost of Quality / Internal Logistics** — Budget rows whose
-      ``Tag`` matches the component name and whose ``Category``
-      matches the item's Category (after applying the same Category
-      auto-fill from PDH that ``_calc_for_item`` uses).
-
-    Rows are deduped by their original BOM/Budget index so the same
-    underlying source row never appears twice in a single download.
-    Returns one DataFrame per :data:`SOURCE_EXTRACT_CATEGORIES` entry;
-    empty frames preserve column order so a "no rows matched" download
-    still has headers.
-    """
-    coerced = _coerce_scenario_df(items_df)
-
-    # Per-component row-index collectors. We use sets keyed on the
-    # source DataFrame's index so dedupe is automatic.
-    milk_step1_idx: set = set()
-    milk_step2_idx: set = set()
-    ing_step1_idx: set = set()
-    ing_step2_idx: set = set()
-    pkg_idx: set = set()
-    conv_idx: set = set()
-    coq_idx: set = set()
-    logistics_idx: set = set()
-
-    bom = sources.bom_df
-    budget = sources.budget_df
-
-    for _, row in coerced.iterrows():
-        month = row.get("Month", "")
-        plant = row.get("Plant", "")
-        milk_ref = row.get("Milk Reference SKU", "")
-        ingredient_ref = row.get("Ingredient Reference SKU", "") or milk_ref
-        packaging_ref = row.get("Packaging Reference SKU", "") or milk_ref
-        conversion_ref = row.get("Conversion Reference SKU", "") or milk_ref
-
-        # Milk: 2-step.
-        s1, s2 = _bom_rows_two_step(
-            sources, month=month, plant=plant,
-            step1_rule_item_desc=milk_ref, step2_tag="Milk",
-        )
-        milk_step1_idx.update(s1.index.tolist())
-        milk_step2_idx.update(s2.index.tolist())
-
-        # Ingredient: 2-step.
-        s1, s2 = _bom_rows_two_step(
-            sources, month=month, plant=plant,
-            step1_rule_item_desc=ingredient_ref, step2_tag="Ingredient",
-        )
-        ing_step1_idx.update(s1.index.tolist())
-        ing_step2_idx.update(s2.index.tolist())
-
-        # Packaging: 1-step.
-        pkg = _bom_rows_one_step(
-            sources, month=month, plant=plant,
-            rule_item_desc=packaging_ref,
-            level_match=_LEVEL_EQUALS_1,
-            tag_include={"Packaging"},
-        )
-        pkg_idx.update(pkg.index.tolist())
-
-        # Conversion: 1-step (excludes Milk Component / Ingredient /
-        # Milk / Packaging / Depreciation; non-blank Tag required).
-        conv = _bom_rows_one_step(
-            sources, month=month, plant=plant,
-            rule_item_desc=conversion_ref,
-            level_match=_LEVEL_EQUALS_1,
-            tag_exclude=_CONVERSION_TAG_EXCLUDE,
-            require_non_empty_tag=True,
-        )
-        conv_idx.update(conv.index.tolist())
-
-        # Budget categories. Apply the same Category auto-fill the calc
-        # engine uses (PDH lookup off Milk Reference SKU when blank) so
-        # the download matches what was actually summed.
-        category = row.get("Category", "")
-        if not str(category or "").strip():
-            category = _lookup_category(sources, milk_ref)
-        cat_norm = _norm(category)
-        if cat_norm and not budget.empty and "_norm_category" in budget.columns:
-            coq_rows = budget[
-                (budget["_norm_category"] == cat_norm)
-                & (budget["_norm_tag"] == _norm("Cost of Quality"))
-            ]
-            log_rows = budget[
-                (budget["_norm_category"] == cat_norm)
-                & (budget["_norm_tag"] == _norm("Internal Logistics (Shuttling & WHSE)"))
-            ]
-            coq_idx.update(coq_rows.index.tolist())
-            logistics_idx.update(log_rows.index.tolist())
-
-    # Materialize. For Milk and Ingredient we tag rows with the
-    # ``Step`` column then concatenate so a single download covers both
-    # lookups. Labels are descriptive so an analyst opening the CSV
-    # immediately sees which row is the step-1 anchor (Tag = "Milk
-    # Component") vs the step-2 cost rows (Tag = "Milk" / "Ingredient")
-    # without having to remember the lookup convention.
-    def _bom_with_step(idx: set, step_label: str) -> pd.DataFrame:
-        if not idx:
-            return _project_bom_cols(bom.iloc[0:0]).assign(Step=pd.Series(dtype=str))
-        out = _project_bom_cols(bom.loc[sorted(idx)])
-        out.insert(0, "Step", step_label)
-        return out
-
-    milk_df = pd.concat(
-        [
-            _bom_with_step(milk_step1_idx, "1 - Anchor (Tag=Milk Component)"),
-            _bom_with_step(milk_step2_idx, "2 - Cost rows (Tag=Milk)"),
-        ],
-        ignore_index=True,
-    )
-    ingredient_df = pd.concat(
-        [
-            _bom_with_step(ing_step1_idx, "1 - Anchor (Tag=Milk Component)"),
-            _bom_with_step(ing_step2_idx, "2 - Cost rows (Tag=Ingredient)"),
-        ],
-        ignore_index=True,
-    )
-    packaging_df = _project_bom_cols(bom.loc[sorted(pkg_idx)] if pkg_idx else bom.iloc[0:0])
-    conversion_df = _project_bom_cols(bom.loc[sorted(conv_idx)] if conv_idx else bom.iloc[0:0])
-
-    # Budget projection: keep only user-facing columns (drop the
-    # ``_norm_*`` and ``_budget_value`` helpers added by load_sources).
-    budget_cols = [
-        c for c in budget.columns
-        if not c.startswith("_norm_") and not c.startswith("_budget_")
-    ]
-    coq_df = (budget.loc[sorted(coq_idx), budget_cols].copy()
-              if coq_idx else budget.loc[:, budget_cols].iloc[0:0])
-    log_df = (budget.loc[sorted(logistics_idx), budget_cols].copy()
-              if logistics_idx else budget.loc[:, budget_cols].iloc[0:0])
-
-    return {
-        "Milk": milk_df,
-        "Ingredient": ingredient_df,
-        "Packaging": packaging_df,
-        "Conversion": conversion_df,
-        "Cost of Quality": coq_df,
-        "Internal Logistics (Shuttling & WHSE)": log_df,
-    }
+    level2 = bom.loc[sorted(level2_idx)] if level2_idx else bom.iloc[0:0]
+    return _project_bom_cols(level1), _project_bom_cols(level2)
 
 
 def summarize_scenarios(

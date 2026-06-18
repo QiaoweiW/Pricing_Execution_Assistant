@@ -176,7 +176,7 @@ def _build_synthetic_sources() -> RfpPnlSources:
         cost_col="Ext Cost.1",
         month_options=(target_month,),
         plant_options=(target_plant,),
-        reference_sku_options=(target_sku,),
+        pdh_item_desc_set=frozenset(),
         category_by_desc={},
         budget_sum_by_cat_tag={},
     )
@@ -286,7 +286,7 @@ def _live_sources() -> RfpPnlSources:
         cost_col="Ext Cost.1",
         month_options=tuple(sorted(bom["Per Beg"].dropna().astype(str).unique())),
         plant_options=tuple(sorted(bom["Plant"].dropna().astype(str).unique())),
-        reference_sku_options=(),
+        pdh_item_desc_set=frozenset(),
         category_by_desc={},
         budget_sum_by_cat_tag={},
     )

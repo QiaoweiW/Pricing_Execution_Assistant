@@ -10,6 +10,7 @@ each scenario through ``recompute_items`` before aggregating.
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 
 import pandas as pd
@@ -19,15 +20,17 @@ from data_sources.rfp_pnl_store import (
     COST_OVERRIDE_FOR,
     METRIC_COLS,
     REQUIRED_INPUT_FIELDS,
-    SOURCE_EXTRACT_CATEGORIES,
     STRICT_CALC_METRICS,
     SUMMARY_PER_ITEM_METRICS,
     SUMMARY_TOTAL_LABEL,
     SUMMARY_TOTAL_METRICS,
     _calc_for_item,
-    extract_source_rows,
+    _norm,
+    bom_search,
+    bom_search_item_options,
     find_missing_required_inputs,
     recompute_items,
+    reference_sku_options,
     summarize_scenarios,
 )
 from tests.test_rfp_conversion_cost import (
@@ -613,130 +616,94 @@ def test_total_gp_matches_manual_dollar_sum():
     assert total_gp == pytest.approx(expected)
 
 
-# ─── extract_source_rows ─────────────────────────────────────────────────────
+# ─── BOM Search + Reference SKU dropdown sourcing ─────────────────────────────
+#
+# The Reference SKU dropdowns and the BOM Search panel both source their
+# options from the BOM (Level-1 ``Rule Item Desc`` for a Month + Plant); the
+# Reference SKU list is additionally gated on PDH membership. ``bom_search``
+# returns the matching Level-1 rows plus their chained Level-2 sub-recipe rows.
 
-@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
-                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
-def test_extract_source_rows_returns_all_categories():
-    """Every advertised category appears in the result, even if empty."""
-    sources = _live_sources()
-    extracts = extract_source_rows(_scenario_with_two_items(), sources)
-    assert set(extracts.keys()) == set(SOURCE_EXTRACT_CATEGORIES)
-    for cat, df in extracts.items():
-        assert isinstance(df, pd.DataFrame), f"{cat} not a DataFrame"
-
-
-@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
-                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
-def test_extract_milk_and_ingredient_have_descriptive_step_labels():
-    """Milk / Ingredient downloads include both step-1 anchor rows and
-    step-2 cost rows, with the ``Step`` column carrying descriptive
-    labels (not bare ``"1"`` / ``"2"``) so an analyst opening the CSV
-    can immediately tell anchors from cost rows.
-    """
-    sources = _live_sources()
-    items = pd.DataFrame([{
-        col: "" for col in METRIC_COLS
-    }])
-    items.loc[0, "Item"] = "Item 1"
-    items.loc[0, "Month"] = "1-Jun-26"
-    items.loc[0, "Plant"] = "Portland"
-    items.loc[0, "Target SKU Name"] = "DG Hvy Whip Hg UP"
-    items.loc[0, "Milk Reference SKU"] = "DG Hvy Whip Hg UP"
-    items.loc[0, "Milk Reference SKU lbs per Each"] = 4.30
-    items.loc[0, "Target SKU lbs per Each"] = 4.30
-
-    extracts = extract_source_rows(items, sources)
-    milk = extracts["Milk"]
-    assert "Step" in milk.columns
-    assert not milk.empty
-    milk_steps = set(milk["Step"])
-    assert any("Anchor" in s for s in milk_steps), \
-        f"Milk extract missing step-1 anchor label, got {milk_steps}"
-    assert any("Tag=Milk)" in s for s in milk_steps), \
-        f"Milk extract missing step-2 'Tag=Milk' cost rows, got {milk_steps}"
-
-    ingredient = extracts["Ingredient"]
-    ingredient_steps = set(ingredient["Step"])
-    assert any("Anchor" in s for s in ingredient_steps), \
-        f"Ingredient extract missing step-1 anchor label, got {ingredient_steps}"
-    assert any("Tag=Ingredient)" in s for s in ingredient_steps), \
-        f"Ingredient extract missing step-2 'Tag=Ingredient' cost rows, got {ingredient_steps}"
+_KNOWN_MONTH = "1-Jun-26"
+_KNOWN_PLANT = "Portland"
+_KNOWN_SKU = "DG Hvy Whip Hg UP"
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
                     reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
-def test_extract_filter_parity_with_calc_engine():
-    """Extracted rows reconcile to the calc-engine cost.
-
-    For Packaging (a 1-step lookup), Σ Ext Cost.1 × target_lbs / ref_lbs
-    over the extracted rows must equal the cost surfaced in the
-    recomputed scenario table.
-    """
-    from data_sources.rfp_pnl_store import _to_float as to_float
+def test_bom_search_item_options_are_level1_for_month_plant():
+    """Item Description options are unique, sorted Level-1 descs for the pair."""
     sources = _live_sources()
-    items = pd.DataFrame([{
-        col: "" for col in METRIC_COLS
-    }])
-    items.loc[0, "Item"] = "Item 1"
-    items.loc[0, "Month"] = "1-Jun-26"
-    items.loc[0, "Plant"] = "Portland"
-    items.loc[0, "Target SKU Name"] = "DG Hvy Whip Hg UP"
-    items.loc[0, "Milk Reference SKU"] = "DG Hvy Whip Hg UP"
-    items.loc[0, "Packaging Reference SKU"] = "DG Hvy Whip Hg UP"
-    items.loc[0, "Milk Reference SKU lbs per Each"] = 4.30
-    items.loc[0, "Packaging Reference SKU lbs per Each"] = 4.30
-    items.loc[0, "Target SKU lbs per Each"] = 4.30
-    items.loc[0, "Target SKU Volume (units)"] = 1
-    items.loc[0, "PCM $/lbs"] = 0.26
-
-    refreshed = recompute_items(items, sources)
-    expected_pkg = float(refreshed.iloc[0]["Packaging"])
-
-    extracts = extract_source_rows(items, sources)
-    pkg = extracts["Packaging"]
-    if pkg.empty:
-        pytest.skip("Live BOM has no Packaging rows for this anchor")
-
-    ext_sum = pd.to_numeric(pkg["Ext Cost.1"], errors="coerce").fillna(0.0).sum()
-    # ref_lbs == target_lbs == 4.30 → scaling factor is 1.
-    assert float(ext_sum) == pytest.approx(expected_pkg)
+    opts = bom_search_item_options(
+        sources, month=_KNOWN_MONTH, plant=_KNOWN_PLANT
+    )
+    assert _KNOWN_SKU in opts
+    bom = sources.bom_df
+    for desc in opts:
+        match = bom[
+            (bom["_norm_month"] == _norm(_KNOWN_MONTH))
+            & (bom["_norm_plant"] == _norm(_KNOWN_PLANT))
+            & (bom["_norm_rule_item_desc"] == _norm(desc))
+            & (bom["Level"].astype(str).str.strip() == "1")
+        ]
+        assert not match.empty, f"{desc} has no Level-1 row for the pair"
+    # Deduped and sorted case-insensitively.
+    assert list(opts) == sorted(set(opts), key=lambda x: x.casefold())
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
                     reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
-def test_extract_handles_blank_inputs_without_raising():
-    """An empty / placeholder scenario yields header-only frames, never an exception."""
+def test_item_options_empty_without_both_parents():
+    """A blank Month or Plant collapses the cascading dropdowns to empty."""
     sources = _live_sources()
-    blank = pd.DataFrame([{col: "" for col in METRIC_COLS}])
-    blank.loc[0, "Item"] = "Item 1"
-    extracts = extract_source_rows(blank, sources)
-    assert all(df.empty for df in extracts.values())
-    # Headers preserved so the downloaded CSV isn't an empty file.
-    for df in extracts.values():
-        assert len(df.columns) > 0
+    assert bom_search_item_options(sources, month="", plant=_KNOWN_PLANT) == ()
+    assert bom_search_item_options(sources, month=_KNOWN_MONTH, plant="") == ()
+    assert reference_sku_options(sources, month="", plant=_KNOWN_PLANT) == ()
+    assert reference_sku_options(sources, month=_KNOWN_MONTH, plant="") == ()
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
                     reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
-def test_extract_dedupes_across_items():
-    """Two items pointing at the same anchor must not duplicate rows."""
+def test_bom_search_returns_level1_and_chained_level2():
+    """Level-1 rows match the filters; Level-2 rows are chained sub-recipes."""
     sources = _live_sources()
-    item_template = {col: "" for col in METRIC_COLS}
-    item_template.update({
-        "Month": "1-Jun-26", "Plant": "Portland",
-        "Target SKU Name": "X", "Milk Reference SKU": "DG Hvy Whip Hg UP",
-        "Packaging Reference SKU": "DG Hvy Whip Hg UP",
-        "Milk Reference SKU lbs per Each": 4.30,
-        "Packaging Reference SKU lbs per Each": 4.30,
-        "Target SKU lbs per Each": 4.30,
-    })
-    one = pd.DataFrame([{"Item": "Item 1", **item_template}])
-    two = pd.DataFrame([
-        {"Item": "Item 1", **item_template},
-        {"Item": "Item 2", **item_template},
-    ])
-    pkg_one = extract_source_rows(one, sources)["Packaging"]
-    pkg_two = extract_source_rows(two, sources)["Packaging"]
-    assert len(pkg_one) == len(pkg_two), \
-        "Duplicate items inflated the extracted row count — dedupe broken"
+    level1, level2 = bom_search(
+        sources, month=_KNOWN_MONTH, plant=_KNOWN_PLANT, item_desc=_KNOWN_SKU,
+    )
+    assert not level1.empty
+    assert (level1["Level"].astype(str).str.strip() == "1").all()
+    assert (level1["Rule Item Desc"].map(_norm) == _norm(_KNOWN_SKU)).all()
+    if not level2.empty:
+        assert level2["Level"].astype(str).str.contains("2").all()
+    # The synthetic ``Step`` column belonged to the retired extractor; the
+    # BOM-search output must carry only native BOM columns.
+    assert "Step" not in level1.columns
+    assert "Step" not in level2.columns
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_bom_search_blank_filters_yield_header_only_frames():
+    """Missing filters return empty frames that still carry column headers."""
+    sources = _live_sources()
+    level1, level2 = bom_search(sources, month="", plant="", item_desc="")
+    assert level1.empty and level2.empty
+    assert len(level1.columns) > 0 and len(level2.columns) > 0
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_reference_sku_options_gate_on_pdh_membership():
+    """Reference SKU options are Level-1 BOM descs intersected with PDH."""
+    sources = _live_sources()
+    all_level1 = bom_search_item_options(
+        sources, month=_KNOWN_MONTH, plant=_KNOWN_PLANT
+    )
+    assert len(all_level1) >= 2
+    # Admit only the first two Level-1 descs into a synthetic PDH set; the
+    # Reference SKU dropdown must return exactly that intersection.
+    admitted = all_level1[:2]
+    gated = dataclasses.replace(
+        sources, pdh_item_desc_set=frozenset(_norm(d) for d in admitted)
+    )
+    opts = reference_sku_options(gated, month=_KNOWN_MONTH, plant=_KNOWN_PLANT)
+    assert set(opts) == set(admitted)

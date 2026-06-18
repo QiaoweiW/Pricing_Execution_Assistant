@@ -1450,33 +1450,42 @@ def _rfp_render_item_inputs(idx: int, sources: _rfp_pnl_store.RfpPnlSources) -> 
             )
 
         # ── Reference SKUs ─────────────────────────────────────────────────
+        # Options cascade off this item's Month + Plant: unique Level-1
+        # BOM ``Rule Item Desc`` values that also exist in the PDH file.
+        # The list updates on the next rerun after Month / Plant change.
+        ref_sku_opts = _rfp_pnl_store.reference_sku_options(
+            sources,
+            month=st.session_state.get(_rfp_input_key(idx, "Month")),
+            plant=st.session_state.get(_rfp_input_key(idx, "Plant")),
+        )
         st.markdown(
             "**Reference SKUs**  ·  "
-            "*Ingredient / Packaging / Conversion default to the Milk Reference SKU when left blank.*"
+            "*Level-1 BOM items for the selected Month + Plant. "
+            "Ingredient / Packaging / Conversion default to the Milk Reference SKU when left blank.*"
         )
         ref1, ref2 = st.columns(2)
         with ref1:
             st.selectbox(
                 "Milk Reference SKU",
-                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Milk Reference SKU"))),
+                options=_rfp_options_with_current(ref_sku_opts, st.session_state.get(_rfp_input_key(idx, "Milk Reference SKU"))),
                 key=_rfp_input_key(idx, "Milk Reference SKU"),
             )
             st.selectbox(
                 "Ingredient Reference SKU",
-                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Ingredient Reference SKU"))),
+                options=_rfp_options_with_current(ref_sku_opts, st.session_state.get(_rfp_input_key(idx, "Ingredient Reference SKU"))),
                 key=_rfp_input_key(idx, "Ingredient Reference SKU"),
                 help="Leave blank to inherit Milk Reference SKU.",
             )
         with ref2:
             st.selectbox(
                 "Packaging Reference SKU",
-                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Packaging Reference SKU"))),
+                options=_rfp_options_with_current(ref_sku_opts, st.session_state.get(_rfp_input_key(idx, "Packaging Reference SKU"))),
                 key=_rfp_input_key(idx, "Packaging Reference SKU"),
                 help="Leave blank to inherit Milk Reference SKU.",
             )
             st.selectbox(
                 "Conversion Reference SKU",
-                options=_rfp_options_with_current(sources.reference_sku_options, st.session_state.get(_rfp_input_key(idx, "Conversion Reference SKU"))),
+                options=_rfp_options_with_current(ref_sku_opts, st.session_state.get(_rfp_input_key(idx, "Conversion Reference SKU"))),
                 key=_rfp_input_key(idx, "Conversion Reference SKU"),
                 help="Leave blank to inherit Milk Reference SKU.",
             )
@@ -1683,12 +1692,17 @@ after editing inputs.
 
   *Reference SKU lbs/Each:* Milk Ref lbs/Each is required; Ingredient /
   Packaging / Conversion all inherit Milk Ref lbs/Each when blank.
+
+  *Reference SKU dropdowns* list the unique Level-1 `Rule Item Desc`
+  values for the item's selected Month + Plant (restricted to values
+  that also exist in PDH).
 - **`BOM/Budget/Budget_Update.csv`** — based on the **current fiscal year
   financial budget**. Cost of Quality and Internal Logistics
   (Shuttling & WHSE) are aggregated by `Category` and multiplied by
   Target SKU lbs per Each.
-- **`RO Tracking/Demand Plan/qry_pdh.csv`** — provides the Reference SKU
-  dropdown list (Item Description) and the default `Category`
+- **`RO Tracking/Demand Plan/qry_pdh.csv`** — gates the Reference SKU
+  dropdown list (a `Rule Item Desc` must also appear in PDH
+  `Item Description`) and provides the default `Category`
   (Portfolio Major) for the Milk Reference SKU.
 
 **Cost overrides:** every cost component (Milk, Ingredient, Packaging,
@@ -1922,92 +1936,114 @@ Saved scenarios live under
             key="rfp_pnl_download",
         )
 
-    # ── Download Source Data ──────────────────────────────────────────────────
+    # ── BOM Search ────────────────────────────────────────────────────────────
     st.markdown("---")
-    _render_source_data_download(current_items, sources)
+    _render_bom_search(sources)
 
     # ── Multi-Scenario Summary ────────────────────────────────────────────────
     st.markdown("---")
     _render_rfp_pnl_summary(sources, saved)
 
 
-# ── 8a. Download Source Data ──────────────────────────────────────────────────
+# ── 8a. BOM Search ────────────────────────────────────────────────────────────
 
-# One CSV download per cost component. The store's ``extract_source_rows``
-# replicates the calc engine's filters so the download reconciles to the
-# scenario table — see the ``test_extract_*_filter_parity`` tests.
+# A standalone browser over ``BOM_History_Tracker_tagged.csv``. The store's
+# ``bom_search`` returns the Level-1 rows for the chosen Month + Plant + Item
+# Description and the chained Level-2 sub-recipe rows. It is independent of the
+# scenario items — purely a lookup aid for analysts inspecting the BOM.
 
-def _render_source_data_download(
-    current_items: pd.DataFrame,
-    sources: _rfp_pnl_store.RfpPnlSources,
-) -> None:
-    """Foldable panel offering a CSV per cost-component source slice.
+_BOM_SEARCH_MONTH_KEY = "rfp_bom_search_month"
+_BOM_SEARCH_PLANT_KEY = "rfp_bom_search_plant"
+_BOM_SEARCH_ITEM_KEY = "rfp_bom_search_item"
 
-    For each component we extract only the source rows actually
-    referenced by the items in the current scenario:
 
-    * Milk / Ingredient → step-1 anchor + step-2 sub-recipe rows from
-      ``BOM_History_Tracker_tagged.csv`` (combined into one CSV with a
-      ``Step`` column).
-    * Packaging / Conversion → single-step BOM lookup rows.
-    * Cost of Quality / Internal Logistics → matching rows from
-      ``Budget_Update.csv`` filtered by the item's Category.
+def _render_bom_search(sources: _rfp_pnl_store.RfpPnlSources) -> None:
+    """Foldable panel that searches the BOM and offers Level-1 / Level-2 CSVs.
+
+    Three cascading filters — Month (``Per Beg``), Plant, and Item
+    Description (Level-1 ``Rule Item Desc``, cascading off Month + Plant) —
+    drive two extracts the analyst can preview and download:
+
+    * **Level 1** — rows matching the three filters at ``Level`` = 1.
+    * **Level 2** — the chained sub-recipe rows reached from each Level-1
+      anchor's ``Ing-Rsrc Desc`` (see :func:`_rfp_pnl_store.bom_search`).
 
     The expander stays collapsed by default to keep the page compact.
     """
-    with st.expander("📥 Download Source Data", expanded=False):
+    with st.expander("🔎 BOM Search", expanded=False):
         st.markdown(
-            "Each download below contains the **exact source rows** the "
-            "calc engine referenced for the items in this scenario — the "
-            "same filters used to populate the cost cells in the scenario "
-            "table, deduped across items.\n\n"
-            "**Milk / Ingredient** use a two-step BOM lookup:\n"
-            "1. **Anchor** (Tag = `Milk Component`) — the parent recipe row "
-            "that points at a sub-recipe.\n"
-            "2. **Cost rows** (Tag = `Milk` for Milk, `Tag = Ingredient` for "
-            "Ingredient) — the sub-recipe lines that drive the actual cost.\n"
-            "\n"
-            "Both steps are included in the downloads, distinguished by the "
-            "`Step` column. If a Milk or Ingredient download contains only "
-            "the step-1 anchor, the BOM has no matching step-2 rows for "
-            "that recipe — which is also why the corresponding cost cell "
-            "shows $0 in the scenario table above.\n\n"
-            "*Empty CSVs (just headers) mean no source rows matched the "
-            "current item inputs.*"
+            "Search `BOM_History_Tracker_tagged.csv` by **Month**, **Plant** "
+            "and **Item Description**, then download the matching **Level 1** "
+            "rows and their chained **Level 2** sub-recipe rows. The Item "
+            "Description list shows Level-1 `Rule Item Desc` values for the "
+            "selected Month + Plant."
         )
 
-        try:
-            extracts = _rfp_pnl_store.extract_source_rows(current_items, sources)
-        except Exception as exc:  # noqa: BLE001 — surfaced to the user
-            st.error(f"Could not extract source rows: {exc}")
+        c1, c2 = st.columns(2)
+        with c1:
+            month = st.selectbox(
+                "Month",
+                options=_rfp_options_with_current(
+                    sources.month_options,
+                    st.session_state.get(_BOM_SEARCH_MONTH_KEY),
+                ),
+                key=_BOM_SEARCH_MONTH_KEY,
+                help="Matches BOM `Per Beg`.",
+            )
+        with c2:
+            plant = st.selectbox(
+                "Plant",
+                options=_rfp_options_with_current(
+                    sources.plant_options,
+                    st.session_state.get(_BOM_SEARCH_PLANT_KEY),
+                ),
+                key=_BOM_SEARCH_PLANT_KEY,
+                help="Matches BOM `Plant`.",
+            )
+
+        # Item Description cascades off Month + Plant. ``_rfp_options_with_current``
+        # keeps any previously-picked value in the list so Streamlit never
+        # raises when the parents change and the old value drops out.
+        item_opts = _rfp_pnl_store.bom_search_item_options(
+            sources, month=month, plant=plant,
+        )
+        item_desc = st.selectbox(
+            "Item Description",
+            options=_rfp_options_with_current(
+                item_opts, st.session_state.get(_BOM_SEARCH_ITEM_KEY)
+            ),
+            key=_BOM_SEARCH_ITEM_KEY,
+            help="Level-1 `Rule Item Desc` for the selected Month + Plant.",
+        )
+
+        if not (month and plant and item_desc):
+            st.info("Select a Month, Plant and Item Description to search the BOM.")
             return
 
-        # Two columns of three buttons each — keeps the layout compact.
-        cols = st.columns(2)
-        for i, category in enumerate(_rfp_pnl_store.SOURCE_EXTRACT_CATEGORIES):
-            df = extracts.get(category, pd.DataFrame())
-            with cols[i % 2]:
-                # ``key`` must be unique per button; slug the category.
-                key_slug = (
-                    category.lower()
-                    .replace(" ", "_").replace("(", "").replace(")", "")
-                    .replace("&", "and").replace("/", "_per_")
-                )
-                file_stub = f"rfp_source_{key_slug}.csv"
-                st.download_button(
-                    label=f"⬇️ {category} ({len(df):,} rows)",
-                    data=_to_csv_bytes(df),
-                    file_name=file_stub,
-                    mime="text/csv",
-                    use_container_width=True,
-                    key=f"rfp_pnl_src_{key_slug}",
-                    help=(
-                        "Source: BOM_History_Tracker_tagged.csv"
-                        if category in {"Milk", "Ingredient",
-                                        "Packaging", "Conversion"}
-                        else "Source: Budget_Update.csv"
-                    ),
-                )
+        try:
+            level1, level2 = _rfp_pnl_store.bom_search(
+                sources, month=month, plant=plant, item_desc=item_desc,
+            )
+        except Exception as exc:  # noqa: BLE001 — surfaced to the user
+            st.error(f"Could not search the BOM: {exc}")
+            return
+
+        slug = item_desc.lower().replace(" ", "_").replace("/", "_")
+        for level_label, level_no, df in (
+            ("Level 1", 1, level1),
+            ("Level 2", 2, level2),
+        ):
+            st.markdown(f"**{level_label}** — {len(df):,} rows")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.download_button(
+                label=f"⬇️ Download {level_label} ({len(df):,} rows)",
+                data=_to_csv_bytes(df),
+                file_name=f"bom_search_{slug}_level{level_no}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=f"rfp_bom_search_dl_l{level_no}",
+                help="Source: BOM_History_Tracker_tagged.csv",
+            )
 
 
 # ── 8b. Multi-Scenario Summary ────────────────────────────────────────────────

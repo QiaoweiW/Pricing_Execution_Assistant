@@ -39,6 +39,11 @@ _PDH_PATH = "RO Tracking/Demand Plan/qry_pdh.csv"
 # Scenario persistence location
 SCENARIO_FOLDER = "Program_Bid_Management/New_Bids"
 
+# Drop-folder for analyst-uploaded BOM Indented Recipe files. A downstream
+# pipeline merges these into ``BOM_History_Tracker_tagged.csv``; the page only
+# needs to land the raw upload here. See :func:`save_bom_append`.
+BOM_APPEND_FOLDER = "BOM/BOM_Append"
+
 # Canonical item table schema (one row per target SKU item).
 ITEM_COL = "Item"
 METRIC_COLS: tuple[str, ...] = (
@@ -536,6 +541,29 @@ def save_scenario(
 def scenario_exists(file_path: str) -> bool:
     """Return True when a scenario file already exists in New_Bids."""
     return any(s.full_path == file_path for s in list_scenarios())
+
+
+def save_bom_append(file_name: str, payload: bytes) -> str:
+    """Upload a raw BOM Indented Recipe file to ``Files/BOM/BOM_Append``.
+
+    The file is stored verbatim under its (sanitized) original name so a
+    downstream pipeline can pick it up and merge it into the tagged BOM
+    tracker. Returns the full lakehouse path it was written to. The
+    original extension is preserved; an existing file of the same name is
+    overwritten (the drop-folder is keyed by the analyst-supplied name).
+    """
+    name = str(file_name).strip().replace("\\", "_").replace("/", "_")
+    if not name:
+        raise RfpPnlStoreError("Upload file name cannot be empty.")
+    if not payload:
+        raise RfpPnlStoreError("Upload is empty — nothing to save.")
+
+    file_path = f"{BOM_APPEND_FOLDER}/{name}"
+    try:
+        _io.write_bytes(_SECRETS_SECTION, file_path, payload)
+    except _io.LakehouseIOError as exc:
+        raise RfpPnlStoreError(str(exc)) from exc
+    return file_path
 
 
 def _lookup_category(sources: RfpPnlSources, item_desc: object) -> str:

@@ -1171,6 +1171,7 @@ _RFP_ETAG_KEY = "_rfp_pnl_etag"
 _RFP_NAME_KEY = "rfp_pnl_scenario_name"
 _RFP_INPUT_PREFIX = "rfp_in_"
 _RFP_INPUT_SEEDED_FLAG = "_rfp_pnl_inputs_seeded"
+_RFP_BOM_UPLOAD_KEY = "rfp_bom_upload"
 
 # Field groups used by the per-item input panel.
 # A "field" is a metric collected from the user (free text, number, or
@@ -1643,6 +1644,40 @@ def _rfp_style_display(display_df: pd.DataFrame):
     return display_df.style.apply(_row_style, axis=1)
 
 
+def _render_bom_upload() -> None:
+    """Upload box for analyst-supplied BOM Indented Recipe files.
+
+    Lands the raw upload in ``Files/BOM/BOM_Append`` (a drop-folder a
+    downstream pipeline merges into the tagged BOM tracker), so an analyst
+    whose month is missing from the scenario dropdowns can supply the BOM
+    that unlocks P&L generation for it. The file is written under its own
+    (sanitized) name on button click — not on every rerun — so a stray
+    rerun never re-saves the upload.
+    """
+    st.info(
+        "If you couldn't find your month in the dropdown below, upload "
+        "relevant BOM indented recipe to enable P&L generation."
+    )
+    uploaded = st.file_uploader(
+        "Upload BOM Indented Recipe",
+        type=["csv", "xlsx", "xls"],
+        key=_RFP_BOM_UPLOAD_KEY,
+        help="Saved to `Files/BOM/BOM_Append` for downstream processing.",
+    )
+    if uploaded is None:
+        return
+
+    if st.button("⬆️ Upload to BOM_Append", key="rfp_bom_upload_save"):
+        try:
+            saved_path = _rfp_pnl_store.save_bom_append(
+                uploaded.name, uploaded.getvalue()
+            )
+        except _rfp_pnl_store.RfpPnlStoreError as exc:
+            st.error(f"Could not upload BOM file: {exc}")
+        else:
+            st.success(f"Uploaded to `Files/{saved_path}`")
+
+
 def _render_rfp_pnl_analysis() -> None:
     """Render the scenario-based RFP P&L Analysis section.
 
@@ -1715,6 +1750,10 @@ Saved scenarios live under
 `Files/Program_Bid_Management/New_Bids/<scenario>.csv`.
             """.strip()
         )
+    st.markdown("---")
+
+    # ── Upload BOM Indented Recipe ────────────────────────────────────────────
+    _render_bom_upload()
     st.markdown("---")
 
     st.caption(

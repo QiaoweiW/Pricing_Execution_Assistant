@@ -678,6 +678,10 @@ def test_bom_search_returns_level1_and_chained_level2():
     # BOM-search output must carry only native BOM columns.
     assert "Step" not in level1.columns
     assert "Step" not in level2.columns
+    # ``Scrap Factor`` is surfaced immediately before ``Unit Cost.1``.
+    cols = list(level1.columns)
+    assert "Scrap Factor" in cols
+    assert cols.index("Scrap Factor") == cols.index("Unit Cost.1") - 1
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),

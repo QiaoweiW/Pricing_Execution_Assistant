@@ -1073,6 +1073,7 @@ _BOM_OUTPUT_COLS_ORDER: tuple[str, ...] = (
     "Ing-Rsrc Desc",
     "Qty", "UM.1", "Qty.1", "UM.2",
     "Unit Cost", "Ext Cost",
+    "Scrap Factor",
     "Unit Cost.1", "Ext Cost.1",
     "Tag",
 )

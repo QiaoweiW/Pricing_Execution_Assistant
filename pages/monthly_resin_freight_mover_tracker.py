@@ -3843,6 +3843,142 @@ def _render_milk_autoupdate_status() -> None:
             st.rerun()
 
 
+# ── Milk Commodity Cost summary table (latest vs prior month) ────────────────
+#
+# Rendered directly below the milk chart: a compact comparison of the five
+# FMMO advanced-price components for the two most-recent months present in
+# the milk (HTST) JSON, plus the month-over-month change.  The five display
+# metrics are derived from the three latest tracker rows — HTST Class I,
+# ESL Class I, and Class II — because Class I skim differs by Category
+# (HTST vs ESL) while Class I butterfat and both Class II rates are single
+# FMMO prices shared across families.
+#
+# Each metric: (display label, preferred Category, Class token, rate column).
+# Category is a *preference*: the lookup falls back to any other family
+# carrying the same (Class, rate) so a missing Category never blanks a row.
+_MILK_SUMMARY_METRICS: tuple[tuple[str, str, str, str], ...] = (
+    ("Class I Skim HTST",  "HTST", "I",  _milk_store.COL_SKIM),
+    ("Class I Skim ESL",   "ESL",  "I",  _milk_store.COL_SKIM),
+    ("Class I Butterfat",  "HTST", "I",  _milk_store.COL_BUTTERFAT),
+    ("Class II Skim",      "ESL",  "II", _milk_store.COL_SKIM),
+    ("Class II Butterfat", "ESL",  "II", _milk_store.COL_BUTTERFAT),
+)
+
+# Column order for the summary table; index 0 is the row-label column.
+_MILK_SUMMARY_COLS: tuple[str, str, str, str] = (
+    "Metric", "$/lbs Current Month", "$/lbs Last Month", "Change",
+)
+
+
+def _build_milk_commodity_summary(
+    milk_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    """Build the latest-vs-prior-month milk commodity summary table.
+
+    Returns ``(summary_df, current_month, last_month)`` where ``summary_df``
+    has the columns in :data:`_MILK_SUMMARY_COLS` with **numeric** rate
+    values (``None`` where a rate is unavailable) — currency formatting is
+    left to the page layer.  ``current_month`` / ``last_month`` are the two
+    most-recent month timestamps in the milk (HTST) JSON; ``last_month`` is
+    ``None`` when only a single month is present.  An empty / malformed
+    frame yields a header-only table and two ``None`` months so the caller
+    can simply skip rendering.
+
+    Pure function on a copy — never mutates ``milk_df``.
+    """
+    empty = pd.DataFrame(columns=_MILK_SUMMARY_COLS)
+    df = _strip_df_columns(milk_df).copy()
+    if df.empty or not {"Month", "Category", "Class"}.issubset(df.columns):
+        return empty, None, None
+
+    df["Month"] = pd.to_datetime(df["Month"], errors="coerce")
+    df = df.dropna(subset=["Month"])
+    if df.empty:
+        return empty, None, None
+
+    # Class II skim/butterfat are uniform across families; reuse the chart's
+    # ESL-II mirror so a Culture-only month still resolves Class II rates.
+    df = _mirror_culture_ii_skim_bfat_from_esl_ii(df)
+
+    df["_cat"] = df["Category"].astype(str).str.strip().str.upper()
+    df["_cls"] = df["Class"].map(_normalise_milk_usage_class)
+
+    months = sorted(pd.to_datetime(df["Month"].unique()))
+    current_month = months[-1] if months else None
+    last_month = months[-2] if len(months) >= 2 else None
+
+    # Resolve rate columns tolerantly (header drift like "Skim Rate ").
+    # "Skim" excludes "Nonfat Solids" so it can't be greedily absorbed.
+    skim_col = next(
+        (c for c in df.columns if "skim" in c.lower() and "nonfat" not in c.lower()),
+        None,
+    )
+    bf_col = next((c for c in df.columns if "butter" in c.lower()), None)
+    col_for = {_milk_store.COL_SKIM: skim_col, _milk_store.COL_BUTTERFAT: bf_col}
+
+    def _rate(month, pref_cat, cls, rate_key) -> Optional[float]:
+        col = col_for.get(rate_key)
+        if month is None or col is None:
+            return None
+        rows = df[(df["Month"] == month) & (df["_cls"] == cls)]
+        if rows.empty:
+            return None
+        pref = rows[rows["_cat"] == pref_cat.upper()]
+        pick = pref if not pref.empty else rows
+        val = pd.to_numeric(pick.iloc[0][col], errors="coerce")
+        return None if pd.isna(val) else float(val)
+
+    label_col, cur_col, last_col, chg_col = _MILK_SUMMARY_COLS
+    rows_out: list[dict] = []
+    for label, pref_cat, cls, rate_key in _MILK_SUMMARY_METRICS:
+        cur = _rate(current_month, pref_cat, cls, rate_key)
+        last = _rate(last_month, pref_cat, cls, rate_key)
+        change = None if cur is None or last is None else cur - last
+        rows_out.append(
+            {label_col: label, cur_col: cur, last_col: last, chg_col: change}
+        )
+
+    return pd.DataFrame(rows_out, columns=_MILK_SUMMARY_COLS), current_month, last_month
+
+
+def _render_milk_commodity_summary_table(milk_df: pd.DataFrame) -> None:
+    """Render the latest-vs-prior-month milk commodity summary below the chart.
+
+    Formats rates as ``$ x.xxxx`` and renders the month-over-month change
+    finance-style — a decrease is parenthesised — matching the operator's
+    reference snapshot.  Silently no-ops when the milk JSON yields no rows.
+    """
+    summary, current_month, last_month = _build_milk_commodity_summary(milk_df)
+    if summary.empty:
+        return
+
+    def _money(v: object) -> str:
+        return "" if v is None or pd.isna(v) else f"$ {float(v):,.4f}"
+
+    def _change(v: object) -> str:
+        if v is None or pd.isna(v):
+            return ""
+        v = float(v)
+        return f"({abs(v):,.4f})" if v < 0 else f"{v:,.4f}"
+
+    label_col, cur_col, last_col, chg_col = _MILK_SUMMARY_COLS
+    display = summary.copy()
+    display[cur_col] = display[cur_col].map(_money)
+    display[last_col] = display[last_col].map(_money)
+    display[chg_col] = display[chg_col].map(_change)
+    # Row labels become the (header-less) index, mirroring the snapshot.
+    display = display.rename(columns={label_col: ""}).set_index("")
+
+    months = [
+        f"Current Month = {m:%b %Y}" if i == 0 else f"Last Month = {m:%b %Y}"
+        for i, m in enumerate((current_month, last_month))
+        if m is not None
+    ]
+    if months:
+        st.caption("  ·  ".join(months) + "  ·  source: FMMO milk (HTST) JSON")
+    st.table(display)
+
+
 def _render_milk_commodity(
     uploads: dict[str, _Uploaded],
     current_month: pd.Timestamp,
@@ -3931,6 +4067,11 @@ def _render_milk_commodity(
                 "CSV matches what you see on screen."
             ),
         )
+
+    # Latest-vs-prior-month FMMO component summary, sourced from the full
+    # milk (HTST) JSON (independent of the chart's slicer / Category / Class
+    # filters) so it always reflects the two most-recent months on record.
+    _render_milk_commodity_summary_table(milk.df)
 
 
 # Session-state keys for the Packaging Index time slicer + index filter.

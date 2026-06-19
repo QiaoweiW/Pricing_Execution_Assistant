@@ -269,6 +269,47 @@ def test_summary_totals_use_volume_weighting():
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
                     reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_summary_retail_side_metrics():
+    """Delivered Price / Retail Price / Retailer's Margin% per item, plus a
+    volume-weighted Total Delivered Price.
+
+    FOBs are override-driven (Item A = 2.30, Item B = 0.95). We add a
+    Retail Price and Freight Cost to each so Delivered = FOB + Freight and
+    Margin = (Retail − Delivered) / Retail. Both items carry equal volume
+    (200 lbs), so the weighted Total Delivered collapses to the mean.
+    """
+    sources = _live_sources()
+    items = _scenario_with_two_items()
+    # Item A: Delivered = 2.30 + 0.20 = 2.50; Margin = (4.00−2.50)/4.00.
+    items.loc[0, "Retail Price"] = 4.00
+    items.loc[0, "Freight Cost"] = 0.20
+    # Item B: Delivered = 0.95 + 0.05 = 1.00; Margin = (2.00−1.00)/2.00.
+    items.loc[1, "Retail Price"] = 2.00
+    items.loc[1, "Freight Cost"] = 0.05
+
+    df = summarize_scenarios({"S": items}, sources)
+
+    def _cell(item: str, metric: str):
+        return df.loc[(df["Item"] == item) & (df["Metric"] == metric), "S"].iloc[0]
+
+    assert _cell("Item A", "Delivered Price") == pytest.approx(2.50)
+    assert _cell("Item B", "Delivered Price") == pytest.approx(1.00)
+    assert _cell("Item A", "Retail Price") == pytest.approx(4.00)
+    assert _cell("Item B", "Retail Price") == pytest.approx(2.00)
+    assert _cell("Item A", "Retailer's Margin%") == pytest.approx(0.375)
+    assert _cell("Item B", "Retailer's Margin%") == pytest.approx(0.50)
+
+    # Total Delivered Price is volume-weighted (lbs); equal volumes → mean.
+    assert _cell(SUMMARY_TOTAL_LABEL, "Delivered Price") == pytest.approx(1.75)
+
+    # Retail Price / Retailer's Margin% are per-item only — no Total row.
+    totals = df[df["Item"] == SUMMARY_TOTAL_LABEL]["Metric"].tolist()
+    assert "Retail Price" not in totals
+    assert "Retailer's Margin%" not in totals
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
 def test_summary_filters_by_item_and_category():
     """Empty filter → include all; non-empty → restrict and re-aggregate Totals."""
     sources = _live_sources()

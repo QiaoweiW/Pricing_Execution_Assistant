@@ -975,17 +975,23 @@ def recompute_items(items_df: pd.DataFrame, sources: RfpPnlSources) -> pd.DataFr
 #: ``FOB Revenue`` makes it explicit that the figure is FOB-based and
 #: doesn't include freight / retailer markup. ``Volume (pounds)``
 #: spells out the unit so it's not confused with units / cases.
+#: ``Delivered Price`` / ``Retail Price`` are per-EA prices and
+#: ``Retailer's Margin%`` is the retail-side margin ratio — all shown
+#: per item so an analyst sees the retail story alongside the FOB story.
 SUMMARY_PER_ITEM_METRICS: tuple[str, ...] = (
     "Volume (pounds)", "FOB Price", "FOB Revenue", "PCM%", "GP%",
+    "Delivered Price", "Retail Price", "Retailer's Margin%",
 )
 
 #: Total roll-up rows. Volume (pounds) / FOB Revenue / GP are SUMS
 #: across items in *dollars* (Total GP = Σ GP $/EA × units, NOT a sum
-#: of per-EA values). PCM% and GP% are volume-weighted (lbs) so they
-#: reflect the realized portfolio profitability, not a misleading
-#: equal-weighted average.
+#: of per-EA values). PCM% / GP% / ``Delivered Price`` are volume-weighted
+#: (lbs) so they reflect the realized portfolio rate / price, not a
+#: misleading equal-weighted average. (Retail Price / Retailer's Margin%
+#: are intentionally per-item only — no portfolio roll-up was requested.)
 SUMMARY_TOTAL_METRICS: tuple[str, ...] = (
     "Volume (pounds)", "FOB Revenue", "GP", "PCM%", "GP%",
+    "Delivered Price",
 )
 
 SUMMARY_TOTAL_LABEL = "Total"
@@ -1004,6 +1010,9 @@ def _summary_per_item_values(item_row: pd.Series) -> dict[str, Optional[float]]:
     fob = _to_float(item_row.get("FOB Price"))
     pcm_pct = _to_float(item_row.get("PCM%"))
     gp_pct = _to_float(item_row.get("GP%"))
+    delivered = _to_float(item_row.get("Delivered Price"))
+    retail = _to_float(item_row.get("Retail Price"))
+    retailer_margin = _to_float(item_row.get("Retailer's Margin%"))
 
     volume_lbs = None if units is None or lbs_each is None else units * lbs_each
     revenue = None if fob is None or units is None else fob * units
@@ -1016,6 +1025,9 @@ def _summary_per_item_values(item_row: pd.Series) -> dict[str, Optional[float]]:
         "FOB Revenue": revenue,
         "PCM%": pcm_pct,
         "GP%": gp_pct,
+        "Delivered Price": delivered,
+        "Retail Price": retail,
+        "Retailer's Margin%": retailer_margin,
         "_units": units,
     }
 
@@ -1050,6 +1062,7 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
     units = [r.get("_units") for r in per_item_records]
     pcm_pcts = [r.get("PCM%") for r in per_item_records]
     gp_pcts = [r.get("GP%") for r in per_item_records]
+    delivered_prices = [r.get("Delivered Price") for r in per_item_records]
 
     def _sum(xs: list) -> Optional[float]:
         clean = [x for x in xs if x is not None]
@@ -1069,6 +1082,10 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
         "GP": total_gp_dollars,
         "PCM%": _weighted_average(pcm_pcts, weights),
         "GP%": _weighted_average(gp_pcts, weights),
+        # Portfolio Delivered Price = volume-weighted (lbs) average of the
+        # per-EA delivered prices, mirroring the PCM% / GP% weighting so
+        # the Total reflects the realized price mix, not a flat average.
+        "Delivered Price": _weighted_average(delivered_prices, weights),
     }
 
 
@@ -1331,8 +1348,20 @@ def summarize_scenarios(
             row[scenario_name] = totals.get(metric)
         rows.append(row)
 
-    return pd.DataFrame(
+    result = pd.DataFrame(
         rows,
         columns=["Item", "Category", "Metric", *scenarios.keys()],
     )
+    # pandas coerces Python ``None`` to float ``NaN`` whenever a scenario
+    # column also holds floats — that NaN would surface as ``$nan`` /
+    # ``nan%`` in the table for any genuinely blank metric (e.g. an item
+    # with no Retail Price). Restore ``None`` for every missing cell so the
+    # page formatters render a clean blank, mirroring the ``_to_float`` NaN
+    # guard the per-cell calc already applies.
+    scenario_cols = list(scenarios.keys())
+    if scenario_cols:
+        result[scenario_cols] = result[scenario_cols].astype(object).where(
+            result[scenario_cols].notna(), None
+        )
+    return result
 

@@ -2108,6 +2108,11 @@ _SUMMARY_METRIC_FORMATTERS: dict[str, callable] = {
     ),
     "PCM%": _fmt_pct,
     "GP%": _fmt_pct,
+    # Retail-side metrics: prices share FOB's 4-decimal $ format; the
+    # margin is a ratio rendered as a percentage like PCM% / GP%.
+    "Delivered Price": _fmt_money,
+    "Retail Price": _fmt_money,
+    "Retailer's Margin%": _fmt_pct,
 }
 
 
@@ -2124,7 +2129,8 @@ def _render_rfp_pnl_summary(
 
     Lets the analyst pick any subset of saved scenarios, optionally
     filter by Item / Category, and view a side-by-side comparison with
-    a Total roll-up at the bottom (volume-weighted PCM% / GP%).
+    a Total roll-up at the bottom (volume-weighted PCM% / GP% /
+    Delivered Price).
     """
     st.markdown("### 📊 Multi-Scenario Summary")
     st.caption(

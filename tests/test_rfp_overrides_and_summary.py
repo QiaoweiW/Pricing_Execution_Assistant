@@ -270,13 +270,15 @@ def test_summary_totals_use_volume_weighting():
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
                     reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
 def test_summary_retail_side_metrics():
-    """Delivered Price / Retail Price / Retailer's Margin% per item, plus a
-    volume-weighted Total Delivered Price.
+    """Delivered Price / Retail Price / Retailer's Margin% per item, plus
+    unit-weighted Total FOB Price / Delivered Price.
 
     FOBs are override-driven (Item A = 2.30, Item B = 0.95). We add a
     Retail Price and Freight Cost to each so Delivered = FOB + Freight and
-    Margin = (Retail − Delivered) / Retail. Both items carry equal volume
-    (200 lbs), so the weighted Total Delivered collapses to the mean.
+    Margin = (Retail − Delivered) / Retail. No Trade% here, so the after-
+    trade prices equal the pre-trade prices and the metric labels stay
+    plain. Units differ (A=100, B=200), so the unit-weighted Totals are NOT
+    a flat mean.
     """
     sources = _live_sources()
     items = _scenario_with_two_items()
@@ -299,13 +301,89 @@ def test_summary_retail_side_metrics():
     assert _cell("Item A", "Retailer's Margin%") == pytest.approx(0.375)
     assert _cell("Item B", "Retailer's Margin%") == pytest.approx(0.50)
 
-    # Total Delivered Price is volume-weighted (lbs); equal volumes → mean.
-    assert _cell(SUMMARY_TOTAL_LABEL, "Delivered Price") == pytest.approx(1.75)
+    # Totals are unit-weighted: Σ(price × units) / Σ units, units A=100 B=200.
+    # FOB:       (2.30·100 + 0.95·200) / 300 = 1.40
+    # Delivered: (2.50·100 + 1.00·200) / 300 = 1.50
+    assert _cell(SUMMARY_TOTAL_LABEL, "FOB Price") == pytest.approx(1.40)
+    assert _cell(SUMMARY_TOTAL_LABEL, "Delivered Price") == pytest.approx(1.50)
 
     # Retail Price / Retailer's Margin% are per-item only — no Total row.
     totals = df[df["Item"] == SUMMARY_TOTAL_LABEL]["Metric"].tolist()
     assert "Retail Price" not in totals
     assert "Retailer's Margin%" not in totals
+
+
+# ─── Trade% (scenario-wide gross-up) ─────────────────────────────────────────
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_trade_carries_across_items_and_grosses_prices():
+    """One filled Trade% carries to all items and grosses FOB / Delivered up;
+    Retailer's Margin% is measured against the after-trade delivered price.
+    """
+    sources = _live_sources()
+    items = _scenario_with_two_items()
+    items.loc[0, "Retail Price"] = 4.00
+    items.loc[0, "Freight Cost"] = 0.20
+    items.loc[0, "Trade%"] = 0.20      # only Item A filled
+    # Item B Trade% intentionally left blank → must be carried over.
+
+    out = recompute_items(items, sources)
+
+    # Carry-over: every item shares the single Trade%.
+    assert [float(v) for v in out["Trade%"]] == pytest.approx([0.20, 0.20])
+
+    a = out.iloc[0]
+    # FOB 2.30 → after-trade 2.30 / (1 − 0.20) = 2.875.
+    assert float(a["FOB Price"]) == pytest.approx(2.30)
+    assert float(a["FOB Price After Trade"]) == pytest.approx(2.875)
+    # Delivered 2.30 + 0.20 = 2.50 → after-trade 2.50 / 0.80 = 3.125.
+    assert float(a["Delivered Price After Trade"]) == pytest.approx(3.125)
+    # Margin uses the after-trade delivered: (4.00 − 3.125) / 4.00.
+    assert float(a["Retailer's Margin%"]) == pytest.approx(0.21875)
+
+    # Item B (FOB 0.95) also grossed up even though its Trade% was blank.
+    b = out.iloc[1]
+    assert float(b["FOB Price After Trade"]) == pytest.approx(0.95 / 0.80)
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_invalid_trade_leaves_after_trade_equal_to_pretrade():
+    """A Trade% ≥ 1 (or otherwise invalid) is ignored — no gross-up."""
+    sources = _live_sources()
+    items = _scenario_with_two_items()
+    items.loc[0, "Trade%"] = 1.5  # out of range
+
+    out = recompute_items(items, sources)
+    a = out.iloc[0]
+    assert float(a["FOB Price After Trade"]) == pytest.approx(float(a["FOB Price"]))
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_summary_relabels_and_uses_after_trade_when_trade_present():
+    """With a Trade%, the summary swaps FOB / Delivered to after-trade values
+    and labels the rows (After Trade)."""
+    sources = _live_sources()
+    items = _scenario_with_two_items()
+    items.loc[0, "Trade%"] = 0.20
+
+    df = summarize_scenarios({"S": items}, sources)
+    metrics = set(df["Metric"])
+    assert "FOB Price (After Trade)" in metrics
+    assert "Delivered Price (After Trade)" in metrics
+    assert "FOB Price" not in metrics
+    assert "Delivered Price" not in metrics
+
+    def _cell(item: str, metric: str):
+        return df.loc[(df["Item"] == item) & (df["Metric"] == metric), "S"].iloc[0]
+
+    # Item A FOB 2.30 → after-trade 2.875.
+    assert _cell("Item A", "FOB Price (After Trade)") == pytest.approx(2.875)
+    # Total is unit-weighted (A=100, B=200): A after = 2.875, B after = 0.95/0.8
+    # = 1.1875 → (2.875·100 + 1.1875·200) / 300 = 1.75.
+    assert _cell(SUMMARY_TOTAL_LABEL, "FOB Price (After Trade)") == pytest.approx(1.75)
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),

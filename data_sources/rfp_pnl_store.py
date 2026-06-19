@@ -53,6 +53,11 @@ METRIC_COLS: tuple[str, ...] = (
     "Target SKU lbs per Each",
     "Target SKU Volume (units)",
     "Target SKU Volume (pounds)",
+    # Trade spend, entered as a fraction below 1 (e.g. 0.15 = 15%). A single
+    # value applies to the whole scenario — ``recompute_items`` carries the
+    # first non-blank Trade% to every item. It grosses the quoted prices up
+    # via ``price / (1 - Trade%)``. See ``_apply_trade`` / ``_calc_for_item``.
+    "Trade%",
     "Milk Reference SKU",
     "Ingredient Reference SKU",
     "Packaging Reference SKU",
@@ -64,6 +69,9 @@ METRIC_COLS: tuple[str, ...] = (
     "Category",
     "PCM $/lbs",
     "FOB Price",
+    # FOB Price grossed up for trade spend: FOB Price / (1 - Trade%).
+    # Equals FOB Price when no Trade% is set. Strictly recomputed.
+    "FOB Price After Trade",
     # Cost rows: each component has an ``<Component> Override`` companion
     # column for the analyst's manual override (blank = use BOM/Budget
     # default; type a number to override). The displayed component cell
@@ -100,6 +108,10 @@ METRIC_COLS: tuple[str, ...] = (
     "Retail Price",
     "Freight Cost",
     "Delivered Price",
+    # Delivered Price grossed up for trade spend: Delivered Price /
+    # (1 - Trade%). Equals Delivered Price when no Trade% is set. The
+    # Retailer's Margin% is computed against THIS after-trade price.
+    "Delivered Price After Trade",
     "Retailer's Margin%",
 )
 
@@ -133,6 +145,7 @@ STRICT_CALC_METRICS = {
     "Cost of Quality",
     "Internal Logistics (Shuttling & WHSE)",
     "FOB Price",
+    "FOB Price After Trade",
     "Total Costs",
     "PCM",
     "PCM%",
@@ -140,6 +153,7 @@ STRICT_CALC_METRICS = {
     "GP $/lbs",
     "GP%",
     "Delivered Price",
+    "Delivered Price After Trade",
     "Retailer's Margin%",
 }
 
@@ -260,6 +274,32 @@ def _apply_override(default: Optional[float], override_raw: object) -> Optional[
     if override is not None:
         return override
     return default
+
+
+def _is_valid_trade(trade: Optional[float]) -> bool:
+    """A usable Trade% is a fraction in ``[0, 1)`` — strictly below 1.
+
+    Values outside this range (negative, or ``>= 1`` which would make the
+    ``1 - Trade%`` gross-up zero/negative) are treated as "no trade" by
+    :func:`_apply_trade`; the page surfaces a warning so the analyst can
+    fix the entry rather than silently get an un-grossed price.
+    """
+    return trade is not None and 0.0 <= trade < 1.0
+
+
+def _apply_trade(price: Optional[float], trade: Optional[float]) -> Optional[float]:
+    """Gross ``price`` up for trade spend: ``price / (1 - Trade%)``.
+
+    Returns ``price`` unchanged when there is no usable trade (blank /
+    invalid Trade%, see :func:`_is_valid_trade`) or when ``Trade% == 0``,
+    so the "after trade" figure always equals the input price absent a
+    valid, non-zero trade. ``None`` price propagates as ``None``.
+    """
+    if price is None:
+        return None
+    if not _is_valid_trade(trade) or trade == 0.0:
+        return price
+    return price / (1.0 - trade)
 
 
 def _to_float(value: object) -> Optional[float]:
@@ -869,16 +909,25 @@ def _calc_for_item(row: pd.Series, sources: RfpPnlSources) -> dict[str, Optional
 
     # Retail-side metrics. Freight defaults to $0/EA when blank (per
     # spec); Delivered Price is therefore well-defined whenever FOB is.
-    # Retailer's Margin% requires a non-zero Retail Price; otherwise the
-    # division would be undefined and we surface a blank cell.
     retail = _to_float(row.get("Retail Price"))
     freight = _to_float(row.get("Freight Cost"))
     freight_for_calc = 0.0 if freight is None else freight
     delivered = None if fob is None else fob + freight_for_calc
+
+    # Trade spend grosses the quoted prices up. ``_apply_trade`` returns the
+    # input price unchanged when Trade% is blank / zero / invalid, so the
+    # "after trade" figures are always safe to surface.
+    trade = _to_float(row.get("Trade%"))
+    fob_after_trade = _apply_trade(fob, trade)
+    delivered_after_trade = _apply_trade(delivered, trade)
+
+    # Retailer's Margin% is measured against the AFTER-TRADE delivered
+    # price (the price the retailer actually pays). Requires a non-zero
+    # Retail Price; otherwise the division is undefined → blank cell.
     retailer_margin = (
         None
-        if delivered is None or retail is None or retail == 0
-        else (retail - delivered) / retail
+        if delivered_after_trade is None or retail is None or retail == 0
+        else (retail - delivered_after_trade) / retail
     )
 
     return {
@@ -894,6 +943,7 @@ def _calc_for_item(row: pd.Series, sources: RfpPnlSources) -> dict[str, Optional
         "Cost of Quality": coq,
         "Internal Logistics (Shuttling & WHSE)": internal,
         "FOB Price": fob,
+        "FOB Price After Trade": fob_after_trade,
         "Total Costs": total_costs,
         "PCM": pcm,
         "PCM%": pcm_pct,
@@ -901,6 +951,7 @@ def _calc_for_item(row: pd.Series, sources: RfpPnlSources) -> dict[str, Optional
         "GP $/lbs": gp_lbs,
         "GP%": gp_pct,
         "Delivered Price": delivered,
+        "Delivered Price After Trade": delivered_after_trade,
         "Retailer's Margin%": retailer_margin,
     }
 
@@ -942,16 +993,41 @@ def find_missing_required_inputs(
     return issues
 
 
+def _first_nonblank(series: pd.Series) -> str:
+    """Return the first non-blank value in ``series`` as a string, else ""."""
+    for value in series.tolist():
+        if not _is_blank(value):
+            return str(value).strip()
+    return ""
+
+
+def _carry_trade_across_items(out: pd.DataFrame) -> None:
+    """Propagate a single scenario-wide Trade% to every item, in place.
+
+    Trade spend is a scenario-level lever: the analyst fills it on any one
+    item and it applies to all. We take the first non-blank ``Trade%`` and
+    write it to every row so each item's calc (and any saved CSV / summary
+    recompute) sees the same value. No-op when no item has a Trade%.
+    """
+    if "Trade%" not in out.columns:
+        return
+    effective = _first_nonblank(out["Trade%"])
+    if effective:
+        out["Trade%"] = effective
+
+
 def recompute_items(items_df: pd.DataFrame, sources: RfpPnlSources) -> pd.DataFrame:
     """Recompute scenario defaults and strict formulas for all item rows.
 
     Rules:
+    * Trade% is first carried across all items (scenario-wide lever).
     * STRICT_CALC_METRICS are always overwritten.
     * DEFAULTABLE_METRICS are only filled when the current cell is blank.
     * Non-derived fields (manual inputs and override columns) are
       preserved as-entered.
     """
     out = _coerce_scenario_df(items_df)
+    _carry_trade_across_items(out)
     for idx, row in out.iterrows():
         calc = _calc_for_item(row, sources)
         for metric, value in calc.items():
@@ -985,55 +1061,76 @@ SUMMARY_PER_ITEM_METRICS: tuple[str, ...] = (
 
 #: Total roll-up rows. Volume (pounds) / FOB Revenue / GP are SUMS
 #: across items in *dollars* (Total GP = Σ GP $/EA × units, NOT a sum
-#: of per-EA values). PCM% / GP% / ``Delivered Price`` are volume-weighted
-#: (lbs) so they reflect the realized portfolio rate / price, not a
-#: misleading equal-weighted average. (Retail Price / Retailer's Margin%
-#: are intentionally per-item only — no portfolio roll-up was requested.)
+#: of per-EA values). PCM% / GP% are volume-weighted (lbs). ``FOB Price``
+#: and ``Delivered Price`` are **unit-weighted** ($/EA prices roll up by
+#: Σ(price × units) / Σ units — the realized average price per unit).
+#: (Retail Price / Retailer's Margin% are intentionally per-item only —
+#: no portfolio roll-up was requested.)
 SUMMARY_TOTAL_METRICS: tuple[str, ...] = (
-    "Volume (pounds)", "FOB Revenue", "GP", "PCM%", "GP%",
+    "Volume (pounds)", "FOB Price", "FOB Revenue", "GP", "PCM%", "GP%",
     "Delivered Price",
 )
 
 SUMMARY_TOTAL_LABEL = "Total"
 
+#: Summary price metrics whose displayed value/label switch to the
+#: after-trade figure when any included item carries a Trade%. Maps the
+#: base metric → the label shown once trade is in play.
+SUMMARY_AFTER_TRADE_LABELS: dict[str, str] = {
+    "FOB Price": "FOB Price (After Trade)",
+    "Delivered Price": "Delivered Price (After Trade)",
+}
+
 
 def _summary_per_item_values(item_row: pd.Series) -> dict[str, Optional[float]]:
-    """Derive the five per-item summary metrics from a recomputed item row.
+    """Derive the per-item summary metrics from a recomputed item row.
 
     All inputs are tolerated as raw cell values (strings or numbers) and
     coerced via ``_to_float``. Returns ``None`` for any metric whose
     inputs are missing so the summary table can render blank cells
     cleanly rather than $0 placeholders.
+
+    ``FOB Price`` / ``Delivered Price`` use the **after-trade** figures
+    (which equal the pre-trade prices when no Trade% is set), so the
+    summary always reflects the price the customer is quoted. ``_units`` /
+    ``_trade`` are private fields the Total roll-up and the after-trade
+    relabelling consume — they are never displayed directly.
     """
     units = _to_float(item_row.get("Target SKU Volume (units)"))
     lbs_each = _to_float(item_row.get("Target SKU lbs per Each"))
     fob = _to_float(item_row.get("FOB Price"))
     pcm_pct = _to_float(item_row.get("PCM%"))
     gp_pct = _to_float(item_row.get("GP%"))
-    delivered = _to_float(item_row.get("Delivered Price"))
     retail = _to_float(item_row.get("Retail Price"))
     retailer_margin = _to_float(item_row.get("Retailer's Margin%"))
+    trade = _to_float(item_row.get("Trade%"))
+
+    # Prefer the after-trade prices; fall back to the pre-trade values for
+    # legacy scenarios saved before the after-trade columns existed.
+    fob_after = _to_float(item_row.get("FOB Price After Trade"))
+    fob_shown = fob if fob_after is None else fob_after
+    delivered = _to_float(item_row.get("Delivered Price"))
+    delivered_after = _to_float(item_row.get("Delivered Price After Trade"))
+    delivered_shown = delivered if delivered_after is None else delivered_after
 
     volume_lbs = None if units is None or lbs_each is None else units * lbs_each
     revenue = None if fob is None or units is None else fob * units
-    # ``_units`` is preserved on the per-item record (not displayed) so
-    # the Total roll-up can compute Total GP = Σ (GP $/EA × units), i.e.
-    # actual GP dollars, rather than mistakenly summing per-EA values.
     return {
         "Volume (pounds)": volume_lbs,
-        "FOB Price": fob,
+        "FOB Price": fob_shown,
         "FOB Revenue": revenue,
         "PCM%": pcm_pct,
         "GP%": gp_pct,
-        "Delivered Price": delivered,
+        "Delivered Price": delivered_shown,
         "Retail Price": retail,
         "Retailer's Margin%": retailer_margin,
         "_units": units,
+        "_trade": trade,
     }
 
 
 def _weighted_average(values: list[float], weights: list[float]) -> Optional[float]:
-    """Volume-weighted average. Returns ``None`` when no weight is positive."""
+    """Weighted average. Returns ``None`` when no weight is positive."""
     paired = [
         (v, w) for v, w in zip(values, weights)
         if v is not None and w is not None and w > 0
@@ -1054,7 +1151,9 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
     the per-EA GP values directly would mix items of different sizes
     and hide the portfolio's actual profit. PCM% and GP% are weighted
     by Volume (lbs) so the portfolio rate reflects revenue/profit-mix
-    rather than item count.
+    rather than item count. ``FOB Price`` / ``Delivered Price`` are $/EA
+    prices, so they roll up **unit-weighted** — Σ(price × units) / Σ units,
+    the average price actually realized per unit.
     """
     volumes = [r.get("Volume (pounds)") for r in per_item_records]
     revenues = [r.get("FOB Revenue") for r in per_item_records]
@@ -1062,6 +1161,7 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
     units = [r.get("_units") for r in per_item_records]
     pcm_pcts = [r.get("PCM%") for r in per_item_records]
     gp_pcts = [r.get("GP%") for r in per_item_records]
+    fob_prices = [r.get("FOB Price") for r in per_item_records]
     delivered_prices = [r.get("Delivered Price") for r in per_item_records]
 
     def _sum(xs: list) -> Optional[float]:
@@ -1075,17 +1175,17 @@ def _summary_total_values(per_item_records: list[dict]) -> dict[str, Optional[fl
     ]
     total_gp_dollars = sum(gp_dollars) if gp_dollars else None
 
-    weights = [v if v is not None else 0.0 for v in volumes]
+    # Percentages weight by Volume (lbs); $/EA prices weight by units.
+    lb_weights = [v if v is not None else 0.0 for v in volumes]
+    unit_weights = [u if u is not None else 0.0 for u in units]
     return {
         "Volume (pounds)": _sum(volumes),
         "FOB Revenue": _sum(revenues),
         "GP": total_gp_dollars,
-        "PCM%": _weighted_average(pcm_pcts, weights),
-        "GP%": _weighted_average(gp_pcts, weights),
-        # Portfolio Delivered Price = volume-weighted (lbs) average of the
-        # per-EA delivered prices, mirroring the PCM% / GP% weighting so
-        # the Total reflects the realized price mix, not a flat average.
-        "Delivered Price": _weighted_average(delivered_prices, weights),
+        "PCM%": _weighted_average(pcm_pcts, lb_weights),
+        "GP%": _weighted_average(gp_pcts, lb_weights),
+        "FOB Price": _weighted_average(fob_prices, unit_weights),
+        "Delivered Price": _weighted_average(delivered_prices, unit_weights),
     }
 
 
@@ -1319,12 +1419,29 @@ def summarize_scenarios(
                 canonical_keys.append(key)
         per_scenario[name] = records
 
+    # When any included item carries a (valid, non-zero) Trade%, the FOB /
+    # Delivered price metrics already hold after-trade values, so we relabel
+    # them to make that explicit in the Metric column. Pre-trade scenarios
+    # keep the plain labels.
+    trade_exists = any(
+        _is_valid_trade(r.get("_trade")) and (r.get("_trade") or 0.0) > 0.0
+        for records in per_scenario.values()
+        for r in records
+    )
+
+    def _label(metric: str) -> str:
+        return (
+            SUMMARY_AFTER_TRADE_LABELS[metric]
+            if trade_exists and metric in SUMMARY_AFTER_TRADE_LABELS
+            else metric
+        )
+
     # ── Step 2. Per-item rows: one row per (Item, Category, metric).
     rows: list[dict] = []
     for item_name, category in canonical_keys:
         for metric in SUMMARY_PER_ITEM_METRICS:
             row: dict[str, object] = {
-                "Item": item_name, "Category": category, "Metric": metric,
+                "Item": item_name, "Category": category, "Metric": _label(metric),
             }
             for scenario_name in scenarios:
                 match = next(
@@ -1341,7 +1458,7 @@ def summarize_scenarios(
     #            the (already filtered) per-scenario records.
     for metric in SUMMARY_TOTAL_METRICS:
         row = {
-            "Item": SUMMARY_TOTAL_LABEL, "Category": "", "Metric": metric,
+            "Item": SUMMARY_TOTAL_LABEL, "Category": "", "Metric": _label(metric),
         }
         for scenario_name in scenarios:
             totals = _summary_total_values(per_scenario[scenario_name])

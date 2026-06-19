@@ -1128,6 +1128,7 @@ _RFP_SECTION_ROWS: list[tuple[str, bool]] = [
     ("Target SKU lbs per Each", False),
     ("Target SKU Volume (units)", False),
     ("Target SKU Volume (pounds)", False),
+    ("Trade%", False),
     ("Reference SKUs", True),
     ("Milk Reference SKU", False),
     ("Ingredient Reference SKU", False),
@@ -1143,6 +1144,7 @@ _RFP_SECTION_ROWS: list[tuple[str, bool]] = [
     ("PCM $/lbs", False),
     ("Target SKU P&L ($/EA)", True),
     ("FOB Price", False),
+    ("FOB Price After Trade", False),
     ("Milk", False),
     ("Ingredient", False),
     ("Packaging", False),
@@ -1160,6 +1162,7 @@ _RFP_SECTION_ROWS: list[tuple[str, bool]] = [
     # Delivered Price = FOB + Freight; Retailer's Margin% closes the
     # loop on retail economics.
     ("Delivered Price", False),
+    ("Delivered Price After Trade", False),
     ("Retail Price", False),
     ("Retailer's Margin%", False),
 ]
@@ -1188,6 +1191,9 @@ _RFP_INPUT_TEXT_FIELDS: tuple[str, ...] = ("Target SKU Name", "Category")
 _RFP_INPUT_NUMERIC_FIELDS: tuple[str, ...] = (
     "Target SKU lbs per Each",
     "Target SKU Volume (units)",
+    # Scenario-wide trade spend (fraction below 1). Carried to every item
+    # on Refresh; grosses FOB / Delivered prices up via / (1 - Trade%).
+    "Trade%",
     "Milk Reference SKU lbs per Each",
     "Ingredient Reference SKU lbs per Each",
     "Packaging Reference SKU lbs per Each",
@@ -1263,7 +1269,9 @@ _RFP_METRIC_FORMATTERS: dict[str, callable] = {
     "Packaging Reference SKU lbs per Each": _fmt_number,
     "Conversion Reference SKU lbs per Each": _fmt_number,
     "PCM $/lbs": _fmt_money,
+    "Trade%": _fmt_pct,
     "FOB Price": _fmt_money,
+    "FOB Price After Trade": _fmt_money,
     "Milk": _fmt_money,
     "Ingredient": _fmt_money,
     "Packaging": _fmt_money,
@@ -1279,6 +1287,7 @@ _RFP_METRIC_FORMATTERS: dict[str, callable] = {
     "GP%": _fmt_pct,
     "Retail Price": _fmt_money,
     "Delivered Price": _fmt_money,
+    "Delivered Price After Trade": _fmt_money,
     "Retailer's Margin%": _fmt_pct,
 }
 
@@ -1303,6 +1312,20 @@ def _rfp_clear_input_state() -> None:
     for key in list(st.session_state.keys()):
         if key.startswith(_RFP_INPUT_PREFIX):
             del st.session_state[key]
+
+
+def _rfp_effective_trade_in_state(item_count: int) -> str:
+    """First non-blank ``Trade%`` widget value across all items (else "").
+
+    Trade% is a scenario-wide lever; this lets the input panel mirror the
+    one value the analyst typed onto every item. Mirrors the store-side
+    carry-over in ``recompute_items._carry_trade_across_items``.
+    """
+    for i in range(item_count):
+        val = _rfp_stringify(st.session_state.get(_rfp_input_key(i, "Trade%")))
+        if val:
+            return val
+    return ""
 
 
 def _rfp_stringify(value: object) -> str:
@@ -1372,7 +1395,9 @@ def _rfp_collect_inputs_from_state(item_count: int) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=[_rfp_pnl_store.ITEM_COL, *_rfp_pnl_store.METRIC_COLS])
 
 
-def _rfp_render_item_inputs(idx: int, sources: _rfp_pnl_store.RfpPnlSources) -> None:
+def _rfp_render_item_inputs(
+    idx: int, sources: _rfp_pnl_store.RfpPnlSources, item_count: int
+) -> None:
     """Render the foldable input panel for one Target SKU item.
 
     The panel exposes every manually-editable metric from the snapshot.
@@ -1435,6 +1460,24 @@ def _rfp_render_item_inputs(idx: int, sources: _rfp_pnl_store.RfpPnlSources) -> 
                 key=_rfp_input_key(idx, "Target SKU Volume (units)"),
                 help="Numbers only. Volume (pounds) is calculated.",
             )
+
+        # Trade% — a scenario-wide lever. Mirror the first non-blank value
+        # onto this (blank) item before the widget renders so the entry
+        # visibly carries to every item. The committed value is re-applied
+        # uniformly by ``recompute_items`` on Refresh.
+        trade_key = _rfp_input_key(idx, "Trade%")
+        if not _rfp_stringify(st.session_state.get(trade_key)):
+            shared_trade = _rfp_effective_trade_in_state(item_count)
+            if shared_trade:
+                st.session_state[trade_key] = shared_trade
+        st.text_input(
+            "Trade% (fraction below 1, e.g. 0.15 = 15%)",
+            key=trade_key,
+            help="Applies to the whole scenario — fill it on any one item "
+                 "and it carries to all on Refresh. Grosses FOB / Delivered "
+                 "prices up via price / (1 − Trade%).",
+        )
+
         n3, n4 = st.columns(2)
         with n3:
             st.text_input(
@@ -1746,6 +1789,20 @@ override. Type a number into the override field to replace the
 BOM/Budget default; leave it blank to use the calculated value. Override
 values are persisted alongside the scenario and rehydrated on load.
 
+**Trade%:** a scenario-wide trade-spend lever entered as a fraction
+**below 1** (e.g. `0.15` for 15%). Fill it on **any one item** and it is
+carried to **every item** automatically on Refresh — there is a single
+Trade% per scenario. It grosses the quoted prices up:
+
+- **FOB Price After Trade** = FOB Price ÷ (1 − Trade%)
+- **Delivered Price After Trade** = Delivered Price ÷ (1 − Trade%)
+
+The **Retailer's Margin%** is measured against the **Delivered Price After
+Trade**. When a scenario carries a Trade%, the Multi-Scenario Summary shows
+the after-trade FOB / Delivered figures and labels them *(After Trade)*. A
+blank, zero, or out-of-range (≥ 1) Trade% leaves the after-trade prices
+equal to the pre-trade values.
+
 Saved scenarios live under
 `Files/Program_Bid_Management/New_Bids/<scenario>.csv`.
             """.strip()
@@ -1859,7 +1916,19 @@ Saved scenarios live under
                 st.rerun()
 
     for idx in range(item_count):
-        _rfp_render_item_inputs(idx, sources)
+        _rfp_render_item_inputs(idx, sources, item_count)
+
+    # Validate the scenario-wide Trade% (must be a fraction below 1). The
+    # calc engine ignores an out-of-range value, so warn rather than fail.
+    effective_trade = _rfp_pnl_store._to_float(  # noqa: SLF001 — shared parser
+        _rfp_effective_trade_in_state(item_count)
+    )
+    if effective_trade is not None and not (0.0 <= effective_trade < 1.0):
+        st.warning(
+            "⚠️ **Trade%** must be a fraction below 1 (e.g. `0.15` for 15%). "
+            f"`{effective_trade:g}` is out of range and will be ignored — "
+            "FOB / Delivered After-Trade prices will equal the pre-trade values."
+        )
 
     # ── Refresh: commit inputs → recompute scenario ───────────────────────────
     refresh_col, hint_col = st.columns([1, 4])
@@ -2113,6 +2182,11 @@ _SUMMARY_METRIC_FORMATTERS: dict[str, callable] = {
     "Delivered Price": _fmt_money,
     "Retail Price": _fmt_money,
     "Retailer's Margin%": _fmt_pct,
+    # After-trade label variants surfaced when a scenario carries Trade%
+    # (see SUMMARY_AFTER_TRADE_LABELS) — same $ formatting as the base
+    # price metrics.
+    "FOB Price (After Trade)": _fmt_money,
+    "Delivered Price (After Trade)": _fmt_money,
 }
 
 
@@ -2129,8 +2203,10 @@ def _render_rfp_pnl_summary(
 
     Lets the analyst pick any subset of saved scenarios, optionally
     filter by Item / Category, and view a side-by-side comparison with
-    a Total roll-up at the bottom (volume-weighted PCM% / GP% /
-    Delivered Price).
+    a Total roll-up at the bottom: PCM% / GP% are volume-weighted (lbs);
+    FOB Price / Delivered Price are unit-weighted. When a scenario carries
+    a Trade%, the FOB / Delivered figures are after-trade and labelled
+    accordingly.
     """
     st.markdown("### 📊 Multi-Scenario Summary")
     st.caption(

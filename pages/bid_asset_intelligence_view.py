@@ -1644,8 +1644,19 @@ def _rfp_render_item_inputs(
 
 
 def _rfp_build_display_table(items_df: pd.DataFrame) -> pd.DataFrame:
-    """Render-friendly matrix: metric rows × item columns, formatted for display."""
-    out = pd.DataFrame({"Metric": [label for label, _ in _RFP_SECTION_ROWS]})
+    """Render-friendly matrix: metric rows × item columns, formatted for display.
+
+    The on-screen ``Metric`` label decouples from the underlying data-column
+    name so the pre-trade FOB / Delivered rows can read "(before trade%)"
+    (shared with the summary via ``SUMMARY_BEFORE_TRADE_LABELS``) while the
+    value/formatter lookups still key off the original column name.
+    """
+    out = pd.DataFrame({
+        "Metric": [
+            _rfp_pnl_store.SUMMARY_BEFORE_TRADE_LABELS.get(label, label)
+            for label, _ in _RFP_SECTION_ROWS
+        ]
+    })
 
     item_labels: list[str] = []
     used: set[str] = set()
@@ -2182,16 +2193,25 @@ _SUMMARY_METRIC_FORMATTERS: dict[str, callable] = {
     "Delivered Price": _fmt_money,
     "Retail Price": _fmt_money,
     "Retailer's Margin%": _fmt_pct,
-    # After-trade label variants surfaced when a scenario carries Trade%
-    # (see SUMMARY_AFTER_TRADE_LABELS) — same $ formatting as the base
-    # price metrics.
-    "FOB Price (After Trade)": _fmt_money,
-    "Delivered Price (After Trade)": _fmt_money,
+}
+
+# The summary relabels FOB / Delivered / FOB Revenue with a
+# "(before trade%)" or "(After Trade)" suffix (see the store's
+# SUMMARY_*_TRADE_LABELS). This reverse map folds every such label back to
+# its base metric so the formatter table above only needs the base keys.
+_SUMMARY_LABEL_TO_BASE: dict[str, str] = {
+    label: base
+    for mapping in (
+        _rfp_pnl_store.SUMMARY_BEFORE_TRADE_LABELS,
+        _rfp_pnl_store.SUMMARY_AFTER_TRADE_LABELS,
+    )
+    for base, label in mapping.items()
 }
 
 
 def _format_summary_cell(metric: str, value: object) -> str:
-    formatter = _SUMMARY_METRIC_FORMATTERS.get(metric, _fmt_passthrough)
+    base = _SUMMARY_LABEL_TO_BASE.get(metric, metric)
+    formatter = _SUMMARY_METRIC_FORMATTERS.get(base, _fmt_passthrough)
     return formatter(value)
 
 

@@ -1073,9 +1073,19 @@ SUMMARY_TOTAL_METRICS: tuple[str, ...] = (
 
 SUMMARY_TOTAL_LABEL = "Total"
 
-#: Summary price metrics whose displayed value/label switch to the
-#: after-trade figure when any included item carries a Trade%. Maps the
-#: base metric → the label shown once trade is in play.
+#: Pre-trade price/revenue metrics are labelled "(before trade%)" so the
+#: table makes explicit that they exclude the trade-spend gross-up. Maps the
+#: base metric → its displayed label. Applied to both the per-item scenario
+#: table and the multi-scenario summary.
+SUMMARY_BEFORE_TRADE_LABELS: dict[str, str] = {
+    "FOB Price": "FOB Price (before trade%)",
+    "Delivered Price": "Delivered Price (before trade%)",
+    "FOB Revenue": "FOB Revenue (before trade%)",
+}
+
+#: When any included item carries a Trade%, the FOB / Delivered price
+#: metrics switch to the after-trade figure and take these labels instead
+#: of their "(before trade%)" counterparts. FOB Revenue stays pre-trade.
 SUMMARY_AFTER_TRADE_LABELS: dict[str, str] = {
     "FOB Price": "FOB Price (After Trade)",
     "Delivered Price": "Delivered Price (After Trade)",
@@ -1430,11 +1440,12 @@ def summarize_scenarios(
     )
 
     def _label(metric: str) -> str:
-        return (
-            SUMMARY_AFTER_TRADE_LABELS[metric]
-            if trade_exists and metric in SUMMARY_AFTER_TRADE_LABELS
-            else metric
-        )
+        # Trade present → FOB / Delivered show after-trade values & labels;
+        # everything else (incl. FOB Revenue, always pre-trade) takes its
+        # "(before trade%)" label, falling back to the bare name otherwise.
+        if trade_exists and metric in SUMMARY_AFTER_TRADE_LABELS:
+            return SUMMARY_AFTER_TRADE_LABELS[metric]
+        return SUMMARY_BEFORE_TRADE_LABELS.get(metric, metric)
 
     # ── Step 2. Per-item rows: one row per (Item, Category, metric).
     rows: list[dict] = []

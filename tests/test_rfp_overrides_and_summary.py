@@ -21,6 +21,7 @@ from data_sources.rfp_pnl_store import (
     METRIC_COLS,
     REQUIRED_INPUT_FIELDS,
     STRICT_CALC_METRICS,
+    SUMMARY_BEFORE_TRADE_LABELS,
     SUMMARY_PER_ITEM_METRICS,
     SUMMARY_TOTAL_LABEL,
     SUMMARY_TOTAL_METRICS,
@@ -228,13 +229,18 @@ def test_summary_shape_and_metrics():
     per_item = df[df["Item"] != SUMMARY_TOTAL_LABEL]
     totals = df[df["Item"] == SUMMARY_TOTAL_LABEL]
     assert set(per_item["Item"]) == {"Item A", "Item B"}
-    assert set(per_item["Metric"]) == set(SUMMARY_PER_ITEM_METRICS)
-    assert set(totals["Metric"]) == set(SUMMARY_TOTAL_METRICS)
 
-    # Each per-item metric appears exactly once per item.
+    # No Trade% → FOB / Delivered / FOB Revenue carry "(before trade%)" labels.
+    def _expected(metrics: tuple[str, ...]) -> list[str]:
+        return [SUMMARY_BEFORE_TRADE_LABELS.get(m, m) for m in metrics]
+
+    assert set(per_item["Metric"]) == set(_expected(SUMMARY_PER_ITEM_METRICS))
+    assert set(totals["Metric"]) == set(_expected(SUMMARY_TOTAL_METRICS))
+
+    # Each per-item metric appears exactly once per item, in order.
     for item in ("Item A", "Item B"):
         sub = per_item[per_item["Item"] == item]
-        assert list(sub["Metric"]) == list(SUMMARY_PER_ITEM_METRICS)
+        assert list(sub["Metric"]) == _expected(SUMMARY_PER_ITEM_METRICS)
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
@@ -294,8 +300,9 @@ def test_summary_retail_side_metrics():
     def _cell(item: str, metric: str):
         return df.loc[(df["Item"] == item) & (df["Metric"] == metric), "S"].iloc[0]
 
-    assert _cell("Item A", "Delivered Price") == pytest.approx(2.50)
-    assert _cell("Item B", "Delivered Price") == pytest.approx(1.00)
+    # No Trade% here → FOB / Delivered carry the "(before trade%)" label.
+    assert _cell("Item A", "Delivered Price (before trade%)") == pytest.approx(2.50)
+    assert _cell("Item B", "Delivered Price (before trade%)") == pytest.approx(1.00)
     assert _cell("Item A", "Retail Price") == pytest.approx(4.00)
     assert _cell("Item B", "Retail Price") == pytest.approx(2.00)
     assert _cell("Item A", "Retailer's Margin%") == pytest.approx(0.375)
@@ -304,8 +311,8 @@ def test_summary_retail_side_metrics():
     # Totals are unit-weighted: Σ(price × units) / Σ units, units A=100 B=200.
     # FOB:       (2.30·100 + 0.95·200) / 300 = 1.40
     # Delivered: (2.50·100 + 1.00·200) / 300 = 1.50
-    assert _cell(SUMMARY_TOTAL_LABEL, "FOB Price") == pytest.approx(1.40)
-    assert _cell(SUMMARY_TOTAL_LABEL, "Delivered Price") == pytest.approx(1.50)
+    assert _cell(SUMMARY_TOTAL_LABEL, "FOB Price (before trade%)") == pytest.approx(1.40)
+    assert _cell(SUMMARY_TOTAL_LABEL, "Delivered Price (before trade%)") == pytest.approx(1.50)
 
     # Retail Price / Retailer's Margin% are per-item only — no Total row.
     totals = df[df["Item"] == SUMMARY_TOTAL_LABEL]["Metric"].tolist()
@@ -345,6 +352,23 @@ def test_trade_carries_across_items_and_grosses_prices():
     # Item B (FOB 0.95) also grossed up even though its Trade% was blank.
     b = out.iloc[1]
     assert float(b["FOB Price After Trade"]) == pytest.approx(0.95 / 0.80)
+
+
+@pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
+                    reason=f"Live BOM CSV not present at {_LIVE_BOM_PATH}")
+def test_summary_pretrade_metrics_carry_before_trade_label():
+    """With no Trade%, FOB / Delivered / FOB Revenue read '(before trade%)'."""
+    sources = _live_sources()
+    metrics = set(
+        summarize_scenarios({"S": _scenario_with_two_items()}, sources)["Metric"]
+    )
+    assert "FOB Price (before trade%)" in metrics
+    assert "Delivered Price (before trade%)" in metrics
+    assert "FOB Revenue (before trade%)" in metrics
+    # The bare names must not leak through once relabelled.
+    assert "FOB Price" not in metrics
+    assert "Delivered Price" not in metrics
+    assert "FOB Revenue" not in metrics
 
 
 @pytest.mark.skipif(not _LIVE_BOM_PATH.exists(),
@@ -494,7 +518,10 @@ def test_summary_recomputes_each_scenario():
     items.loc[0, "FOB Price"] = 0.0  # stale ahead-of-recompute
 
     df = summarize_scenarios({"S": items}, sources)
-    fob_a = df.loc[(df["Item"] == "Item A") & (df["Metric"] == "FOB Price"), "S"].iloc[0]
+    # No Trade% → the FOB row is labelled "(before trade%)".
+    fob_a = df.loc[
+        (df["Item"] == "Item A") & (df["Metric"] == "FOB Price (before trade%)"), "S"
+    ].iloc[0]
     # Item A: Milk=1.00 + Ing=0.10 + Pkg=0.20 + PCM=PCM$/lb*lbs/EA=0.50*2=1.00
     # → FOB = 1.00 + 0.10 + 0.20 + 1.00 = 2.30
     assert fob_a == pytest.approx(2.30)
@@ -663,7 +690,8 @@ def test_summary_emits_fob_revenue_rows():
     sources = _live_sources()
     df = summarize_scenarios({"S": _scenario_with_two_items()}, sources)
     metric_values = set(df["Metric"])
-    assert "FOB Revenue" in metric_values
+    # FOB Revenue is always pre-trade, hence the "(before trade%)" label.
+    assert "FOB Revenue (before trade%)" in metric_values
     assert "Revenue" not in metric_values
 
 

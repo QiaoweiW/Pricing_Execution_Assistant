@@ -2215,18 +2215,96 @@ def _format_summary_cell(metric: str, value: object) -> str:
     return formatter(value)
 
 
+# Style applied to the Total band so it separates from the per-item rows.
+_TOTAL_ROW_STYLE = "background-color: rgba(255, 193, 7, 0.18); font-weight: 600"
+
+
+def _highlight_total_row(row: pd.Series) -> list[str]:
+    """Styler row-callback: shade the Total row (the pivot is indexed by Item)."""
+    is_total = row.name == _rfp_pnl_store.SUMMARY_TOTAL_LABEL
+    return [_TOTAL_ROW_STYLE if is_total else ""] * len(row)
+
+
+def _summary_metric_order(summary_df: pd.DataFrame) -> list[str]:
+    """Distinct Metric labels in first-appearance (display) order.
+
+    Derived from the long summary frame rather than the metric constants so the
+    after-trade vs before-trade relabelling is already reflected.
+    """
+    return list(dict.fromkeys(summary_df["Metric"].tolist()))
+
+
+def _pivot_summary_wide(
+    summary_df: pd.DataFrame,
+    scenario_labels: list[str],
+    metrics: list[str],
+) -> pd.DataFrame:
+    """Pivot the long summary frame into an item-by-(metric × scenario) layout.
+
+    The long input has columns ``["Item", "Category", "Metric", *scenarios]``
+    with one row per ``(Item, Metric)``. The result has:
+
+      * one row per item (first-appearance order, ``Total`` pinned last),
+        indexed by Item;
+      * a two-level column MultiIndex ``(Metric, Scenario)`` grouped by metric
+        (in ``metrics`` order) with each scenario nested inside — e.g.
+        ``(Volume, A), (Volume, B), (FOB Price, A), (FOB Price, B), …``.
+
+    ``Category`` is intentionally dropped. Missing cells stay ``None`` so the
+    per-metric formatters render clean blanks.
+    """
+    # Item order: first appearance, with the Total band forced to the bottom.
+    items = list(dict.fromkeys(summary_df["Item"].tolist()))
+    total = _rfp_pnl_store.SUMMARY_TOTAL_LABEL
+    if total in items:
+        items = [i for i in items if i != total] + [total]
+
+    # One column per (metric, scenario), grouped by metric. Each metric's rows
+    # are sliced once and indexed by Item for O(1) per-item lookup.
+    columns: dict[tuple[str, str], list] = {}
+    for metric in metrics:
+        by_item = summary_df[summary_df["Metric"] == metric].set_index("Item")
+        for scenario in scenario_labels:
+            series = by_item[scenario] if scenario in by_item.columns else None
+            columns[(metric, scenario)] = [
+                None if series is None or item not in series.index
+                else series.get(item)
+                for item in items
+            ]
+
+    wide = pd.DataFrame(columns, index=pd.Index(items, name="Item"))
+    if wide.empty:
+        return wide
+
+    wide.columns = pd.MultiIndex.from_tuples(
+        wide.columns, names=["Metric", "Scenario"]
+    )
+    # pandas coerces None -> NaN whenever a column also holds floats; restore
+    # None so the per-metric formatters (and the CSV) render clean blanks,
+    # mirroring summarize_scenarios' own NaN->None guard.
+    return wide.astype(object).where(wide.notna(), None)
+
+
+def _flatten_wide_for_csv(wide: pd.DataFrame) -> pd.DataFrame:
+    """Flatten the pivot's MultiIndex columns for a clean, re-importable CSV."""
+    flat = wide.copy()
+    flat.columns = [f"{metric} — {scenario}" for metric, scenario in wide.columns]
+    return flat.reset_index()  # promote Item back to a regular column
+
+
 def _render_rfp_pnl_summary(
     sources: _rfp_pnl_store.RfpPnlSources,
     saved: list[_rfp_pnl_store.ScenarioFile],
 ) -> None:
     """Render the Multi-Scenario Summary section.
 
-    Lets the analyst pick any subset of saved scenarios, optionally
-    filter by Item / Category, and view a side-by-side comparison with
-    a Total roll-up at the bottom: PCM% / GP% are volume-weighted (lbs);
-    FOB Price / Delivered Price are unit-weighted. When a scenario carries
-    a Trade%, the FOB / Delivered figures are after-trade and labelled
-    accordingly.
+    Lets the analyst pick any subset of saved scenarios, optionally filter by
+    Item / Category / Metric, and view a side-by-side comparison pivoted as
+    item × (metric → scenario): columns are grouped by metric with each
+    scenario nested inside (e.g. Volume A, Volume B, FOB A, FOB B). A Total
+    roll-up is pinned to the bottom: PCM% / GP% are volume-weighted (lbs);
+    FOB Price / Delivered Price are unit-weighted. When a scenario carries a
+    Trade%, the FOB / Delivered figures are after-trade and labelled accordingly.
     """
     st.markdown("### 📊 Multi-Scenario Summary")
     st.caption(
@@ -2320,36 +2398,45 @@ def _render_rfp_pnl_summary(
         st.info("No items match the current filters.")
         return
 
-    # Apply per-metric formatting to scenario columns; leave Item /
-    # Category / Metric as plain strings.
-    formatted = summary_df.copy()
-    for label in selected_labels:
-        if label not in formatted.columns:
-            continue
-        formatted[label] = [
-            _format_summary_cell(metric, val)
-            for metric, val in zip(formatted["Metric"], formatted[label])
-        ]
+    # ── Metric filter ─────────────────────────────────────────────────────
+    # Options come from the computed frame (so trade-aware labels are correct).
+    # Empty selection = show every metric.
+    metric_options = _summary_metric_order(summary_df)
+    metrics_filter = st.multiselect(
+        "Metrics (empty = all)",
+        options=metric_options,
+        default=[],
+        key="rfp_pnl_summary_metrics_filter",
+        help=(
+            "Pick which metrics to compare. Columns are grouped by metric, with "
+            "each selected scenario shown side-by-side within the metric."
+        ),
+    )
+    metrics = metrics_filter or metric_options
 
-    # Highlight the Total band so it visually separates from per-item rows.
-    def _row_style(row: pd.Series) -> list[str]:
-        if row.get("Item") == _rfp_pnl_store.SUMMARY_TOTAL_LABEL:
-            return ["background-color: rgba(255, 193, 7, 0.18); font-weight: 600"] * len(row)
-        return [""] * len(row)
+    # ── Pivot to item × (metric → scenario) and render ────────────────────
+    wide = _pivot_summary_wide(summary_df, selected_labels, metrics)
+    if wide.empty:
+        st.info("No data for the selected metrics.")
+        return
 
-    height = max(400, 36 * (len(formatted) + 1) + 4)
+    # Format each (metric, scenario) cell by its metric; shade the Total band.
+    cell_formatters = {
+        col: (lambda v, metric=col[0]: _format_summary_cell(metric, v))
+        for col in wide.columns
+    }
+    height = max(400, 36 * (len(wide) + 2) + 4)
     st.dataframe(
-        formatted.style.apply(_row_style, axis=1),
+        wide.style.format(cell_formatters).apply(_highlight_total_row, axis=1),
         use_container_width=True,
-        hide_index=True,
         height=height,
     )
 
-    # CSV export of the *unformatted* numeric summary so analysts can pull
-    # it into Excel / Tableau without re-parsing the rendered strings.
+    # CSV export mirrors the pivoted layout (flat headers, unformatted numbers)
+    # so analysts can pull it into Excel / Tableau without re-parsing strings.
     st.download_button(
         label="⬇️ Download Summary (CSV)",
-        data=_to_csv_bytes(summary_df),
+        data=_to_csv_bytes(_flatten_wide_for_csv(wide)),
         file_name="rfp_pnl_multi_scenario_summary.csv",
         mime="text/csv",
         key="rfp_pnl_summary_download",

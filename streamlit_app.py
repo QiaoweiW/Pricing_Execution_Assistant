@@ -52,6 +52,7 @@ VIEW_NAME_MAPPING = {
     "unit_economics_view":                "Unit Economics",
     "demand_view":                        "Demand Insight",
     "demand_planner_analytics_view":      "Demand Planner Analytics",
+    "pricebook_editor_view":              "Pricebook Editor",
 }
 
 # Views temporarily hidden from the sidebar without being deleted.

@@ -803,14 +803,49 @@ def run_variable_pricing(data_files):
     # How to Use section
     st.subheader("How to Use")
     st.markdown("""
-    This tool generates VBCS files for variable pricing items with dynamic market-based calculations.
-    
-    **What it does:**
-    - Processes execution data with UOM calculations
-    - Applies effective dates and market classifications
-    - Handles special cross-dock logic for Winco and URM customers
-    - Generates separate VBCS files for different customer groups
-    
+    This tool turns your monthly execution data into Oracle-ready VBCS price files for
+    variable (market-based) pricing items. Upload the 5 files below, click **Run**, and the
+    tool produces **three** downloadable CSV files — one for **URM/TOPCO**, one for **Winco**,
+    and one for everyone else (**Batch**).
+
+    **Step 1 — Build the prices (happens automatically when you click Run):**
+    1. Your execution prices are matched to each item's units of measure (EA, CA, ST, PL, BC),
+       so every item gets a price for each pack size.
+    2. Each price is rounded using that item's rounding rule.
+    3. An effective start/end date is attached based on the *Effective Date Assumptions* file.
+    4. A market index name (e.g., the milk market it follows) is attached from the *Milk Market Index* file.
+    5. Everything is reshaped into the exact column layout Oracle expects for a VBCS upload.
+
+    **Step 2 — How the URM and Winco lists are generated (the "cross-dock" logic):**
+
+    URM and Winco are special: instead of pricing every store individually, we price **one
+    representative store** and then copy that price list out to all of their other stores.
+    The tool reads the *Customer Extract Report* to know which stores exist.
+    - **Winco:** the prices set for the store **`WINCO 002 KENNEWICK DSD`** are copied to *every*
+      other Winco DSD store found in the Customer Extract Report.
+    - **URM/TOPCO:** the prices set for the store **`TOWN PUMP`** are copied to *every* other
+      URM/TOPCO store, **except** the Spokane warehouse sites (`URM WHSE SPOKANE` /
+      `URM WHSE SPOKANE HTST`) and a small list of customers that don't belong on this list.
+
+    The result is split by customer name into the three files: any customer containing "URM" or
+    "TOPCO" → **URM file**, any containing "WINCO" → **Winco file**, and everything else → **Batch file**.
+    Duplicate rows are removed automatically. The files appear under **Download Output** as soon as
+    Step 1–2 finish — you can download them right away.
+
+    **Step 3 — Emailing the URM & Winco price sheets (optional, Windows only):**
+
+    After the CSVs are generated, you can click **"Receive URM & Winco DSD sheets for Customer
+    Distribution"** under Download Output. For each of URM and Winco, the tool opens the matching
+    macro-enabled Excel template, drops the new prices into it, refreshes the workbook, and lets
+    the workbook email itself out:
+    - **URM template** runs: `Step1_UpdateData` → paste prices → `Step2_SaveNewMonthasValues` → `Step3_SendPreparedEmail`
+    - **Winco template** runs: `Step1_RollForwardData` → paste prices → `Step2_ExportCleanVersion` → `Step3_EmailPriceList`
+
+    This email step needs **Windows + Microsoft Excel + Outlook (open and signed in)**, and the
+    `pywin32` library (the tool installs it for you if it's missing). If it can't run — for example
+    on a non-Windows server — the CSV files are still generated and downloadable; only the
+    automatic email is skipped.
+
     **Reminder - all csv files should be UTF-8 format**
     """)
     

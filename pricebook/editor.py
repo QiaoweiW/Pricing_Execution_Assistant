@@ -67,6 +67,7 @@ _FILTER_LABELS = {
     "customersitenumber":  "Customer site # (contains — comma for multiple)",
     "batchno":             "Batch # (contains)",
     "market":              "Market",
+    "pricinguom":          "Pricing UOM (empty = all)",
     "status":              "Status",
     "adjustmentstartdate": "Adjustment start on/after",
     "adjustmentenddate":   "Adjustment end on/before",
@@ -255,8 +256,8 @@ def _changes_from_upload(upload_df: pd.DataFrame, fields: dict,
 def _defaults_caption(defaults: dict | None) -> str:
     if not defaults:
         return ""
-    pairs = ", ".join(f"{k} = {v}" for k, v in defaults.items())
-    return f"Always filtered to: {pairs}"
+    pairs = " · ".join(f"{k} = {v}" for k, v in defaults.items())
+    return f"🔒 Locked filters (always applied to every read): {pairs}"
 
 
 def _render_status_guide(df: pd.DataFrame) -> None:
@@ -330,14 +331,16 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
 
     st.subheader(f"{title} — ERP Editor")
     st.caption(f"Read & write via ORDS REST `/{cfg['resource']}` (table {cfg['table']})")
+    # Surface the always-on constraints explicitly on the section so it's clear
+    # which columns are pinned (and therefore why some rows won't appear).
+    locked = _defaults_caption(cfg.get("defaults"))
+    if locked:
+        st.caption(locked)
 
     df_key = f"{key}_df"
 
     # --- Foldable READ section ------------------------------------------
     with st.expander("📂 Read Data in Oracle", expanded=(df_key not in st.session_state)):
-        caption = _defaults_caption(cfg.get("defaults"))
-        if caption:
-            st.caption(caption)
         filters = _filter_widgets(key, cfg["filters"], fields, filter_options)
         c1, c2 = st.columns([1, 3])
         with c1:

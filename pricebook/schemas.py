@@ -78,17 +78,18 @@ PRICEADJS_FILTERS = [
     ("customersitenumber",  "ContainsAny"),      # comma = multiple site numbers
     ("batchno",             "Contains"),         # find an upload batch
     ("market",              "Equals"),           # dropdown of distinct markets
+    ("pricinguom",          "In"),               # multi-select UOM (LOV UOM); empty = all
     ("status",              "In"),               # multi-select dropdown (LOV STATUS)
     ("adjustmentstartdate", "DateOnOrAfter"),
     ("adjustmentenddate",   "DateOnOrBefore"),
 ]
 
 # Fixed constraints always applied to the READ (the columns marked "D").
-# These match the "market price" slice shown in the spec screenshot, so the
-# user never has to set them. Shown in output but not offered as filters.
+# These pin the read to the market-price slice, so the user never sets them;
+# they're surfaced explicitly on the page. ``pricinguom`` is intentionally NOT
+# here — it's a filter (above), defaulting to all UOMs, so CA/ST/etc. are visible.
 PRICEADJS_DEFAULTS = {
     "pricelistname":  "CP_Market Price",
-    "pricinguom":     "EA",
     "adjustmenttype": "MARKUP_AMOUNT",
 }
 

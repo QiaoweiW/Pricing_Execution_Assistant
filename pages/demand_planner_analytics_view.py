@@ -351,8 +351,11 @@ def _render_distribution_tracker() -> None:
 #                                    button required (one was removed
 #                                    in May 2026 once the ETag cache
 #                                    key replaced the TTL-only flow).
-# 3. Month filters                 — Prior + LE month dropdowns sourced from
-#                                    the distinct values in RO_History "Month".
+# 3. Filters                       — ONE "🔍 Filters" section holding the
+#                                    Prior + LE month pickers (sourced from the
+#                                    distinct RO_History "Month" values; they
+#                                    drive the build) plus the per-field
+#                                    multiselects beneath them.
 # 4. Auto-regen                    — when the RO_History ETag advances,
 #                                    `RO_Comparison_Output.csv` is silently
 #                                    regenerated + republished to Fabric;
@@ -360,9 +363,11 @@ def _render_distribution_tracker() -> None:
 #                                    Programs, Summary Report) reads from
 #                                    that same in-memory frame so the
 #                                    cascade is automatic.
-# 5. Field filters + Editable table + Subtotal + per-Format drivers
+# 5. Editable table + Subtotal + per-Format drivers
 #                                  — wrapped in a single @st.fragment for
-#                                    sub-second filter / edit interactions.
+#                                    sub-second edit / Save interactions.  The
+#                                    field filters (step 3) live above it and
+#                                    are applied here from session_state.
 
 # Session-state keys.  Centralised so we never typo a key elsewhere.
 _SS_SUMMARY_DF      = "_ro_cmp_summary_df"
@@ -523,7 +528,12 @@ def _render_ro_comparison() -> None:
             item_master_df = None
             item_master_err = str(exc)
 
-        # 3. Month filters.
+        # 3. Filters section — Prior/LE month pickers + the per-field filters,
+        #    grouped in ONE "🔍 Filters" expander.  The expander is used as a
+        #    deferred container: the month pickers render first (they drive the
+        #    comparison build below), then the field filters render into the
+        #    SAME expander once the summary frame exists to supply their options
+        #    (see step 5b).
         months = list_months(history_df)
         if len(months) < 2:
             st.warning(
@@ -531,7 +541,9 @@ def _render_ro_comparison() -> None:
                 f"({len(months)} found) — need at least 2 to build a comparison."
             )
             return
-        prior_month, le_month = _render_month_filters(months)
+        filters_exp = st.expander("🔍 Filters", expanded=True)
+        with filters_exp:
+            prior_month, le_month = _render_month_filters(months)
 
         if prior_month == le_month:
             st.info("Pick two different months to see a comparison.")
@@ -562,6 +574,18 @@ def _render_ro_comparison() -> None:
 
         # 5. Warnings.
         _render_warnings_banner(warnings)
+
+        # 5b. Field filters — rendered into the SAME "🔍 Filters" expander as
+        #     the month pickers, now that the summary frame exists to supply
+        #     each multiselect's options.  Selections persist in session_state;
+        #     the editor fragment applies them via `_apply_filters`.  These
+        #     widgets live OUTSIDE the editor fragment, so a field-filter change
+        #     is a full rerun — cheap, because the Fabric reads and the
+        #     comparison build above are signature-guarded and short-circuit
+        #     when nothing upstream changed.
+        with filters_exp:
+            st.divider()
+            _render_field_filter_widgets(st.session_state[_SS_SUMMARY_DF])
 
         # 6-10. Customer Input upload, RO_Comparison_Output editor,
         #       per-Format drivers, and Early-Start programs — grouped in
@@ -1111,21 +1135,23 @@ def _render_warnings_banner(w: ComparisonWarnings) -> None:
 
 @st.fragment
 def _render_filtered_editor_fragment(prior_month, le_month) -> None:
-    """Render the filter widgets + editor + subtotal + per-Format summary + Save.
+    """Render the editor + subtotal + per-Format summary + Save.
 
     Why this is a fragment
     ----------------------
-    Filter / edit / Save interactions used to trigger a full page
-    rerun, which re-executed the upload control, re-fetched
-    RO_History + dp_dimitems from Fabric (cache-hit but still pays
-    the cache key check), re-ran ``build_ro_comparison``, and
-    re-rendered the warnings banner — every time the planner
-    clicked anything in this block.  Wrapping the interactive part
-    in a fragment (Streamlit ≥ 1.33) scopes the rerun to just this
-    function: changing a multiselect / editing a cell / clicking
-    Save only re-renders the widgets contained here.  Anything
-    OUTSIDE the fragment (upload, month pickers, warnings) only
-    reruns on its own widget changes, which is exactly what we want.
+    Cell-edit / Save interactions used to trigger a full page rerun, which
+    re-executed the upload control, re-fetched RO_History + dp_dimitems from
+    Fabric (cache-hit but still pays the cache key check), re-ran
+    ``build_ro_comparison``, and re-rendered the warnings banner — every time
+    the planner edited a cell or hit Save.  Wrapping the editable part in a
+    fragment (Streamlit ≥ 1.33) scopes the rerun to just this function:
+    editing a cell / clicking Save only re-renders this block.
+
+    Filters live OUTSIDE this fragment, in the shared "🔍 Filters" section
+    (month pickers + field filters).  Changing one is a full rerun, but a
+    cheap one — the Fabric reads and the comparison build are signature-guarded
+    and short-circuit when nothing upstream changed.  We read the planner's
+    saved field-filter selections from session_state and apply them here.
 
     Why not @st.cache_data
     ----------------------
@@ -1139,7 +1165,9 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     """
     summary_df: pd.DataFrame = st.session_state[_SS_SUMMARY_DF]
 
-    filtered_df = _render_field_filters_and_apply(summary_df)
+    # Field filters are rendered up in the shared "🔍 Filters" section; here we
+    # just apply the planner's saved selections to the (possibly edited) frame.
+    filtered_df = _apply_filters(summary_df, _read_filter_state_from_session())
     st.caption(
         f"Showing {len(filtered_df):,} of {len(summary_df):,} rows · "
         f"Prior: {prior_month.strftime('%B %Y')} · "
@@ -1208,40 +1236,40 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
 _BLANK_FILTER_SENTINEL: str = "(blank)"
 
 
-def _render_field_filters_and_apply(summary_df: pd.DataFrame) -> pd.DataFrame:
-    """Render the filter multiselects and return *summary_df* narrowed.
+def _render_field_filter_widgets(summary_df: pd.DataFrame) -> None:
+    """Render the per-column filter multiselects (widgets only — no apply).
 
-    Empty multiselects mean "no filter on this column".  Filter state
-    persists in ``st.session_state`` under stable keys so a rerun
-    (caused by an edit or month change) doesn't clear the planner's
-    selections.
+    Selections persist in ``st.session_state`` under stable keys (see
+    :func:`_filter_widget_key`) so a rerun doesn't clear the planner's picks;
+    the editor fragment reads them back with
+    :func:`_read_filter_state_from_session` and narrows the frame via
+    :func:`_apply_filters`. There is no ``st.expander`` here — these widgets
+    are rendered inside the shared "🔍 Filters" section, directly beneath the
+    Prior/LE month pickers.
 
     Blank-cell handling
     -------------------
     Every column whose source frame has at least one blank cell
-    (NaN / empty string / whitespace) exposes a special
-    ``"(blank)"`` option at the top of its multiselect.  Picking it
-    narrows the view to *exactly those blank rows* — the canonical
-    way for a planner to find e.g. items missing a Portfolio Minor
-    that need triaging.  See :data:`_BLANK_FILTER_SENTINEL`.
+    (NaN / empty string / whitespace) exposes a special ``"(blank)"`` option
+    at the top of its multiselect.  Picking it narrows the view to *exactly
+    those blank rows* — the canonical way for a planner to find e.g. items
+    missing a Portfolio Minor that need triaging.  See
+    :data:`_BLANK_FILTER_SENTINEL`.
     """
-    with st.expander("🔍 Filters", expanded=False):
-        st.caption(
-            "Tip: pick **(blank)** in any filter to surface rows where "
-            "that column is empty (handy for finding items missing a "
-            "Portfolio Minor, Supply Format, etc.)."
-        )
-        cols = st.columns(3)
-        for i, col_name in enumerate(_RO_FILTER_COLUMNS):
-            with cols[i % 3]:
-                options = _filter_options_for_column(summary_df[col_name])
-                st.multiselect(
-                    col_name,
-                    options=options,
-                    key=_filter_widget_key(col_name),
-                )
-
-    return _apply_filters(summary_df, _read_filter_state_from_session())
+    st.caption(
+        "Tip: pick **(blank)** in any filter to surface rows where "
+        "that column is empty (handy for finding items missing a "
+        "Portfolio Minor, Supply Format, etc.)."
+    )
+    cols = st.columns(3)
+    for i, col_name in enumerate(_RO_FILTER_COLUMNS):
+        with cols[i % 3]:
+            options = _filter_options_for_column(summary_df[col_name])
+            st.multiselect(
+                col_name,
+                options=options,
+                key=_filter_widget_key(col_name),
+            )
 
 
 def _filter_options_for_column(series: pd.Series) -> list[str]:

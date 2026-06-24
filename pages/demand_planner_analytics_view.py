@@ -249,7 +249,9 @@ from data_sources.ro_summary_report import (
     summary_to_csv_bytes,
 )
 from data_sources.ro_seed_pipeline import (
+    DELETE_TARGETS,
     PipelineResult,
+    delete_history_rows_for_month,
     run_distribution_tracker_pipeline,
 )
 from utils import fabric_signin_widget
@@ -387,6 +389,9 @@ _SS_AUTO_REGEN_BANNER = "_ro_cmp_auto_regen_banner"
 # Result of the last Distribution Tracker pipeline run (PipelineResult). Held in
 # session_state so the RO Summary foldable survives reruns until the next run.
 _SS_PIPELINE_RESULT = "_ro_pipeline_result"
+# Results (list[MonthDeleteResult]) of the last month-cleanup action — held so
+# the outcome survives the rerun the delete button triggers.
+_SS_CLEANUP_RESULT = "_ro_cleanup_result"
 
 # RO Summary Report (separate fragment).
 #
@@ -769,6 +774,9 @@ def _render_customer_input_uploader() -> None:
     if result is not None:
         _render_ro_pipeline_summary(result)
 
+    # Maintenance tool: delete a mislabeled month from the history files.
+    _render_month_cleanup()
+
 
 # Icons for each run-log level, used by the RO Summary renderer.
 _LOG_LEVEL_ICON = {"info": "•", "success": "✅", "warning": "⚠️", "error": "❌"}
@@ -826,6 +834,78 @@ def _render_ro_pipeline_summary(result: PipelineResult) -> None:
             for entry in result.log:
                 icon = _LOG_LEVEL_ICON.get(entry.level, "•")
                 st.markdown(f"{icon} {entry.text}")
+
+
+# Display label (shown in the multiselect) → DELETE_TARGETS key.
+_CLEANUP_LABEL_TO_KEY = {
+    "RO_History_Tracker.csv": "ro_history",
+    "Distribution_Tracker_History.csv": "distribution_history",
+}
+
+
+def _render_month_cleanup() -> None:
+    """Render the destructive 'delete a month' maintenance tool.
+
+    Removes every row for a chosen calendar month from one or both history files
+    — the recovery path for a mislabeled pipeline run. Guarded behind an
+    explicit file selection AND a confirmation checkbox so it can't fire by
+    accident, and collapsed by default so it stays out of the normal workflow.
+    """
+    with st.expander("🧹 Maintenance — delete a month's rows (careful)", expanded=False):
+        st.caption(
+            "Permanently removes **every row for the chosen month** from the "
+            "selected Fabric file(s) — matched by calendar month, regardless of "
+            "the stored date format. Use this to undo a mislabeled run. "
+            "**This cannot be undone.**"
+        )
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            cleanup_month = st.date_input(
+                "Month to delete",
+                value=date.today().replace(day=1),
+                format="YYYY-MM-DD",
+                key="ro_cleanup_month",
+                help="Any row whose Month falls in this calendar month is removed.",
+            )
+        with c2:
+            targets = st.multiselect(
+                "File(s) to clean",
+                options=list(_CLEANUP_LABEL_TO_KEY.keys()),
+                key="ro_cleanup_targets",
+                help="Pick one or both history files.",
+            )
+
+        confirm = st.checkbox(
+            f"Yes — permanently delete all **{cleanup_month:%B %Y}** rows from "
+            "the selected file(s).",
+            key="ro_cleanup_confirm",
+        )
+        do_delete = st.button(
+            "🗑️ Delete month",
+            type="primary",
+            disabled=(not targets or not confirm),
+            key="ro_cleanup_btn",
+            help="Enabled once you select at least one file and tick the confirmation.",
+        )
+
+        if do_delete:
+            with st.spinner(f"Deleting {cleanup_month:%B %Y} rows from Fabric…"):
+                st.session_state[_SS_CLEANUP_RESULT] = [
+                    delete_history_rows_for_month(_CLEANUP_LABEL_TO_KEY[lbl], cleanup_month)
+                    for lbl in targets
+                ]
+
+        # Results persist across the rerun the button triggers.
+        results = st.session_state.get(_SS_CLEANUP_RESULT)
+        if results:
+            renderer = {"success": st.success, "warning": st.warning, "error": st.error}
+            for r in results:
+                renderer.get(r.level, st.info)(r.message)
+            st.caption(
+                "Re-read the section (or change a month picker) to see the "
+                "comparison refreshed against the updated history."
+            )
 
 
 def _render_month_filters(months: list) -> tuple:

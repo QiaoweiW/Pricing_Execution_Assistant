@@ -324,10 +324,37 @@ def _build_ro_seed(
 
 # ── Stage 2: expand RO_Seed + merge into RO_History_Tracker ──────────────────
 
+def _resolve_seed_month(snapshot_months: list[str], log: _Log) -> str:
+    """Pick the canonical ``Month`` label to stamp on the expanded seed.
+
+    Uses the **snapshot month from the uploaded file** (what the planner put in
+    the ``Month`` column) — NOT ``date.today()`` — so a July snapshot uploaded
+    in June is still recorded as July. The original notebook used today's date,
+    which silently mislabels the run whenever it isn't executed during the
+    snapshot's own month. Falls back to the current month only when the upload
+    carries no usable Month at all.
+    """
+    parsed = (_canon_date(pd.Series(snapshot_months))
+              if snapshot_months else pd.Series([], dtype="datetime64[ns]"))
+    valid = sorted(d for d in parsed if pd.notna(d))
+    if not valid:
+        fallback = pd.Timestamp(date.today()).replace(day=1)
+        log.warn(f"Upload has no usable snapshot Month — stamping RO_History with "
+                 f"the current month {fallback:%m/%d/%Y} instead.")
+        return fallback.strftime("%m/%d/%Y")
+    chosen = valid[-1]
+    if len(valid) > 1:
+        spanned = ", ".join(d.strftime("%m/%d/%Y") for d in valid)
+        log.warn(f"Upload spans multiple snapshot months ({spanned}) — stamping "
+                 f"RO_History with the latest, {chosen:%m/%d/%Y}.")
+    return pd.Timestamp(chosen).strftime("%m/%d/%Y")
+
+
 def _expand_seed(
     ro_seed: pd.DataFrame,
     df_ro_hist: pd.DataFrame,
     anchor_ts: pd.Timestamp,
+    seed_month: str,
     log: _Log,
 ) -> tuple[pd.DataFrame, int]:
     """Return ``(expanded_seed, new_ro_key_count)``."""
@@ -394,8 +421,9 @@ def _expand_seed(
     log.info(f"Assigned {new_assigned:,} new RO Keys" if new_assigned
              else "All seed rows matched existing RO Keys in history.")
 
-    # Month = first day of the current month (canonical format).
-    df_seed["Month"] = pd.Timestamp(date.today()).replace(day=1).strftime("%m/%d/%Y")
+    # Month = the snapshot month from the uploaded file (NOT today's date), so a
+    # snapshot is recorded under its own month regardless of when it's run.
+    df_seed["Month"] = seed_month
 
     final_cols = _BUSINESS_COLS + ["First Ship Round", "Lbs./yr Exp", "Days in Year",
                                    "FY Lbs. Total", "FY Lbs. Exp", "RO Key", "Month"]
@@ -508,7 +536,12 @@ def run_distribution_tracker_pipeline(
             df_new, df_history, log)
         result.snapshot_months = snapshot_months
 
-        seed_expanded, new_keys = _expand_seed(ro_seed, df_ro_hist, anchor_ts, log)
+        # Stamp the run with the upload's snapshot month (not today's date).
+        seed_month = _resolve_seed_month(snapshot_months, log)
+        log.info(f"RO_History Month stamp: {seed_month}")
+
+        seed_expanded, new_keys = _expand_seed(
+            ro_seed, df_ro_hist, anchor_ts, seed_month, log)
         ro_history_combined = _merge_into_ro_history(seed_expanded, df_ro_hist, log)
 
         # ---- Write outputs (only after every compute step succeeded) --------
@@ -552,8 +585,86 @@ def run_distribution_tracker_pipeline(
         return result
 
 
+# ── Maintenance: delete a calendar month's rows from a history file ──────────
+
+# UI-facing target key → (blob path, friendly label). Keeps the view from
+# hard-coding OneLake paths.
+DELETE_TARGETS: dict[str, tuple[str, str]] = {
+    "ro_history": (_RO_HISTORY_TRACKER_BLOB_PATH, "RO_History_Tracker.csv"),
+    "distribution_history": (_DIST_HISTORY_BLOB_PATH, "Distribution_Tracker_History.csv"),
+}
+
+
+@dataclass
+class MonthDeleteResult:
+    """Outcome of one delete-a-month maintenance action."""
+    ok: bool
+    target_label: str
+    level: str = "info"          # success | warning | error
+    message: str = ""
+    removed: Optional[int] = None
+    remaining: Optional[int] = None
+
+
+def delete_history_rows_for_month(target: str, month: date) -> MonthDeleteResult:
+    """Delete every row falling in ``month``'s calendar month from a history file.
+
+    ``target`` is a key of :data:`DELETE_TARGETS`. Matching is by **(year,
+    month)** of a canonicalised ``Month`` (or legacy ``Date``) column, so it is
+    robust to the various stored formats (``7/1/2026``, ``07/01/2026``,
+    ``2026-07-01``, Excel serials) and removes the whole month regardless of day.
+
+    Destructive but safe-by-construction: reads, filters in memory, and only
+    writes back when at least one row actually matched. Never raises — failures
+    come back as ``ok=False`` with an explanatory message.
+    """
+    if target not in DELETE_TARGETS:
+        return MonthDeleteResult(False, target, "error", f"Unknown target '{target}'.")
+    blob_path, label = DELETE_TARGETS[target]
+    month_name = pd.Timestamp(month).strftime("%B %Y")
+
+    try:
+        df, _etag = read_csv(_SECRETS_SECTION, blob_path, read_csv_kwargs=_STR_READ_KW)
+    except LakehouseIOError as exc:
+        return MonthDeleteResult(False, label, "error", f"Could not read {label}: {exc}")
+    if df is None:
+        return MonthDeleteResult(False, label, "error",
+                                 f"{label} not found in Fabric — nothing to delete.")
+
+    df = df.copy()
+    df.columns = df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
+    month_col = "Month" if "Month" in df.columns else ("Date" if "Date" in df.columns else None)
+    if month_col is None:
+        return MonthDeleteResult(False, label, "error",
+                                 f"{label} has no 'Month' or 'Date' column to match on.")
+
+    col_dt = _canon_date(df[month_col])
+    tgt = pd.Timestamp(month)
+    mask = (col_dt.dt.year == tgt.year) & (col_dt.dt.month == tgt.month)
+    removed = int(mask.sum())
+    if removed == 0:
+        return MonthDeleteResult(True, label, "warning",
+                                 f"No {month_name} rows found in {label} — nothing deleted.",
+                                 removed=0, remaining=len(df))
+
+    kept = df.loc[~mask].reset_index(drop=True)
+    try:
+        write_csv(_SECRETS_SECTION, blob_path, kept, etag=None)
+    except LakehouseIOError as exc:
+        return MonthDeleteResult(False, label, "error",
+                                 f"Matched {removed:,} {month_name} rows in {label} but the "
+                                 f"write-back failed (no rows deleted): {exc}")
+    return MonthDeleteResult(True, label, "success",
+                             f"Deleted {removed:,} {month_name} row(s) from {label} — "
+                             f"{len(kept):,} rows remain.",
+                             removed=removed, remaining=len(kept))
+
+
 __all__ = [
     "LogEntry",
     "PipelineResult",
     "run_distribution_tracker_pipeline",
+    "DELETE_TARGETS",
+    "MonthDeleteResult",
+    "delete_history_rows_for_month",
 ]

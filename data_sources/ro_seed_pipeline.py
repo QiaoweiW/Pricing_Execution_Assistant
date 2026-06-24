@@ -1,0 +1,559 @@
+"""
+Distribution Tracker → RO_History_Tracker pipeline (Streamlit-native).
+
+This is the Streamlit/OneLake port of the two Microsoft Fabric notebook cells
+that planners previously ran by hand:
+
+  1. **Merge** the freshly-uploaded ``Distribution_Tracker.csv`` into
+     ``Distribution_Tracker_History.csv`` — date-overlap cleanup, schema align,
+     dedup, type/customer-name normalisation — then **build** ``RO_Seed.csv``
+     (filter ``Reflected in APS = no`` / not ``declined`` / ``Probability > 0``,
+     aggregate duplicate source rows).
+  2. **Expand** RO_Seed (7 computed columns, stable RO Key assignment, ``Month``)
+     and **merge** it into ``RO_History_Tracker.csv`` (replace matching-Month
+     rows, append, dedup).
+
+Why a dedicated module
+----------------------
+The notebook used direct lakehouse filesystem I/O (``/lakehouse/default/…``),
+which only works *inside* Fabric.  Streamlit reaches OneLake through the ADLS
+connector layer (:mod:`data_sources.fabric_lakehouse_io`), so the logic is
+re-expressed against ``read_csv`` / ``write_csv`` / ``delete_blob``.
+
+Two deliberate departures from the notebook, both for safety in a live app:
+
+* **Compute-then-write.**  Every output frame is built fully in memory *before*
+  any Fabric write happens, so a parsing/logic error can never leave the three
+  output files in a half-updated, mutually-inconsistent state.
+* **Structured logging.**  Each ``print(...)`` / warning from the notebook
+  becomes a :class:`LogEntry` with a level, so the UI can render the run report
+  (and surface warnings prominently) instead of dumping text to a console.
+
+The function is pure-ish: its only side effects are the explicit Fabric writes
+at the end and the source-file delete.  It never touches Streamlit, so it is
+unit-testable and safe to call from anywhere.
+"""
+from __future__ import annotations
+
+import io
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from pandas.tseries.offsets import MonthEnd
+
+from .fabric_lakehouse_io import (
+    LakehouseIOError,
+    delete_blob,
+    read_csv,
+    write_csv,
+)
+
+# ── OneLake locations (relative to "Files/") ─────────────────────────────────
+_SECRETS_SECTION: str = "fabric_htst"
+_SOURCE_BLOB_PATH: str = "RO Tracking/Append_New_History/Distribution_Tracker.csv"
+_DIST_HISTORY_BLOB_PATH: str = "RO Tracking/Distribution_Tracker_History.csv"
+_RO_SEED_BLOB_PATH: str = "RO Tracking/RO_Seed.csv"
+_RO_HISTORY_TRACKER_BLOB_PATH: str = "RO Tracking/RO_History_Tracker.csv"
+
+# Read every RO CSV as raw strings with blanks preserved — the pipeline does its
+# own typing, exactly like the notebook.
+_STR_READ_KW: dict = {"dtype": str, "keep_default_na": False}
+
+# The snapshot/date column. Older exports call it "Date"; we standardise to "Month".
+_DATE_COLUMN = "Month"
+
+# Header rename map applied to both the new file and history.
+_RENAME_MAP = {
+    "Anticipated Annual Lbs. Vol": "Lbs./yr",
+    "Annual PC $": "PC$/yr",
+    "Total Anticipated Slotting Costs": "Slotting",
+}
+
+# RO_Seed business columns (group keys + summed metrics + final column order).
+_AGG_KEYS = ["Format", "Customer", "Taxonomy", "Brand", "Item #",
+             "Item Desc", "Probability", "First Ship Date"]
+_SUM_COLS = ["Lbs./yr", "PC$/yr", "Slotting"]
+_RO_SEED_COLS = ["Format", "Customer", "Taxonomy", "Brand", "Item #",
+                 "Item Desc", "Probability", "First Ship Date", "Lbs./yr",
+                 "PC$/yr", "Slotting"]
+
+# RO expansion (stage 2) columns.
+_MATCH_COLS = ["Format", "Customer", "Taxonomy", "Brand", "Item #"]
+_BUSINESS_COLS = ["Format", "Customer", "Taxonomy", "Brand", "Item #",
+                  "Item Desc", "Probability", "First Ship Date",
+                  "Lbs./yr", "PC$/yr", "Slotting"]
+_EXPANSION_COLS = ["First Ship Round", "Lbs./yr Exp", "Days in Year",
+                   "FY Lbs. Total", "FY Lbs. Exp", "RO Key", "Month"]
+
+
+# ── Structured run log ───────────────────────────────────────────────────────
+
+@dataclass
+class LogEntry:
+    """One line of the run report. ``level`` ∈ info | success | warning | error."""
+    level: str
+    text: str
+
+
+@dataclass
+class PipelineResult:
+    """Outcome of one pipeline run — the UI renders this verbatim."""
+    ok: bool
+    log: list[LogEntry] = field(default_factory=list)
+    # Headline stats (None until the relevant stage completes).
+    snapshot_months: list[str] = field(default_factory=list)
+    dist_history_rows: Optional[int] = None
+    ro_seed_rows: Optional[int] = None
+    ro_history_rows: Optional[int] = None
+    new_ro_keys: Optional[int] = None
+    ro_seed_total_lbs: Optional[float] = None
+
+    @property
+    def warnings(self) -> list[str]:
+        return [e.text for e in self.log if e.level == "warning"]
+
+    @property
+    def errors(self) -> list[str]:
+        return [e.text for e in self.log if e.level == "error"]
+
+
+class _Log:
+    """Tiny accumulator so each stage reads like the notebook's print()s."""
+
+    def __init__(self) -> None:
+        self.entries: list[LogEntry] = []
+
+    def info(self, text: str) -> None:
+        self.entries.append(LogEntry("info", text))
+
+    def ok(self, text: str) -> None:
+        self.entries.append(LogEntry("success", text))
+
+    def warn(self, text: str) -> None:
+        self.entries.append(LogEntry("warning", text))
+
+    def err(self, text: str) -> None:
+        self.entries.append(LogEntry("error", text))
+
+
+# ── Date canonicalisation (shared by both stages) ────────────────────────────
+
+def _canon_date(series: pd.Series) -> pd.Series:
+    """Parse mixed date representations (mm/dd/yyyy, ISO, Excel serial) → datetime."""
+    s = series.astype(str).str.strip()
+    s = s.replace(["nan", "NaN", "NaT", "None", "NULL", ""], pd.NA)
+    is_serial = s.str.fullmatch(r"\d+(\.0+)?", na=False)  # pure numeric ⇒ Excel serial
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if is_serial.any():
+        out.loc[is_serial] = pd.to_datetime(
+            pd.to_numeric(s[is_serial]), origin="1899-12-30", unit="D")
+    out.loc[~is_serial] = pd.to_datetime(s[~is_serial], errors="coerce")
+    return out
+
+
+def _canon_date_str(series: pd.Series) -> pd.Series:
+    """Canonical date → ``mm/dd/yyyy`` text (blank for unparseable)."""
+    return _canon_date(series).dt.strftime("%m/%d/%Y").fillna("")
+
+
+def _scrub_headers(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip BOM, collapse whitespace, trim — then standardise Date→Month."""
+    df = df.copy()
+    df.columns = (
+        df.columns.str.replace("﻿", "", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    if "Month" not in df.columns and "Date" in df.columns:
+        df = df.rename(columns={"Date": "Month"})
+    return df.rename(columns=_RENAME_MAP)
+
+
+# ── Stage 1: merge history + build RO_Seed ───────────────────────────────────
+
+def _merge_history_and_build_seed(
+    df_new: pd.DataFrame,
+    df_history: pd.DataFrame,
+    log: _Log,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Return ``(combined_history, ro_seed_filtered, snapshot_months)``."""
+    df_new = _scrub_headers(df_new)
+    df_history = _scrub_headers(df_history)
+    log.info(f"New file: {df_new.shape[0]:,} rows, {df_new.shape[1]} cols")
+    log.info(f"History file: {df_history.shape[0]:,} rows, {df_history.shape[1]} cols")
+
+    new_months = (
+        set(df_new[_DATE_COLUMN].dropna().unique())
+        if _DATE_COLUMN in df_new.columns else set()
+    )
+    snapshot_months = sorted(str(m) for m in new_months)
+    log.info(f"Snapshot date(s) in new file: {snapshot_months or 'NONE FOUND'}")
+
+    # 1. Remove overlapping snapshot dates from history (avoid stacking).
+    if _DATE_COLUMN in df_new.columns and _DATE_COLUMN in df_history.columns:
+        if new_months:
+            before = len(df_history)
+            df_history = df_history[~df_history[_DATE_COLUMN].isin(new_months)]
+            removed = before - len(df_history)
+            if removed > 0:
+                log.info(f"Date overlap: removed {removed:,} existing history rows "
+                         f"for dates {snapshot_months}")
+            else:
+                log.ok(f"No date overlap in history for dates {snapshot_months}")
+    else:
+        log.warn(f"Date column '{_DATE_COLUMN}' missing from one or both files — "
+                 "skipping date-based cleanup.")
+
+    # 2. Schema align — reorder/extend the new file to match history.
+    if list(df_new.columns) != list(df_history.columns) and len(df_history.columns):
+        only_new = set(df_new.columns) - set(df_history.columns)
+        only_hist = set(df_history.columns) - set(df_new.columns)
+        log.warn("Column mismatch detected between new file and history. "
+                 f"Only in new: {sorted(only_new) or '—'}; "
+                 f"only in history: {sorted(only_hist) or '—'}. "
+                 "Aligned the new file to the history schema (missing cols blank).")
+        df_new = df_new.reindex(columns=list(df_history.columns), fill_value="")
+    else:
+        log.ok("Schemas match")
+
+    # 3. Append + de-duplicate.
+    df_combined = pd.concat([df_history, df_new], ignore_index=True)
+    before = len(df_combined)
+    df_combined = df_combined.drop_duplicates(ignore_index=True)
+    log.info(f"Combined: {before:,} → {len(df_combined):,} rows after dedupe "
+             f"({before - len(df_combined):,} dupes removed)")
+
+    # 4. Type / text cleanup.
+    df_combined = _clean_combined_types(df_combined)
+    log.ok("Formatting and cleanup applied")
+
+    # 5. Build RO_Seed from the current snapshot.
+    ro_seed = _build_ro_seed(df_combined, new_months, log)
+    return df_combined, ro_seed, snapshot_months
+
+
+def _clean_combined_types(df: pd.DataFrame) -> pd.DataFrame:
+    """Port of the notebook's type/text normalisation (section 5)."""
+    df = df.copy()
+
+    # 5a. Text fields → str, drop literal 'nan'.
+    for col in ["Format", "Customer", "Taxonomy", "Brand", "Item Desc"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace("nan", "")
+
+    # 5a-i. Customer case-collision fix — prefer a non-UPPERCASE spelling,
+    #       else the most common variant, for each case-insensitive group.
+    if "Customer" in df.columns:
+        groups: dict[str, list[str]] = {}
+        for name in df["Customer"].value_counts().index:
+            groups.setdefault(str(name).lower().strip(), []).append(name)
+        canonical: dict[str, str] = {}
+        for key, variants in groups.items():
+            non_upper = [v for v in variants if not str(v).isupper()]
+            canonical[key] = non_upper[0] if non_upper else variants[0]
+        df["Customer"] = df["Customer"].map(
+            lambda x: canonical.get(str(x).lower().strip(), x))
+
+    # 5b. Item # → nullable Int64.
+    if "Item #" in df.columns:
+        df["Item #"] = pd.to_numeric(
+            df["Item #"].astype(str).str.replace(r"[^\d.-]", "", regex=True),
+            errors="coerce").astype("Int64")
+
+    # 5c. First Ship Date → mm/dd/yyyy (Excel serials + text).
+    if "First Ship Date" in df.columns:
+        df["First Ship Date"] = _canon_date_str(df["First Ship Date"])
+
+    # 5d. Decimal numerics (incl. Probability for the >0 filter later).
+    for col in ["Lbs./yr", "PC$/yr", "Slotting", "Probability"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(r"[^\d.-]", "", regex=True),
+                errors="coerce").astype(float)
+    return df
+
+
+def _build_ro_seed(
+    df_combined: pd.DataFrame,
+    new_months: set,
+    log: _Log,
+) -> pd.DataFrame:
+    """Filter the combined history to the seed extract (section 7)."""
+    if _DATE_COLUMN in df_combined.columns and new_months:
+        df = df_combined[df_combined[_DATE_COLUMN].isin(new_months)].copy()
+        log.info(f"RO_Seed snapshot rows (Month in {sorted(str(m) for m in new_months)}): "
+                 f"{len(df):,}")
+    else:
+        df = df_combined.copy()
+        log.warn(f"Date column '{_DATE_COLUMN}' missing or no snapshot dates — "
+                 f"seeding from all {len(df):,} combined rows.")
+
+    if "Reflected in APS" in df.columns:
+        df = df[df["Reflected in APS"].astype(str).str.strip().str.lower() == "no"]
+        log.info(f"After 'Reflected in APS = no': {len(df):,} rows")
+    if "Pipeline Status" in df.columns:
+        df = df[~df["Pipeline Status"].astype(str).str.lower()
+                .str.contains("declined", na=False)]
+        log.info(f"After 'Pipeline Status != declined': {len(df):,} rows")
+    if "Probability" in df.columns:
+        df = df[df["Probability"] > 0]
+        log.info(f"After 'Probability > 0': {len(df):,} rows")
+
+    # Aggregate duplicate source rows: sum the metric columns per business key.
+    agg_keys = [c for c in _AGG_KEYS if c in df.columns]
+    sum_cols = [c for c in _SUM_COLS if c in df.columns]
+    for c in sum_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    before = len(df)
+    if agg_keys and sum_cols:
+        df = df.groupby(agg_keys, dropna=False, as_index=False)[sum_cols].sum(min_count=1)
+        log.info(f"After aggregation (sum dup rows): {len(df):,} rows "
+                 f"({before - len(df):,} duplicates collapsed)")
+
+    # Enforce the RO_Seed column set/order; create any missing as blank.
+    missing = [c for c in _RO_SEED_COLS if c not in df.columns]
+    if missing:
+        log.warn(f"RO_Seed missing columns created blank: {missing}")
+        for c in missing:
+            df[c] = None
+    return df[_RO_SEED_COLS].copy()
+
+
+# ── Stage 2: expand RO_Seed + merge into RO_History_Tracker ──────────────────
+
+def _expand_seed(
+    ro_seed: pd.DataFrame,
+    df_ro_hist: pd.DataFrame,
+    anchor_ts: pd.Timestamp,
+    log: _Log,
+) -> tuple[pd.DataFrame, int]:
+    """Return ``(expanded_seed, new_ro_key_count)``."""
+    df_seed = ro_seed.copy()
+
+    # Idempotency guard: drop any pre-existing expansion columns, canonicalise
+    # the ship date, and collapse exact-duplicate business rows.
+    df_seed = df_seed.drop(columns=[c for c in _EXPANSION_COLS if c in df_seed.columns])
+    df_seed["First Ship Date"] = _canon_date_str(df_seed["First Ship Date"])
+    before = len(df_seed)
+    df_seed = df_seed.drop_duplicates(subset=_BUSINESS_COLS, keep="first").reset_index(drop=True)
+    if before != len(df_seed):
+        log.info(f"Expansion: removed {before - len(df_seed):,} exact-duplicate seed rows "
+                 f"({before:,} → {len(df_seed):,})")
+
+    # Numeric conversions for the maths.
+    for col in ["Probability", "Lbs./yr", "PC$/yr", "Slotting"]:
+        df_seed[col] = pd.to_numeric(
+            df_seed[col].astype(str).str.replace(r"[^\d.-]", "", regex=True),
+            errors="coerce").astype(float)
+    df_seed["Item #"] = pd.to_numeric(
+        df_seed["Item #"].astype(str).str.replace(r"[^\d.-]", "", regex=True),
+        errors="coerce").astype("Int64")
+
+    fsd = _canon_date(df_seed["First Ship Date"])
+
+    # First Ship Round = IF(DAY>1, EOMONTH+1, d) — round up to next month start.
+    fsr = pd.Series(pd.to_datetime(
+        np.where(fsd.dt.day > 1, (fsd + MonthEnd(0)) + pd.Timedelta(days=1), fsd)
+    ), index=df_seed.index)
+
+    df_seed["Lbs./yr Exp"] = df_seed["Probability"] * df_seed["Lbs./yr"]
+    days = ((anchor_ts - fsr).dt.days + 1).fillna(0)
+    df_seed["Days in Year"] = days.clip(lower=0, upper=365).astype(int)
+    df_seed["FY Lbs. Total"] = df_seed["Lbs./yr"] * df_seed["Days in Year"] / 365
+    df_seed["FY Lbs. Exp"] = df_seed["Lbs./yr Exp"] * df_seed["Days in Year"] / 365
+    df_seed["First Ship Round"] = fsr.dt.strftime("%m/%d/%Y").fillna("")
+
+    # RO Key — stable per (Format, Customer, Taxonomy, Brand, Item #) across
+    # history; new combos get the next integer after the existing max.
+    key_map: dict[tuple, int] = {}
+    max_key = 0
+    if "RO Key" in df_ro_hist.columns and len(df_ro_hist) > 0:
+        hist = df_ro_hist.copy()
+        hist["Item #"] = pd.to_numeric(
+            hist["Item #"].astype(str).str.replace(r"[^\d.-]", "", regex=True),
+            errors="coerce").astype("Int64")
+        hist["RO Key"] = pd.to_numeric(hist["RO Key"], errors="coerce").astype("Int64")
+        lk = hist.dropna(subset=["RO Key"]).drop_duplicates(subset=_MATCH_COLS, keep="first")
+        key_map = {tuple(combo): k for combo, k in
+                   zip(lk[_MATCH_COLS].astype(str).values.tolist(), lk["RO Key"])}
+        if hist["RO Key"].notna().any():
+            max_key = int(hist["RO Key"].dropna().max())
+    log.info(f"Max existing RO Key in history: {max_key}")
+
+    combos = df_seed[_MATCH_COLS].astype(str).apply(tuple, axis=1)
+    next_key, new_assigned = max_key, 0
+    for c in combos:  # first-appearance order
+        if c not in key_map:
+            next_key += 1
+            key_map[c] = next_key
+            new_assigned += 1
+    df_seed["RO Key"] = combos.map(key_map).astype("Int64")
+    log.info(f"Assigned {new_assigned:,} new RO Keys" if new_assigned
+             else "All seed rows matched existing RO Keys in history.")
+
+    # Month = first day of the current month (canonical format).
+    df_seed["Month"] = pd.Timestamp(date.today()).replace(day=1).strftime("%m/%d/%Y")
+
+    final_cols = _BUSINESS_COLS + ["First Ship Round", "Lbs./yr Exp", "Days in Year",
+                                   "FY Lbs. Total", "FY Lbs. Exp", "RO Key", "Month"]
+    missing = [c for c in final_cols if c not in df_seed.columns]
+    if missing:
+        raise LakehouseIOError(f"Missing expected columns after expansion: {missing}")
+    df_seed = df_seed[final_cols]
+    log.ok(f"RO_Seed expanded to {df_seed.shape[1]} columns, {len(df_seed):,} rows")
+    return df_seed, new_assigned
+
+
+def _merge_into_ro_history(
+    df_seed_expanded: pd.DataFrame,
+    df_ro_hist: pd.DataFrame,
+    log: _Log,
+) -> pd.DataFrame:
+    """Replace matching-Month rows in RO_History_Tracker, then append the seed."""
+    # Round-trip the expanded seed through CSV so it is all-strings, exactly
+    # matching the on-disk RO_Seed.csv we publish (the history is all-strings).
+    buf = io.StringIO()
+    df_seed_expanded.to_csv(buf, index=False)
+    df_seed_str = pd.read_csv(io.StringIO(buf.getvalue()), **_STR_READ_KW)
+    df_seed_str.columns = df_seed_str.columns.str.replace(r"\s+", " ", regex=True).str.strip()
+
+    df_hist = df_ro_hist
+    if len(df_hist) > 0:
+        if list(df_hist.columns) != list(df_seed_str.columns):
+            log.warn("RO_History_Tracker column order differs — reindexing to match seed.")
+            df_hist = df_hist.reindex(columns=df_seed_str.columns, fill_value="")
+        df_hist = df_hist.copy()
+        df_hist["Month"] = _canon_date_str(df_hist["Month"])
+
+    df_seed_str["Month"] = _canon_date_str(df_seed_str["Month"])
+    seed_months = set(df_seed_str["Month"].unique())
+    log.info(f"Months in new seed: {sorted(seed_months)}")
+
+    before = len(df_hist)
+    removed = 0
+    if "Month" in df_hist.columns and len(df_hist) > 0:
+        mask = df_hist["Month"].isin(seed_months)
+        removed = int(mask.sum())
+        df_hist = df_hist.loc[~mask].reset_index(drop=True)
+    log.info(f"Removed {removed:,} existing RO_History rows matching seed Month(s)")
+
+    combined = pd.concat([df_hist, df_seed_str], ignore_index=True).drop_duplicates().reset_index(drop=True)
+    log.info(f"RO_History rebuild: {before:,} − {removed:,} removed + {len(df_seed_str):,} "
+             f"appended = {len(combined):,} final rows")
+    return combined
+
+
+# ── Public entry point ───────────────────────────────────────────────────────
+
+def run_distribution_tracker_pipeline(
+    new_file_bytes: bytes,
+    *,
+    anchor_date: date,
+) -> PipelineResult:
+    """Run the full Distribution Tracker → RO_History_Tracker pipeline.
+
+    Parameters
+    ----------
+    new_file_bytes:
+        Raw bytes of the uploaded ``Distribution_Tracker.csv``.
+    anchor_date:
+        Fiscal year-end anchor (``Analysis!$B$3``) driving ``Days in Year``.
+
+    All three Fabric outputs are computed in memory first and only written once
+    every stage succeeds, so a logic error never leaves a partial update. On a
+    successful run the staged source file is deleted (notebook parity).
+
+    Never raises: any failure is captured as an ``error`` log entry and returned
+    with ``ok=False`` so the caller can render it.
+    """
+    log = _Log()
+    result = PipelineResult(ok=False, log=log.entries)
+    anchor_ts = pd.Timestamp(anchor_date)
+    log.info(f"Fiscal year-end anchor: {anchor_ts:%m/%d/%Y}")
+
+    try:
+        # ---- Read inputs (no writes yet) ------------------------------------
+        try:
+            df_new = pd.read_csv(io.BytesIO(new_file_bytes), **_STR_READ_KW)
+        except Exception as exc:  # noqa: BLE001
+            log.err(f"Could not read the uploaded CSV: {exc}")
+            return result
+        if df_new.empty:
+            log.err("The uploaded Distribution_Tracker.csv has no rows.")
+            return result
+
+        df_history, _ = read_csv(_SECRETS_SECTION, _DIST_HISTORY_BLOB_PATH,
+                                 read_csv_kwargs=_STR_READ_KW)
+        if df_history is None:
+            log.warn(f"'Files/{_DIST_HISTORY_BLOB_PATH}' not found — starting a fresh "
+                     "distribution history from this upload.")
+            df_history = pd.DataFrame(columns=df_new.columns)
+
+        df_ro_hist, _ = read_csv(_SECRETS_SECTION, _RO_HISTORY_TRACKER_BLOB_PATH,
+                                 read_csv_kwargs=_STR_READ_KW)
+        if df_ro_hist is None:
+            log.warn(f"'Files/{_RO_HISTORY_TRACKER_BLOB_PATH}' not found — it will be "
+                     "created from this run's seed.")
+            df_ro_hist = pd.DataFrame()
+        else:
+            df_ro_hist = df_ro_hist.copy()
+            df_ro_hist.columns = (
+                df_ro_hist.columns.str.replace(r"\s+", " ", regex=True).str.strip())
+
+        # ---- Compute (all in memory) ----------------------------------------
+        dist_history, ro_seed, snapshot_months = _merge_history_and_build_seed(
+            df_new, df_history, log)
+        result.snapshot_months = snapshot_months
+
+        seed_expanded, new_keys = _expand_seed(ro_seed, df_ro_hist, anchor_ts, log)
+        ro_history_combined = _merge_into_ro_history(seed_expanded, df_ro_hist, log)
+
+        # ---- Write outputs (only after every compute step succeeded) --------
+        write_csv(_SECRETS_SECTION, _DIST_HISTORY_BLOB_PATH, dist_history, etag=None)
+        log.ok(f"Distribution_Tracker_History.csv updated — {len(dist_history):,} rows")
+
+        write_csv(_SECRETS_SECTION, _RO_SEED_BLOB_PATH, seed_expanded, etag=None)
+        log.ok(f"RO_Seed.csv generated — {len(seed_expanded):,} rows")
+
+        write_csv(_SECRETS_SECTION, _RO_HISTORY_TRACKER_BLOB_PATH,
+                  ro_history_combined, etag=None)
+        log.ok(f"RO_History_Tracker.csv updated — {len(ro_history_combined):,} rows")
+
+        # ---- Cleanup: delete the staged source (notebook parity) ------------
+        try:
+            if delete_blob(_SECRETS_SECTION, _SOURCE_BLOB_PATH):
+                log.info(f"Cleanup: deleted staged source 'Files/{_SOURCE_BLOB_PATH}'.")
+            else:
+                log.info("Cleanup: no staged source file to delete.")
+        except LakehouseIOError as exc:
+            # Non-fatal: the run succeeded; a stale source file is harmless.
+            log.warn(f"Cleanup skipped — could not delete staged source: {exc}")
+
+        # ---- Headline stats -------------------------------------------------
+        result.dist_history_rows = len(dist_history)
+        result.ro_seed_rows = len(seed_expanded)
+        result.ro_history_rows = len(ro_history_combined)
+        result.new_ro_keys = new_keys
+        if "Lbs./yr" in seed_expanded.columns:
+            result.ro_seed_total_lbs = float(
+                pd.to_numeric(seed_expanded["Lbs./yr"], errors="coerce").fillna(0).sum())
+        result.ok = True
+        return result
+
+    except LakehouseIOError as exc:
+        log.err(f"Fabric I/O error — no partial state written before this point "
+                f"unless a write is named above. Details: {exc}")
+        return result
+    except Exception as exc:  # noqa: BLE001 - surface any unexpected failure
+        log.err(f"Pipeline failed: {exc}")
+        return result
+
+
+__all__ = [
+    "LogEntry",
+    "PipelineResult",
+    "run_distribution_tracker_pipeline",
+]

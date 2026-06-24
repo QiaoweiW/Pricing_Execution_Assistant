@@ -215,7 +215,6 @@ from data_sources.ro_comparison import (
     regenerate_comparison_output,
     ro_item_master_blob_path,
     save_ro_comparison_output,
-    upload_customer_input,
 )
 from data_sources.ro_early_start_programs import (
     COL_FORMAT as ESP_COL_FORMAT,
@@ -248,6 +247,10 @@ from data_sources.ro_summary_report import (
     recompute_subtotals,
     save_ro_summary_report,
     summary_to_csv_bytes,
+)
+from data_sources.ro_seed_pipeline import (
+    PipelineResult,
+    run_distribution_tracker_pipeline,
 )
 from utils import fabric_signin_widget
 from utils.embed_helpers import (
@@ -381,6 +384,9 @@ _SS_AUTO_REGEN_SIG  = "_ro_cmp_auto_regen_sig"
 # Banner payload for the most recent auto-regen — popped after one
 # render so the planner sees it once, not on every interaction.
 _SS_AUTO_REGEN_BANNER = "_ro_cmp_auto_regen_banner"
+# Result of the last Distribution Tracker pipeline run (PipelineResult). Held in
+# session_state so the RO Summary foldable survives reruns until the next run.
+_SS_PIPELINE_RESULT = "_ro_pipeline_result"
 
 # RO Summary Report (separate fragment).
 #
@@ -694,66 +700,132 @@ def _render_ro_item_master_download_button() -> None:
 
 
 def _render_customer_input_uploader() -> None:
-    """Render the "Upload Customer Input CSV" control row.
+    """Render the Distribution Tracker upload → run-pipeline → RO Summary block.
 
-    The uploaded file is saved verbatim (no transformation) to
-    ``Files/RO Tracking/Append_New_History/<original-filename>`` so the
-    downstream Fabric pipeline can ingest it on its usual cadence.
+    On **Run & Save to Fabric** the entire former Fabric-notebook pipeline runs
+    in-app (see :func:`run_distribution_tracker_pipeline`): merge the upload into
+    ``Distribution_Tracker_History.csv`` → build ``RO_Seed.csv`` → expand + merge
+    into ``RO_History_Tracker.csv``, then delete the staged source. The run
+    report (with warnings surfaced prominently) renders in a foldable RO Summary
+    directly beneath the button.
 
-    Independence guarantee: this block is fully self-contained — the
-    summary table below renders whether or not anything has been
-    uploaded.  See the caption on the heading.
+    Independence guarantee: this block is fully self-contained — the comparison
+    table below renders whether or not anything has been uploaded.
     """
-    # Bigger-than-h4 heading per UX direction.  Using inline HTML so we
-    # can hit a 1.35rem size that sits clearly above the rest of the
-    # section's body text but below the section's h3 heading.
     st.markdown(
         "<h4 style='font-size:1.35rem; margin-top:0.25rem;'>"
-        "📤 Save the 'Customer Input' table as a "
-        "&quot;Distribution_Tracker.csv&quot; file (+a new column "
-        "&quot;Month&quot; with the start date of current month) to upload here"
+        "📤 Upload &quot;Distribution_Tracker.csv&quot; to run the RO pipeline"
         "</h4>",
         unsafe_allow_html=True,
     )
     st.caption(
-        "Optional — uploading here only affects the Append_New_History drop "
-        "zone.  After Fabric ingests the file, the RO Comparison table and "
-        "driver breakdown in this subsection refresh automatically."
+        "Export the 'Customer Input' table as **Distribution_Tracker.csv** with a "
+        "**Month** column set to the first day of the current month (e.g. "
+        "2026-06-01). On **Run & Save to Fabric** the app merges it into the "
+        "distribution history, rebuilds RO_Seed, and updates RO_History_Tracker — "
+        "then the RO Comparison below refreshes automatically. No Fabric notebook "
+        "needed."
     )
     uploaded = st.file_uploader(
-        "Save the 'Customer Input' table as a Distribution_Tracker.csv file "
-        "(+ Month column with the start date of current month) to upload here",
+        "Upload Distribution_Tracker.csv",
         type=["csv"],
         key="ro_cmp_customer_input_upload",
         label_visibility="collapsed",
-        help=(
-            "Export the Customer Input table as Distribution_Tracker.csv "
-            "and add a Month column with the first day of the current month "
-            "(e.g. 2026-06-01). On Save it lands in "
-            "Files/RO Tracking/Append_New_History/ under its original "
-            "filename — Fabric never sees the file until you click Save."
-        ),
     )
 
-    save_clicked = st.button(
-        "💾 Save to Fabric",
+    # Fiscal year-end anchor (Analysis!$B$3) — drives the "Days in Year"
+    # expansion maths. Defaults to the notebook's value; planner can override.
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        anchor = st.date_input(
+            "Fiscal year-end anchor",
+            value=date(2027, 3, 31),
+            format="YYYY-MM-DD",
+            key="ro_cmp_anchor_date",
+            help="Analysis!$B$3 — the fiscal year-end used to compute 'Days in "
+                 "Year'. Defaults to 3/31/2027; change it when the fiscal year rolls.",
+        )
+
+    run_clicked = st.button(
+        "▶️ Run & Save to Fabric",
         key="ro_cmp_customer_input_save",
         type="primary",
         disabled=uploaded is None,
-        help="Uploads the selected CSV to the Append_New_History folder in Fabric.",
+        help="Runs the full pipeline and writes Distribution_Tracker_History.csv, "
+             "RO_Seed.csv and RO_History_Tracker.csv to Microsoft Fabric.",
     )
 
-    if uploaded is None or not save_clicked:
-        return
+    if run_clicked and uploaded is not None:
+        with st.spinner(
+            "Running the RO pipeline (merge history → build RO_Seed → "
+            "update RO_History_Tracker)…"
+        ):
+            st.session_state[_SS_PIPELINE_RESULT] = run_distribution_tracker_pipeline(
+                uploaded.getvalue(), anchor_date=anchor,
+            )
 
-    try:
-        with st.spinner(f"Uploading '{uploaded.name}' to Microsoft Fabric…"):
-            blob_path = upload_customer_input(uploaded.name, uploaded.getvalue())
-    except RoComparisonError as exc:
-        st.error(f"❌ Upload failed.\n\n{exc}")
-        return
+    # RO Summary — persists across reruns until the next run.
+    result: Optional[PipelineResult] = st.session_state.get(_SS_PIPELINE_RESULT)
+    if result is not None:
+        _render_ro_pipeline_summary(result)
 
-    st.success(f"✅ Uploaded `{uploaded.name}` to `Files/{blob_path}`.")
+
+# Icons for each run-log level, used by the RO Summary renderer.
+_LOG_LEVEL_ICON = {"info": "•", "success": "✅", "warning": "⚠️", "error": "❌"}
+
+
+def _render_ro_pipeline_summary(result: PipelineResult) -> None:
+    """Render the foldable 'RO Summary' for the last pipeline run.
+
+    Warnings are pulled to the top and shown as a Streamlit warning box so they
+    can't be missed; the full run log (every step) is available beneath the
+    headline so the planner can audit exactly what changed.
+    """
+    title = "📊 RO Summary — last run " + ("✅ success" if result.ok else "❌ failed")
+    with st.expander(title, expanded=True):
+        # Headline outcome + instructions.
+        if result.ok:
+            st.success(
+                "Pipeline completed. **Distribution_Tracker_History.csv**, "
+                "**RO_Seed.csv** and **RO_History_Tracker.csv** were updated in "
+                "Fabric. The RO Comparison below refreshes automatically on the "
+                "next interaction (or change a month picker to force it now)."
+            )
+        else:
+            st.error(
+                "Pipeline did **not** complete — no files were written unless a "
+                "specific write is listed in the log below. Fix the issue(s) and "
+                "re-run. See the errors and warnings below."
+            )
+
+        # Errors first (only on failure), then warnings — both impossible to miss.
+        for err in result.errors:
+            st.error(f"❌ {err}")
+        if result.warnings:
+            st.warning(
+                "**Please review these warnings:**\n\n"
+                + "\n".join(f"- {w}" for w in result.warnings)
+            )
+
+        # Headline metrics (present once the relevant stages ran).
+        if result.ok:
+            months = ", ".join(result.snapshot_months) or "—"
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("RO_Seed rows", f"{result.ro_seed_rows:,}"
+                      if result.ro_seed_rows is not None else "—")
+            m2.metric("New RO Keys", f"{result.new_ro_keys:,}"
+                      if result.new_ro_keys is not None else "—")
+            m3.metric("RO_History rows", f"{result.ro_history_rows:,}"
+                      if result.ro_history_rows is not None else "—")
+            m4.metric("RO_Seed total Lbs./yr", f"{result.ro_seed_total_lbs:,.0f}"
+                      if result.ro_seed_total_lbs is not None else "—")
+            st.caption(f"Snapshot month(s) processed: **{months}**")
+
+        # Full step-by-step run log (audit trail).
+        with st.expander("Full run log", expanded=not result.ok):
+            for entry in result.log:
+                icon = _LOG_LEVEL_ICON.get(entry.level, "•")
+                st.markdown(f"{icon} {entry.text}")
 
 
 def _render_month_filters(months: list) -> tuple:

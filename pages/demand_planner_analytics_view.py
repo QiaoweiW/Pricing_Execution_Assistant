@@ -72,7 +72,6 @@ from data_sources.demand_summary import (
     build_demand_pivot,
     build_monthly_budget_lookup,
     build_supply_format_lookup,
-    clear_demand_summary_cache,
     demand_plan_comparison_blob_path,
     fetch_mgmt_plan_full,
     fetch_mgmt_plan_history_tracker,
@@ -93,7 +92,10 @@ from data_sources.demand_plan_comparison import (
     ComparisonResult,
     DISPLAY_LABELS as DPC_DISPLAY_LABELS,
     DISPLAY_ORDER as DPC_DISPLAY_ORDER,
+    COLS_HIDDEN_BY_DEFAULT as DPC_COLS_HIDDEN_BY_DEFAULT,
     PERCENT_COLS as DPC_PERCENT_COLS,
+    fetch_fy27_budget_by_row_id,
+    fy27_budget_blob_path,
     COL_LABEL as DPC_COL_LABEL,
     DRV_COL_PMAJ,
     DRV_COL_SFMT,
@@ -234,6 +236,7 @@ from data_sources.ro_summary_report import (
     COL_DIM_PMINOR as SR_COL_DIM_PMINOR,
     COL_DIM_SFMT as SR_COL_DIM_SFMT,
     COL_LABEL as SR_COL_LABEL,
+    COL_ROW_ID as SR_COL_ROW_ID,
     COL_TOTAL_DELTA as SR_COL_TOTAL_DELTA,
     COL_Y1_CHANGE as SR_COL_Y1_CHANGE,
     COL_Y1_LATEST as SR_COL_Y1_LATEST,
@@ -765,9 +768,22 @@ def _render_customer_input_uploader() -> None:
             "Running the RO pipeline (merge history → build RO_Seed → "
             "update RO_History_Tracker)…"
         ):
-            st.session_state[_SS_PIPELINE_RESULT] = run_distribution_tracker_pipeline(
+            result = run_distribution_tracker_pipeline(
                 uploaded.getvalue(), anchor_date=anchor,
             )
+        st.session_state[_SS_PIPELINE_RESULT] = result
+        if result.ok:
+            # The pipeline just wrote new history to Fabric. The comparison and
+            # month pickers above were rendered BEFORE this write (so they still
+            # show the pre-upload months), and the month selectboxes persist
+            # their prior value by key (so they'd stay on the old "latest" even
+            # after a refresh). Drop the cached history read AND reset the
+            # picker keys, then rerun — so the just-absorbed month appears and
+            # the LE picker defaults to it immediately.
+            fetch_ro_history_df(force_refresh=True)
+            st.session_state.pop("ro_cmp_prior_month", None)
+            st.session_state.pop("ro_cmp_le_month", None)
+            st.rerun()
 
     # RO Summary — persists across reruns until the next run.
     result: Optional[PipelineResult] = st.session_state.get(_SS_PIPELINE_RESULT)
@@ -2225,17 +2241,36 @@ def _render_summary_report_fragment() -> None:
         )
         return
 
+    editor_cols = _summary_report_column_order()
+    editor_df = view_df.loc[:, [c for c in editor_cols if c in view_df.columns]]
+    sr_row_ids = (
+        view_df[SR_COL_ROW_ID].tolist()
+        if SR_COL_ROW_ID in view_df.columns
+        else []
+    )
+    sr_labels = (
+        view_df[SR_COL_LABEL].tolist()
+        if SR_COL_LABEL in view_df.columns
+        else []
+    )
+
+    def _style_ro_row(row: pd.Series) -> list[str]:
+        return _style_ro_summary_editor_row(
+            row, row_ids=sr_row_ids, labels=sr_labels,
+        )
+
+    styled_editor_df = editor_df.style.apply(_style_ro_row, axis=1)
     edited_view = st.data_editor(
-        view_df,
+        styled_editor_df,
         key="ro_sr_editor",
         num_rows="fixed",
         use_container_width=True,
         # Header (38) + per-row (35) sized to fit the whole template
         # without scrolling for the common ~10-30 visible row range,
         # capped so a huge template doesn't dominate the page.
-        height=min(35 * (len(view_df) + 1) + 38, 900),
+        height=min(35 * (len(editor_df) + 1) + 38, 900),
         column_config=_summary_report_column_config(),
-        column_order=_summary_report_column_order(),
+        column_order=editor_cols,
         hide_index=True,
     )
 
@@ -2715,21 +2750,33 @@ def _render_demand_summary() -> None:
             )
             return
 
-        # Consolidated "Refresh from Fabric" button.  One click clears
-        # BOTH cached snapshots so the planner gets a consistent re-read
-        # pair — matches the refresh model the RO Comparison section
-        # uses ("🔄 Refresh from Fabric") so the two sections feel
-        # uniform.
+        # Consolidated "Refresh from Fabric" button.  One click re-reads
+        # the ENTIRE section from the lakehouse — not just the two demand
+        # summary CSVs, but the Demand Plan Comparison summary and the
+        # Product Line Review below it.
+        #
+        # Why a full ``st.cache_data.clear()`` and not just
+        # ``clear_demand_summary_cache()``: the comparison + PLR pull
+        # several *other* Fabric sources (IBP Shipments/Orders, the PDH /
+        # customer / ship-to dims, the RO Summary delta, the FY27 budget
+        # workbook) behind their own caches, and their build outputs are
+        # keyed on a cheap ``(rows, cols)`` shape signature — so a content
+        # change that leaves the shape intact would otherwise serve a
+        # stale build even after the raw reads refresh.  Flushing every
+        # ``@st.cache_data`` slot (the same primitive the Market Barometer
+        # "Refresh from Fabric" uses) is the only way to guarantee all
+        # three sub-sections move together on one click.
         if st.button(
             "🔄 Refresh from Fabric",
             key="demand_summary_refresh_from_fabric",
             help=(
-                "Re-read both `qry_mgmt_plan_full.csv` and "
-                "`qry_total_item_level_demand.csv` from Microsoft Fabric "
-                "now — bypasses the 15-minute cache."
+                "Re-read this whole section from Microsoft Fabric now — "
+                "the Demand Summary CSVs, the Demand Plan Comparison "
+                "summary, and the Product Line Review — bypassing every "
+                "data cache."
             ),
         ):
-            clear_demand_summary_cache()
+            st.cache_data.clear()
             st.rerun()
 
         # Load both files.  We catch errors PER FILE so a failure on
@@ -3487,12 +3534,24 @@ def _render_demand_plan_comparison_section() -> None:
 # across reruns so the planner doesn't have to re-click on every
 # interaction once they've expanded the section.
 _DPC_ENABLED_KEY: str = "demand_plan_comparison_enabled"
+# When False, hide Total Actuals … Current Plan (Forecast) in the table.
+_DPC_SHOW_DETAIL_COLS_KEY: str = "demand_plan_comparison_show_detail_cols"
 
 # TTL for the derived (build) outputs.  60 minutes — matches the bumped
 # raw-CSV TTL so the build cache never out-lives its inputs.  The "🔄
 # Refresh from Fabric" button clears the raw cache (and the page reruns,
 # so the build cache misses cleanly on the next render).
 _CACHE_TTL_SECONDS_OUTPUTS: int = 60 * 60
+
+
+def _fy27_budget_workbook_etag() -> str:
+    """Cheap cache-bust key for the FY27 budget xlsx in Fabric."""
+    try:
+        from data_sources.fabric_lakehouse_io import get_file_properties
+        props = get_file_properties("fabric_htst", fy27_budget_blob_path())
+        return str(getattr(props, "etag", "") or "")
+    except Exception:
+        return ""
 
 
 def _signature_for(df: Optional[pd.DataFrame]) -> tuple[int, int]:
@@ -3543,12 +3602,21 @@ def _cached_enriched_sources(
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_fy27_budget_by_row_id(budget_etag: str) -> tuple[dict[str, float], tuple[str, ...]]:
+    """Cache FY27 leaf budgets keyed by comparison ``row_id``."""
+    result = fetch_fy27_budget_by_row_id()
+    return dict(result.by_row_id), tuple(result.warnings)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_demand_plan_comparison_payload(
     sig_key: tuple,
     filters: ComparisonFilters,
     ro_lookup_key: tuple,
+    budget_lookup_key: tuple,
     _enriched: EnrichedSources,
     _ro_lookup: dict,
+    _budget_by_row_id: dict[str, float],
 ) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
     """Cache the comparison build, returning a NATIVE tuple.
 
@@ -3566,6 +3634,7 @@ def _cached_demand_plan_comparison_payload(
         None, None, None, filters,
         ro_total_delta_by_path=_ro_lookup,
         enriched=_enriched,
+        budget_by_row_id=_budget_by_row_id,
     )
     return result.table, tuple(result.warnings), bool(result.ro_summary_available)
 
@@ -3725,6 +3794,11 @@ def _render_demand_plan_comparison_fragment() -> None:
     ro_lookup = fetch_ro_summary_total_delta_by_path()
     dim_df, dim_warning = _load_demand_comparison_dim()
 
+    # 4b. FY27 Budget workbook (leaf budgets for the Budget column).
+    budget_etag = _fy27_budget_workbook_etag()
+    budget_by_row_id, budget_warnings = _cached_fy27_budget_by_row_id(budget_etag)
+    budget_lookup_key = tuple(sorted(budget_by_row_id.items()))
+
     # 5. Build the shared enrichment ONCE, then reuse it across all
     #    three builders.  Cached on data signatures so repeated reruns
     #    with the same data + filters are free.
@@ -3742,7 +3816,13 @@ def _render_demand_plan_comparison_fragment() -> None:
             tracker_df, ibp_df, ibp_orders_df, pdh_df,
         )
         table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-            enrich_sig + (ro_sig,), filters, ro_sig, enriched, ro_lookup,
+            enrich_sig + (ro_sig, budget_lookup_key),
+            filters,
+            ro_sig,
+            budget_lookup_key,
+            enriched,
+            ro_lookup,
+            budget_by_row_id,
         )
         prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
             enrich_sig + (filters.prior_month,), filters, enriched,
@@ -3761,6 +3841,7 @@ def _render_demand_plan_comparison_fragment() -> None:
         warnings.append(ibp_orders_warning)
     if dim_warning:
         warnings.append(dim_warning)
+    warnings.extend(budget_warnings)
     for msg in warnings:
         st.warning(f"⚠️ {msg}")
 
@@ -3974,6 +4055,80 @@ def _load_demand_comparison_dim() -> tuple[Optional[pd.DataFrame], Optional[str]
         )
 
 
+# Hierarchy table row highlights (planner-facing).
+_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD = "background-color: #ffcc80; font-weight: 700"
+_ROW_STYLE_SUBTOTAL = "background-color: #fde9d9; font-weight: 600"
+_ROW_STYLE_MEMO = "font-style: italic; color: #555555"
+_ROW_STYLE_PLR_CUSTOMER = "background-color: #e3f2fd"
+
+_DPC_HIGHLIGHT_ROW_IDS: frozenset[str] = frozenset({"butter"})
+_RO_HIGHLIGHT_ROW_IDS: frozenset[str] = frozenset({"butter", "but"})
+_PLR_HIGHLIGHT_LABELS: frozenset[str] = frozenset({"Branded", "Private", "Grand Total"})
+
+
+def _normalize_table_label(label: object) -> str:
+    """Strip hierarchy indent (NBSP) and surrounding whitespace."""
+    return str(label).replace("\u00a0", " ").strip()
+
+
+def _is_butter_highlight_row(
+    idx: int,
+    *,
+    row_ids: list[str] | None,
+    labels: list[str] | None,
+    highlight_row_ids: frozenset[str],
+) -> bool:
+    if row_ids is not None and idx < len(row_ids) and row_ids[idx] in highlight_row_ids:
+        return True
+    if labels is not None and idx < len(labels):
+        return _normalize_table_label(labels[idx]) == "Butter"
+    return False
+
+
+def _style_comparison_hierarchy_row(
+    row: pd.Series,
+    *,
+    subtotal_flags: list[bool],
+    memo_flags: list[bool],
+    row_ids: list[str] | None,
+    labels: list[str] | None,
+) -> list[str]:
+    """Orange+bold Butter row; peach subtotals; italic memo rows."""
+    idx = int(row.name)
+    n = len(row)
+    if _is_butter_highlight_row(
+        idx,
+        row_ids=row_ids,
+        labels=labels,
+        highlight_row_ids=_DPC_HIGHLIGHT_ROW_IDS,
+    ):
+        return [_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD] * n
+    if idx < len(subtotal_flags) and subtotal_flags[idx]:
+        return [_ROW_STYLE_SUBTOTAL] * n
+    if idx < len(memo_flags) and memo_flags[idx]:
+        return [_ROW_STYLE_MEMO] * n
+    return [""] * n
+
+
+def _style_ro_summary_editor_row(
+    row: pd.Series,
+    *,
+    row_ids: list[str],
+    labels: list[str],
+) -> list[str]:
+    """Highlight the Butter row in the RO Summary editor (match DPC by name)."""
+    idx = int(row.name)
+    n = len(row)
+    if _is_butter_highlight_row(
+        idx,
+        row_ids=row_ids,
+        labels=labels,
+        highlight_row_ids=_RO_HIGHLIGHT_ROW_IDS,
+    ):
+        return [_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD] * n
+    return [""] * n
+
+
 def _demand_comparison_column_config(percent_labels: list[str]) -> dict:
     """Return the ``column_config`` for the comparison table.
 
@@ -3991,7 +4146,7 @@ def _demand_comparison_column_config(percent_labels: list[str]) -> dict:
         if label in percent_labels:
             config[label] = st.column_config.NumberColumn(label, format="%.1f%%")
         else:
-            config[label] = st.column_config.NumberColumn(label, format="%.1f")
+            config[label] = st.column_config.NumberColumn(label, format="%.2f")
     return config
 
 
@@ -4061,6 +4216,12 @@ def _render_demand_comparison_table(result) -> None:
     # the internal metadata columns.
     subtotal_flags = table["_is_subtotal"].tolist()
     memo_flags = table["_is_memo"].tolist()
+    row_ids = (
+        table["_row_id"].tolist() if "_row_id" in table.columns else None
+    )
+    label_flags = (
+        table[DPC_COL_LABEL].tolist() if DPC_COL_LABEL in table.columns else None
+    )
 
     display_df = table.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
@@ -4070,17 +4231,34 @@ def _render_demand_comparison_table(result) -> None:
         if label in display_df.columns:
             display_df[label] = display_df[label] * 100.0
 
-    # Pin column order: label first, then metrics in display order.
-    column_order = [DPC_COL_LABEL, *[DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER]]
+    # Optional detail columns (hidden by default per planner spec).
+    hidden_detail_labels = {
+        DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT
+    }
+    show_detail_cols = st.checkbox(
+        "Show actuals & month detail columns "
+        "(Total Actuals through Current Plan (Forecast))",
+        value=False,
+        key=_DPC_SHOW_DETAIL_COLS_KEY,
+        help=(
+            "When unchecked, the table shows Last Plan through Budget only. "
+            "Download and Save to Fabric still include every column."
+        ),
+    )
+    visible_metric_cols = [
+        DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER
+        if show_detail_cols or DPC_DISPLAY_LABELS[c] not in hidden_detail_labels
+    ]
+    column_order = [DPC_COL_LABEL, *visible_metric_cols]
 
     def _style_row(row: pd.Series) -> list[str]:
-        """Shade subtotals, italicise memo rows (by positional index)."""
-        i = int(row.name)
-        if i < len(subtotal_flags) and subtotal_flags[i]:
-            return ["background-color: #fde9d9; font-weight: 600"] * len(row)
-        if i < len(memo_flags) and memo_flags[i]:
-            return ["font-style: italic; color: #555555"] * len(row)
-        return [""] * len(row)
+        return _style_comparison_hierarchy_row(
+            row,
+            subtotal_flags=subtotal_flags,
+            memo_flags=memo_flags,
+            row_ids=row_ids,
+            labels=label_flags,
+        )
 
     styled = display_df.style.apply(_style_row, axis=1)
 
@@ -4134,7 +4312,7 @@ def _render_one_driver_table(
         DRV_COL_PMAJ: st.column_config.TextColumn(DRV_COL_PMAJ, width="small"),
         DRV_COL_SFMT: st.column_config.TextColumn(DRV_COL_SFMT, width="small"),
         DRV_COL_BRAND: st.column_config.TextColumn(DRV_COL_BRAND, width="small"),
-        value_col: st.column_config.NumberColumn(value_col, format="%.1f"),
+        value_col: st.column_config.NumberColumn(value_col, format="%.2f"),
     }
     for col in DRV_DRIVER_COLS:
         column_config[col] = st.column_config.TextColumn(col, width="large")
@@ -4344,7 +4522,7 @@ def _render_demand_driver_drill_down(
             DRV_ITEM_COL_CUSTOMER_ID: cc.TextColumn(
                 "Customer / Account No", width="small",
             ),
-            DRV_ITEM_COL_DELTA: cc.NumberColumn(format="%.1f"),
+            DRV_ITEM_COL_DELTA: cc.NumberColumn(format="%.2f"),
         }
         st.caption(
             f"**{len(items_df):,} item(s)** in **{group_labels[sel_group]} → "
@@ -4391,17 +4569,24 @@ def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
 
     subtotal_flags = table["_is_subtotal"].tolist() if "_is_subtotal" in table.columns else []
     memo_flags = table["_is_memo"].tolist() if "_is_memo" in table.columns else []
+    row_ids = (
+        table["_row_id"].tolist() if "_row_id" in table.columns else None
+    )
+    label_flags = (
+        table[DPC_COL_LABEL].tolist() if DPC_COL_LABEL in table.columns else None
+    )
     for pct_col in (PMAF_COL_ORDERED_PCT, PMAF_COL_SHIPPED_PCT):
         if pct_col in out_df.columns:
             out_df[pct_col] = out_df[pct_col] * 100.0
 
     def _style_row(row: pd.Series) -> list[str]:
-        i = int(row.name)
-        if i < len(subtotal_flags) and subtotal_flags[i]:
-            return ["background-color: #fde9d9; font-weight: 600"] * len(row)
-        if i < len(memo_flags) and memo_flags[i]:
-            return ["font-style: italic; color: #555555"] * len(row)
-        return [""] * len(row)
+        return _style_comparison_hierarchy_row(
+            row,
+            subtotal_flags=subtotal_flags,
+            memo_flags=memo_flags,
+            row_ids=row_ids,
+            labels=label_flags,
+        )
 
     styled = out_df.style.apply(_style_row, axis=1)
     column_order = [
@@ -4416,11 +4601,11 @@ def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
     ]
     column_config = {
         DPC_COL_LABEL: st.column_config.TextColumn(DPC_COL_LABEL, width="large", pinned=True),
-        PMAF_COL_PRIOR_PLAN: st.column_config.NumberColumn(PMAF_COL_PRIOR_PLAN, format="%.1f"),
-        PMAF_COL_ORDERED: st.column_config.NumberColumn(PMAF_COL_ORDERED, format="%.1f"),
-        PMAF_COL_SHIPPED: st.column_config.NumberColumn(PMAF_COL_SHIPPED, format="%.1f"),
-        PMAF_COL_ORDERED_DIFF: st.column_config.NumberColumn(PMAF_COL_ORDERED_DIFF, format="%.1f"),
-        PMAF_COL_SHIPPED_DIFF: st.column_config.NumberColumn(PMAF_COL_SHIPPED_DIFF, format="%.1f"),
+        PMAF_COL_PRIOR_PLAN: st.column_config.NumberColumn(PMAF_COL_PRIOR_PLAN, format="%.2f"),
+        PMAF_COL_ORDERED: st.column_config.NumberColumn(PMAF_COL_ORDERED, format="%.2f"),
+        PMAF_COL_SHIPPED: st.column_config.NumberColumn(PMAF_COL_SHIPPED, format="%.2f"),
+        PMAF_COL_ORDERED_DIFF: st.column_config.NumberColumn(PMAF_COL_ORDERED_DIFF, format="%.2f"),
+        PMAF_COL_SHIPPED_DIFF: st.column_config.NumberColumn(PMAF_COL_SHIPPED_DIFF, format="%.2f"),
         PMAF_COL_ORDERED_PCT: st.column_config.NumberColumn(PMAF_COL_ORDERED_PCT, format="%.1f%%"),
         PMAF_COL_SHIPPED_PCT: st.column_config.NumberColumn(PMAF_COL_SHIPPED_PCT, format="%.1f%%"),
     }
@@ -5293,14 +5478,11 @@ def _render_plr_table_for_pm(
 
     def _style_row(row: pd.Series) -> list[str]:
         idx = int(row.name)
-        # Customer-detail rows (now keyed on Corporate Group, planner
-        # spec) — light blue background so they read as a distinct band
-        # below the brand / pminor / sfmt hierarchy.  Colour:
-        # Material Design "Light Blue 50" (#e3f2fd) — high enough
-        # contrast to register at a glance, low enough to keep the
-        # cell text readable without forcing a colour change there.
-        blue = "background-color: #e3f2fd" if is_customer[idx] else ""
-        return [blue] * len(row)
+        if labels[idx] in _PLR_HIGHLIGHT_LABELS:
+            return [_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD] * len(row)
+        if is_customer[idx]:
+            return [_ROW_STYLE_PLR_CUSTOMER] * len(row)
+        return [""] * len(row)
 
     st.dataframe(
         display.style.apply(_style_row, axis=1),

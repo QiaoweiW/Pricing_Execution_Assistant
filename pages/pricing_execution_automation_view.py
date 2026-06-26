@@ -33,7 +33,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from data_sources import bid_asset_store as _bid_store
-from data_sources import price_book_distribution as _price_book
 from data_sources import task_manager_store as _task_store
 from data_sources import vbcs_refrehable_store as _vbcs_store
 from data_sources.bid_asset_store import BidAssetStoreError
@@ -508,7 +507,7 @@ def render():
     st.markdown('<h2 style="font-size: 1.8rem; color: #1f77b4; margin-bottom: 1rem;">Select Tool</h2>', unsafe_allow_html=True)
 
     # Create columns for tool selection with better visuals
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         if st.button("**Fixed Pricing**\n\nClick to generate VBCS files for Fixed and Quarterly pricing items", width='stretch', type="primary", key="fixed_btn"):
@@ -526,10 +525,6 @@ def render():
         if st.button("**Combine VBCS**\n\nClick to combine all VBCS files into one", width='stretch', type="primary", key="combine_btn"):
             st.session_state.selected_tool = "Combine VBCS"
 
-    with col5:
-        if st.button("**Pricing Update Validation (Testing)**\n\nClick to analyze pricing discrepancies", width='stretch', type="primary", key="validation_btn"):
-            st.session_state.selected_tool = "Pricing Update Validation"
-
     # Initialize session state if not exists
     if 'selected_tool' not in st.session_state:
         st.session_state.selected_tool = "Fixed Pricing"
@@ -545,8 +540,6 @@ def render():
         run_variable_pricing(data_files)
     elif st.session_state.selected_tool == "Combine VBCS":
         run_combine_vbcs(data_files)
-    elif st.session_state.selected_tool == "Pricing Update Validation":
-        run_pricing_validation(data_files)
 
     # Bottom section: shared execution task manager
     _render_task_manager_section()
@@ -1099,348 +1092,6 @@ def run_variable_pricing(data_files):
     else:
         st.info("No data available for download. Please run the generation first.")
 
-    # ── Distribute Price Book ────────────────────────────────────────────────
-    #
-    # Always render — the lookup pulls from the lakehouse (parquet +
-    # VBCS_refrehable folder), so it works even on a fresh session with
-    # no in-memory cache.  Kept INSIDE the Variable Pricing tool per
-    # operator spec ("under Variable Pricing > Download Output") so the
-    # price book lives next to the rates that drive it.
-    _render_distribute_price_book()
-
-
-# UI-only display label overrides for the cascading filters.  The
-# underlying parquet column name is kept in the data layer (so a column
-# rename upstream only needs one constant update there) — the
-# operator-facing string is rendered through this map so we can call
-# the start-date filter "Old Price Start Date" without losing the link
-# to the parquet schema.
-_FILTER_DISPLAY_LABEL_OVERRIDES: dict[str, str] = {
-    # Parquet column "Price Adjustment Start Date" → renders as
-    # "Old Price Start Date" because in the Price Book workflow that
-    # value represents the OLD price's effective start (the NEW
-    # effective window is sourced from the matched VBCS row).
-    "Price Adjustment Start Date": "Old Price Start Date",
-}
-
-
-def _filter_display_label(logical_col: str) -> str:
-    """Return the operator-facing label for a cascading filter column.
-
-    Looks up the column in :data:`_FILTER_DISPLAY_LABEL_OVERRIDES`
-    first; falls back to the raw column name when there's no override.
-    """
-    return _FILTER_DISPLAY_LABEL_OVERRIDES.get(logical_col, logical_col)
-
-
-def _render_distribute_price_book() -> None:
-    """Render the Distribute Price Book section under Variable Pricing.
-
-    Workflow
-    --------
-    1.  Load ``Files/FG_Pricing_History/B2C_Pricing_History.parquet``.
-    2.  Five cascading multi-selects: Item Category → Customer →
-        Ship to Site → Old Price Start Date → Pricing UOM.
-        Each downstream dropdown only exposes values still present in
-        the upstream-narrowed slice.
-    3.  Compute the price book via
-        :func:`price_book_distribution.build_price_book` using the
-        ``topmost`` (earliest) selected Old Price Start Date as
-        the +1-calendar-month reference for the New Price lookup.
-    4.  Preview the resulting frame, then expose Download / Send.
-
-    Failure modes are LOCALISED here — a parquet read failure renders
-    a single ``st.error`` and returns; an SMTP send failure renders a
-    per-recipient error list.  None of this can break the Variable
-    Pricing generation pipeline that lives above it.
-    """
-    st.markdown("---")
-    st.markdown("### 📦 Distribute Price Book")
-    st.caption(
-        "Filter B2C Pricing History → look up New Prices from the latest "
-        "VBCS files → download or email the resulting Price Book CSV."
-    )
-
-    with st.expander("Open the Price Book builder", expanded=False):
-        # ── 1. Load parquet + resolve schema ────────────────────────────────
-        try:
-            parquet_df = _price_book.load_b2c_pricing_history()
-        except _price_book.PriceBookError as exc:
-            st.error(f"❌ Could not load B2C Pricing History parquet: {exc}")
-            return
-        if parquet_df.empty:
-            st.warning(
-                "⚠️ B2C Pricing History parquet is empty — verify the upstream "
-                "pipeline has published rows to "
-                "`Files/FG_Pricing_History/B2C_Pricing_History.parquet`."
-            )
-            return
-        try:
-            column_map = _price_book.validate_parquet_schema(parquet_df)
-        except _price_book.PriceBookError as exc:
-            st.error(f"❌ Parquet schema error: {exc}")
-            return
-
-        # ── 2. Cascading multi-selects ──────────────────────────────────────
-        #
-        # Each filter narrows the parquet to the rows surviving the
-        # upstream selections, then the next filter's options are
-        # computed from that narrowed slice.  This is the natural
-        # cascading-multiselect semantics every BI tool uses.
-        selections: dict[str, list] = {}
-        narrowing = parquet_df
-        date_display_to_value: dict[str, pd.Timestamp] = {}
-
-        st.markdown("**Cascading filters** (each one narrows the next)")
-        cols = st.columns(5)
-        for i, logical in enumerate(_price_book.CASCADING_FILTERS):
-            options = _price_book.distinct_options(narrowing, logical, column_map)
-            with cols[i]:
-                # Operator-facing label honours the override map so the
-                # date filter can read "Old Price Start Date" while the
-                # underlying data path still keys on the parquet column.
-                display_label = _filter_display_label(logical)
-                if logical == _price_book.PARQUET_COL_START_DATE:
-                    # Date options: show YYYY-MM-DD strings so the
-                    # multiselect popover stays compact and sortable.
-                    display_options = [
-                        pd.Timestamp(o).strftime("%Y-%m-%d") for o in options
-                    ]
-                    # Remember the mapping so we can recover the
-                    # original Timestamp when building the filter.
-                    for disp, orig in zip(display_options, options):
-                        date_display_to_value[disp] = pd.Timestamp(orig)
-                    picked_display = st.multiselect(
-                        display_label,
-                        options=display_options,
-                        default=[],
-                        key=f"price_book_filter_{logical}",
-                        placeholder="(any)",
-                    )
-                    picked = [date_display_to_value[d] for d in picked_display]
-                else:
-                    picked = st.multiselect(
-                        display_label,
-                        options=options,
-                        default=[],
-                        key=f"price_book_filter_{logical}",
-                        placeholder="(any)",
-                    )
-            selections[logical] = picked
-            narrowing = _price_book.apply_filters(narrowing, selections, column_map)
-
-        row_count = len(narrowing)
-        st.caption(f"📋 {row_count:,} parquet row(s) match your filters")
-
-        if row_count == 0:
-            st.info("No rows match — adjust your filters above.")
-            return
-
-        # ── 3. Resolve the topmost (earliest) selected Old Price Start Date ─
-        start_picks = selections.get(_price_book.PARQUET_COL_START_DATE) or []
-        if not start_picks:
-            st.warning(
-                "⚠️ Select at least one **Old Price Start Date** so the "
-                "system knows which calendar month to look up New Prices "
-                "for (lookup month = topmost selected date + 1 calendar "
-                "month)."
-            )
-            return
-        topmost = min(pd.Timestamp(p) for p in start_picks)
-        target_month = (
-            topmost.normalize().replace(day=1) + pd.DateOffset(months=1)
-        ).normalize()
-        st.caption(
-            f"🎯 New Price lookup will scan VBCS files in "
-            f"{_vbcs_store.get_folder_label()} for `Adjustmentstartdate` "
-            f"in **{target_month.strftime('%B %Y')}** "
-            f"(topmost selected Old Price Start Date "
-            f"{topmost.strftime('%Y-%m-%d')} + 1 calendar month)."
-        )
-
-        # ── 4. Generate button — builds the Price Book DataFrame ────────────
-        if st.button("📝 Generate Price Book", type="primary", key="price_book_generate"):
-            with st.spinner("Building Price Book…"):
-                try:
-                    vbcs_files = _price_book.read_all_vbcs_files()
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"❌ Could not enumerate VBCS files: {exc}")
-                    return
-                try:
-                    result = _price_book.build_price_book(
-                        parquet_df,
-                        selections,
-                        column_map,
-                        topmost_start_date=topmost,
-                        vbcs_files=vbcs_files,
-                    )
-                except _price_book.PriceBookError as exc:
-                    st.error(f"❌ Could not build Price Book: {exc}")
-                    return
-            st.session_state["price_book_result"] = result
-            st.session_state["price_book_selections_snapshot"] = {
-                k: list(v) for k, v in selections.items()
-            }
-
-        # ── 5. Render the saved result (across reruns) ──────────────────────
-        result = st.session_state.get("price_book_result")
-        if result is None:
-            return
-
-        st.success(
-            f"✅ Built Price Book with {len(result.df):,} row(s) "
-            f"({result.matched_rows:,} matched a VBCS row, "
-            f"{result.unmatched_rows:,} unmatched ⇒ blank New Price)."
-        )
-
-        if result.conflicts:
-            with st.expander(
-                f"⚠️ {len(result.conflicts)} VBCS conflict(s) detected — "
-                "those rows have blank New Price",
-                expanded=False,
-            ):
-                for c in result.conflicts:
-                    pairs = ", ".join(f"`{f}` → {a}" for f, a in c.values)
-                    st.write(
-                        f"- **{c.item}** | site `{c.site}` | UOM `{c.uom}` — {pairs}"
-                    )
-
-        st.dataframe(result.df, use_container_width=True, height=320)
-
-        # ── 6. Download + email controls ────────────────────────────────────
-        file_name = f"price_book_{pd.Timestamp.now():%Y%m%d-%H%M}.csv"
-        csv_bytes = result.df.to_csv(index=False).encode("utf-8")
-        col_dl, col_send = st.columns([1, 2])
-        with col_dl:
-            st.download_button(
-                label="⬇️ Download Price Book (CSV)",
-                data=csv_bytes,
-                file_name=file_name,
-                mime="text/csv",
-                key="price_book_download",
-            )
-        with col_send:
-            st.markdown("**📧 Send Price Book by email**")
-            # Up-front SMTP configuration probe: lets us surface the
-            # copy-pasteable secrets template BEFORE the operator has
-            # typed an email address + clicked send, instead of after.
-            smtp_ready = _price_book.is_smtp_configured()
-            if not smtp_ready:
-                st.warning(
-                    "⚠️ Email sender is not configured yet — the "
-                    "**Send** button is disabled until SMTP credentials "
-                    "are present in `.streamlit/secrets.toml`.  "
-                    "Downloading the CSV (left) still works."
-                )
-                with st.expander(
-                    "Show secrets.toml template", expanded=False
-                ):
-                    st.caption(
-                        "Paste ONE of these blocks into "
-                        "`.streamlit/secrets.toml` (local) or the "
-                        "Streamlit Cloud secrets editor, then reload "
-                        "the app."
-                    )
-                    st.code(
-                        _price_book.smtp_template_for_ui(),
-                        language="toml",
-                    )
-            raw_emails = st.text_area(
-                "Recipient email addresses (one or more, separated by "
-                "comma, semicolon, or newline)",
-                key="price_book_recipients",
-                placeholder=(
-                    "alice@darigold.com, bob@partner.com\n"
-                    "carol@darigold.com"
-                ),
-                height=80,
-                disabled=not smtp_ready,
-            )
-            if st.button(
-                "📤 Send Price Book",
-                type="primary",
-                key="price_book_send",
-                disabled=not smtp_ready,
-            ):
-                tokens = _price_book.parse_recipients(raw_emails)
-                valid, invalid = _price_book.validate_recipients(tokens)
-                if invalid:
-                    st.error(
-                        f"❌ Invalid email address(es) (will not be "
-                        f"contacted): {invalid}"
-                    )
-                if not valid:
-                    st.warning("⚠️ Enter at least one valid email address.")
-                    return
-                summary_lines = _summarise_price_book_for_email(
-                    result, selections,
-                )
-                with st.spinner(
-                    f"Sending Price Book to {len(valid)} recipient(s)…"
-                ):
-                    try:
-                        delivery = _price_book.send_price_book(
-                            recipients=valid,
-                            csv_bytes=csv_bytes,
-                            file_name=file_name,
-                            summary_lines=summary_lines,
-                        )
-                    except _price_book.PriceBookError as exc:
-                        # The error already carries the full template;
-                        # surface it as a plain code block so toml
-                        # formatting is preserved.
-                        st.error("❌ SMTP config error — see template below.")
-                        st.code(str(exc), language="toml")
-                        return
-                successes = [d for d in delivery if d.success]
-                failures  = [d for d in delivery if not d.success]
-                if successes:
-                    st.success(
-                        f"✅ Delivered to {len(successes)} recipient(s): "
-                        + ", ".join(f"`{d.recipient}`" for d in successes)
-                    )
-                if failures:
-                    st.error(
-                        f"❌ Failed to deliver to {len(failures)} "
-                        "recipient(s):"
-                    )
-                    for d in failures:
-                        st.write(f"- `{d.recipient}` — {d.error}")
-
-
-def _summarise_price_book_for_email(
-    result, selections: dict[str, list],
-) -> list[str]:
-    """Build the per-send email-body summary lines.
-
-    Kept narrow on purpose — the body lists the filter selections used
-    and the matched / unmatched row counts so the recipient can sanity-
-    check the attachment without opening it.  Anything fancier
-    belongs in the CSV, not the email body.
-    """
-    lines: list[str] = []
-    selection_blurb = ", ".join(
-        f"{k}={v}" for k, v in selections.items() if v
-    )
-    if selection_blurb:
-        lines.append(f"Filters: {selection_blurb}")
-    if result.target_month is not None:
-        lines.append(
-            f"Lookup month for New Price: "
-            f"{result.target_month.strftime('%B %Y')}"
-        )
-    lines.append(f"Total rows: {len(result.df):,}")
-    lines.append(f"Matched VBCS rows: {result.matched_rows:,}")
-    lines.append(
-        f"Unmatched rows (blank New Price): {result.unmatched_rows:,}"
-    )
-    if result.conflicts:
-        lines.append(
-            f"VBCS conflicts blanked: {len(result.conflicts)} "
-            "(see Distribute Price Book screen for details)"
-        )
-    return lines
-
 
 def run_combine_vbcs(data_files):
     """Run VBCS File Combination"""
@@ -1563,22 +1214,4 @@ def run_combine_vbcs(data_files):
         )
     else:
         st.info("No combined data available for download. Please run the combination first.")
-
-
-def run_pricing_validation(data_files):
-    """Run pricing validation analysis"""
-    st.markdown("### Pricing Update Validation")
-    
-    st.info("🚧 Pricing validation feature is under development.")
-    st.markdown("""
-    This feature will analyze pricing discrepancies and validate pricing updates.
-    
-    **Planned functionality:**
-    - Compare pricing data across different time periods
-    - Identify pricing anomalies and discrepancies
-    - Validate pricing calculations
-    - Generate validation reports
-    
-    **Coming soon in a future update!**
-    """)
 

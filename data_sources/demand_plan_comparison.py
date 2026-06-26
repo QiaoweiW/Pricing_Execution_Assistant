@@ -63,12 +63,18 @@ Cultured subtotal to avoid double-counting.
 
 Units
 -----
-Every value is in **millions of pounds**, rounded to one decimal place
-for display — matching the planner's Excel and the Demand MOM Summary
-above it.
+Every value is in **millions of pounds**, rounded to two decimal places
+for display.
+
+Budget column
+-------------
+Leaf-row **Budget** values are read from
+``Files/RO Tracking/Demand Plan/FY27_Budget_Demand_Plan_Summary.xlsx``
+(see :func:`fetch_fy27_budget_by_row_id`).  Subtotals sum their children.
 """
 from __future__ import annotations
 
+import io
 import logging
 from dataclasses import dataclass, field
 from datetime import date
@@ -88,7 +94,7 @@ from data_sources.demand_summary import (
     FORECAST_BASE_PLAN,
     FORECAST_R_AND_O,
 )
-from data_sources.fabric_lakehouse_io import LakehouseIOError, read_csv
+from data_sources.fabric_lakehouse_io import LakehouseIOError, read_bytes, read_csv
 
 
 logger = logging.getLogger(__name__)
@@ -182,6 +188,10 @@ _DIM_ACCOUNT_DESC_CANDIDATES: tuple[str, ...] = (
 # RO Summary Report (RO_Reporting/RO_Summary_Report.csv).
 _RO_SUMMARY_REPORT_BLOB_PATH: str = (
     "RO Tracking/RO_Reporting/RO_Summary_Report.csv"
+)
+# FY27 leaf budgets (millions of lbs) — row labels mirror COMPARISON_TEMPLATE.
+_FY27_BUDGET_BLOB_PATH: str = (
+    "RO Tracking/Demand Plan/FY27_Budget_Demand_Plan_Summary.xlsx"
 )
 _RO_SUMMARY_SECRETS_SECTION: str = "fabric_htst"
 # The label (tree) column and the metric column we read.  Primary names
@@ -351,54 +361,6 @@ _RO_BRANDED = "Branded"
 _RO_PRIVATE = "Private Label"      # RO Summary labels Private as "Private Label"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# BUDGET — hard-coded per-leaf budget in MILLIONS of lbs.
-# ════════════════════════════════════════════════════════════════════════════
-#
-#   >>> FILL THESE IN <<<
-#
-# The planner specified Budget as a fixed number per row.  Populate each
-# LEAF below with its budget (in millions of lbs); subtotals are summed
-# automatically from their non-memo children, so do NOT set subtotal
-# budgets here.  Memo rows (Cottage Cheese / Sour Cream) may carry their
-# own budget for display but never roll up.
-#
-# Values default to 0.0 until provided.
-_BUDGET_BY_LEAF_M: dict[str, float] = {
-    # ESL
-    "esl_lc_branded": 0.0,
-    "esl_lc_private": 0.0,
-    "esl_sc_branded": 0.0,
-    "esl_sc_private": 0.0,
-    "esl_aerosol":    0.0,
-    # Aseptic
-    "asep_branded":   0.0,
-    "asep_private":   0.0,
-    # Cultured (Supply Format breakdown — these roll up)
-    "cult_large_tub": 0.0,
-    "cult_small_tub": 0.0,
-    "cult_pail":      0.0,
-    # Cultured (memo Portfolio-Minor breakdown — do NOT roll up)
-    "cult_cottage_cheese": 0.0,
-    "cult_sour_cream":     0.0,
-    # Fresh Milk
-    "fm_gallon_jug":  0.0,
-    "fm_caseless_jug": 0.0,
-    "fm_mini_carton": 0.0,
-    "fm_hg_jug":      0.0,
-    "fm_bossy":       0.0,
-    "fm_totes":       0.0,
-    "fm_tanker":      0.0,
-    # Butter
-    "butter":         0.0,
-}
-
-
-def _budget(leaf_id: str) -> float:
-    """Return the hard-coded budget (millions) for *leaf_id* (0.0 if unset)."""
-    return float(_BUDGET_BY_LEAF_M.get(leaf_id, 0.0))
-
-
 # The reporting template.  Declaration order == display order.  Subtotals
 # are declared before their children (top-down, screenshot order); the
 # recompute pass walks children via the id graph so declaration order has
@@ -412,35 +374,28 @@ COMPARISON_TEMPLATE: tuple[TemplateRow, ...] = (
     _subtotal("esl_lc", "Large Carton", 2, ("esl_lc_branded", "esl_lc_private")),
     _leaf("esl_lc_branded", "Branded", 3,
           pmaj_match=_ESL, sfmt_match="Large Carton", brand_match=BRAND_BRANDED,
-          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Large Carton", _RO_BRANDED),
-          budget_m=_budget("esl_lc_branded")),
+          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Large Carton", _RO_BRANDED)),
     _leaf("esl_lc_private", "Private", 3,
           pmaj_match=_ESL, sfmt_match="Large Carton", brand_match=BRAND_PRIVATE,
-          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Large Carton", _RO_PRIVATE),
-          budget_m=_budget("esl_lc_private")),
+          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Large Carton", _RO_PRIVATE)),
     _subtotal("esl_sc", "Small Carton", 2, ("esl_sc_branded", "esl_sc_private")),
     _leaf("esl_sc_branded", "Branded", 3,
           pmaj_match=_ESL, sfmt_match="Small Carton", brand_match=BRAND_BRANDED,
-          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Small Carton", _RO_BRANDED),
-          budget_m=_budget("esl_sc_branded")),
+          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Small Carton", _RO_BRANDED)),
     _leaf("esl_sc_private", "Private", 3,
           pmaj_match=_ESL, sfmt_match="Small Carton", brand_match=BRAND_PRIVATE,
-          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Small Carton", _RO_PRIVATE),
-          budget_m=_budget("esl_sc_private")),
+          ro_summary_path=(_RO_TOTAL, _RO_ESL, "Small Carton", _RO_PRIVATE)),
     _leaf("esl_aerosol", "Aerosol Can", 2,
-          pmaj_match=_ESL, sfmt_match="Aerosol Can",
-          budget_m=_budget("esl_aerosol")),
+          pmaj_match=_ESL, sfmt_match="Aerosol Can"),
 
     # ── Aseptic ─────────────────────────────────────────────────────
     _subtotal("aseptic", "Aseptic", 1, ("asep_branded", "asep_private")),
     _leaf("asep_branded", "Branded", 2,
           pmaj_match=_ESL, sfmt_match="Aseptic", brand_match=BRAND_BRANDED,
-          ro_summary_path=(_RO_TOTAL, _RO_ASEPTIC, _RO_BRANDED),
-          budget_m=_budget("asep_branded")),
+          ro_summary_path=(_RO_TOTAL, _RO_ASEPTIC, _RO_BRANDED)),
     _leaf("asep_private", "Private", 2,
           pmaj_match=_ESL, sfmt_match="Aseptic", brand_match=BRAND_PRIVATE,
-          ro_summary_path=(_RO_TOTAL, _RO_ASEPTIC, _RO_PRIVATE),
-          budget_m=_budget("asep_private")),
+          ro_summary_path=(_RO_TOTAL, _RO_ASEPTIC, _RO_PRIVATE)),
 
     # ── Cultured ────────────────────────────────────────────────────
     # Subtotal = Large Tub + Small Tub + Pail (the Supply Format split).
@@ -449,21 +404,16 @@ COMPARISON_TEMPLATE: tuple[TemplateRow, ...] = (
     _subtotal("cultured", "Cultured", 1, ("cult_large_tub", "cult_small_tub", "cult_pail")),
     _leaf("cult_large_tub", "Large Tub", 2,
           pmaj_match=_CULTURED, sfmt_match="Large Tub",
-          ro_summary_path=(_RO_TOTAL, _RO_CULTURED, "Large Tub"),
-          budget_m=_budget("cult_large_tub")),
+          ro_summary_path=(_RO_TOTAL, _RO_CULTURED, "Large Tub")),
     _leaf("cult_small_tub", "Small Tub", 2,
           pmaj_match=_CULTURED, sfmt_match="Small Tub",
-          ro_summary_path=(_RO_TOTAL, _RO_CULTURED, "Small Tub"),
-          budget_m=_budget("cult_small_tub")),
+          ro_summary_path=(_RO_TOTAL, _RO_CULTURED, "Small Tub")),
     _leaf("cult_pail", "Pail", 2,
-          pmaj_match=_CULTURED, sfmt_match="Pail",
-          budget_m=_budget("cult_pail")),
+          pmaj_match=_CULTURED, sfmt_match="Pail"),
     _leaf("cult_cottage_cheese", "Cottage Cheese", 2,
-          pmaj_match=_CULTURED, pminor_match="Cottage Cheese", is_memo=True,
-          budget_m=_budget("cult_cottage_cheese")),
+          pmaj_match=_CULTURED, pminor_match="Cottage Cheese", is_memo=True),
     _leaf("cult_sour_cream", "Sour Cream", 2,
-          pmaj_match=_CULTURED, pminor_match="Sour Cream", is_memo=True,
-          budget_m=_budget("cult_sour_cream")),
+          pmaj_match=_CULTURED, pminor_match="Sour Cream", is_memo=True),
 
     # ── Fresh Milk ──────────────────────────────────────────────────
     # Subtotal = Gallon Jug … Tanker.
@@ -472,35 +422,28 @@ COMPARISON_TEMPLATE: tuple[TemplateRow, ...] = (
                "fm_hg_jug", "fm_bossy", "fm_totes", "fm_tanker")),
     _leaf("fm_gallon_jug", "Gallon Jug", 2,
           pmaj_match=_FRESH_MILK, sfmt_match="Gallon Jug",
-          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Gallon Jug"),
-          budget_m=_budget("fm_gallon_jug")),
+          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Gallon Jug")),
     _leaf("fm_caseless_jug", "Caseless Jug", 2,
           pmaj_match=_FRESH_MILK, sfmt_match="Caseless Jug",
-          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Caseless Jug"),
-          budget_m=_budget("fm_caseless_jug")),
+          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Caseless Jug")),
     _leaf("fm_mini_carton", "Mini Carton", 2,
           pmaj_match=_FRESH_MILK, sfmt_match="Mini Carton",
-          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Mini Carton"),
-          budget_m=_budget("fm_mini_carton")),
+          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Mini Carton")),
     _leaf("fm_hg_jug", "HG Jug", 2,
           pmaj_match=_FRESH_MILK, sfmt_match="HG Jug",
-          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "HG Jug"),
-          budget_m=_budget("fm_hg_jug")),
+          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "HG Jug")),
     _leaf("fm_bossy", "Bossy", 2,
           pmaj_match=_FRESH_MILK, sfmt_match="Bossy",
-          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Bossy"),
-          budget_m=_budget("fm_bossy")),
+          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Bossy")),
     # "Totes" under Fresh Milk matches Supply Format = "Dispenser" (per
     # the planner's rule), and maps to the RO Summary "Totes" leaf.
     _leaf("fm_totes", "Totes", 2,
           pmaj_match=_FRESH_MILK, sfmt_match="Dispenser",
-          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Totes"),
-          budget_m=_budget("fm_totes")),
+          ro_summary_path=(_RO_TOTAL, _RO_FRESH_MILK, "Totes")),
     # Tanker rows live under "Fresh Milk or Bulk Fluid HTST"; no RO
     # Summary counterpart, so R&O stays 0.
     _leaf("fm_tanker", "Tanker", 2,
-          pmaj_match=_FRESH_MILK_TANKER, sfmt_match="Tanker",
-          budget_m=_budget("fm_tanker")),
+          pmaj_match=_FRESH_MILK_TANKER, sfmt_match="Tanker"),
 
     # ── Butter ──────────────────────────────────────────────────────
     # Per planner direction (2026-06), Butter is now scoped by BOTH
@@ -509,8 +452,7 @@ COMPARISON_TEMPLATE: tuple[TemplateRow, ...] = (
     # Both values come from PDH; the mask ANDs them in _leaf_mask.
     _leaf("butter", "Butter", 1,
           pmaj_match=_BUTTER, pminor_match=_BUTTER_PMINOR,
-          ro_summary_path=(_RO_TOTAL, "Butter"),
-          budget_m=_budget("butter")),
+          ro_summary_path=(_RO_TOTAL, "Butter")),
 )
 
 TEMPLATE_BY_ID: dict[str, TemplateRow] = {row.row_id: row for row in COMPARISON_TEMPLATE}
@@ -590,7 +532,22 @@ DISPLAY_ORDER: tuple[str, ...] = (
 # Columns rendered as percentages (the rest are millions of lbs).
 PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT})
 
+# Metric columns hidden by default in the Streamlit table — planners can
+# expand them via a checkbox on the page.  Spans Total Actuals through
+# Current Plan (Forecast), inclusive.
+COLS_HIDDEN_BY_DEFAULT: tuple[str, ...] = (
+    COL_TOTAL_ACTUALS,
+    COL_PRIOR_MONTH_ACTUAL,
+    COL_PRIOR_MONTH_FORECAST,
+    COL_CURRENT_PLAN_ACTUAL,
+    COL_CURRENT_PLAN_FORECAST,
+)
+
 _LBS_PER_MILLION: float = 1_000_000.0
+
+# Millions-of-lbs display precision for every metric column in this table
+# (and the Prior Month Actual vs Fcst companion table).
+_MILLIONS_DISPLAY_DECIMALS: int = 2
 
 # Prior-Month summary column labels (display contract).
 PMAF_COL_PRIOR_PLAN: str = "Prior Plan"
@@ -1334,6 +1291,177 @@ def build_enriched_sources(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FY27 Budget workbook (Fabric xlsx → leaf row_id lookup)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Map each comparison leaf ``row_id`` to the label path used in
+# ``FY27_Budget_Demand_Plan_Summary.xlsx`` (screenshot hierarchy).
+_BUDGET_LABEL_PATH_BY_ROW_ID: dict[str, tuple[str, ...]] = {
+    "esl_lc_branded": ("ESL", "Large Carton", "Branded"),
+    "esl_lc_private": ("ESL", "Large Carton", "Private"),
+    "esl_sc_branded": ("ESL", "Small Carton", "Branded"),
+    "esl_sc_private": ("ESL", "Small Carton", "Private"),
+    "esl_aerosol": ("ESL", "Aerosol Can"),
+    "asep_branded": ("Aseptic", "Branded"),
+    "asep_private": ("Aseptic", "Private"),
+    "cult_large_tub": ("Cultured", "Large Tub"),
+    "cult_small_tub": ("Cultured", "Small Tub"),
+    "cult_pail": ("Cultured", "Pail"),
+    "cult_cottage_cheese": ("Cultured", "Cottage Cheese"),
+    "cult_sour_cream": ("Cultured", "Sour Cream"),
+    "fm_gallon_jug": ("Fresh Milk", "Gallon Jug"),
+    "fm_caseless_jug": ("Fresh Milk", "Caseless Jug"),
+    "fm_mini_carton": ("Fresh Milk", "Mini Carton"),
+    "fm_hg_jug": ("Fresh Milk", "HG Jug"),
+    "fm_bossy": ("Fresh Milk", "Bossy"),
+    "fm_totes": ("Fresh Milk", "Totes"),
+    "fm_tanker": ("Fresh Milk", "Tanker"),
+    "butter": ("Butter",),
+}
+
+_BUDGET_MAJOR_LABELS: frozenset[str] = frozenset({
+    "ESL", "Aseptic", "Cultured", "Fresh Milk", "Butter",
+})
+_BUDGET_ESL_SFMT_LABELS: frozenset[str] = frozenset({
+    "Large Carton", "Small Carton", "Aerosol Can",
+})
+_BUDGET_CULTURED_CHILD_LABELS: frozenset[str] = frozenset({
+    "Large Tub", "Small Tub", "Pail", "Cottage Cheese", "Sour Cream",
+})
+_BUDGET_FRESH_MILK_SFMT_LABELS: frozenset[str] = frozenset({
+    "Gallon Jug", "Caseless Jug", "Mini Carton", "HG Jug",
+    "Bossy", "Totes", "Tanker",
+})
+_BUDGET_BRAND_LABELS: frozenset[str] = frozenset({"Branded", "Private"})
+_BUDGET_SKIP_LABELS: frozenset[str] = frozenset({
+    "Millions of lbs.", "Millions of lbs", "Budget", "",
+})
+
+
+@dataclass(frozen=True)
+class Fy27BudgetLoadResult:
+    """Parsed FY27 budget workbook keyed by comparison ``row_id``."""
+    by_row_id: dict[str, float]
+    warnings: tuple[str, ...] = ()
+
+
+def fy27_budget_blob_path() -> str:
+    """Return the Fabric blob path for the FY27 budget workbook."""
+    return _FY27_BUDGET_BLOB_PATH
+
+
+def _normalise_budget_label(raw: object) -> str:
+    """Collapse whitespace in a workbook label cell."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    return " ".join(str(raw).split()).strip()
+
+
+def _update_budget_context(label: str) -> list[str]:
+    """Return the hierarchy path after reading *label* from the workbook."""
+    if label.startswith("Total B2C"):
+        return [label]
+    if label in _BUDGET_MAJOR_LABELS:
+        return [label]
+    if label in _BUDGET_ESL_SFMT_LABELS:
+        return ["ESL", label]
+    if label in _BUDGET_CULTURED_CHILD_LABELS:
+        return ["Cultured", label]
+    if label in _BUDGET_FRESH_MILK_SFMT_LABELS:
+        return ["Fresh Milk", label]
+    if label in _BUDGET_BRAND_LABELS:
+        # Branded / Private appear under ESL (LC/SC) or Aseptic only.
+        return []  # caller resolves using prior context
+    return []
+
+
+def parse_fy27_budget_workbook(raw: bytes) -> dict[tuple[str, ...], float]:
+    """Parse the FY27 budget xlsx into ``label_path → millions``."""
+    frame = pd.read_excel(io.BytesIO(raw), header=None, engine="openpyxl")
+    if frame.empty or frame.shape[1] < 2:
+        return {}
+
+    values_by_path: dict[tuple[str, ...], float] = {}
+    context: list[str] = []
+
+    for _, row in frame.iterrows():
+        label = _normalise_budget_label(row.iloc[0])
+        if not label or label in _BUDGET_SKIP_LABELS:
+            continue
+        amount = pd.to_numeric(row.iloc[1], errors="coerce")
+        if pd.isna(amount):
+            continue
+
+        if label in _BUDGET_BRAND_LABELS:
+            if len(context) >= 2 and context[0] == "ESL":
+                path = (context[0], context[1], label)
+            elif context and context[-1] == "Aseptic":
+                path = ("Aseptic", label)
+            else:
+                continue
+        else:
+            context = _update_budget_context(label)
+            if not context:
+                continue
+            path = tuple(context)
+
+        values_by_path[path] = float(amount)
+
+    return values_by_path
+
+
+def budget_by_row_id_from_workbook(
+    values_by_path: dict[tuple[str, ...], float],
+) -> dict[str, float]:
+    """Translate workbook label paths to comparison ``row_id`` budgets."""
+    out: dict[str, float] = {}
+    for row_id, path in _BUDGET_LABEL_PATH_BY_ROW_ID.items():
+        if path in values_by_path:
+            out[row_id] = float(values_by_path[path])
+    return out
+
+
+def load_fy27_budget_by_row_id(raw: Optional[bytes]) -> Fy27BudgetLoadResult:
+    """Parse raw xlsx bytes into per-leaf budgets (millions of lbs)."""
+    if not raw:
+        return Fy27BudgetLoadResult(
+            {}, ("FY27 budget workbook is empty.",),
+        )
+    try:
+        paths = parse_fy27_budget_workbook(raw)
+    except Exception as exc:
+        return Fy27BudgetLoadResult(
+            {}, (f"Could not parse FY27 budget workbook: {exc}",),
+        )
+    by_row_id = budget_by_row_id_from_workbook(paths)
+    warnings: list[str] = []
+    missing = [
+        row_id for row_id in _BUDGET_LABEL_PATH_BY_ROW_ID
+        if row_id not in by_row_id
+    ]
+    if missing:
+        warnings.append(
+            f"FY27 budget workbook: {len(missing)} leaf row(s) had no "
+            f"matching label path (Budget will be 0 for those rows)."
+        )
+    return Fy27BudgetLoadResult(by_row_id=by_row_id, warnings=tuple(warnings))
+
+
+def fetch_fy27_budget_by_row_id() -> Fy27BudgetLoadResult:
+    """Read ``FY27_Budget_Demand_Plan_Summary.xlsx`` from Fabric."""
+    try:
+        raw, _etag = read_bytes(_RO_SUMMARY_SECRETS_SECTION, _FY27_BUDGET_BLOB_PATH)
+    except LakehouseIOError as exc:
+        return Fy27BudgetLoadResult(
+            {}, (
+                f"Could not read `Files/{_FY27_BUDGET_BLOB_PATH}` from "
+                f"Microsoft Fabric: {exc}",
+            ),
+        )
+    return load_fy27_budget_by_row_id(raw)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Build
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1345,6 +1473,7 @@ def build_demand_plan_comparison(
     *,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]] = None,
     enriched: Optional[EnrichedSources] = None,
+    budget_by_row_id: Optional[dict[str, float]] = None,
 ) -> ComparisonResult:
     """Build the Demand Plan Comparison Summary table.
 
@@ -1387,6 +1516,7 @@ def build_demand_plan_comparison(
         tracker_df, ibp_df, pdh_df, filters,
         ro_total_delta_by_path=ro_total_delta_by_path,
         enriched=enriched,
+        budget_by_row_id=budget_by_row_id,
     )
 
     # 4 + 5. Assemble the display frame.
@@ -1426,6 +1556,7 @@ def _build_runtime_artifacts(
     *,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
     enriched: Optional[EnrichedSources],
+    budget_by_row_id: Optional[dict[str, float]] = None,
 ) -> _RuntimeBuildArtifacts:
     """Build reusable runtime artifacts for comparison-style rollups."""
     warnings: list[str] = []
@@ -1469,6 +1600,10 @@ def _build_runtime_artifacts(
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
         )
+        if budget_by_row_id and tpl.row_id in budget_by_row_id:
+            measures[tpl.row_id][COL_BUDGET] = float(
+                budget_by_row_id[tpl.row_id],
+            )
     for tpl in runtime_template:
         if tpl.is_subtotal:
             measures[tpl.row_id] = _rollup_subtotal(tpl, measures, runtime_template_by_id)
@@ -1634,13 +1769,13 @@ def _assemble_table(
 
     df = pd.DataFrame.from_records(records)
 
-    # Round metric columns: 1 dp for millions, 4 dp for ratios (the page
+    # Round metric columns: 2 dp for millions, 4 dp for ratios (the page
     # formats ratios as percentages — keeping 4 dp preserves e.g. 6.3%).
     for col in DISPLAY_ORDER:
         if col in PERCENT_COLS:
             df[col] = df[col].round(4)
         else:
-            df[col] = df[col].round(1)
+            df[col] = df[col].round(_MILLIONS_DISPLAY_DECIMALS)
 
     # Final column order: metadata + label + metrics (display order),
     # renamed to the screenshot labels.
@@ -1783,7 +1918,7 @@ def _assemble_prior_month_actual_vs_fcst_table(
     ]
     pct_cols = [PMAF_COL_ORDERED_PCT, PMAF_COL_SHIPPED_PCT]
     for c in value_cols:
-        out[c] = out[c].round(1)
+        out[c] = out[c].round(_MILLIONS_DISPLAY_DECIMALS)
     for c in pct_cols:
         out[c] = out[c].round(4)
 
@@ -2103,7 +2238,7 @@ def _build_driver_table(buckets: pd.DataFrame, value_col: str) -> pd.DataFrame:
 
         row_data = {
             DRV_COL_PMAJ: pmaj, DRV_COL_SFMT: sfmt, DRV_COL_BRAND: brand,
-            value_col: round(net_m, 1),
+            value_col: round(net_m, _MILLIONS_DISPLAY_DECIMALS),
         }
         for col_name, cell in zip(DRV_DRIVER_COLS, drivers):
             row_data[col_name] = cell
@@ -2223,7 +2358,9 @@ def compute_demand_driver_items(
         DRV_ITEM_COL_BRAND: filtered["brand"],
         DRV_ITEM_COL_CUSTOMER: filtered["customer_name"],
         DRV_ITEM_COL_CUSTOMER_ID: filtered["customer_id"],
-        DRV_ITEM_COL_DELTA: (filtered["delta"] / _LBS_PER_MILLION).round(1),
+        DRV_ITEM_COL_DELTA: (
+            filtered["delta"] / _LBS_PER_MILLION
+        ).round(_MILLIONS_DISPLAY_DECIMALS),
     })
     return out[output_cols].reset_index(drop=True)
 
@@ -2436,7 +2573,14 @@ __all__ = [
     "TEMPLATE_BY_ID",
     "DISPLAY_LABELS",
     "DISPLAY_ORDER",
+    "COLS_HIDDEN_BY_DEFAULT",
     "PERCENT_COLS",
+    "fy27_budget_blob_path",
+    "fetch_fy27_budget_by_row_id",
+    "load_fy27_budget_by_row_id",
+    "parse_fy27_budget_workbook",
+    "budget_by_row_id_from_workbook",
+    "Fy27BudgetLoadResult",
     "COL_LABEL",
     "derive_brand",
     "build_item_dim_lookup",

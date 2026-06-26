@@ -16,12 +16,23 @@ import json
 import pandas as pd
 import streamlit as st
 
+from . import price_book_updater as _pbu
+from . import vbcs_compare as _vc
 from .batch import make_batch_number
 from .ords_client import push_changes
 from .schemas import LOVS, STATUS_LABELS
 
 # Columns rendered with 4-decimal precision when they are numeric.
 _PRICE_COLS = {"baseprice", "adjustmentamount"}
+
+# Session-state key for the last Update-Price-Books run (list[UpdateReport]),
+# so the results + download buttons survive reruns until the next run.
+_SS_PBU_REPORTS = "pbu_update_reports"
+
+# VBCS-compare: lakehouse folder + secrets section + session key for the result.
+_VBCS_FOLDER = "VBCS"
+_VBCS_SECRETS_SECTION = "fabric_htst"
+_SS_VBCS_RESULT = "pb_vbcs_compare_result"
 
 
 def _selectbox_options(lov_key: str, series: pd.Series) -> list[str]:
@@ -391,6 +402,9 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
     st.dataframe(df, use_container_width=True, height=420,
                  column_config=_build_column_config(df, fields))
 
+    # Compare this read against a fixed VBCS file in Fabric (mismatch report).
+    _render_vbcs_compare_section(df)
+
     _render_status_guide(df)
 
     # --- Upload changes (CSV) -------------------------------------------
@@ -480,3 +494,227 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
         )
         if bad:
             st.caption("Re-fetch from Oracle to confirm the current persisted status of each row.")
+
+
+# ── Update Price Books (offline workbook fill from an Oracle extract) ─────────
+
+def render_price_book_updater() -> None:
+    """Render the 'Update Price Books' section.
+
+    A self-contained, offline workflow (no Oracle/ORDS/Fabric I/O): upload one
+    Oracle price-adjustment extract (CSV) + one-or-more customer Price Book
+    workbooks (.xlsx), pick the Old / New price periods, and the matched rows'
+    Old/New/Change cells are filled from the extract and highlighted. Output is
+    a per-file report plus the updated workbooks (individually or as a ZIP).
+
+    All parsing / matching / editing lives in :mod:`price_book_updater`; this
+    function is purely the Streamlit surface.
+    """
+    st.markdown("---")
+    st.subheader("✏️ Update Price Books")
+    st.caption(
+        "Fill each Price Book's **Old Price** / **New Price** from an Oracle "
+        "extract: matched on Item ↔ itemname, Customer Site Name ↔ shiptositename "
+        "(case-insensitive), and Pricing UOM ↔ pricinguom. Only matched rows are "
+        "changed (and highlighted). **Excel** inputs are edited in place; **PDF** "
+        "inputs are converted into an updated copy of the Excel template below."
+    )
+
+    extract_file = st.file_uploader(
+        "1) Oracle price-adjustment extract (CSV)",
+        type=["csv"], key="pbu_extract",
+        help="The Oracle extract (priceadjs schema) holding the price snapshots.",
+    )
+    book_files = st.file_uploader(
+        "2) Price Book file(s) — Excel and/or PDF, upload one or many",
+        type=["xlsx", "pdf"], accept_multiple_files=True, key="pbu_books",
+    )
+    template_file = st.file_uploader(
+        "3) Excel template — only needed when uploading PDFs (its formatting / "
+        "logo is cloned for each PDF conversion)",
+        type=["xlsx"], key="pbu_template",
+        help="An existing Excel price book whose layout/branding the PDF "
+             "conversions should match.",
+    )
+
+    if extract_file is None:
+        st.info("Upload the Oracle extract to choose the price periods.")
+        return
+
+    try:
+        extract_df = _pbu.load_oracle_extract(extract_file.getvalue())
+        periods = _pbu.available_periods(extract_df)
+    except _pbu.PriceBookUpdateError as exc:
+        st.error(f"❌ {exc}")
+        return
+    if not periods:
+        st.warning("The extract has no usable `adjustmentstartdate` values.")
+        return
+
+    # Period pickers sourced from the extract's distinct snapshots. Multi-select
+    # so the user can search several dates per side; leaving a side EMPTY keeps
+    # that price column as-is. (A single-period extract → assign it to Old OR New
+    # to update only that column.) When a row matches >1 selected period, the
+    # latest one wins.
+    label_to_ts = {_pbu.format_period(p): p for p in periods}
+    c1, c2 = st.columns(2)
+    with c1:
+        old_labels = st.multiselect(
+            "Old Price Search Period(s)", list(label_to_ts), key="pbu_old",
+            help="Snapshot(s) whose amount fills Old Price. Leave empty to keep "
+                 "the existing Old Price. If a row matches several, the latest is used.")
+    with c2:
+        new_labels = st.multiselect(
+            "New Price Search Period(s)", list(label_to_ts), key="pbu_new",
+            help="Snapshot(s) whose amount fills New Price. Leave empty to keep "
+                 "the existing New Price.")
+    old_periods = [label_to_ts[l] for l in old_labels]
+    new_periods = [label_to_ts[l] for l in new_labels]
+
+    both_blank = not old_periods and not new_periods
+    if both_blank:
+        st.info("Pick at least one period (Old and/or New) to update.")
+
+    if st.button("▶️ Update Price Books", type="primary",
+                 disabled=(not book_files or both_blank), key="pbu_run"):
+        files = [(f.name, f.getvalue()) for f in book_files]
+        template_bytes = template_file.getvalue() if template_file is not None else None
+        with st.spinner("Matching the Oracle extract into the Price Book(s)…"):
+            st.session_state[_SS_PBU_REPORTS] = _pbu.update_price_books(
+                files, extract_df, old_periods, new_periods,
+                template_bytes=template_bytes)
+
+    reports = st.session_state.get(_SS_PBU_REPORTS)
+    if reports:
+        _render_price_book_update_results(reports)
+
+
+def _render_price_book_update_results(reports: list) -> None:
+    """Render per-file outcomes + download buttons for an updater run."""
+    updated = [r for r in reports if r.ok and r.rows_updated]
+    st.markdown(f"**{len(updated)} of {len(reports)} file(s) updated.**")
+
+    # One-click ZIP of every workbook that produced bytes (updated or pass-through).
+    if any(r.workbook_bytes for r in reports):
+        st.download_button(
+            "⬇️ Download all updated workbooks (ZIP)",
+            data=_pbu.build_zip(reports),
+            file_name="Updated_Price_Books.zip",
+            mime="application/zip", key="pbu_zip",
+        )
+
+    renderer = {"success": st.success, "warning": st.warning, "error": st.error}
+    for i, rep in enumerate(reports):
+        renderer.get(rep.level, st.info)(f"**{rep.file_name}** — {rep.message}")
+        if rep.unmatched:
+            with st.expander(f"{len(rep.unmatched)} unmatched row(s) in {rep.file_name}"):
+                st.write(", ".join(rep.unmatched))
+        if rep.workbook_bytes is not None and rep.rows_updated:
+            st.download_button(
+                f"⬇️ Download updated {rep.file_name}",
+                data=rep.workbook_bytes,
+                file_name=f"Updated_{rep.file_name}",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"pbu_dl_{i}",
+            )
+
+
+# ── Compare the Oracle read against a fixed VBCS file in Fabric ──────────────
+
+def _render_vbcs_compare_section(read_df) -> None:
+    """Render the Fabric-gated 'compare read vs a fixed VBCS file' control.
+
+    Reuses the app's existing Microsoft Fabric sign-in (``fabric_signin_widget``)
+    and lakehouse client (``fabric_lakehouse_io``) — no new auth/IO code. Lists
+    ``Files/VBCS``, compares the (already-filtered) read above against the chosen
+    file via :mod:`vbcs_compare`, and offers a downloadable mismatch report plus
+    a run log. Collapsed by default so it stays out of the normal read flow.
+    """
+    with st.expander("🔬 Compare against a fixed VBCS file (Microsoft Fabric)",
+                     expanded=False):
+        st.caption(
+            "Pick a fixed file from `Files/VBCS` and compare the read above (as "
+            "filtered) against it — flags `adjustmentamount` mismatches matched on "
+            "itemname / pricinguom / shiptositename / adjustmentstartdate (by "
+            "calendar date), treating amounts equal within 4 decimals."
+        )
+
+        # Lazy imports keep the page import-safe and avoid duplicating any auth/IO.
+        try:
+            from utils import fabric_signin_widget as _fsw
+            from data_sources import fabric_lakehouse_io as _flio
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Fabric integration unavailable: {exc}")
+            return
+
+        if not _fsw.is_fabric_signed_in():
+            st.warning(
+                "🔒 **Microsoft Fabric is not connected.** Open **Home & Fabric "
+                "Sign-in** in the sidebar, then return here to compare."
+            )
+            return
+
+        try:
+            files = _flio.list_files(_VBCS_SECRETS_SECTION, _VBCS_FOLDER, suffix=".csv")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not list `Files/{_VBCS_FOLDER}`: {exc}")
+            return
+        if not files:
+            st.info(f"No `.csv` files found in `Files/{_VBCS_FOLDER}`.")
+            return
+
+        name_to_path = {f.name: f.full_path
+                        for f in sorted(files, key=lambda x: x.name.lower())}
+        col_pick, col_btn = st.columns([3, 1])
+        with col_pick:
+            choice = st.selectbox("VBCS file", list(name_to_path), key="pb_vbcs_file")
+        with col_btn:
+            st.write("")  # vertical spacer to align with the selectbox
+            run = st.button("🔬 Compare", type="primary", key="pb_vbcs_run")
+
+        if run:
+            try:
+                file_df, _etag = _flio.read_csv(
+                    _VBCS_SECRETS_SECTION, name_to_path[choice],
+                    read_csv_kwargs={"dtype": str, "keep_default_na": False})
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read `{choice}`: {exc}")
+                return
+            if file_df is None:
+                st.error(f"`{choice}` is empty or unreadable.")
+                return
+            with st.spinner(f"Comparing the read against `{choice}`…"):
+                st.session_state[_SS_VBCS_RESULT] = (
+                    choice, _vc.compare_oracle_to_file(read_df, file_df))
+
+        res = st.session_state.get(_SS_VBCS_RESULT)
+        if res:
+            _render_vbcs_compare_result(*res)
+
+
+def _render_vbcs_compare_result(file_name: str, result) -> None:
+    """Render the compare run log + mismatch report download."""
+    for entry in result.log:
+        if entry.level == "error":
+            st.error(f"❌ {entry.text}")
+        elif entry.level == "warning":
+            st.warning(f"⚠️ {entry.text}")
+        else:
+            st.caption(f"• {entry.text}")
+
+    if not result.ok:
+        return
+    report = result.report
+    if report.empty:
+        st.success(f"✅ No mismatches between the read and `{file_name}`.")
+        return
+
+    st.warning(f"**{len(report):,} mismatch row(s)** vs `{file_name}` "
+               "(see `mismatch_type` in the report).")
+    st.download_button(
+        "⬇️ Download mismatch report (CSV)",
+        data=_vc.report_to_csv_bytes(report),
+        file_name=f"VBCS_compare_{file_name.removesuffix('.csv')}.csv",
+        mime="text/csv", key="pb_vbcs_report_dl",
+    )
+    st.dataframe(report, use_container_width=True, height=360, hide_index=True)

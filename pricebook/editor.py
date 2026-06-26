@@ -12,6 +12,7 @@ Note: SelectboxColumn options are unioned with the values actually present, so
 a legacy value outside the canonical LOV doesn't make the grid raise.
 """
 import json
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -33,6 +34,11 @@ _SS_PBU_REPORTS = "pbu_update_reports"
 _VBCS_FOLDER = "VBCS"
 _VBCS_SECRETS_SECTION = "fabric_htst"
 _SS_VBCS_RESULT = "pb_vbcs_compare_result"
+
+# Every "Download CSV" also drops a timestamped copy of the read here, so the
+# lakehouse keeps an append-only audit trail of what was pulled and when.
+_EXTRACT_SNAPSHOT_DIR = f"{_VBCS_FOLDER}/Extract_Snapshot"
+_SS_SNAPSHOT_MSG = "pb_extract_snapshot_msg"  # (level, text) for the page to show
 
 
 def _selectbox_options(lov_key: str, series: pd.Series) -> list[str]:
@@ -374,6 +380,8 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
         st.session_state[df_key] = fetched
         # Drop any stale results from a previous push.
         st.session_state.pop(f"{key}_results", None)
+        # Drop any stale snapshot message from a previous download.
+        st.session_state.pop(_SS_SNAPSHOT_MSG, None)
 
     df = st.session_state[df_key]
     st.caption(f"{len(df):,} rows loaded from Oracle")
@@ -385,9 +393,12 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
     # --- Download the pulled data ---------------------------------------
     d1, d2, _ = st.columns([1, 1, 4])
     with d1:
+        # Downloading also drops a timestamped copy in Fabric
+        # (Files/VBCS/Extract_Snapshot/) via the on_click callback.
         st.download_button(
             "⬇️ Download CSV", data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{key}.csv", mime="text/csv", key=f"{key}_dl_csv")
+            file_name=f"{key}.csv", mime="text/csv", key=f"{key}_dl_csv",
+            on_click=_save_extract_snapshot, args=(df, key))
     with d2:
         try:
             st.download_button(
@@ -397,6 +408,12 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
                 key=f"{key}_dl_xlsx")
         except Exception as e:  # noqa: BLE001 - openpyxl missing etc.; CSV still works
             st.caption(f"Excel export unavailable: {e}")
+
+    # Surface the outcome of the auto-snapshot triggered by Download CSV.
+    _snap_msg = st.session_state.get(_SS_SNAPSHOT_MSG)
+    if _snap_msg:
+        _level, _text = _snap_msg
+        getattr(st, _level)(_text)
 
     # Read-only view of what's currently in Oracle.
     st.dataframe(df, use_container_width=True, height=420,
@@ -617,6 +634,59 @@ def _render_price_book_update_results(reports: list) -> None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"pbu_dl_{i}",
             )
+
+
+# ── Auto-save a snapshot of every downloaded CSV to Fabric ──────────────────
+
+def _save_extract_snapshot(df: pd.DataFrame, base_name: str) -> None:
+    """Persist a timestamped copy of the downloaded read to the lakehouse.
+
+    Fires from the **Download CSV** button's ``on_click`` so every download
+    also drops a copy in ``Files/VBCS/Extract_Snapshot/`` named
+    ``<base>_<YYYYmmdd_HHMMSS>.csv``.  Reuses the app's existing Fabric
+    sign-in (``fabric_signin_widget``) + lakehouse client
+    (``fabric_lakehouse_io.write_csv``) — no new auth/IO code.
+
+    The outcome is recorded in ``st.session_state`` as a ``(level, text)``
+    pair for the page to render on the post-click rerun; the browser
+    download itself proceeds regardless of what happens here (a missing
+    Fabric connection or write error never blocks the download).
+    """
+    try:
+        from utils import fabric_signin_widget as _fsw
+        from data_sources import fabric_lakehouse_io as _flio
+    except Exception as exc:  # noqa: BLE001
+        st.session_state[_SS_SNAPSHOT_MSG] = (
+            "warning",
+            f"CSV downloaded, but the Fabric snapshot was skipped — "
+            f"integration unavailable: {exc}",
+        )
+        return
+
+    if not _fsw.is_fabric_signed_in():
+        st.session_state[_SS_SNAPSHOT_MSG] = (
+            "warning",
+            "CSV downloaded, but **no Fabric snapshot was saved** — Microsoft "
+            "Fabric is not connected.  Open **Home & Fabric Sign-in** in the "
+            "sidebar, then download again to keep an `Extract_Snapshot` copy.",
+        )
+        return
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    blob_path = f"{_EXTRACT_SNAPSHOT_DIR}/{base_name}_{stamp}.csv"
+    try:
+        _flio.write_csv(_VBCS_SECRETS_SECTION, blob_path, df)
+    except Exception as exc:  # noqa: BLE001
+        st.session_state[_SS_SNAPSHOT_MSG] = (
+            "error",
+            f"CSV downloaded, but saving the Fabric snapshot FAILED: {exc}",
+        )
+        return
+
+    st.session_state[_SS_SNAPSHOT_MSG] = (
+        "success",
+        f"✅ Snapshot saved to `Files/{blob_path}` ({len(df):,} rows).",
+    )
 
 
 # ── Compare the Oracle read against a fixed VBCS file in Fabric ──────────────

@@ -78,6 +78,7 @@ from data_sources.demand_summary import (
     fetch_pdh,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
     save_demand_plan_comparison,
+    sync_history_tracker_with_full,
     fetch_static_budget_base,
     fetch_static_budget_monthly,
     fetch_static_budget_ro,
@@ -2750,10 +2751,14 @@ def _render_demand_summary() -> None:
             )
             return
 
-        # Consolidated "Refresh from Fabric" button.  One click re-reads
-        # the ENTIRE section from the lakehouse — not just the two demand
-        # summary CSVs, but the Demand Plan Comparison summary and the
-        # Product Line Review below it.
+        # Consolidated "Refresh from Fabric" button.  One click:
+        #   1. Snapshots qry_mgmt_plan_full.csv into the plan-history
+        #      tracker as the next ``Cn`` cycle — but only when that
+        #      snapshot isn't already the tracker's latest cycle (a cheap
+        #      sample comparison decides; idempotent on repeat clicks).
+        #   2. Re-reads the ENTIRE section from the lakehouse — not just the
+        #      two demand summary CSVs, but the Demand Plan Comparison
+        #      summary and the Product Line Review below it.
         #
         # Why a full ``st.cache_data.clear()`` and not just
         # ``clear_demand_summary_cache()``: the comparison + PLR pull
@@ -2770,14 +2775,36 @@ def _render_demand_summary() -> None:
             "🔄 Refresh from Fabric",
             key="demand_summary_refresh_from_fabric",
             help=(
-                "Re-read this whole section from Microsoft Fabric now — "
-                "the Demand Summary CSVs, the Demand Plan Comparison "
-                "summary, and the Product Line Review — bypassing every "
-                "data cache."
+                "Snapshot the current plan into the history tracker as a new "
+                "cycle (if it isn't already there), then re-read this whole "
+                "section from Microsoft Fabric — the Demand Summary CSVs, the "
+                "Demand Plan Comparison summary, and the Product Line Review "
+                "— bypassing every data cache."
             ),
         ):
+            # Append the current full plan to the history tracker as the next
+            # cycle BEFORE clearing caches, so the post-refresh comparison
+            # re-reads the freshly-appended cycle.
+            try:
+                st.session_state["demand_summary_sync_result"] = (
+                    sync_history_tracker_with_full())
+            except DemandSummaryError as exc:
+                st.session_state["demand_summary_sync_result"] = {
+                    "action": "error", "message": str(exc)}
             st.cache_data.clear()
             st.rerun()
+
+        # Outcome of the most recent tracker sync (survives the rerun above).
+        _sync_result = st.session_state.get("demand_summary_sync_result")
+        if _sync_result:
+            _action = _sync_result.get("action")
+            _msg = _sync_result.get("message", "")
+            if _action in ("appended", "created"):
+                st.success(f"✅ {_msg}")
+            elif _action == "skipped":
+                st.info(f"ℹ️ {_msg}")
+            else:
+                st.error(f"❌ Plan-history tracker not updated: {_msg}")
 
         # Load both files.  We catch errors PER FILE so a failure on
         # one source doesn't hide the other (common case: one of the

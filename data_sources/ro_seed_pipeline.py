@@ -46,7 +46,9 @@ from pandas.tseries.offsets import MonthEnd
 
 from .fabric_lakehouse_io import (
     LakehouseIOError,
+    archive_bytes,
     delete_blob,
+    read_bytes,
     read_csv,
     write_csv,
 )
@@ -54,6 +56,9 @@ from .fabric_lakehouse_io import (
 # ── OneLake locations (relative to "Files/") ─────────────────────────────────
 _SECRETS_SECTION: str = "fabric_htst"
 _SOURCE_BLOB_PATH: str = "RO Tracking/Append_New_History/Distribution_Tracker.csv"
+# Every uploaded Distribution_Tracker is archived here (timestamped) before the
+# run, so prior inputs are recoverable.
+_RO_INPUT_ARCHIVE_DIR: str = "RO Tracking/Append_New_History/Archive"
 _DIST_HISTORY_BLOB_PATH: str = "RO Tracking/Distribution_Tracker_History.csv"
 _RO_SEED_BLOB_PATH: str = "RO Tracking/RO_Seed.csv"
 _RO_HISTORY_TRACKER_BLOB_PATH: str = "RO Tracking/RO_History_Tracker.csv"
@@ -513,6 +518,17 @@ def run_distribution_tracker_pipeline(
             log.err("The uploaded Distribution_Tracker.csv has no rows.")
             return result
 
+        # Archive the raw upload (timestamped) before doing anything else, so a
+        # bad input can always be recovered. Non-fatal: an archive failure must
+        # not block the run.
+        try:
+            archived = archive_bytes(
+                _SECRETS_SECTION, _RO_INPUT_ARCHIVE_DIR,
+                "Distribution_Tracker.csv", new_file_bytes)
+            log.info(f"Archived upload → 'Files/{archived}'.")
+        except LakehouseIOError as exc:
+            log.warn(f"Could not archive the upload (continuing): {exc}")
+
         df_history, _ = read_csv(_SECRETS_SECTION, _DIST_HISTORY_BLOB_PATH,
                                  read_csv_kwargs=_STR_READ_KW)
         if df_history is None:
@@ -583,6 +599,25 @@ def run_distribution_tracker_pipeline(
     except Exception as exc:  # noqa: BLE001 - surface any unexpected failure
         log.err(f"Pipeline failed: {exc}")
         return result
+
+
+# ── RO_Seed download helpers (for the RO section's download button) ──────────
+
+def ro_seed_blob_path() -> str:
+    """POSIX path (under ``Files/``) of the canonical ``RO_Seed.csv``."""
+    return _RO_SEED_BLOB_PATH
+
+
+def fetch_ro_seed_raw_bytes() -> bytes:
+    """Return ``RO_Seed.csv`` as raw bytes for a byte-for-byte download.
+
+    Raises :class:`LakehouseIOError` if the blob is missing/unreadable so the
+    caller can surface a clear message.
+    """
+    raw, _etag = read_bytes(_SECRETS_SECTION, _RO_SEED_BLOB_PATH)
+    if raw is None:
+        raise LakehouseIOError(f"'Files/{_RO_SEED_BLOB_PATH}' not found.")
+    return raw
 
 
 # ── Maintenance: delete a calendar month's rows from a history file ──────────

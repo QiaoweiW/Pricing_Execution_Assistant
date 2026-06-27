@@ -279,6 +279,36 @@ def write_bytes(
     return props.etag
 
 
+def archive_bytes(
+    secrets_section: str,
+    archive_dir: str,
+    filename: str,
+    payload: bytes,
+    *,
+    timestamp: Optional[str] = None,
+) -> str:
+    """Write ``payload`` to ``<archive_dir>/<stem>_<timestamp><ext>``; return the path.
+
+    A timestamped, append-only copy used by the upload pipelines to keep an
+    audit trail of every raw input *before* it is processed or overwritten
+    (so a bad upload can be recovered by re-uploading an archived copy).
+
+    ``filename`` is the logical leaf name (e.g. ``ibp_base_plan_current.csv``);
+    the suffix is inserted before the extension. ``timestamp`` defaults to the
+    current local time as ``YYYYmmdd_HHMMSS`` — pass an explicit value for
+    deterministic tests. Reuses :func:`write_bytes`, so it inherits the same
+    create-or-overwrite + error-wrapping contract.
+    """
+    if timestamp is None:
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem, dot, ext = filename.rpartition(".")
+    archived_name = f"{stem}_{timestamp}.{ext}" if dot else f"{filename}_{timestamp}"
+    blob_path = f"{archive_dir.rstrip('/')}/{archived_name}"
+    write_bytes(secrets_section, blob_path, payload)
+    return blob_path
+
+
 def delete_blob(secrets_section: str, blob_path: str) -> bool:
     """Delete a blob. Returns True on delete, False when the blob was absent."""
     from azure.core.exceptions import ResourceNotFoundError

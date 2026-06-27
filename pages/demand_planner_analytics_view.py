@@ -78,7 +78,6 @@ from data_sources.demand_summary import (
     fetch_pdh,
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
     save_demand_plan_comparison,
-    sync_history_tracker_with_full,
     fetch_static_budget_base,
     fetch_static_budget_monthly,
     fetch_static_budget_ro,
@@ -256,8 +255,15 @@ from data_sources.ro_seed_pipeline import (
     DELETE_TARGETS,
     PipelineResult,
     delete_history_rows_for_month,
+    fetch_ro_seed_raw_bytes,
+    ro_seed_blob_path,
     run_distribution_tracker_pipeline,
 )
+from data_sources.demand_plan_pipeline import (
+    DemandPlanResult,
+    run_demand_plan_pipeline,
+)
+from data_sources.fabric_lakehouse_io import LakehouseIOError
 from utils import fabric_signin_widget
 from utils.embed_helpers import (
     render_embedded_resource,
@@ -486,6 +492,7 @@ def _render_ro_comparison() -> None:
         )
 
         _render_ro_item_master_download_button()
+        _render_ro_seed_download_button()
 
         # 1b. "How to see your changes after upload" guidance.
         #     Replaces the old "🔄 Refresh from Fabric" button.  The
@@ -704,6 +711,36 @@ def _render_ro_item_master_download_button() -> None:
         help=(
             f"Downloads a byte-for-byte copy of `Files/{blob_path}` "
             "from Microsoft Fabric — no re-serialisation."
+        ),
+    )
+
+
+def _render_ro_seed_download_button() -> None:
+    """Download the current ``RO_Seed.csv`` — the input the Demand Plan ETL reads.
+
+    Lets the planner verify the seed's currency before uploading a new Base Plan
+    (the demand pipeline assumes RO_Seed is the right cycle; see decision #3).
+    """
+    if not fabric_signin_widget.is_fabric_signed_in():
+        return  # the item-master button above already prompts to sign in.
+
+    blob_path = ro_seed_blob_path()
+    try:
+        raw_bytes = fetch_ro_seed_raw_bytes()
+    except LakehouseIOError as exc:
+        st.caption(f"_RO_Seed.csv unavailable for download: {exc}_")
+        return
+
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        label="⬇️ Download RO_Seed.csv (current, from Fabric)",
+        data=raw_bytes,
+        file_name=f"RO_Seed_{today}.csv",
+        mime="text/csv",
+        key="ro_cmp_dl_ro_seed",
+        help=(
+            f"Byte-for-byte copy of `Files/{blob_path}` — the R&O source the "
+            "Demand Plan pipeline expands into `tbl_ro_input`."
         ),
     )
 
@@ -2706,6 +2743,155 @@ def _render_demand_summary_table(
     )
 
 
+# Session-state key for the last Demand Plan pipeline run (survives reruns).
+_SS_DEMAND_PIPELINE_RESULT = "_demand_plan_pipeline_result"
+
+
+def _render_base_plan_uploader() -> None:
+    """Upload a new Base Plan → run the in-app Demand Plan ETL → auto-refresh.
+
+    Mirrors the RO uploader (:func:`_render_customer_input_uploader`): on **Run**
+    the former Fabric-notebook pipeline runs in-app
+    (:func:`run_demand_plan_pipeline`) — rebuilding ``tbl_ro_input``,
+    ``qry_mgmt_plan_full``, ``qry_demand_item_customer_detail`` and
+    ``qry_total_item_level_demand``, and appending the cycle-over-cycle history
+    tracker with the upload's authored ``Cycle``. On success it flushes the
+    section's caches and reruns, so the tables below reflect the new plan with no
+    extra click.
+    """
+    with st.expander("⬆️ Upload a new Base Plan (run the Demand Plan pipeline)",
+                     expanded=False):
+        st.caption(
+            "Upload the new **`ibp_base_plan_current`** export. It must include "
+            "the usual plan columns plus a **`month`** column (the demand-review "
+            "meeting month) and a **`Cycle`** column (e.g. `C5`). On **Run** the "
+            "app archives the upload, rebuilds every demand-plan file, appends "
+            "the history tracker as that cycle, and refreshes this section — no "
+            "Fabric notebook needed. RO_Seed is used as-is (download it in the "
+            "RO Comparison section to verify it's current)."
+        )
+        uploaded = st.file_uploader(
+            "Upload ibp_base_plan_current.csv",
+            type=["csv"],
+            key="demand_base_plan_upload",
+            label_visibility="collapsed",
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            anchor_month = st.date_input(
+                "RO calendar anchor (Month 1)",
+                value=date(2026, 4, 1),
+                format="YYYY-MM-DD",
+                key="demand_base_plan_anchor",
+                help="First month of the R&O 36-month calendar (was the "
+                     "notebook's ANCHOR_MONTH). Defaults to 2026-04-01.",
+            )
+        with c2:
+            window_months = st.number_input(
+                "Forward window (months)",
+                min_value=1, max_value=60, value=24, step=1,
+                key="demand_base_plan_window",
+                help="Rows beyond (meeting month + this many months) are dropped. "
+                     "No lower bound — historical months are always kept.",
+            )
+
+        override_on = st.checkbox(
+            "Override forward-window month (default: use the upload's `month`)",
+            value=False, key="demand_base_plan_override_on",
+        )
+        meeting_override = None
+        if override_on:
+            meeting_override = st.date_input(
+                "Forward-window month",
+                value=date.today().replace(day=1),
+                format="YYYY-MM-DD",
+                key="demand_base_plan_override_month",
+            )
+
+        run_clicked = st.button(
+            "▶️ Run Demand Plan pipeline & Save to Fabric",
+            key="demand_base_plan_run",
+            type="primary",
+            disabled=uploaded is None,
+            help="Builds tbl_ro_input, qry_mgmt_plan_full, the item×customer "
+                 "detail and total item-level demand, then appends the history "
+                 "tracker — all written to Microsoft Fabric.",
+        )
+
+        if run_clicked and uploaded is not None:
+            with st.spinner(
+                "Running the Demand Plan pipeline (RO_Seed → tbl_ro_input → "
+                "mgmt_plan_full → detail → total item-level → history)…"
+            ):
+                result = run_demand_plan_pipeline(
+                    uploaded.getvalue(),
+                    anchor_month=anchor_month,
+                    forward_window_months=int(window_months),
+                    meeting_month_override=meeting_override,
+                )
+            st.session_state[_SS_DEMAND_PIPELINE_RESULT] = result
+            if result.ok:
+                # The pipeline just rewrote every demand-plan file. Flush ALL
+                # @st.cache_data so the Demand Summary, Comparison (shape-signature
+                # build caches) and PLR re-read fresh, then rerun.
+                st.cache_data.clear()
+                st.rerun()
+
+        result: Optional[DemandPlanResult] = st.session_state.get(
+            _SS_DEMAND_PIPELINE_RESULT)
+        if result is not None:
+            _render_demand_plan_pipeline_summary(result)
+
+
+def _render_demand_plan_pipeline_summary(result: DemandPlanResult) -> None:
+    """Render the foldable summary for the last Demand Plan pipeline run."""
+    title = ("📦 Demand Plan pipeline — last run "
+             + ("✅ success" if result.ok else "❌ failed"))
+    with st.expander(title, expanded=True):
+        if result.ok:
+            st.success(
+                f"Pipeline completed for cycle **{result.cycle}**. "
+                "tbl_ro_input, qry_mgmt_plan_full, the item×customer detail, "
+                "total item-level demand, and the history tracker were updated "
+                "in Fabric. This section refreshed automatically."
+            )
+        else:
+            st.error(
+                "Pipeline did **not** complete — no files were written unless a "
+                "specific write is listed in the log below. Fix the issue(s) "
+                "and re-run."
+            )
+
+        for err in result.errors:
+            st.error(f"❌ {err}")
+        if result.warnings:
+            st.warning("**Please review these warnings:**\n\n"
+                       + "\n".join(f"- {w}" for w in result.warnings))
+
+        if result.ok:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("mgmt_plan_full rows", f"{result.mgmt_full_rows:,}"
+                      if result.mgmt_full_rows is not None else "—")
+            m2.metric("detail rows", f"{result.detail_rows:,}"
+                      if result.detail_rows is not None else "—")
+            m3.metric("history rows", f"{result.history_rows:,}"
+                      if result.history_rows is not None else "—")
+            m4.metric("total Demand Plan lbs", f"{result.mgmt_total_lbs:,.0f}"
+                      if result.mgmt_total_lbs is not None else "—")
+            if result.meeting_month and result.window_end:
+                st.caption(
+                    f"Cycle **{result.cycle}** · meeting month "
+                    f"**{result.meeting_month:%Y-%m-%d}** · forward window "
+                    f"< **{result.window_end:%Y-%m-%d}**"
+                )
+
+        with st.expander("Full run log", expanded=not result.ok):
+            for entry in result.log:
+                icon = _LOG_LEVEL_ICON.get(entry.level, "•")
+                st.markdown(f"{icon} {entry.text}")
+
+
 def _render_demand_summary() -> None:
     """Render the Demand Summary section end-to-end inside a foldable expander.
 
@@ -2751,14 +2937,15 @@ def _render_demand_summary() -> None:
             )
             return
 
-        # Consolidated "Refresh from Fabric" button.  One click:
-        #   1. Snapshots qry_mgmt_plan_full.csv into the plan-history
-        #      tracker as the next ``Cn`` cycle — but only when that
-        #      snapshot isn't already the tracker's latest cycle (a cheap
-        #      sample comparison decides; idempotent on repeat clicks).
-        #   2. Re-reads the ENTIRE section from the lakehouse — not just the
-        #      two demand summary CSVs, but the Demand Plan Comparison
-        #      summary and the Product Line Review below it.
+        # Upload a new Base Plan → run the in-app Demand Plan pipeline.
+        # The history tracker is appended (with the upload's authored Cycle)
+        # by that pipeline, so this Refresh button only re-reads.
+        _render_base_plan_uploader()
+
+        # Consolidated "Refresh from Fabric" button.  One click re-reads the
+        # ENTIRE section from the lakehouse — not just the two demand summary
+        # CSVs, but the Demand Plan Comparison summary and the Product Line
+        # Review below it.
         #
         # Why a full ``st.cache_data.clear()`` and not just
         # ``clear_demand_summary_cache()``: the comparison + PLR pull
@@ -2775,36 +2962,13 @@ def _render_demand_summary() -> None:
             "🔄 Refresh from Fabric",
             key="demand_summary_refresh_from_fabric",
             help=(
-                "Snapshot the current plan into the history tracker as a new "
-                "cycle (if it isn't already there), then re-read this whole "
-                "section from Microsoft Fabric — the Demand Summary CSVs, the "
-                "Demand Plan Comparison summary, and the Product Line Review "
-                "— bypassing every data cache."
+                "Re-read this whole section from Microsoft Fabric — the Demand "
+                "Summary CSVs, the Demand Plan Comparison summary, and the "
+                "Product Line Review — bypassing every data cache."
             ),
         ):
-            # Append the current full plan to the history tracker as the next
-            # cycle BEFORE clearing caches, so the post-refresh comparison
-            # re-reads the freshly-appended cycle.
-            try:
-                st.session_state["demand_summary_sync_result"] = (
-                    sync_history_tracker_with_full())
-            except DemandSummaryError as exc:
-                st.session_state["demand_summary_sync_result"] = {
-                    "action": "error", "message": str(exc)}
             st.cache_data.clear()
             st.rerun()
-
-        # Outcome of the most recent tracker sync (survives the rerun above).
-        _sync_result = st.session_state.get("demand_summary_sync_result")
-        if _sync_result:
-            _action = _sync_result.get("action")
-            _msg = _sync_result.get("message", "")
-            if _action in ("appended", "created"):
-                st.success(f"✅ {_msg}")
-            elif _action == "skipped":
-                st.info(f"ℹ️ {_msg}")
-            else:
-                st.error(f"❌ Plan-history tracker not updated: {_msg}")
 
         # Load both files.  We catch errors PER FILE so a failure on
         # one source doesn't hide the other (common case: one of the

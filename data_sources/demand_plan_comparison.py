@@ -789,6 +789,33 @@ def _vectorised_brand(desc_series: pd.Series) -> pd.Series:
     return is_branded.map({True: BRAND_BRANDED, False: BRAND_PRIVATE}).astype("object")
 
 
+# Origin for the Excel/Lotus day-serial fast path — the source CSVs store
+# ``Start of Month`` as an integer day count from this epoch.
+_SERIAL_DAY_ORIGIN = pd.Timestamp("1899-12-30")
+
+# Inclusive day-serial window that pandas can represent as ns-resolution
+# Timestamps.  Derived once from pandas' own Timestamp limits (via plain
+# ``date`` components so the subtraction can't overflow pandas' Timedelta,
+# and to dodge the nanosecond-discard warning), with a 1-day buffer so the
+# partially-representable boundary days are excluded.
+#
+# Why clamp to this window BEFORE converting: ``pd.to_datetime(unit="D")``
+# scales days→nanoseconds inside a ``np.errstate(over="raise")`` block, so a
+# contaminated/overflowing month cell (an absurd magnitude or ±inf) overflows
+# float64 there and raises ``FloatingPointError`` — which ``errors="coerce"``
+# does NOT trap (it only suppresses date-parse failures, not numpy FP errors).
+# Nulling out-of-range values first keeps the intended "unparseable → NaT"
+# contract instead of crashing the whole column on one bad cell.
+_SERIAL_DAY_MIN = (
+    date(pd.Timestamp.min.year, pd.Timestamp.min.month, pd.Timestamp.min.day)
+    - _SERIAL_DAY_ORIGIN.date()
+).days + 1
+_SERIAL_DAY_MAX = (
+    date(pd.Timestamp.max.year, pd.Timestamp.max.month, pd.Timestamp.max.day)
+    - _SERIAL_DAY_ORIGIN.date()
+).days - 1
+
+
 def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
     """Vectorised first-of-month coercion (Excel serials + strings).
 
@@ -800,9 +827,14 @@ def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
     that compares against ``date`` objects keeps working unchanged.
     """
     s = series
-    # 1. Numeric/serial fast path.
+    # 1. Numeric/serial fast path.  Restrict to the representable serial
+    #    window first (``between`` yields False for NaN and ±inf, so those
+    #    are nulled too) — this turns garbage/overflowing cells into NaT
+    #    rather than letting them overflow inside pandas' day→ns scaling.
     as_num = pd.to_numeric(s, errors="coerce")
-    serials_ts = pd.to_datetime(as_num, unit="D", origin="1899-12-30", errors="coerce")
+    as_num = as_num.where(as_num.between(_SERIAL_DAY_MIN, _SERIAL_DAY_MAX))
+    serials_ts = pd.to_datetime(
+        as_num, unit="D", origin=_SERIAL_DAY_ORIGIN, errors="coerce")
     # 2. String fallback for survivors.
     needs_str = serials_ts.isna()
     if needs_str.any():

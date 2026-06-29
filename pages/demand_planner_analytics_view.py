@@ -4090,7 +4090,7 @@ def _render_demand_comparison_filters(
 
     # ── Month defaults ─────────────────────────────────────────────────
     # The computed disjoint split is the FALLBACK; the planner's preferred
-    # windows (Apr–May actuals, Jun 2026–Mar 2027 forecast, May prior
+    # windows (Mar–May actuals, Jun 2026–Mar 2027 forecast, May prior
     # month) override it whenever those exact months exist in the tracker.
     n_months = len(months)
     last_idx = n_months - 1
@@ -4100,7 +4100,7 @@ def _render_demand_comparison_filters(
         """Index of *target* in the month list, or *fallback* if absent."""
         return months.index(target) if target in months else fallback
 
-    actual_start_idx = _month_idx(date(2026, 4, 1), 0)
+    actual_start_idx = _month_idx(date(2026, 3, 1), 0)
     actual_end_idx = _month_idx(date(2026, 5, 1), prior_fallback_idx)
     fc_start_idx = _month_idx(date(2026, 6, 1), min(prior_fallback_idx + 1, last_idx))
     fc_end_idx = _month_idx(date(2027, 3, 1), last_idx)

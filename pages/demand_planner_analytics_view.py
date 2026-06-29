@@ -303,6 +303,38 @@ def _render_instructions() -> None:
     st.markdown("Enable real-time demand insights")
 
 
+# IBP cadence + supporting workbooks — SharePoint share links surfaced as a
+# quick-reference list above RO Comparison.  (label, url) pairs.
+_IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
+    (
+        "IBP Monthly Checklist and Calendar.xlsx",
+        "https://darigold1com.sharepoint.com/:x:/r/sites/"
+        "IntegratedBusinessPlanning-DarigoldDataModel/_layouts/15/Doc.aspx?"
+        "sourcedoc=%7B3180D0A0-F357-4A8D-9DEF-7108DE49D7A6%7D&"
+        "file=IBP%20Monthly%20Checklist%20and%20Calendar.xlsx&"
+        "action=default&mobileredirect=true&"
+        "TeamsCID=067d1c73-9056-42f2-b270-1fb9aa258683",
+    ),
+    (
+        "Baseline Plan Change Journal.xlsx",
+        "https://darigold1com.sharepoint.com/sites/BrandedPricing/"
+        "Shared%20Documents/B2C%20Demand%20Planning/"
+        "Baseline%20Plan%20Change%20Journal.xlsx?web=1",
+    ),
+)
+
+
+def _render_ibp_supporting_files() -> None:
+    """Render the 'IBP Cadence and Supporting files' link list.
+
+    A collapsed expander above RO Comparison listing the IBP cadence /
+    baseline workbooks as clickable SharePoint links.
+    """
+    with st.expander("📅 IBP Cadence and Supporting files", expanded=False):
+        for label, url in _IBP_SUPPORTING_FILES:
+            st.markdown(f"- [{label}]({url})")
+
+
 def _render_demand_planning_dashboard() -> None:
     """Embed the SharePoint Power BI desktop (``.pbix``) file as a live preview.
 
@@ -5771,11 +5803,12 @@ def render() -> None:
     Flow
     ----
     1. Page header + Instructions
-    2. RO Comparison                (collapsible, expanded by default)
-    3. Demand Summary               (collapsible, collapsed by default)
-    4. Product Line Review          (collapsible, collapsed by default)
-    5. Sales Distribution Tracker   (🚚, collapsible, collapsed)
-    6. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
+    2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
+    3. RO Comparison                (collapsible, expanded by default)
+    4. Demand Summary               (collapsible, collapsed by default)
+    5. Product Line Review          (collapsible, collapsed by default)
+    6. Sales Distribution Tracker   (🚚, collapsible, collapsed)
+    7. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -5784,6 +5817,9 @@ def render() -> None:
     )
 
     _render_instructions()
+    st.markdown("---")
+
+    _render_ibp_supporting_files()
     st.markdown("---")
 
     _render_ro_comparison()

@@ -446,6 +446,42 @@ def fetch_ibp_orders_slim_df(
     )
 
 
+@st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_fetch_shipments_months(_cache_token: str) -> tuple[date, ...]:
+    """Streamlit-cached ``SELECT DISTINCT "Month"`` over IBP Shipments."""
+    table_uri = _build_table_uri(_TABLE_SHIPMENTS)
+    token = _acquire_storage_token()
+    sql = f'SELECT DISTINCT "Month" FROM delta_scan(\'{table_uri}\')'
+    try:
+        con = get_duckdb_connection()
+        with duckdb_lock():
+            bind_storage_token(con, token)
+            df = con.execute(sql).df()
+    except FabricAuthError as exc:
+        raise IBPOfficialSourceError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise IBPOfficialSourceError(
+            f"Could not read distinct Months from '{_TABLE_SHIPMENTS}' at "
+            f"{table_uri}.  Underlying error: {exc}"
+        ) from exc
+    # Coerce to first-of-month dates; drop anything unparseable.
+    parsed = pd.to_datetime(df["Month"], errors="coerce").dropna()
+    months = {ts.to_period("M").to_timestamp().date() for ts in parsed}
+    return tuple(sorted(months))
+
+
+def fetch_ibp_shipments_months(*, force_refresh: bool = False) -> tuple[date, ...]:
+    """Return the sorted distinct first-of-month dates in ``dbo.IBP Shipments``.
+
+    Cheap, projection-only scan (``SELECT DISTINCT "Month"``) used to
+    populate the Demand Plan Comparison *Actual* month-range pickers from
+    the actuals' true source rather than from the plan-history tracker.
+    """
+    if force_refresh:
+        _cached_fetch_shipments_months.clear()
+    return _cached_fetch_shipments_months("default")
+
+
 __all__ = [
     "IBPSnapshotMeta",
     "IBPOfficialSourceError",
@@ -453,4 +489,5 @@ __all__ = [
     "fetch_ibp_shipments_df",
     "fetch_ibp_shipments_slim_df",
     "fetch_ibp_orders_slim_df",
+    "fetch_ibp_shipments_months",
 ]

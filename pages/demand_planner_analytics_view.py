@@ -136,6 +136,7 @@ from data_sources.demand_plan_comparison import (
 from data_sources.ibp_official import (
     IBPOfficialSourceError,
     fetch_ibp_orders_slim_df,
+    fetch_ibp_shipments_months,
     fetch_ibp_shipments_slim_df,
 )
 from data_sources.product_line_review import (
@@ -3963,7 +3964,19 @@ def _render_demand_plan_comparison_fragment() -> None:
         )
         return
 
-    filters = _render_demand_comparison_filters(cycles, months)
+    # Actual-range months come from IBP Shipments (the actuals' true
+    # source), so the planner can begin the actual window at a month the
+    # tracker doesn't carry (e.g. April 2026).  Cheap DISTINCT "Month"
+    # scan; on failure fall back to the tracker months.
+    try:
+        actual_months = list(fetch_ibp_shipments_months())
+    except IBPOfficialSourceError as exc:
+        logger.info("IBP Shipments months unavailable for Actual pickers: %s", exc)
+        actual_months = []
+    if not actual_months:
+        actual_months = months
+
+    filters = _render_demand_comparison_filters(cycles, months, actual_months)
     errors = validate_filters(filters)
     if errors:
         for msg in errors:
@@ -4101,7 +4114,7 @@ def _months_in_range_local(start: date, end: date) -> set[date]:
 
 
 def _render_demand_comparison_filters(
-    cycles: list[str], months: list[date],
+    cycles: list[str], months: list[date], actual_months: list[date],
 ) -> ComparisonFilters:
     """Render the cycle + month-range pickers; return a filter selection.
 
@@ -4110,6 +4123,11 @@ def _render_demand_comparison_filters(
     actual window as everything up to and including it, and the forecast
     window as everything after it (so the two windows start out
     disjoint).
+
+    ``months`` (tracker ``Start of Month`` values) drives the Forecast +
+    Prior-Month pickers; ``actual_months`` (IBP Shipments months — the
+    actuals' true source) drives the *Actual* range pickers so the actual
+    window can begin at a month the tracker doesn't carry (e.g. Apr 2026).
     """
     # Sensible default indices.
     # ── Cycle defaults: prefer C3 (current) vs C2 (prior) ──────────────
@@ -4123,17 +4141,26 @@ def _render_demand_comparison_filters(
     # ── Month defaults ─────────────────────────────────────────────────
     # The computed disjoint split is the FALLBACK; the planner's preferred
     # windows (Apr–May actuals, Jun 2026–Mar 2027 forecast, May prior
-    # month) override it whenever those exact months exist in the tracker.
+    # month) override it whenever those exact months exist — actuals in the
+    # IBP month list, forecast/prior in the tracker month list.
     n_months = len(months)
     last_idx = n_months - 1
     prior_fallback_idx = max(0, min(n_months // 2, n_months - 2)) if n_months >= 2 else 0
 
     def _month_idx(target: date, fallback: int) -> int:
-        """Index of *target* in the month list, or *fallback* if absent."""
+        """Index of *target* in the tracker month list, or *fallback*."""
         return months.index(target) if target in months else fallback
 
-    actual_start_idx = _month_idx(date(2026, 4, 1), 0)
-    actual_end_idx = _month_idx(date(2026, 5, 1), prior_fallback_idx)
+    # Actual pickers index into ``actual_months`` (IBP Shipments), not the
+    # tracker months.  Default the actual start to Apr 2026 (else earliest).
+    last_actual_idx = max(0, len(actual_months) - 1)
+
+    def _actual_idx(target: date, fallback: int) -> int:
+        """Index of *target* in the IBP month list, or *fallback*."""
+        return actual_months.index(target) if target in actual_months else fallback
+
+    actual_start_idx = _actual_idx(date(2026, 4, 1), 0)
+    actual_end_idx = _actual_idx(date(2026, 5, 1), last_actual_idx)
     fc_start_idx = _month_idx(date(2026, 6, 1), min(prior_fallback_idx + 1, last_idx))
     fc_end_idx = _month_idx(date(2027, 3, 1), last_idx)
     prior_default_idx = _month_idx(date(2026, 5, 1), prior_fallback_idx)
@@ -4163,12 +4190,12 @@ def _render_demand_comparison_filters(
     row2 = st.columns(2)
     with row2[0]:
         actual_start = st.selectbox(
-            "Actual — beginning month", options=months, index=actual_start_idx,
+            "Actual — beginning month", options=actual_months, index=actual_start_idx,
             key="dpc_actual_start", format_func=fmt_month,
         )
     with row2[1]:
         actual_end = st.selectbox(
-            "Actual — end month", options=months, index=actual_end_idx,
+            "Actual — end month", options=actual_months, index=actual_end_idx,
             key="dpc_actual_end", format_func=fmt_month,
         )
 

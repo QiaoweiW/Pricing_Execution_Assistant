@@ -177,6 +177,29 @@ def _scrub_headers(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=_RENAME_MAP)
 
 
+def _dedupe_identical_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop fully-identical rows, trimming text-cell whitespace first.
+
+    A naive ``drop_duplicates`` misses rows that are logically identical
+    but differ by a stray leading/trailing space or a CSV round-trip
+    artefact in a text cell — the usual reason duplicates survive into the
+    written history.  We strip every object (text) column's edge
+    whitespace BEFORE comparing so the dedupe is clean, and the trimmed
+    values carry through to the written file.  Numeric / Int64 columns are
+    left untouched.
+
+    Returns ``(deduped_df, n_removed)``.
+    """
+    if df is None or df.empty:
+        return df, 0
+    out = df.copy()
+    for col in out.select_dtypes(include="object").columns:
+        out[col] = out[col].astype(str).str.strip()
+    before = len(out)
+    out = out.drop_duplicates(ignore_index=True)
+    return out, before - len(out)
+
+
 # ── Stage 1: merge history + build RO_Seed ───────────────────────────────────
 
 def _merge_history_and_build_seed(
@@ -224,16 +247,20 @@ def _merge_history_and_build_seed(
     else:
         log.ok("Schemas match")
 
-    # 3. Append + de-duplicate.
+    # 3. Append, then normalise types/text, THEN de-duplicate.  Dedup must
+    #    run AFTER cleanup: raw rows that differ only in date format
+    #    (7/1/2026 vs 07/01/2026), Item # formatting (380574 vs 380574.0)
+    #    or Customer casing are distinct strings until cleanup canonicalises
+    #    them — deduping first would leave those identical-after-cleanup
+    #    rows in the written history (the reported duplicate-rows bug).
     df_combined = pd.concat([df_history, df_new], ignore_index=True)
-    before = len(df_combined)
-    df_combined = df_combined.drop_duplicates(ignore_index=True)
-    log.info(f"Combined: {before:,} → {len(df_combined):,} rows after dedupe "
-             f"({before - len(df_combined):,} dupes removed)")
-
-    # 4. Type / text cleanup.
     df_combined = _clean_combined_types(df_combined)
     log.ok("Formatting and cleanup applied")
+
+    before = len(df_combined)
+    df_combined, removed = _dedupe_identical_rows(df_combined)
+    log.info(f"De-duplicated history (post-cleanup): {before:,} → "
+             f"{len(df_combined):,} rows ({removed:,} identical rows removed)")
 
     # 5. Build RO_Seed from the current snapshot.
     ro_seed = _build_ro_seed(df_combined, new_months, log)
@@ -473,9 +500,10 @@ def _merge_into_ro_history(
         df_hist = df_hist.loc[~mask].reset_index(drop=True)
     log.info(f"Removed {removed:,} existing RO_History rows matching seed Month(s)")
 
-    combined = pd.concat([df_hist, df_seed_str], ignore_index=True).drop_duplicates().reset_index(drop=True)
+    combined = pd.concat([df_hist, df_seed_str], ignore_index=True)
+    combined, deduped = _dedupe_identical_rows(combined)
     log.info(f"RO_History rebuild: {before:,} − {removed:,} removed + {len(df_seed_str):,} "
-             f"appended = {len(combined):,} final rows")
+             f"appended − {deduped:,} identical = {len(combined):,} final rows")
     return combined
 
 

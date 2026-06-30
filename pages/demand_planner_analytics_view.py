@@ -46,6 +46,7 @@ widget interaction.
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from datetime import date, datetime
 from typing import Callable, Optional
 
@@ -178,6 +179,31 @@ from data_sources.demand_item_customer import (
 from data_sources.customer_dims import (
     CustomerDimsError,
     fetch_dp_dimcustomernames_df,
+)
+from data_sources.plan_lift import (
+    COL_MONTH as PL_COL_MONTH,
+    CORP_GROUP_UNMAPPED,
+    DIM_UNKNOWN,
+    IRI_FILTER_COLUMNS,
+    IRIResult,
+    PlanLiftBuildStats,
+    PlanLiftError,
+    SLICER_DIMS,
+    YoYLiftResult,
+    build_month_fiscal_labels,
+    build_plan_lift_base,
+    compute_iri_unit_lift,
+    compute_yoy_lift,
+    fetch_dimcalendar_df,
+    fetch_factscurrentaps_slim_df,
+    fetch_iri_df,
+    iri_file_label,
+    list_iri_files,
+    list_iri_filter_options,
+    list_minor_products,
+    list_portfolios,
+    list_slicer_options_for_portfolio,
+    today_month_begin,
 )
 from data_sources.ship_to_sites import (
     ShipToSitesSourceError,
@@ -5821,6 +5847,671 @@ def _render_plr_chart_for_pm(
     )
 
 
+# ── Plan Lift Analysis ────────────────────────────────────────────────────────
+#
+# Independent of every RO calculation: this section reads its own Fabric
+# sources (IBP Shipments, dp_factscurrentaps, dp_dimitems,
+# dp_dimcustomernames, dp_dimcalendar), computes "YoY Lift%" entirely in
+# Streamlit, and renders ABOVE RO Comparison so it shares no session
+# state with the RO workflow.  The metric itself lives in
+# :mod:`data_sources.plan_lift`; this layer only orchestrates caching,
+# slicers and charting.
+
+_PLAN_LIFT_CHART_HEIGHT = 380
+
+# Combo-slicer display order + human labels.  Keys are the internal
+# dim-column names produced by the plan_lift builder (see ``SLICER_DIMS``).
+_PLAN_LIFT_SLICER_ORDER: tuple[str, ...] = (
+    "corporate_group", "portfolio_major", "supply_format", "size",
+    "taxonomy", "brand_category", "brand_name", "portfolio_minor",
+    "item_code",
+)
+_PLAN_LIFT_SLICER_LABELS: dict[str, str] = {
+    "corporate_group": "Corporate Group",
+    "portfolio_major": "Portfolio",
+    "supply_format": "Supply Format",
+    "size": "Size",
+    "taxonomy": "Taxonomy",
+    "brand_category": "Brand Category",
+    "brand_name": "Brand",
+    "portfolio_minor": "Minor Product",
+    "item_code": "Item",
+}
+# Sanity guard — keep the view's slicer order in lock-step with the
+# builder's canonical dim set so a new dim can't silently drop off the UI.
+assert set(_PLAN_LIFT_SLICER_ORDER) == set(SLICER_DIMS)
+
+# The three combo builders offered inside every Portfolio section.
+_PLAN_LIFT_COMBO_IDS: tuple[str, ...] = ("A", "B", "C")
+# Combo slicer dims = every dim EXCEPT Portfolio (the combo is already
+# scoped to its enclosing Portfolio, so a Portfolio picker would be moot).
+_PLAN_LIFT_COMBO_DIMS: tuple[str, ...] = tuple(
+    d for d in _PLAN_LIFT_SLICER_ORDER if d != "portfolio_major"
+)
+# Categorical palette for the many lines a Portfolio chart can carry
+# (one per Minor Product + applied combos + IRI overlays).
+_PLAN_LIFT_PALETTE: tuple[str, ...] = (
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_plan_lift_base(
+    _ship_sig: tuple[int, int],
+    _plan_sig: tuple[int, int],
+    _dim_sig: tuple[int, int],
+    _cust_sig: tuple[int, int],
+    *,
+    _shipments_df: pd.DataFrame,
+    _plan_df: pd.DataFrame,
+    _dimitems_df: Optional[pd.DataFrame],
+    _customer_names_df: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, dict]:
+    """Build + cache the item×month×dims base, keyed on source signatures.
+
+    Mirrors the PLR caching contract: the signatures (rows, cols) form the
+    cache key while the underscore-prefixed frames are passed for the
+    actual build but excluded from hashing.  The build's
+    :class:`PlanLiftBuildStats` is returned as a plain ``dict`` so the
+    cached value is a builtin (avoids the pickle class-identity hazard
+    documented in ``data_sources.ibp_official``).
+    """
+    base, stats = build_plan_lift_base(
+        shipments_df=_shipments_df,
+        plan_df=_plan_df,
+        dimitems_df=_dimitems_df,
+        customer_names_df=_customer_names_df,
+    )
+    return base, asdict(stats)
+
+
+def _render_plan_lift_analysis() -> None:
+    """Foldable 'Plan Lift Analysis' section (above RO, independent of it)."""
+    with st.expander("📈 Plan Lift Analysis", expanded=False):
+        st.caption(
+            "**YoY Lift%** per Portfolio, computed entirely here from IBP "
+            "**Shipments** + the **current plan** (`dp_factscurrentaps`).  "
+            "At each month a series' numerator is its **plan** lbs when "
+            "planned, else its **shipped** lbs; the prior year is that same "
+            "numerator shifted back 12 months.  Lift is the **ratio of "
+            "sums** (`Σnumerator / Σprior-year − 1`), so left of today reads "
+            "actual-vs-actual and right of today reads plan-vs-actual.  "
+            "Corporate Group is resolved for both sides through "
+            "`dp_dimcustomernames`."
+        )
+        if not fabric_signin_widget.is_fabric_signed_in():
+            fabric_signin_widget.render()
+            return
+        _render_plan_lift_fragment()
+
+
+@st.fragment
+def _render_plan_lift_fragment() -> None:
+    """Load sources, build the base once, render per-portfolio charts.
+
+    A ``@st.fragment`` so slicer / button interactions rerun only this
+    section — never the RO or Demand Summary blocks above/below.
+    """
+    _render_plan_lift_instructions()
+
+    # 1) Required sources.  Shipments + current plan are hard dependencies;
+    #    a failure here means there is nothing to chart.
+    try:
+        with st.spinner("Reading Plan Lift sources from Microsoft Fabric…"):
+            shipments_df = fetch_ibp_shipments_slim_df()
+            plan_df = fetch_factscurrentaps_slim_df()
+    except (IBPOfficialSourceError, PlanLiftError) as exc:
+        st.error(f"❌ Could not load the Plan Lift sources.\n\n{exc}")
+        return
+
+    # 2) Soft dependencies — dims + the Corporate Group lookup degrade
+    #    gracefully (blank dims / "(Unmapped)" group) rather than blocking.
+    try:
+        dimitems_df = fetch_dimitems_df()
+    except RoComparisonError as exc:
+        logger.warning("dp_dimitems load failed for Plan Lift: %s", exc)
+        dimitems_df = None
+    try:
+        customer_names_df = fetch_dp_dimcustomernames_df()
+    except CustomerDimsError as exc:
+        logger.warning("dp_dimcustomernames load failed for Plan Lift: %s", exc)
+        customer_names_df = None
+    try:
+        calendar_df = fetch_dimcalendar_df()
+    except PlanLiftError as exc:
+        logger.warning("dp_dimcalendar load failed for Plan Lift: %s", exc)
+        calendar_df = None
+
+    # 3) Build (cached) the item×month×dims base frame.
+    base, stats_dict = _cached_plan_lift_base(
+        _signature_for(shipments_df),
+        _signature_for(plan_df),
+        _signature_for(dimitems_df),
+        _signature_for(customer_names_df),
+        _shipments_df=shipments_df,
+        _plan_df=plan_df,
+        _dimitems_df=dimitems_df,
+        _customer_names_df=customer_names_df,
+    )
+    if base is None or base.empty:
+        st.info("ℹ️ No overlapping shipment / plan rows to chart yet.")
+        return
+
+    _render_plan_lift_coverage(PlanLiftBuildStats(**stats_dict))
+
+    fiscal_labels = build_month_fiscal_labels(calendar_df)
+    today = today_month_begin(date.today())
+
+    portfolios = list_portfolios(base)
+    if not portfolios:
+        st.info("ℹ️ No `portfolio_major` values found in `dp_dimitems`.")
+        return
+
+    # 4) Section-level control: prior-year volume floor (one for the whole
+    #    section).  The IRI dataset is picked PER PORTFOLIO below.
+    volume_floor = st.number_input(
+        "Prior-year volume floor (lbs)",
+        min_value=0.0, value=0.0, step=1000.0,
+        key="plan_lift_volume_floor",
+        help=(
+            "Suppress (show 'n.m.') any series-month whose prior-year base "
+            "is positive but below this many pounds, so a tiny denominator "
+            "can't produce an explosive lift.  0 disables the floor."
+        ),
+    )
+
+    # List the available IRI files ONCE (one cheap round-trip) and hand the
+    # paths to every Portfolio; each Portfolio renders its own picker + does
+    # its own lazy load, so files differ per Portfolio without N listings.
+    try:
+        iri_paths = list_iri_files()
+    except PlanLiftError as exc:
+        logger.warning("Could not list IRI files for Plan Lift: %s", exc)
+        iri_paths = []
+
+    # 5) One lazy expander per Portfolio: Minor-Product lines by default,
+    #    plus combos / IRI overlays the planner adds via the button.
+    for idx, pmaj in enumerate(portfolios):
+        if idx:
+            st.divider()
+        with st.expander(f"📦 {pmaj}", expanded=False):
+            _render_plan_lift_portfolio(
+                base, pmaj, volume_floor, iri_paths, today, fiscal_labels,
+            )
+
+
+def _render_plan_lift_instructions() -> None:
+    """Plain-English 'how this section works' block at the top."""
+    with st.expander("📖 Instructions — what this shows & how it's built", expanded=False):
+        st.markdown(
+            "**What it shows.**  For every Portfolio, a line per **Minor "
+            "Product** tracking **YoY Lift %** — how this year's volume "
+            "compares to the same month a year earlier.\n\n"
+            "**How a line is built (ratio of sums).**  For each month we add "
+            "up the relevant volume, then divide by the same total from 12 "
+            "months earlier and subtract 1:\n"
+            "- **This month's volume** = the **current plan** "
+            "(`consensus_plan_lbs`) when a plan exists, otherwise actual "
+            "**shipped** lbs.  So *left of the 'today' line* reads "
+            "actual-vs-actual; *right of it* reads plan-vs-actual (shaded).\n"
+            "- **Prior year** = the **actual shipped** volume from 12 months "
+            "back — **always shipments, never the plan/APS**, even for future "
+            "months.  Every line answers \"vs. what we actually shipped a "
+            "year ago\".\n"
+            "- If there's no prior-year shipped volume to divide by, the "
+            "point shows **'n.m.'** (not meaningful).\n\n"
+            "**Combos (A / B / C).**  Build your own line inside any "
+            "Portfolio by picking Corporate Group / Supply Format / Brand / "
+            "Item etc. (choices are limited to that Portfolio).  Lines appear "
+            "only after you press **➕ Add to chart**.\n\n"
+            "**IRI overlay.**  Tick **Include IRI data** in a combo to add "
+            "syndicated **Unit Lift %** (`Incremental ÷ Base Units`, summed "
+            "to the month) from the IRI file you pick in that Portfolio's own "
+            "section.  It's a **promotional** lift — a different idea from "
+            "YoY — so it's drawn **dashed on the right-hand axis**.\n\n"
+            "**Data sources.**  IBP Shipments + `dp_factscurrentaps` "
+            "(plan) → the lift; `dp_dimitems` → Portfolio / Minor Product / "
+            "Brand etc.; `dp_dimcustomernames` → Corporate Group (for both "
+            "shipments and plan); `dp_dimcalendar` → fiscal labels; "
+            "`Files/RO Tracking/IRI/` → the IRI overlay."
+        )
+
+
+def _render_plan_lift_coverage(stats: PlanLiftBuildStats) -> None:
+    """Surface build warnings + a one-line mapping-coverage caption."""
+    for msg in stats.warnings:
+        st.warning(f"⚠️ {msg}")
+    notes: list[str] = []
+    if stats.corp_unmapped_plan_pct >= 1.0:
+        notes.append(f"{stats.corp_unmapped_plan_pct:.0f}% of plan lbs unmapped")
+    if stats.corp_unmapped_ship_pct >= 1.0:
+        notes.append(f"{stats.corp_unmapped_ship_pct:.0f}% of shipment lbs unmapped")
+    if stats.item_unmatched_pct >= 1.0:
+        notes.append(f"{stats.item_unmatched_pct:.0f}% of lbs from items absent in dp_dimitems")
+    if notes:
+        st.caption(
+            "Coverage — " + "; ".join(notes)
+            + f". Those land in **{CORP_GROUP_UNMAPPED}** / **{DIM_UNKNOWN}** "
+            "and are still counted in any series they belong to."
+        )
+
+
+def _render_plan_lift_iri_picker(
+    pmaj: str, iri_paths: list[str],
+) -> tuple[Optional[pd.DataFrame], dict[str, list[str]]]:
+    """Render one Portfolio's IRI dataset picker + lazy load.
+
+    The IRI CSV (tens of MB) is fetched only once a combo IN THIS
+    PORTFOLIO has its "Include IRI data" box ticked — detected via the
+    per-combo checkbox keys in ``st.session_state`` — so a Portfolio the
+    planner never overlays IRI on pays nothing.  Two Portfolios that pick
+    the same file share one cached read.
+
+    Returns ``(iri_df_or_None, iri_filter_options)``.
+    """
+    if not iri_paths:
+        st.caption("_No IRI files found in `Files/RO Tracking/IRI/`._")
+        return None, {}
+
+    selected = st.selectbox(
+        "IRI dataset (for this Portfolio's combo overlays)",
+        options=iri_paths,
+        format_func=iri_file_label,
+        key=f"plan_lift_iri_file_{pmaj}",
+        help="Pick which IRI export this Portfolio's combos overlay; each "
+             "combo reads its IRI filters from this file.",
+    )
+
+    iri_wanted = any(
+        bool(st.session_state.get(f"plan_lift_{pmaj}_{c}_iri"))
+        for c in _PLAN_LIFT_COMBO_IDS
+    )
+    if not iri_wanted:
+        st.caption("_Tick **Include IRI data** in a combo below to load this dataset._")
+        return None, {}
+
+    try:
+        with st.spinner(f"Reading IRI dataset '{iri_file_label(selected)}'…"):
+            iri_df = fetch_iri_df(selected)
+        return iri_df, list_iri_filter_options(iri_df)
+    except PlanLiftError as exc:
+        logger.warning("IRI load failed: %s", exc)
+        st.warning(f"⚠️ Could not load the selected IRI dataset: {exc}")
+        return None, {}
+
+
+def _plan_lift_combo_label(combo_id: str, selections: dict[str, list[str]]) -> str:
+    """Build a compact, human label for a combo line from its filters."""
+    if not selections:
+        return f"Combo {combo_id}"
+    parts = [
+        f"{_PLAN_LIFT_SLICER_LABELS[dim]}: {', '.join(vals)}"
+        for dim, vals in selections.items()
+    ]
+    summary = " · ".join(parts)
+    if len(summary) > 80:  # keep the legend readable
+        summary = summary[:77] + "…"
+    return f"Combo {combo_id} ({summary})"
+
+
+def _render_plan_lift_combo(
+    pmaj: str,
+    combo_id: str,
+    scoped_options: dict[str, list[str]],
+    iri_options: dict[str, list[str]],
+) -> dict:
+    """Render one combo builder (slicers + optional IRI) inside a Portfolio.
+
+    Returns a *pending* spec ``{label, plan_filters, iri_enabled,
+    iri_filters}`` reflecting the current widget state — the caller
+    snapshots it into applied state on the "Add to chart" click.  All
+    widget keys are namespaced by ``(portfolio, combo)`` so the three
+    combos and every Portfolio stay independent.
+    """
+    with st.expander(f"Combo {combo_id}", expanded=False):
+        selections: dict[str, list[str]] = {}
+        cols = st.columns(3)
+        for i, dim in enumerate(_PLAN_LIFT_COMBO_DIMS):
+            with cols[i % 3]:
+                chosen = st.multiselect(
+                    _PLAN_LIFT_SLICER_LABELS[dim],
+                    scoped_options.get(dim, []),
+                    key=f"plan_lift_{pmaj}_{combo_id}_{dim}",
+                )
+            if chosen:
+                selections[dim] = chosen
+
+        iri_enabled = st.checkbox(
+            "Include IRI data",
+            key=f"plan_lift_{pmaj}_{combo_id}_iri",
+            help="Overlay IRI promotional Unit Lift % (right axis) for the "
+                 "filters below, from the IRI dataset chosen at the top.",
+        )
+        iri_filters: dict[str, list[str]] = {}
+        if iri_enabled:
+            if not iri_options:
+                st.caption("_Select an IRI dataset at the top of the section to filter it._")
+            icols = st.columns(3)
+            for i, col in enumerate(IRI_FILTER_COLUMNS):
+                with icols[i % 3]:
+                    chosen = st.multiselect(
+                        col, iri_options.get(col, []),
+                        key=f"plan_lift_{pmaj}_{combo_id}_iri_{col}",
+                    )
+                if chosen:
+                    iri_filters[col] = chosen
+
+    return {
+        "label": _plan_lift_combo_label(combo_id, selections),
+        "plan_filters": selections,
+        "iri_enabled": bool(iri_enabled),
+        "iri_filters": iri_filters,
+    }
+
+
+def _render_plan_lift_portfolio(
+    base: pd.DataFrame,
+    pmaj: str,
+    volume_floor: float,
+    iri_paths: list[str],
+    today: pd.Timestamp,
+    fiscal_labels: dict,
+) -> None:
+    """Render one Portfolio: Minor-Product lines + combo/IRI overlays + download."""
+    # Default lines: one YoY-lift line per Minor Product in this Portfolio.
+    minors = list_minor_products(base, pmaj)
+    minor_lines = [
+        compute_yoy_lift(
+            base, {"portfolio_major": [pmaj], "portfolio_minor": [m]},
+            label=m, volume_floor=volume_floor,
+        )
+        for m in minors
+    ]
+    if not minor_lines:
+        st.caption(f"_No Minor Products found for {pmaj}._")
+
+    # IRI dataset for THIS Portfolio (lazy-loaded when a combo wants it).
+    iri_df, iri_options = _render_plan_lift_iri_picker(pmaj, iri_paths)
+
+    # Combo builders A/B/C — slicer options scoped to THIS Portfolio.
+    scoped_options = list_slicer_options_for_portfolio(base, pmaj)
+    st.markdown("**Build custom lines** (choices limited to this Portfolio):")
+    pending = [
+        _render_plan_lift_combo(pmaj, cid, scoped_options, iri_options)
+        for cid in _PLAN_LIFT_COMBO_IDS
+    ]
+
+    # Deferred apply: combos / IRI only reach the chart on the button click.
+    applied_key = f"plan_lift_applied_{pmaj}"
+    c1, c2, _ = st.columns([1, 1, 2])
+    with c1:
+        if st.button("➕ Add to chart", key=f"plan_lift_add_{pmaj}", type="primary"):
+            st.session_state[applied_key] = [
+                s for s in pending if s["plan_filters"] or s["iri_enabled"]
+            ]
+    with c2:
+        if st.button("Clear added", key=f"plan_lift_clear_{pmaj}"):
+            st.session_state.pop(applied_key, None)
+    applied: list[dict] = st.session_state.get(applied_key, [])
+
+    # Compute the applied combo lift lines + IRI overlays.
+    combo_lines: list[YoYLiftResult] = []
+    iri_lines: list[IRIResult] = []
+    for spec in applied:
+        if spec["plan_filters"]:
+            combo_lines.append(compute_yoy_lift(
+                base, {"portfolio_major": [pmaj], **spec["plan_filters"]},
+                label=spec["label"], volume_floor=volume_floor,
+            ))
+        if spec["iri_enabled"] and iri_df is not None:
+            iri_lines.append(compute_iri_unit_lift(
+                iri_df, spec["iri_filters"], label=f"{spec['label']} · IRI",
+            ))
+
+    # Line-removal control — untick any series (Minor Product, combo or IRI)
+    # to drop it from the chart.  State-backed so the choice survives the
+    # fragment reruns that Plotly's own legend-click hiding would reset.
+    visible = _plan_lift_visible_lines(pmaj, minor_lines, combo_lines, iri_lines)
+    minor_v = [ln for ln in minor_lines if ln.label in visible]
+    combo_v = [ln for ln in combo_lines if ln.label in visible]
+    iri_v = [ln for ln in iri_lines if ln.label in visible]
+
+    fig = _build_plan_lift_figure(minor_v, combo_v, iri_v, today, fiscal_labels)
+    st.plotly_chart(
+        fig, use_container_width=True, theme=None,
+        key=f"plan_lift_chart_{pmaj}",
+    )
+    if not applied:
+        st.caption("ℹ️ Build Combo A/B/C above and press **➕ Add to chart** to overlay custom lines.")
+
+    download = _plan_lift_download_frame(minor_v, combo_v, iri_v)
+    st.download_button(
+        "⬇️ Download data",
+        data=download.to_csv(index=False).encode("utf-8"),
+        file_name=f"plan_lift_{pmaj.replace(' ', '_').lower()}.csv",
+        mime="text/csv",
+        key=f"plan_lift_dl_{pmaj}",
+        help="Every series currently shown on the chart (Minor Products + combos + IRI).",
+    )
+
+
+def _plan_lift_visible_lines(
+    pmaj: str,
+    minor_lines: list[YoYLiftResult],
+    combo_lines: list[YoYLiftResult],
+    iri_lines: list[IRIResult],
+) -> set[str]:
+    """Render the 'Lines to display' control; return the labels to keep.
+
+    Every series starts visible.  Unticking a label removes that line and
+    the choice persists across reruns (unlike Plotly's legend-click, which
+    resets each time the fragment rebuilds the figure).  Newly added series
+    (e.g. a combo the planner just applied) auto-appear; previously removed
+    ones stay removed.
+    """
+    labels: list[str] = []
+    for line in (*minor_lines, *combo_lines, *iri_lines):
+        if line.label not in labels:   # dedupe, preserve order
+            labels.append(line.label)
+    if not labels:
+        return set()
+
+    sel_key = f"plan_lift_visible_{pmaj}"
+    known_key = f"plan_lift_visible_known_{pmaj}"
+    known = st.session_state.get(known_key)
+    if sel_key not in st.session_state or known is None:
+        st.session_state[sel_key] = list(labels)               # first render: all on
+    else:
+        new = [lbl for lbl in labels if lbl not in known]      # auto-show new series
+        st.session_state[sel_key] = [
+            lbl for lbl in st.session_state[sel_key] if lbl in labels
+        ] + new
+    st.session_state[known_key] = list(labels)
+
+    chosen = st.multiselect(
+        "Lines to display",
+        options=labels,
+        key=sel_key,
+        help="Untick a series to remove its line from the chart.",
+    )
+    return set(chosen)
+
+
+def _build_plan_lift_figure(
+    minor_lines: list[YoYLiftResult],
+    combo_lines: list[YoYLiftResult],
+    iri_lines: list[IRIResult],
+    today: pd.Timestamp,
+    fiscal_labels: dict,
+) -> go.Figure:
+    """Build the multi-line %-axis chart (today marker, future shading, IRI y2).
+
+    Minor-Product + combo YoY-lift lines share the left % axis; IRI Unit
+    Lift % lines are dashed on a secondary right % axis because they
+    measure a different (promotional) concept.
+    """
+    fig = go.Figure()
+    months_all: list[pd.Timestamp] = []
+    colour_idx = 0
+
+    def _add_lift_line(line: YoYLiftResult, width: float) -> None:
+        nonlocal colour_idx
+        colour = _PLAN_LIFT_PALETTE[colour_idx % len(_PLAN_LIFT_PALETTE)]
+        colour_idx += 1
+        frame = line.frame
+        if frame.empty:
+            return
+        months_all.extend(frame[PL_COL_MONTH].tolist())
+        customdata = [
+            [num, py, fiscal_labels.get(m, "")]
+            for m, num, py in zip(
+                frame[PL_COL_MONTH], frame["numerator"], frame["prior_year"],
+            )
+        ]
+        fig.add_trace(go.Scatter(
+            x=frame[PL_COL_MONTH].tolist(),
+            y=frame["lift"].tolist(),
+            name=line.label,
+            mode="lines+markers",
+            connectgaps=False,  # a NaN ("n.m.") leaves a real gap
+            line=dict(color=colour, width=width),
+            marker=dict(size=5),
+            customdata=customdata,
+            hovertemplate=(
+                "<b>%{x|%b %Y}</b> %{customdata[2]}<br>"
+                + line.label
+                + ": %{y:.1%}<br>"
+                "numerator %{customdata[0]:,.0f} lbs · "
+                "prior yr %{customdata[1]:,.0f} lbs<extra></extra>"
+            ),
+        ))
+
+    for line in minor_lines:           # default Minor-Product lines
+        _add_lift_line(line, width=2.0)
+    for line in combo_lines:           # applied combos — thicker to stand out
+        _add_lift_line(line, width=3.0)
+
+    for line in iri_lines:             # IRI overlays on the secondary axis
+        colour = _PLAN_LIFT_PALETTE[colour_idx % len(_PLAN_LIFT_PALETTE)]
+        colour_idx += 1
+        frame = line.frame
+        if frame.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=frame["month"].tolist(),
+            y=frame["unit_lift"].tolist(),
+            name=line.label,
+            mode="lines+markers",
+            connectgaps=False,
+            line=dict(color=colour, width=2.0, dash="dot"),
+            marker=dict(size=5, symbol="diamond"),
+            yaxis="y2",
+            customdata=[
+                [inc, bs] for inc, bs in zip(frame["incremental"], frame["base"])
+            ],
+            hovertemplate=(
+                "<b>%{x|%b %Y}</b><br>" + line.label
+                + ": %{y:.1%}<br>"
+                "incremental %{customdata[0]:,.0f} / base %{customdata[1]:,.0f}"
+                "<extra></extra>"
+            ),
+        ))
+
+    fig.add_hline(y=0, line=dict(color="#cccccc", width=1))
+    if months_all:
+        xmax = max(months_all)
+        # Shade current-month-onward (plan-influenced) and mark "today".
+        if xmax >= today:
+            fig.add_vrect(
+                x0=today.to_pydatetime(), x1=xmax.to_pydatetime(),
+                fillcolor="#fbeec1", opacity=0.30, line_width=0, layer="below",
+                annotation_text="plan / actual",
+                annotation_position="top right", annotation_font_size=10,
+            )
+        fig.add_vline(
+            x=today.to_pydatetime(),
+            line=dict(color="#888888", width=1.5, dash="dash"),
+        )
+
+    layout = dict(
+        height=_PLAN_LIFT_CHART_HEIGHT,
+        margin=dict(l=55, r=60, t=60, b=40),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0.0,
+            font=dict(size=11), bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#cccccc", borderwidth=1,
+        ),
+        xaxis=dict(title=None, tickfont=dict(size=11)),
+        yaxis=dict(
+            title="YoY Lift %", tickformat=".0%",
+            tickfont=dict(size=11), zeroline=False,
+        ),
+        hovermode="x unified",
+    )
+    if iri_lines:
+        layout["yaxis2"] = dict(
+            title="IRI Unit Lift %", tickformat=".0%",
+            overlaying="y", side="right", showgrid=False,
+            zeroline=False, tickfont=dict(size=11),
+        )
+    fig.update_layout(**layout)
+    return fig
+
+
+def _plan_lift_download_frame(
+    minor_lines: list[YoYLiftResult],
+    combo_lines: list[YoYLiftResult],
+    iri_lines: list[IRIResult],
+) -> pd.DataFrame:
+    """Concatenate every plotted series into one tidy, labelled download frame."""
+    lift_cols = [
+        "series", "series_type", "filters_applied", PL_COL_MONTH, "plan_sum",
+        "ship_sum", "numerator", "prior_year", "lift", "below_floor",
+    ]
+    parts: list[pd.DataFrame] = []
+    for kind, lines in (("Minor Product", minor_lines), ("Combo", combo_lines)):
+        for line in lines:
+            if line.frame.empty:
+                continue
+            frame = line.frame.copy()
+            frame.insert(0, "series", line.label)
+            frame.insert(1, "series_type", kind)
+            frame["filters_applied"] = _plan_lift_describe_filters(line.filters)
+            parts.append(frame[lift_cols])
+
+    frames: list[pd.DataFrame] = []
+    if parts:
+        frames.append(pd.concat(parts, ignore_index=True))
+    for line in iri_lines:
+        if line.frame.empty:
+            continue
+        frame = line.frame.rename(columns={
+            "incremental": "iri_incremental_units",
+            "base": "iri_base_units",
+            "unit_lift": "iri_unit_lift",
+        }).copy()
+        frame.insert(0, "series", line.label)
+        frame.insert(1, "series_type", "IRI Unit Lift")
+        frame["filters_applied"] = _plan_lift_describe_filters(line.filters)
+        frames.append(frame)
+
+    if not frames:
+        return pd.DataFrame(columns=lift_cols)
+    # Union of columns across plan-lift + IRI shapes (missing → NaN).
+    return pd.concat(frames, ignore_index=True)
+
+
+def _plan_lift_describe_filters(filters) -> str:
+    """Render an applied-filter dict as a compact, human-readable string."""
+    if not filters:
+        return "(whole company)"
+    return "; ".join(
+        f"{_PLAN_LIFT_SLICER_LABELS.get(dim, dim)}={', '.join(map(str, vals))}"
+        for dim, vals in filters.items()
+    )
+
+
 # ── 3. Entry point ────────────────────────────────────────────────────────────
 
 
@@ -5831,11 +6522,12 @@ def render() -> None:
     ----
     1. Page header + Instructions
     2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
-    3. RO Comparison                (collapsible, expanded by default)
-    4. Demand Summary               (collapsible, collapsed by default)
-    5. Product Line Review          (collapsible, collapsed by default)
-    6. Sales Distribution Tracker   (🚚, collapsible, collapsed)
-    7. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
+    3. Plan Lift Analysis           (📈, collapsible, collapsed; above RO)
+    4. RO Comparison                (collapsible, expanded by default)
+    5. Demand Summary               (collapsible, collapsed by default)
+    6. Product Line Review          (collapsible, collapsed by default)
+    7. Sales Distribution Tracker   (🚚, collapsible, collapsed)
+    8. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -5847,6 +6539,11 @@ def render() -> None:
     st.markdown("---")
 
     _render_ibp_supporting_files()
+    st.markdown("---")
+
+    # Plan Lift Analysis sits ABOVE RO Comparison and reads its own Fabric
+    # sources, so it stays fully independent of the RO calculations below.
+    _render_plan_lift_analysis()
     st.markdown("---")
 
     _render_ro_comparison()

@@ -1635,6 +1635,25 @@ def _build_runtime_artifacts(
     actual_months = _months_in_range(filters.actual_start, filters.actual_end)
     forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
     prior_month = filters.prior_month.replace(day=1)
+
+    # Guard: Prior Month Forecast benchmarks against the PRIOR cycle's plan
+    # for the prior month.  If that cycle carries no Base/R&O rows for the
+    # prior month the forecast is 0 and PM Actual would silently show the
+    # full actual as if it were a beat — surface that instead of hiding it.
+    if not trk.empty:
+        has_prior_forecast = bool((
+            (trk["cycle"] == filters.prior_cycle)
+            & trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+            & (trk["month"] == prior_month)
+        ).any())
+        if not has_prior_forecast:
+            warnings.append(
+                f"Prior cycle {filters.prior_cycle} has no Base/R&O plan rows "
+                f"for the prior month ({prior_month:%b %Y}), so Prior Month "
+                "Forecast is 0 and PM Actual reflects the full actual.  "
+                "Verify the tracker or choose a different prior cycle."
+            )
+
     runtime_template = _build_runtime_template_for_filters(
         trk, ibp, filters,
         actual_months=actual_months,
@@ -1715,9 +1734,15 @@ def _compute_leaf_measures(
     total_actuals = _sum_millions(ibp, ibp_mask & ibp_in_actual)
     prior_month_actual = _sum_millions(ibp, ibp_mask & ibp_in_prior)
 
-    # ── Plan buckets (tracker, current cycle, Base + R&O) ────────────
+    # ── Plan buckets (tracker, Base + R&O) ───────────────────────────
+    # Prior Month Forecast benchmarks the prior-month actual against the
+    # forecast that was live BEFORE the month closed — i.e. the PRIOR
+    # cycle's plan for that month — so PM Actual reads as a genuine
+    # forecast-vs-actual variance.  ("Prior" here means the prior cycle,
+    # not just the prior month.)  The current cycle's view of the actual
+    # window is already captured by Current Plan (Actual) below.
     prior_month_forecast = _sum_millions(
-        trk, trk_mask & cur_cycle & is_base_or_ro & trk_in_prior)
+        trk, trk_mask & prior_cycle & is_base_or_ro & trk_in_prior)
     current_plan_actual = _sum_millions(
         trk, trk_mask & cur_cycle & is_base_or_ro & trk_in_actual)
     current_plan_forecast = _sum_millions(
@@ -2530,7 +2555,7 @@ def build_pm_actual_driver_table(
     """Return the PM Actual driver table + item-level bucket detail.
 
     Value + driver magnitude = **PM Actual delta** = prior-month IBP
-    actual minus prior-month current-cycle (Base + R&O) tracker forecast
+    actual minus prior-month PRIOR-cycle (Base + R&O) tracker forecast
     (the same quantity as the comparison's *PM Actual* column).  Driver
     buckets are ``(Customer Name – Customer No)``: the actual side keys on
     IBP's own ``Customer Name`` / ``Customer No``; the forecast side maps
@@ -2569,10 +2594,13 @@ def build_pm_actual_driver_table(
             act["item_key"] = act["item_key"].map(_clean_str)
             parts.append(act[bucket_cols])
 
-    # ── Forecast side (tracker, current cycle, Base+R&O, prior month): −pounds ─
+    # ── Forecast side (tracker, PRIOR cycle, Base+R&O, prior month): −pounds ─
+    #    Prior cycle (not current): PM Actual measures actuals vs. the
+    #    forecast that was live before the month closed (see the comparison's
+    #    prior_month_forecast in _compute_leaf_measures).
     if not trk.empty:
         fc = trk.loc[
-            (trk["cycle"] == filters.current_cycle)
+            (trk["cycle"] == filters.prior_cycle)
             & (trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O)))
             & (trk["month"] == prior_month)
         ].copy()

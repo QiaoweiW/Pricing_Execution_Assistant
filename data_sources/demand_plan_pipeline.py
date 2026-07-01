@@ -496,6 +496,17 @@ def _append_history_tracker(
     if replaced:
         log.info(f"History tracker: replacing {replaced:,} existing rows for cycle {cycle_label}.")
     combined = pd.concat([existing[keep], new_rows], ignore_index=True)[_TRACKER_COLUMNS]
+
+    # De-duplicate: the tracker is an all-text frame, so normalise every
+    # column (trim whitespace, <NA> → "") and drop fully-identical rows.
+    # This stops duplicates accumulating in the published CSV from repeated
+    # runs, upstream repeats, or a prior file that already carried them.
+    combined = combined.apply(lambda c: c.astype("string").str.strip().fillna(""))
+    before = len(combined)
+    combined = combined.drop_duplicates(ignore_index=True)[_TRACKER_COLUMNS]
+    deduped = before - len(combined)
+    if deduped:
+        log.info(f"History tracker: removed {deduped:,} duplicate row(s).")
     log.ok(f"qry_mgmt_plan_history_tracker → cycle {cycle_label} "
            f"(+{len(new_rows):,} rows, {len(combined):,} total)")
     return combined

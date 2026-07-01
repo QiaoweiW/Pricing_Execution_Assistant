@@ -134,3 +134,26 @@ def test_pipeline_skips_write_when_seed_missing(monkeypatch):
     res = dp.run_demand_plan_pipeline(_base_plan_bytes())
     assert not res.ok
     assert dp._MGMT_PLAN_FULL_BLOB not in written        # nothing written
+
+
+def test_history_tracker_dedupes_identical_rows(monkeypatch):
+    """Existing duplicate rows for other cycles collapse; no dupes in output."""
+    dup = {
+        "Start of Month": "5/1/2026", "Item": "310180", "Item Description": "x",
+        "Party Site Number": "10036", "Demand Plan Pounds": "100",
+        "Forecast Type": "Base Plan", "Business Unit": "B2C", "Cycle": "C4",
+    }
+    existing = pd.DataFrame([dup, dict(dup)])            # two identical C4 rows
+    monkeypatch.setattr(dp, "read_csv",
+                        lambda sec, path, read_csv_kwargs=None: (existing.copy(), "e"))
+
+    mgmt_full = pd.DataFrame([{
+        "Start of Month": "2026-06-01", "Item": "310180", "Item Description": "DG",
+        "Party Site Number": "10036", "Demand Plan Pounds": "2000",
+        "Forecast Type": "Base Plan", "Business Unit": "B2C",
+    }])
+    combined = dp._append_history_tracker(mgmt_full, "C5", dp._Log())
+
+    assert int(combined.duplicated().sum()) == 0        # no duplicate rows
+    assert len(combined) == 2                            # 1 deduped C4 + 1 new C5
+    assert set(combined["Cycle"]) == {"C4", "C5"}

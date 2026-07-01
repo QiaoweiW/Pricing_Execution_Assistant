@@ -4263,11 +4263,21 @@ def _render_demand_comparison_filters(
 
     # Plain-language echo of the current selection — makes the active
     # window obvious at a glance regardless of dropdown contrast.
+    #
+    # Date ranges are shown per source: **Shipments** (the comparison's
+    # actuals) span the actual window, while **Orders** are pulled for the
+    # prior month only (they feed the Prior-Month Actual-vs-Forecast table's
+    # Ordered column — see the fragment's ibp_orders load).  The Prior-Month
+    # clause states that "Prior Month Forecast" is the PRIOR cycle's plan for
+    # that month (see _compute_leaf_measures, which sums it under
+    # ``prior_cycle``), so PM Actual = actual − prior-cycle forecast.
     st.caption(
         f"📌 Comparing **{current_cycle}** (current) vs **{prior_cycle}** (prior)  ·  "
-        f"Actuals **{fmt_month(actual_start)} – {fmt_month(actual_end)}**  ·  "
+        f"Shipments (actuals) **{fmt_month(actual_start)} – {fmt_month(actual_end)}**  ·  "
+        f"Orders **{fmt_month(prior_month)}** (prior month only)  ·  "
         f"Forecast **{fmt_month(forecast_start)} – {fmt_month(forecast_end)}**  ·  "
-        f"Prior month **{fmt_month(prior_month)}**"
+        f"Prior month **{fmt_month(prior_month)}** "
+        f"(its forecast = the **{prior_cycle}** prior-cycle plan)"
     )
 
     return ComparisonFilters(

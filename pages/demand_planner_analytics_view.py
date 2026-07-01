@@ -351,7 +351,7 @@ _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
         "Baseline%20Plan%20Change%20Journal.xlsx?web=1",
     ),
     (
-        "IBP Demand Planning Report (Fabric)",
+        "Tiger Report",
         "https://app.fabric.microsoft.com/groups/"
         "2a12208d-127f-4f59-b062-3f44876388dc/reports/"
         "f2627a71-11c0-4cdc-85be-05780079c71b/88798e0648107555d421"
@@ -363,6 +363,12 @@ _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
         "2a12208d-127f-4f59-b062-3f44876388dc/reports/"
         "3068bf60-96eb-493f-8610-630c725940d7/6f2c04f0ad6811196392"
         "?experience=power-bi&clientSideAuth=0",
+    ),
+    (
+        "SLT Dashboard",
+        "https://app.fabric.microsoft.com/groups/me/reports/"
+        "7d03fb42-73c9-48c3-8ebf-b2dffceed69d/8e711805f364f2606729"
+        "?ctid=c9a55ced-3b88-408c-ab99-8db8b9b90286&experience=power-bi",
     ),
 )
 

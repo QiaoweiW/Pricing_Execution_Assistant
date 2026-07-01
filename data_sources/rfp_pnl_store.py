@@ -398,7 +398,18 @@ def _month_sort_key(label: str) -> tuple[int, datetime]:
     return (0, dt.to_pydatetime())
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+# ``cache_resource`` (not ``cache_data``): ``load_sources`` returns a
+# read-only ``RfpPnlSources`` bundle of source frames + lookup maps.
+# ``cache_data`` pickles its return value to hand each caller a private
+# copy, but pickling this bundle fails (``UnserializableReturnValueError``)
+# — the custom dataclass trips pickle when Streamlit's file-watcher
+# re-executes this module and swaps the class identity (see the same
+# hazard documented in ``data_sources.ibp_official``).  ``cache_resource``
+# stores the object by reference and never serializes it, which is exactly
+# right here: the bundle is treated as read-only (every consumer filters
+# ``bom_df`` / ``pdh_df`` / ``budget_df`` into new frames, never mutating
+# them in place), so sharing one instance across sessions is safe.
+@st.cache_resource(ttl=300, show_spinner=False)
 def load_sources() -> RfpPnlSources:
     """Load/normalize BOM + Budget + PDH source files with cache."""
     bom = _read_csv_or_raise(_BOM_PATH)

@@ -827,19 +827,41 @@ def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
     that compares against ``date`` objects keeps working unchanged.
     """
     s = series
-    # 1. Numeric/serial fast path.  Restrict to the representable serial
-    #    window first (``between`` yields False for NaN and ±inf, so those
-    #    are nulled too) — this turns garbage/overflowing cells into NaT
-    #    rather than letting them overflow inside pandas' day→ns scaling.
+    # 0. Already-typed datetime columns (e.g. IBP Shipments "Month" read via
+    #    DuckDB, which returns a TIMESTAMP → datetime64) need no serial /
+    #    string parsing — floor straight to first-of-month.  This MUST come
+    #    first: ``pd.to_numeric(datetime64)`` yields huge nanosecond integers
+    #    (NOT NaN), which fall outside the serial window AND dodge the
+    #    string fallback below, leaving every row NaT — which empties the
+    #    actuals frame downstream (Total Actuals / PM Actual all zero).
+    if pd.api.types.is_datetime64_any_dtype(s):
+        dt = s.dt.tz_localize(None) if getattr(s.dtype, "tz", None) is not None else s
+        floored = dt.dt.to_period("M").dt.to_timestamp()
+        return floored.dt.date.where(floored.notna(), other=None)
+    # 1. Numeric/serial fast path.  Convert ONLY the in-window finite serials
+    #    and hand pandas nothing else: ``between`` yields False for NaN and
+    #    ±inf, so the converted subset is guaranteed clean.  This matters
+    #    because ``pd.to_datetime(unit="D")`` scales days→nanoseconds via
+    #    ``np.round`` under ``np.errstate(over="raise", invalid="raise")``
+    #    (pandas ≥2.3) — so an overflowing magnitude trips ``over`` AND a
+    #    plain NaN in the array trips ``invalid`` on some numpy builds, both
+    #    raising ``FloatingPointError`` which ``errors="coerce"`` does NOT
+    #    trap.  Feeding only finite in-range values sidesteps both flags.
     as_num = pd.to_numeric(s, errors="coerce")
-    as_num = as_num.where(as_num.between(_SERIAL_DAY_MIN, _SERIAL_DAY_MAX))
-    serials_ts = pd.to_datetime(
-        as_num, unit="D", origin=_SERIAL_DAY_ORIGIN, errors="coerce")
-    # 2. String fallback for survivors.
-    needs_str = serials_ts.isna()
+    in_window = as_num.between(_SERIAL_DAY_MIN, _SERIAL_DAY_MAX)
+    serials_ts = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    if in_window.any():
+        serials_ts.loc[in_window] = pd.to_datetime(
+            as_num[in_window], unit="D", origin=_SERIAL_DAY_ORIGIN,
+            errors="coerce")
+    # 2. String fallback — only for cells that aren't numeric at all (genuine
+    #    date strings).  A numeric value that merely fell outside the serial
+    #    window is a contaminated serial, not a date string: leave it NaT
+    #    rather than re-parsing it (which would route an absurd magnitude back
+    #    through the same overflow-prone ns-unit cast).
+    needs_str = serials_ts.isna() & as_num.isna()
     if needs_str.any():
         str_ts = pd.to_datetime(s[needs_str], errors="coerce")
-        serials_ts = serials_ts.copy()
         serials_ts.loc[needs_str] = str_ts
     # Snap to first-of-month, return as a Series of ``date`` (object).
     out = serials_ts.dt.to_period("M").dt.to_timestamp()

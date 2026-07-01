@@ -330,8 +330,10 @@ def _render_instructions() -> None:
     st.markdown("Enable real-time demand insights")
 
 
-# IBP cadence + supporting workbooks — SharePoint share links surfaced as a
-# quick-reference list above RO Comparison.  (label, url) pairs.
+# IBP cadence + supporting workbooks / reports — SharePoint share links and
+# Power BI report links surfaced as a quick-reference list above RO
+# Comparison.  (label, url) pairs; each opens in a new tab (auth is gated by
+# SharePoint / Power BI / Fabric themselves — these are not secrets).
 _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
     (
         "IBP Monthly Checklist and Calendar.xlsx",
@@ -347,6 +349,20 @@ _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
         "https://darigold1com.sharepoint.com/sites/BrandedPricing/"
         "Shared%20Documents/B2C%20Demand%20Planning/"
         "Baseline%20Plan%20Change%20Journal.xlsx?web=1",
+    ),
+    (
+        "IBP Demand Planning Report (Fabric)",
+        "https://app.fabric.microsoft.com/groups/"
+        "2a12208d-127f-4f59-b062-3f44876388dc/reports/"
+        "f2627a71-11c0-4cdc-85be-05780079c71b/88798e0648107555d421"
+        "?experience=fabric-developer",
+    ),
+    (
+        "IBP Demand Planning Report (Power BI)",
+        "https://app.powerbi.com/groups/"
+        "2a12208d-127f-4f59-b062-3f44876388dc/reports/"
+        "3068bf60-96eb-493f-8610-630c725940d7/6f2c04f0ad6811196392"
+        "?experience=power-bi&clientSideAuth=0",
     ),
 )
 

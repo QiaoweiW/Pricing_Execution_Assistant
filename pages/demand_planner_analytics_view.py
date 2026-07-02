@@ -4178,9 +4178,14 @@ def _render_demand_comparison_filters(
     window can begin at a month the tracker doesn't carry (e.g. Apr 2026).
     """
     # Sensible default indices.
-    # ── Cycle defaults: prefer C3 (current) vs C2 (prior) ──────────────
-    default_current = "C3" if "C3" in cycles else cycles[-1]
-    default_prior = "C2" if "C2" in cycles else cycles[-2]
+    # ── Cycle defaults: anchor on cycle ORDER, never a hard-coded label.
+    #    ``cycles`` is in natural order (C1, C2, C3 …; see
+    #    list_tracker_cycles), so the newest cycle is "current" and the one
+    #    before it is "prior".  This stays correct as new cycles land —
+    #    e.g. when C4 arrives it becomes the default current with C3 prior —
+    #    rather than pinning to a specific label that goes stale each cycle.
+    default_current = cycles[-1]
+    default_prior = cycles[-2] if len(cycles) >= 2 else cycles[-1]
     if default_prior == default_current:  # guard very small cycle lists
         default_prior = next(
             (c for c in reversed(cycles) if c != default_current), cycles[0]

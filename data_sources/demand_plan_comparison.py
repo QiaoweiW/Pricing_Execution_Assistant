@@ -570,8 +570,10 @@ class ComparisonFilters:
     Attributes
     ----------
     current_cycle / prior_cycle
-        Cycle labels from the tracker's ``Cycle`` column (e.g. ``"C3"``
-        / ``"C2"``).
+        Cycle labels from the tracker's ``Cycle`` column — whichever the
+        planner selects as the current vs. the prior cycle (defaults anchor
+        on cycle order: newest = current, the one before it = prior).
+        Prior Month Forecast is summed from ``prior_cycle``.
     actual_start / actual_end
         Inclusive month bounds (first-of-month dates) for the **actual**
         window (IBP shipments + current-cycle "actual" plan).

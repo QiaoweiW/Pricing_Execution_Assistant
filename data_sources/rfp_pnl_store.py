@@ -498,7 +498,17 @@ def load_sources() -> RfpPnlSources:
     )
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+# ``cache_resource`` (not ``cache_data``), same reasoning as load_sources:
+# this returns a list of ``ScenarioFile`` dataclasses, and ``cache_data``
+# pickles its result — which fails (``UnserializableReturnValueError``) when
+# Streamlit's file-watcher re-executes this module and swaps the dataclass
+# identity (see data_sources.ibp_official for the same hazard).
+# ``cache_resource`` stores the list by reference and never serializes it.
+# Safe here: the returned list is read-only for every caller (iterated to
+# build the scenario picker / comparison — never mutated in place), so
+# sharing one instance across sessions is correct.  The 120 s TTL still
+# applies, so the folder listing refreshes on the same cadence.
+@st.cache_resource(ttl=120, show_spinner=False)
 def list_scenarios() -> list[ScenarioFile]:
     """Return scenario CSV files in Files/Program_Bid_Management/New_Bids."""
     try:

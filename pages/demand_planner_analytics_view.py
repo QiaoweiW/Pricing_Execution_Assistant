@@ -5215,7 +5215,10 @@ def _render_product_line_review() -> None:
     """Foldable Product Line Review section (bottom of page)."""
     with st.expander("📋 Product Line Review", expanded=False):
         st.caption(
-            "**One table + one chart per Portfolio Major.**  Hierarchical "
+            "**One table + one chart per Portfolio Major.**  "
+            "📌 **Current Cycle Plan = Base Plan + R&O** — both are included "
+            "(closed current-fiscal-year months are shown as **actual "
+            "shipments** instead).  Hierarchical "
             "**Brand → Portfolio Minor → Supply Format** roll-up with "
             "customer-detail rows (light blue) aggregated by **Corporate "
             "Group**; volumes in **millions of lbs**.  Run-rate columns "

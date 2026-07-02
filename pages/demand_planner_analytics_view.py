@@ -4274,16 +4274,19 @@ def _render_demand_comparison_filters(
     # actuals) span the actual window, while **Orders** are pulled for the
     # prior month only (they feed the Prior-Month Actual-vs-Forecast table's
     # Ordered column — see the fragment's ibp_orders load).  The Prior-Month
-    # clause states that "Prior Month Forecast" is the PRIOR cycle's plan for
-    # that month (see _compute_leaf_measures, which sums it under
-    # ``prior_cycle``), so PM Actual = actual − prior-cycle forecast.
+    # clause spells out both legs of PM Actual: the actual is prior-month
+    # SHIPMENTS (not orders — see _compute_leaf_measures.prior_month_actual,
+    # summed off the IBP Shipments frame), and the forecast is the PRIOR
+    # cycle's plan for that month (summed under ``prior_cycle``).  So
+    # PM Actual = prior-month shipments − prior-cycle forecast.
     st.caption(
         f"📌 Comparing **{current_cycle}** (current) vs **{prior_cycle}** (prior)  ·  "
         f"Shipments (actuals) **{fmt_month(actual_start)} – {fmt_month(actual_end)}**  ·  "
         f"Orders **{fmt_month(prior_month)}** (prior month only)  ·  "
         f"Forecast **{fmt_month(forecast_start)} – {fmt_month(forecast_end)}**  ·  "
         f"Prior month **{fmt_month(prior_month)}** "
-        f"(its forecast = the **{prior_cycle}** prior-cycle plan)"
+        f"(its **actual = shipments**, not orders; its forecast = the "
+        f"**{prior_cycle}** prior-cycle plan)"
     )
 
     return ComparisonFilters(
@@ -4854,8 +4857,10 @@ def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
     """
     st.markdown("#### 📌 Prior Month Actual vs Fcst")
     st.caption(
-        "Prior Plan = Prior Month Forecast, Ordered = IBP Orders (Ordered Qty lbs), "
-        "Shipped = Prior Month Actual.  All values are in millions of lbs."
+        "Prior Plan = Prior Month Forecast (prior-cycle plan for the prior month), "
+        "Ordered = IBP Orders (Ordered Qty lbs), "
+        "Shipped = **Prior Month Actual = prior-month IBP Shipments (not orders)**.  "
+        "All values are in millions of lbs."
     )
     if table is None or table.empty:
         st.info("No rows available for Prior Month Actual vs Fcst.")

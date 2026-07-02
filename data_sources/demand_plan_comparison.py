@@ -2017,6 +2017,63 @@ def _assemble_prior_month_actual_vs_fcst_table(
     return out.loc[:, ordered_cols].rename(columns={COL_LABEL: "Millions of lbs."})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prior-month shipment diagnostic (reconciliation aid)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Label for a dimension that PDH left blank (item absent from PDH, or no
+# Supply Format) — surfaced so "lost" pounds are visible, not silently gone.
+DIAG_UNMAPPED: str = "(unmapped)"
+
+# Diagnostic frame column names (kept as constants so the view never
+# string-types them by hand).
+DIAG_COL_PMAJ: str = "Portfolio Major"
+DIAG_COL_SFMT: str = "Supply Format"
+DIAG_COL_LBS: str = "Shipped Lbs"
+DIAG_COL_MLBS: str = "Shipped (M lbs)"
+
+
+def build_prior_month_shipment_diagnostic(
+    ibp: Optional[pd.DataFrame], prior_month: date,
+) -> pd.DataFrame:
+    """Return prior-month IBP Shipments broken down by Portfolio Major × Supply Format.
+
+    A pure reconciliation aid: it sums the **already-enriched** shipments
+    (PDH dims attached) for the prior month and groups by
+    ``(Portfolio Major, Supply Format)`` so a planner can see how a raw
+    prior-month shipment total decomposes — in particular which ESL
+    Supply Formats roll into the *ESL* hierarchy line (Large/Small Carton,
+    Aerosol Can), which land in the separate *Aseptic* line, and which fall
+    outside the reporting hierarchy entirely.  Blank dims surface as
+    :data:`DIAG_UNMAPPED` (item not in PDH / no format).
+
+    Returns a plain DataFrame — columns ``Portfolio Major, Supply Format,
+    Shipped Lbs, Shipped (M lbs)`` — sorted by pounds desc.  No Streamlit,
+    no I/O, no custom types: safe to cache or render directly.  Empty frame
+    when there are no prior-month rows.
+    """
+    cols = [DIAG_COL_PMAJ, DIAG_COL_SFMT, DIAG_COL_LBS, DIAG_COL_MLBS]
+    if ibp is None or ibp.empty:
+        return pd.DataFrame(columns=cols)
+
+    sub = ibp.loc[ibp["month"] == prior_month]
+    if sub.empty:
+        return pd.DataFrame(columns=cols)
+
+    grouped = pd.DataFrame({
+        DIAG_COL_PMAJ: sub["pmaj"].astype(str).str.strip().replace("", DIAG_UNMAPPED),
+        DIAG_COL_SFMT: sub["sfmt"].astype(str).str.strip().replace("", DIAG_UNMAPPED),
+        DIAG_COL_LBS: pd.to_numeric(sub["pounds"], errors="coerce").fillna(0.0),
+    })
+    out = (
+        grouped.groupby([DIAG_COL_PMAJ, DIAG_COL_SFMT], as_index=False)[DIAG_COL_LBS]
+        .sum()
+        .sort_values(DIAG_COL_LBS, ascending=False, ignore_index=True)
+    )
+    out[DIAG_COL_MLBS] = out[DIAG_COL_LBS] / _LBS_PER_MILLION
+    return out[cols]
+
+
 def _build_runtime_template_for_filters(
     trk: pd.DataFrame,
     ibp: pd.DataFrame,
@@ -2681,6 +2738,12 @@ __all__ = [
     "build_item_dim_frame",
     "build_demand_plan_comparison",
     "build_prior_month_actual_vs_fcst_table",
+    "build_prior_month_shipment_diagnostic",
+    "DIAG_UNMAPPED",
+    "DIAG_COL_PMAJ",
+    "DIAG_COL_SFMT",
+    "DIAG_COL_LBS",
+    "DIAG_COL_MLBS",
     "comparison_to_csv_bytes",
     "PMAF_COL_PRIOR_PLAN",
     "PMAF_COL_ORDERED",

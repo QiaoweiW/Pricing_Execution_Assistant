@@ -16,10 +16,15 @@ import pandas as pd
 from data_sources.demand_plan_comparison import (
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
+    DIAG_COL_LBS,
+    DIAG_COL_PMAJ,
+    DIAG_COL_SFMT,
+    DIAG_UNMAPPED,
     FORECAST_BASE_PLAN,
     ComparisonFilters,
     TemplateRow,
     _compute_leaf_measures,
+    build_prior_month_shipment_diagnostic,
     _vectorised_start_of_month as som,
 )
 
@@ -100,3 +105,51 @@ def test_prior_month_forecast_uses_prior_cycle():
     # Prior-cycle C3 (3.0 M lbs), NOT current-cycle C4 (9.0).
     assert m[COL_PRIOR_MONTH_FORECAST] == 3.0
     assert m[COL_PRIOR_MONTH_ACTUAL] == 5.0
+
+
+# ── Prior-month shipment diagnostic ──────────────────────────────────────────
+
+def test_shipment_diagnostic_splits_by_pmaj_and_format():
+    prior_month = dt.date(2026, 6, 1)
+    ibp = _enriched_ibp([
+        # ESL splits across formats: LC + Aerosol roll into the ESL line,
+        # Aseptic is a SEPARATE line — the diagnostic must show them apart.
+        {"item_key": "1", "item_desc": "", "customer_no": "", "customer_name": "",
+         "month": prior_month, "pounds": 10_000_000.0,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": ""},
+        {"item_key": "2", "item_desc": "", "customer_no": "", "customer_name": "",
+         "month": prior_month, "pounds": 7_000_000.0,
+         "pmaj": "ESL", "sfmt": "Aseptic", "pminor": "", "brand": ""},
+        # Item missing from PDH → blank pmaj/sfmt → surfaces as "(unmapped)".
+        {"item_key": "3", "item_desc": "", "customer_no": "", "customer_name": "",
+         "month": prior_month, "pounds": 1_000_000.0,
+         "pmaj": "", "sfmt": "", "pminor": "", "brand": ""},
+        # A different month must be excluded.
+        {"item_key": "4", "item_desc": "", "customer_no": "", "customer_name": "",
+         "month": dt.date(2026, 5, 1), "pounds": 99_000_000.0,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": ""},
+    ])
+    out = build_prior_month_shipment_diagnostic(ibp, prior_month)
+
+    # Only June rows; May excluded.
+    assert float(out[DIAG_COL_LBS].sum()) == 18_000_000.0
+    lookup = {(r[DIAG_COL_PMAJ], r[DIAG_COL_SFMT]): r[DIAG_COL_LBS]
+              for _, r in out.iterrows()}
+    assert lookup[("ESL", "Large Carton")] == 10_000_000.0
+    assert lookup[("ESL", "Aseptic")] == 7_000_000.0
+    assert lookup[(DIAG_UNMAPPED, DIAG_UNMAPPED)] == 1_000_000.0
+    # Total ESL (all formats) = 17M, which exceeds the page's ESL line
+    # (Large Carton only here, 10M) because Aseptic is broken out — the
+    # exact reconciliation gap the diagnostic exists to expose.
+    esl = out.loc[out[DIAG_COL_PMAJ] == "ESL", DIAG_COL_LBS].sum()
+    assert float(esl) == 17_000_000.0
+
+
+def test_shipment_diagnostic_empty_when_no_prior_month_rows():
+    ibp = _enriched_ibp([
+        {"item_key": "1", "item_desc": "", "customer_no": "", "customer_name": "",
+         "month": dt.date(2026, 5, 1), "pounds": 5.0,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": ""},
+    ])
+    out = build_prior_month_shipment_diagnostic(ibp, dt.date(2026, 6, 1))
+    assert out.empty

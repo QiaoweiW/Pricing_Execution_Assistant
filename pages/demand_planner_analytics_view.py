@@ -122,7 +122,11 @@ from data_sources.demand_plan_comparison import (
     build_base_plan_driver_table,
     build_demand_plan_comparison,
     build_enriched_sources,
+    DIAG_COL_LBS,
+    DIAG_COL_MLBS,
+    DIAG_COL_PMAJ,
     build_prior_month_actual_vs_fcst_table,
+    build_prior_month_shipment_diagnostic,
     build_pm_actual_driver_table,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
@@ -4135,6 +4139,13 @@ def _render_demand_plan_comparison_fragment() -> None:
     # 8. Prior Month Actual vs Fcst summary (between comparison and drivers).
     _render_prior_month_actual_vs_fcst_table(prior_month_vs_fcst)
 
+    # 8b. Prior-Month Shipment Diagnostic (reconciliation) — foldable and
+    #     read-only.  Reuses the already-built enriched shipments
+    #     (``enriched.ibp``), so it adds no Fabric read and NO new cache
+    #     layer (sidesteps the cache-serialisation pitfall entirely) and
+    #     cannot affect any other section.
+    _render_prior_month_shipment_diagnostic(enriched.ibp, filters.prior_month)
+
     # 9. Driver tables — share the same EnrichedSources + dim signature.
     #    Foldable so the comparison + Prior-Month tables stay visible
     #    while the heavy driver drill-downs stay tucked away until needed.
@@ -4936,6 +4947,72 @@ def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
         column_order=[c for c in column_order if c in out_df.columns],
         column_config=column_config,
     )
+
+
+def _render_prior_month_shipment_diagnostic(
+    ibp: Optional[pd.DataFrame], prior_month: date,
+) -> None:
+    """Foldable, read-only prior-month shipment reconciliation.
+
+    Decomposes the selected prior month's IBP Shipments by Portfolio Major
+    × Supply Format so a raw portfolio total (e.g. "Total ESL") can be
+    reconciled against the hierarchy lines above.  Self-contained: it reads
+    the enriched shipments already in memory and writes nothing, so it can't
+    affect any other section; no new cache layer is introduced.
+    """
+    with st.expander("🔎 Prior-Month Shipment Diagnostic (reconciliation)", expanded=False):
+        st.caption(
+            "Breaks the selected prior month's **IBP Shipments** down by "
+            "**Portfolio Major × Supply Format** so you can reconcile a raw "
+            "portfolio total against the hierarchy lines above.  Reminder: the "
+            "**ESL** line = ESL × {Large Carton, Small Carton, Aerosol Can}; "
+            "**Aseptic** (ESL × Aseptic) is a *separate* line; rows with a "
+            "blank/other Supply Format or an `(unmapped)` Portfolio Major "
+            "(item not in PDH) are **not** counted in any hierarchy line.  "
+            "Read-only — independent of the tables above."
+        )
+        detail = build_prior_month_shipment_diagnostic(ibp, prior_month)
+        if detail.empty:
+            st.info(f"No IBP Shipments rows for {prior_month:%b %Y}.")
+            return
+
+        total_lbs = float(detail[DIAG_COL_LBS].sum())
+        st.metric(
+            f"Total {prior_month:%b %Y} shipments (all items)",
+            f"{total_lbs:,.0f} lbs · {total_lbs / 1e6:,.2f} M",
+        )
+
+        num_lbs = st.column_config.NumberColumn(DIAG_COL_LBS, format="%.0f")
+        num_mlbs = st.column_config.NumberColumn(DIAG_COL_MLBS, format="%.2f")
+
+        rollup = (
+            detail.groupby(DIAG_COL_PMAJ, as_index=False)[DIAG_COL_LBS].sum()
+            .sort_values(DIAG_COL_LBS, ascending=False, ignore_index=True)
+        )
+        rollup[DIAG_COL_MLBS] = rollup[DIAG_COL_LBS] / 1e6
+        st.markdown(
+            "**By Portfolio Major** — compare a portfolio total here (e.g. Total "
+            "ESL across every format) against the corresponding line above."
+        )
+        st.dataframe(
+            rollup, use_container_width=True, hide_index=True,
+            column_config={DIAG_COL_LBS: num_lbs, DIAG_COL_MLBS: num_mlbs},
+        )
+
+        st.markdown("**By Portfolio Major × Supply Format**")
+        st.dataframe(
+            detail, use_container_width=True, hide_index=True,
+            column_config={DIAG_COL_LBS: num_lbs, DIAG_COL_MLBS: num_mlbs},
+        )
+
+        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+        st.download_button(
+            "⬇️ Download diagnostic (CSV)",
+            data=detail.to_csv(index=False).encode("utf-8"),
+            file_name=f"prior_month_shipment_diagnostic_{prior_month:%Y%m}_{today}.csv",
+            mime="text/csv",
+            key="dpc_prior_month_diag_dl",
+        )
 
 
 def _render_demand_comparison_driver_tables_cached(

@@ -243,6 +243,7 @@ def test_current_last_total_delta_and_total_actuals_removed():
     )
     table = result.table
     assert "Total Actuals" not in table.columns          # column removed
+    assert "Reconciliation" in table.columns             # column added
     row = table.loc[table["_row_id"] == "esl_lc_branded"].iloc[0]
     # Current Plan = actuals(7) + current forecast(10) = 17.
     assert float(row["Current Plan"]) == 17.0
@@ -250,6 +251,9 @@ def test_current_last_total_delta_and_total_actuals_removed():
     assert float(row["Last Plan"]) == 20.0
     # Total Delta = Current − Last = 17 − 20 = −3.
     assert float(row["Total Delta"]) == -3.0
+    # Reconciliation = Total Actuals − PM Actual − Base Plan − R&O
+    #   = 7 − (4 − 8) − (10 − 9) − 0 = 7 + 4 − 1 = 10.
+    assert float(row["Reconciliation"]) == 10.0
 
 
 def test_not_captured_flags_items_outside_the_template():

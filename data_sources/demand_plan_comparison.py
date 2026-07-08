@@ -506,6 +506,10 @@ COL_PM_ACTUAL: str              = "pm_actual"
 COL_TOTAL_DELTA: str            = "total_delta"
 COL_LAST_PLAN: str              = "last_plan"
 COL_V_BUDGET: str               = "v_budget"
+# Reconciliation residual: Total Actuals − PM Actual − Base Plan delta −
+# R&O delta.  Should net to ~0 when the actuals fully reconcile against
+# the plan-delta components; a non-zero value flags an unexplained gap.
+COL_RECONCILIATION: str         = "reconciliation"
 
 # Ratio columns — NOT additive; computed from each row's own derived
 # values after roll-up.
@@ -550,6 +554,7 @@ DISPLAY_LABELS: dict[str, str] = {
     COL_TOTAL_DELTA_PCT:       "Total Delta %",
     COL_BASE_PLAN:             "Base Plan",
     COL_R_AND_O:               "R&O",
+    COL_RECONCILIATION:        "Reconciliation",
     COL_V_BUDGET:              "v. Budget",
     COL_PCT:                   "%",
     COL_BUDGET:                "Budget",
@@ -559,19 +564,21 @@ DISPLAY_ORDER: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST, COL_LAST_PLAN,
     COL_CURRENT_PLAN, COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
-    COL_BASE_PLAN, COL_R_AND_O, COL_V_BUDGET, COL_PCT, COL_BUDGET,
+    COL_BASE_PLAN, COL_R_AND_O, COL_RECONCILIATION,
+    COL_V_BUDGET, COL_PCT, COL_BUDGET,
 )
 # Columns rendered as percentages (the rest are millions of lbs).
 PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT})
 
 # Metric columns hidden by default in the Streamlit table — planners can
-# expand them via a checkbox on the page.  Spans Prior Month Actual
-# through Current Plan (Forecast), inclusive.
+# expand them via a checkbox on the page.  Prior Month Actual through
+# Current Plan (Forecast), plus the Reconciliation residual.
 COLS_HIDDEN_BY_DEFAULT: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL,
     COL_CURRENT_PLAN_FORECAST,
+    COL_RECONCILIATION,
 )
 
 _LBS_PER_MILLION: float = 1_000_000.0
@@ -1965,6 +1972,13 @@ def _assemble_table(
         pm_actual = m[COL_PRIOR_MONTH_ACTUAL] - m[COL_PRIOR_MONTH_FORECAST]
         total_delta = current_plan - last_plan
         v_budget = current_plan - m[COL_BUDGET]
+        # Reconciliation residual: what's left of the actuals once the
+        # plan-delta components are backed out.  = Total Actuals − PM Actual
+        # − Base Plan delta − R&O delta (all additive, so this stays linear
+        # and rolls up as the sum of children).
+        reconciliation = (
+            m[COL_TOTAL_ACTUALS] - pm_actual - m[COL_BASE_PLAN] - m[COL_R_AND_O]
+        )
 
         # Ratio columns — guard divide-by-zero (blank when undefined).
         #   Total Delta %  = Total Delta as a share of Last Plan (the MoM move).
@@ -1989,6 +2003,7 @@ def _assemble_table(
             COL_TOTAL_DELTA_PCT: total_delta_pct,
             COL_BASE_PLAN: m[COL_BASE_PLAN],
             COL_R_AND_O: m[COL_R_AND_O],
+            COL_RECONCILIATION: reconciliation,
             COL_V_BUDGET: v_budget,
             COL_PCT: pct,
             COL_BUDGET: m[COL_BUDGET],

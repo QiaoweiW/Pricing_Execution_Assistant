@@ -25,6 +25,7 @@ from data_sources.demand_plan_comparison import (
     SERIES_ACTUAL,
     DemandMomFilters,
     build_demand_mom_pivot,
+    build_item_dim_frame_cascade,
     list_mom_filter_values,
     validate_mom_filters,
 )
@@ -48,6 +49,22 @@ def _pdh() -> pd.DataFrame:
         "Portfolio Major": ["ESL", "Cultured"],
         "Supply Format": ["Large Carton", "Small Tub"],
         "Portfolio Minor": ["Milk", "Cultured"],
+    })
+
+
+def _ro_item_master() -> pd.DataFrame:
+    """RO_Item_Master fallback — classifies item 300 (absent from PDH).
+
+    Also carries a deliberately-wrong mapping for item 100 to prove PDH
+    wins the cascade.  Uses RO_Item_Master's native column spellings.
+    """
+    return pd.DataFrame({
+        "Item #": [100, 300],
+        "Item Desc": ["WRONG DESC", "Mystery SKU"],
+        "Brand Category": ["Private", "Private"],
+        "Portfolio Major": ["WRONG PMAJ", "Cultured"],
+        "Supply Format": ["WRONG SFMT", "Pail"],
+        "Portfolio Minor": ["WRONG", "Cultured"],
     })
 
 
@@ -198,6 +215,49 @@ def test_list_mom_filter_values_scopes_to_tracker_and_flags_blank():
     assert "Cultured" in opts["portfolio_majors"]
     # Item 300 is in the tracker but unmapped → (blank) offered, listed last.
     assert opts["portfolio_majors"][-1] == PMAJ_BLANK_LABEL
+
+
+def test_list_mom_filter_values_gains_recovered_pmaj_from_item_master():
+    """With RO_Item_Master, item 300's recovered PMaj shows as an option."""
+    opts = list_mom_filter_values(_tracker(), _pdh(), _ro_item_master())
+    assert "Cultured" in opts["portfolio_majors"]
+    # Item 300 is now classified → the (blank) option should not be forced
+    # by that item any longer (every tracker item now maps).
+    assert PMAJ_BLANK_LABEL not in opts["portfolio_majors"]
+
+
+# ── RO_Item_Master dimension fallback (PDH → RO_Item_Master cascade) ─────────
+
+def test_cascade_pdh_wins_and_item_master_fills_gaps():
+    casc = build_item_dim_frame_cascade(_pdh(), _ro_item_master())
+    row100 = casc.loc[casc["__item_key"] == "100"].iloc[0]
+    # Item 100 is in BOTH → PDH wins over RO_Item_Master's wrong values.
+    assert row100["pmaj"] == "ESL"
+    assert row100["sfmt"] == "Large Carton"
+    # Item 300 is only in RO_Item_Master → recovered from the fallback.
+    row300 = casc.loc[casc["__item_key"] == "300"].iloc[0]
+    assert row300["pmaj"] == "Cultured"
+    assert row300["sfmt"] == "Pail"
+
+
+def test_cascade_none_fallback_is_pdh_only():
+    """A ``None`` fallback degrades to today's PDH-only behaviour."""
+    casc = build_item_dim_frame_cascade(_pdh(), None)
+    assert set(casc["__item_key"]) == {"100", "200"}  # no item 300
+
+
+def test_item_master_fallback_recovers_unmapped_item():
+    """Passing RO_Item_Master captures item 300 that PDH alone dropped."""
+    res = build_demand_mom_pivot(
+        _tracker(), _ibp(), _pdh(), _filters(),
+        item_master_df=_ro_item_master(),
+    )
+    # No longer in the not-captured log …
+    assert "300" not in set(res.not_captured_items["Item"].astype(str))
+    # … and its forecast pounds now land under Cultured / Pail (Jun Base Plan).
+    sku = res.sku_detail_for("Cultured", FORECAST_BASE_PLAN, "Pail")
+    assert "300" in set(sku["Item"].astype(str))
+    assert float(sku.loc[sku["Item"].astype(str) == "300"].iloc[0]["2026-06"]) == 0.3
 
 
 # ── validate_mom_filters ────────────────────────────────────────────────────

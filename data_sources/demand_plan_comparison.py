@@ -774,6 +774,54 @@ def build_item_dim_frame(pdh_df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return out.drop_duplicates(subset="__item_key", keep="last").reset_index(drop=True)
 
 
+# Dimension fields recovered from the fallback tier (the dim frame's columns
+# minus the join key).  Named once so the cascade merge and any future
+# consumer agree on exactly which fields cascade.
+_DIM_CASCADE_FIELDS: tuple[str, ...] = ("pmaj", "sfmt", "pminor", "brand", "desc")
+
+
+def build_item_dim_frame_cascade(
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Return a per-item dim frame with a PDH → RO_Item_Master cascade.
+
+    Builds the vectorised dim frame from **both** ``qry_pdh.csv`` (primary)
+    and ``RO_Item_Master.csv`` (fallback) via :func:`build_item_dim_frame`
+    — whose candidate column lists already resolve either schema — then
+    coalesces them **per field**: PDH wins whenever it carries a non-blank
+    value, and RO_Item_Master fills the gaps (both a wholly-missing item and
+    an item PDH knows but left a dimension blank).  This is the Demand-MOM
+    analogue of the RO Comparison's ``dp_dimitems → RO_Item_Master`` cascade
+    and the classic pivot's Supply-Format fallback, extended to Portfolio
+    Major so items absent from PDH stop collapsing into the ``(blank)``
+    bucket when RO_Item_Master can classify them.
+
+    Columns: ``__item_key, pmaj, sfmt, pminor, brand, desc``.  A missing /
+    empty tier returns the other unchanged, so this degrades gracefully to
+    today's PDH-only behaviour when RO_Item_Master is unavailable.
+    """
+    primary = build_item_dim_frame(pdh_df)
+    fallback = build_item_dim_frame(item_master_df)
+    if fallback.empty:
+        return primary
+    if primary.empty:
+        return fallback
+
+    # Outer-join on the shared key so items in either tier survive; the
+    # fallback columns arrive under a ``_fb`` suffix for the coalesce.
+    merged = primary.merge(
+        fallback, on="__item_key", how="outer", suffixes=("", "_fb"),
+    )
+    for col in _DIM_CASCADE_FIELDS:
+        primary_vals = merged[col].astype("string").fillna("").str.strip()
+        fallback_vals = merged[f"{col}_fb"].astype("string").fillna("").str.strip()
+        # PDH value when present, else the RO_Item_Master value.
+        merged[col] = primary_vals.where(primary_vals != "", fallback_vals)
+
+    return merged[["__item_key", *_DIM_CASCADE_FIELDS]].reset_index(drop=True)
+
+
 # ── Vectorised primitives (used by the enrichment helpers) ──────────────────
 #
 # These are pure functions over ``pd.Series`` — no per-row Python calls,
@@ -2495,7 +2543,9 @@ _NC_COLUMNS: tuple[str, ...] = (
 
 # The reasons a tracker item can be missing from the MOM Summary, most
 # actionable (data-quality) first.
-_NC_REASON_NO_MAPPING: str = "No Portfolio Major / Supply Format mapping (PDH)"
+_NC_REASON_NO_MAPPING: str = (
+    "No Portfolio Major / Supply Format mapping (PDH and RO_Item_Master)"
+)
 _NC_REASON_FILTERED: str   = "Excluded by the active Portfolio Major / Supply Format filter"
 _NC_REASON_ZERO: str       = "Zero forecast pounds in the selected window"
 
@@ -2650,18 +2700,21 @@ def _norm_dim(value) -> str:
 
 
 def list_mom_filter_values(
-    tracker_df: Optional[pd.DataFrame], pdh_df: Optional[pd.DataFrame],
+    tracker_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame] = None,
 ) -> dict[str, list[str]]:
     """Return the Portfolio Major / Supply Format options for the MOM filters.
 
-    Scoped to the items the tracker actually carries (joined to PDH dims)
-    so the planner's dropdowns list only relevant values.  Tracker items
-    with no PDH mapping contribute the ``(blank)`` sentinel so they remain
+    Scoped to the items the tracker actually carries (joined to the same
+    PDH → RO_Item_Master dim cascade the pivot uses) so the dropdowns list
+    exactly the values that can appear in the table.  Tracker items unknown
+    to **both** sources contribute the ``(blank)`` sentinel so they remain
     selectable.  Returns ``{"portfolio_majors": [...], "supply_formats":
     [...]}`` (sorted, ``(blank)`` last).
     """
     empty = {"portfolio_majors": [], "supply_formats": []}
-    dim = build_item_dim_frame(pdh_df)
+    dim = build_item_dim_frame_cascade(pdh_df, item_master_df)
     if tracker_df is None or tracker_df.empty or TRK_ITEM not in tracker_df.columns:
         return empty
 
@@ -2801,6 +2854,7 @@ def build_demand_mom_pivot(
     pdh_df: Optional[pd.DataFrame],
     filters: DemandMomFilters,
     *,
+    item_master_df: Optional[pd.DataFrame] = None,
     budget_lookup: Optional[BudgetLookup] = None,
     monthly_budget: Optional[MonthlyBudgetLookup] = None,
 ) -> DemandMomResult:
@@ -2814,10 +2868,16 @@ def build_demand_mom_pivot(
         A slice of ``dbo.IBP Shipments`` (the actuals source) — ideally
         already projected to the actual window by the caller.
     pdh_df
-        ``qry_pdh.csv`` — supplies Portfolio Major / Supply Format per
-        item (the tracker + shipments carry neither).
+        ``qry_pdh.csv`` — primary source of Portfolio Major / Supply
+        Format per item (the tracker + shipments carry neither).
     filters
         The :class:`DemandMomFilters` selection.
+    item_master_df
+        Optional ``RO_Item_Master.csv`` — the **fallback** dimension tier.
+        Items PDH can't classify (or left blank) are recovered from here
+        via :func:`build_item_dim_frame_cascade`, so they stop collapsing
+        into the ``(blank)`` bucket / the not-captured log.  ``None``
+        preserves the PDH-only behaviour.
     budget_lookup / monthly_budget
         Same optional budget inputs as the classic pivot — the annual
         leaf budget feeds the ``Total Budget`` column (forecast branches
@@ -2834,8 +2894,9 @@ def build_demand_mom_pivot(
         by_month={}, has_data=False,
     )
 
-    # ── Enrich both sources with PDH dims (one shared dim frame) ────────
-    dim_frame = build_item_dim_frame(pdh_df)
+    # ── Enrich both sources with dims (PDH primary, RO_Item_Master
+    #    fallback) — one shared, cascaded dim frame ──────────────────────
+    dim_frame = build_item_dim_frame_cascade(pdh_df, item_master_df)
     trk = _enrich_tracker(tracker_df, dim_frame)
     ibp = _enrich_ibp(ibp_df, dim_frame)
 

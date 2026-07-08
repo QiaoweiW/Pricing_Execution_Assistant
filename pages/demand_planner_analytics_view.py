@@ -139,6 +139,7 @@ from data_sources.demand_plan_comparison import (
     MOM_ROW_PMAJ,
     MOM_ROW_FORECAST,
     MOM_ROW_SFMT,
+    NC_COL_ITEM,
     build_demand_mom_pivot,
     list_mom_filter_values,
     validate_mom_filters,
@@ -3294,7 +3295,8 @@ def _render_demand_pivot_fragment() -> None:
         )
         return
 
-    pdh_df = _load_demand_comparison_pdh()          # non-fatal (dims blank on fail)
+    pdh_df = _load_demand_comparison_pdh()          # primary dims (non-fatal)
+    item_master_df = _load_mom_item_master()        # fallback dims (non-fatal)
     budget_lookup = _build_demand_pivot_budget_lookup()
     monthly_budget = _load_demand_pivot_monthly_budget()
 
@@ -3319,7 +3321,7 @@ def _render_demand_pivot_fragment() -> None:
     if not actual_months:
         actual_months = tracker_months
 
-    field_options = list_mom_filter_values(tracker.df, pdh_df)
+    field_options = list_mom_filter_values(tracker.df, pdh_df, item_master_df)
 
     # 3. Render the filters (Cycle + Actual/Forecast ranges + PMaj/SFmt).
     filters = _render_demand_mom_filters(
@@ -3353,6 +3355,7 @@ def _render_demand_pivot_fragment() -> None:
         with st.spinner("Building Demand MOM Summary…"):
             result = build_demand_mom_pivot(
                 tracker.df, ibp_df, pdh_df, filters,
+                item_master_df=item_master_df,
                 budget_lookup=budget_lookup,
                 monthly_budget=monthly_budget,
             )
@@ -3512,13 +3515,27 @@ def _render_demand_mom_filters(
     )
 
 
+# Deep link to the RO_Item_Master.csv file in the Fabric lakehouse — the
+# authoritative place to look up / add a Portfolio Major + Supply Format for
+# items the MOM dim cascade (PDH → RO_Item_Master) still can't classify.
+_RO_ITEM_MASTER_FABRIC_URL: str = (
+    "https://app.fabric.microsoft.com/groups/"
+    "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
+    "a01f513d-eee7-41eb-8c15-670bc40e7fc8"
+    "?experience=fabric-developer"
+    "&selectedPath=Files%2FRO%20Tracking%2FRO_Item_Master.csv"
+)
+
+
 def _render_mom_not_captured_log(not_captured: pd.DataFrame) -> None:
     """Render the "in tracker but not captured in the MOM Summary" log.
 
     Sits at the top of the results.  When every tracker item (selected
     cycle, forecast window) made it into the pivot, a compact success
     note confirms the reconciliation ran; otherwise an expanded warning
-    lists the missing items + reason, with a CSV download.
+    lists the missing items + reason, a CSV download, a one-click copy of
+    the item numbers, and a jump link to ``RO_Item_Master.csv`` in Fabric
+    so the planner can classify the stragglers at source.
     """
     if not_captured is None or not_captured.empty:
         st.caption(
@@ -3535,19 +3552,46 @@ def _render_mom_not_captured_log(not_captured: pd.DataFrame) -> None:
         st.caption(
             "Items present in `qry_mgmt_plan_history_tracker.csv` for the "
             "selected cycle + forecast window that do **not** appear in the "
-            "pivot below — with the reason (missing PDH Portfolio Major / "
-            "Supply Format mapping, excluded by an active filter, or zero "
-            "forecast pounds).  Reconcile these before trusting the totals."
+            "pivot below — with the reason (no Portfolio Major / Supply "
+            "Format mapping in **PDH or RO_Item_Master**, excluded by an "
+            "active filter, or zero forecast pounds).  Reconcile these "
+            "before trusting the totals."
         )
         st.dataframe(not_captured, use_container_width=True, hide_index=True)
-        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-        st.download_button(
-            label="⬇️ Download not-captured items (CSV)",
-            data=not_captured.to_csv(index=False).encode("utf-8"),
-            file_name=f"demand_mom_not_captured_{today}.csv",
-            mime="text/csv",
-            key="demand_mom_not_captured_download",
+
+        # Reconciliation aids: jump to the fallback source in Fabric, copy
+        # the item list to paste into it, and download the full log.
+        col_link, col_dl = st.columns([1, 1])
+        with col_link:
+            st.link_button(
+                "🔎 Open RO_Item_Master.csv in Fabric",
+                _RO_ITEM_MASTER_FABRIC_URL,
+                use_container_width=True,
+                help=(
+                    "Add a Portfolio Major + Supply Format for these items "
+                    "here; the MOM Summary picks them up on the next refresh."
+                ),
+            )
+        with col_dl:
+            today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+            st.download_button(
+                label="⬇️ Download not-captured items (CSV)",
+                data=not_captured.to_csv(index=False).encode("utf-8"),
+                file_name=f"demand_mom_not_captured_{today}.csv",
+                mime="text/csv",
+                key="demand_mom_not_captured_download",
+                use_container_width=True,
+            )
+
+        # ``st.code`` renders a built-in copy button — the fastest way to
+        # lift the item numbers and search for them in RO_Item_Master.
+        items = (
+            not_captured[NC_COL_ITEM].astype(str).str.strip().tolist()
+            if NC_COL_ITEM in not_captured.columns else []
         )
+        if items:
+            st.caption("Item numbers to look up (copy →):")
+            st.code(", ".join(items), language="text")
 
 
 def _render_mom_sku_drilldown(result: DemandMomResult, row: pd.Series) -> None:
@@ -4475,6 +4519,22 @@ def _load_demand_comparison_pdh() -> Optional[pd.DataFrame]:
         return fetch_pdh().df
     except DemandSummaryError as exc:
         logger.info("qry_pdh.csv unavailable for Demand Plan Comparison: %s", exc)
+        return None
+
+
+def _load_mom_item_master() -> Optional[pd.DataFrame]:
+    """Return ``RO_Item_Master.csv`` for the MOM dim fallback, or ``None``.
+
+    Non-fatal: if RO_Item_Master can't be read the Demand MOM Summary just
+    degrades to PDH-only dimensions (more items land in the not-captured
+    log), rather than breaking the section.
+    """
+    try:
+        return fetch_ro_item_master_df()
+    except RoComparisonError as exc:
+        logger.info(
+            "RO_Item_Master.csv unavailable for Demand MOM dim fallback: %s", exc,
+        )
         return None
 
 

@@ -808,7 +808,20 @@ class DemandPivotResult:
 _COL_ROW_ID: str       = "_row_id"
 _COL_INDENT: str       = "_indent"
 _COL_IS_SUBTOTAL: str  = "_is_subtotal"
-_HIDDEN_COLS: tuple[str, ...] = (_COL_ROW_ID, _COL_INDENT, _COL_IS_SUBTOTAL)
+# Dimension breadcrumb for each pivot row — the raw (Portfolio Major,
+# Forecast Type, Supply Format) tuple behind the indented Row Label.
+# Empty string means "this level is not pinned" (e.g. a PMaj header row
+# leaves forecast/sfmt blank; the Grand Total leaves all three blank).
+# Hidden like the other structural columns, but let a row-select
+# drill-down resolve a clicked row back to the leaf(s) it summarises
+# WITHOUT re-parsing the NBSP-indented label string.
+_COL_PMAJ_DIM: str     = "_pmaj"
+_COL_FORECAST_DIM: str = "_forecast"
+_COL_SFMT_DIM: str     = "_sfmt"
+_HIDDEN_COLS: tuple[str, ...] = (
+    _COL_ROW_ID, _COL_INDENT, _COL_IS_SUBTOTAL,
+    _COL_PMAJ_DIM, _COL_FORECAST_DIM, _COL_SFMT_DIM,
+)
 
 # Indentation unit used when rendering the label column.  Two
 # non-breaking spaces per indent level — that's what reads cleanly in
@@ -1457,6 +1470,378 @@ def list_available_filter_values(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared pivot-assembly primitives
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The hierarchy walk (long frame → indented, subtotalled wide pivot),
+# the footer roll-up, and the long-form chart frame are the same shape
+# for the classic Demand Pivot (Base Plan / R&O) and the Demand MOM
+# Summary (which stitches an extra ``Actual`` branch on top).  They are
+# factored out here — public, forecast-type-agnostic — so both builders
+# share ONE definition instead of duplicating ~150 lines of hierarchy
+# logic.  Callers supply their own ``forecast_order`` (the ordered set
+# of Forecast Type branches to walk beneath each Portfolio Major).
+
+
+@dataclass(frozen=True)
+class AssembledPivot:
+    """Return value of :func:`assemble_hierarchical_pivot`.
+
+    Attributes
+    ----------
+    pivot
+        The indented, subtotalled wide-format display frame (one row per
+        PMaj header / Forecast Type subtotal / SFmt leaf + a trailing
+        ``Grand Total``).  Carries the hidden ``_row_id`` / ``_indent`` /
+        ``_is_subtotal`` metadata columns.
+    grand_budget_by_forecast
+        ``{forecast_type -> annual budget millions}`` for the visible
+        window — only forecast types in ``budgeted_forecasts`` appear.
+    grand_budget_total_m
+        Sum of ``grand_budget_by_forecast`` over every budgeted branch.
+    visible_pmajs, visible_sfmts
+        The distinct Portfolio Major / Supply Format values that survived
+        into ``wide`` — handed back so callers can reuse them for their
+        own budget slicing without re-deriving from the index.
+    """
+    pivot: pd.DataFrame
+    grand_budget_by_forecast: dict[str, float]
+    grand_budget_total_m: float
+    visible_pmajs: set[str]
+    visible_sfmts: set[str]
+
+
+def build_month_wide(long_df: pd.DataFrame) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    """Pivot a tidy long frame into ``(PMaj, ForecastType, SFmt) × Month``.
+
+    Expects the ``__pmaj / __forecast / __sfmt / __month`` dimension
+    columns and a pre-scaled ``__lbs_m`` (millions) measure — the same
+    intermediate shape both builders produce.  Returns the wide frame
+    (month columns already renamed to ``%Y-%m`` display labels, ascending)
+    plus the ordered tuple of those month-column labels.
+    """
+    grouped = (
+        long_df.groupby(["__pmaj", "__forecast", "__sfmt", "__month"],
+                        observed=True, dropna=False)["__lbs_m"]
+        .sum().reset_index()
+    )
+    wide = grouped.pivot_table(
+        index=["__pmaj", "__forecast", "__sfmt"],
+        columns="__month",
+        values="__lbs_m",
+        aggfunc="sum",
+        fill_value=0.0,
+        observed=True,
+    )
+    # ``pivot_table`` returns date-typed columns in ascending order —
+    # exactly the chronological month axis we want.  Rename to labels.
+    month_dates: list[date] = list(wide.columns)
+    wide.columns = pd.Index([_format_month_label(d) for d in month_dates])
+    return wide, tuple(wide.columns.tolist())
+
+
+def assemble_hierarchical_pivot(
+    wide: pd.DataFrame,
+    month_col_labels: tuple[str, ...],
+    annual: BudgetLookup,
+    forecast_order: tuple[str, ...],
+    *,
+    budgeted_forecasts: Optional[set[str]] = None,
+) -> AssembledPivot:
+    """Walk ``wide`` into the indented, subtotalled display pivot.
+
+    Row order: Portfolio Major (alphabetical, ``(blank)`` last) → each
+    Forecast Type in *forecast_order* → Supply Format (alphabetical,
+    ``(blank)`` last).  PMaj headers and Forecast Type subtotals are
+    dropped when every descendant rounds to zero (within
+    :data:`_EMPTY_ROW_TOLERANCE_M`), so the table never shows an empty
+    branch.  A ``Grand Total`` row is appended when any row survives.
+
+    Parameters
+    ----------
+    forecast_order
+        The Forecast Type branches to walk beneath each PMaj, in display
+        order (e.g. ``(FORECAST_BASE_PLAN, FORECAST_R_AND_O)`` for the
+        classic pivot, or ``("Actual", "Base Plan", "R&O")`` for the MOM
+        stitch).
+    budgeted_forecasts
+        Which Forecast Type branches carry an annual Total Budget.
+        Branches outside this set (e.g. ``"Actual"`` — shipments have no
+        budget) get a ``NaN`` budget cell so the column renders blank for
+        them rather than a misleading ``0.0``.  Defaults to *every*
+        branch in *forecast_order* (the classic-pivot behaviour).
+    """
+    budgeted = (
+        set(forecast_order) if budgeted_forecasts is None
+        else set(budgeted_forecasts)
+    )
+
+    visible_pmajs = {str(p) for p in wide.index.get_level_values(0).unique()}
+    visible_sfmts = {str(s) for s in wide.index.get_level_values(2).unique()}
+
+    # PMaj order: alphabetical, with ``(blank)`` always last (matches the
+    # Excel screenshot).  Forecast Type order comes from the caller.
+    pmaj_values = sorted({p for p in wide.index.get_level_values(0)})
+    if PMAJ_BLANK_LABEL in pmaj_values:
+        pmaj_values = [p for p in pmaj_values if p != PMAJ_BLANK_LABEL]
+        pmaj_values.append(PMAJ_BLANK_LABEL)
+
+    output_rows: list[dict] = []
+    next_row_id = 0
+
+    def _make_row(
+        label: str,
+        indent: int,
+        values: dict[str, float],
+        is_subtotal: bool,
+        budget_m: float,
+        *,
+        pmaj_dim: str = "",
+        forecast_dim: str = "",
+        sfmt_dim: str = "",
+    ) -> dict:
+        nonlocal next_row_id
+        row = {
+            "Row Label": _build_indented_label(label, indent),
+            _COL_ROW_ID: next_row_id,
+            _COL_INDENT: indent,
+            _COL_IS_SUBTOTAL: is_subtotal,
+            _COL_PMAJ_DIM: pmaj_dim,
+            _COL_FORECAST_DIM: forecast_dim,
+            _COL_SFMT_DIM: sfmt_dim,
+        }
+        next_row_id += 1
+        for c in month_col_labels:
+            row[c] = round(float(values.get(c, 0.0)), 1)
+        row[TOTAL_COLUMN_LABEL] = round(
+            float(sum(values.get(c, 0.0) for c in month_col_labels)), 1,
+        )
+        row[TOTAL_BUDGET_COLUMN_LABEL] = round(float(budget_m), 1)
+        return row
+
+    def _is_empty_values(values: dict[str, float]) -> bool:
+        return all(
+            abs(float(values.get(c, 0.0))) <= _EMPTY_ROW_TOLERANCE_M
+            for c in month_col_labels
+        )
+
+    for pmaj in pmaj_values:
+        # PMaj-level subtotal (sum across every Forecast Type + SFmt).
+        try:
+            pmaj_slice = wide.xs(pmaj, level=0, drop_level=False)
+        except KeyError:
+            continue
+        pmaj_totals = pmaj_slice.sum(axis=0).to_dict()
+        if _is_empty_values(pmaj_totals):
+            continue
+
+        # PMaj budget spans every budgeted forecast type (annual.by_leaf
+        # only holds budgeted branches, so an un-budgeted ``Actual`` leaf
+        # simply contributes nothing here).
+        pmaj_budget_m = annual.slice_total(
+            pmaj_whitelist={pmaj}, sfmt_whitelist=visible_sfmts,
+        )
+        pmaj_idx = len(output_rows)
+        output_rows.append(_make_row(
+            pmaj, 0, pmaj_totals, is_subtotal=True, budget_m=pmaj_budget_m,
+            pmaj_dim=str(pmaj),
+        ))
+
+        pmaj_has_visible_child = False
+        for forecast in forecast_order:
+            try:
+                f_slice = wide.xs((pmaj, forecast), level=(0, 1), drop_level=False)
+            except KeyError:
+                continue
+            f_totals = f_slice.sum(axis=0).to_dict()
+            if _is_empty_values(f_totals):
+                continue
+
+            f_budget_m = (
+                annual.slice_total(
+                    forecast=forecast,
+                    pmaj_whitelist={pmaj},
+                    sfmt_whitelist=visible_sfmts,
+                )
+                if forecast in budgeted else float("nan")
+            )
+            output_rows.append(
+                _make_row(
+                    forecast, 1, f_totals, is_subtotal=True, budget_m=f_budget_m,
+                    pmaj_dim=str(pmaj), forecast_dim=str(forecast),
+                ),
+            )
+
+            sfmts = sorted({s for s in f_slice.index.get_level_values(2)})
+            if PMAJ_BLANK_LABEL in sfmts:
+                sfmts = [s for s in sfmts if s != PMAJ_BLANK_LABEL]
+                sfmts.append(PMAJ_BLANK_LABEL)
+            for sfmt in sfmts:
+                leaf_values = f_slice.xs(sfmt, level=2).iloc[0].to_dict()
+                if _is_empty_values(leaf_values):
+                    continue
+                leaf_budget_m = (
+                    annual.lookup_leaf(pmaj, forecast, sfmt)
+                    if forecast in budgeted else float("nan")
+                )
+                output_rows.append(
+                    _make_row(
+                        sfmt, 2, leaf_values, is_subtotal=False,
+                        budget_m=leaf_budget_m,
+                        pmaj_dim=str(pmaj), forecast_dim=str(forecast),
+                        sfmt_dim=str(sfmt),
+                    ),
+                )
+            pmaj_has_visible_child = True
+
+        if not pmaj_has_visible_child:
+            # Every forecast-type branch empty — pop the PMaj header we
+            # just added and roll back the id so ids stay dense.
+            output_rows.pop(pmaj_idx)
+            next_row_id -= 1
+
+    grand_budget_by_forecast = {
+        ft: annual.slice_total(
+            forecast=ft,
+            pmaj_whitelist=visible_pmajs,
+            sfmt_whitelist=visible_sfmts,
+        )
+        for ft in forecast_order if ft in budgeted
+    }
+    grand_budget_total_m = float(sum(grand_budget_by_forecast.values()))
+
+    if output_rows:
+        grand_totals = wide.sum(axis=0).to_dict()
+        output_rows.append(
+            _make_row(
+                "Grand Total", 0, grand_totals, is_subtotal=True,
+                budget_m=grand_budget_total_m,
+            ),
+        )
+
+    return AssembledPivot(
+        pivot=pd.DataFrame(output_rows),
+        grand_budget_by_forecast=grand_budget_by_forecast,
+        grand_budget_total_m=grand_budget_total_m,
+        visible_pmajs=visible_pmajs,
+        visible_sfmts=visible_sfmts,
+    )
+
+
+def forecast_month_grouped(long_df: pd.DataFrame) -> pd.DataFrame:
+    """Group a long frame to ``(__forecast, __month) → __lbs_m`` sums.
+
+    Shared source for both the footer subtotals and the chart frame so
+    the two always reconcile to the same post-filter numbers.
+    """
+    return (
+        long_df.groupby(["__forecast", "__month"], observed=True)["__lbs_m"]
+        .sum().reset_index()
+    )
+
+
+def footer_wide_from_grouped(
+    grouped: pd.DataFrame, forecast_order: tuple[str, ...],
+) -> pd.DataFrame:
+    """Pivot the ``(__forecast, __month)`` grouping into a per-type footer.
+
+    Guarantees one row per Forecast Type in *forecast_order* (a filter
+    that narrowed to a single type would otherwise drop the others),
+    with month columns renamed to display labels.
+    """
+    footer_wide = grouped.pivot_table(
+        index="__forecast", columns="__month",
+        values="__lbs_m", aggfunc="sum", fill_value=0.0,
+    )
+    footer_wide.columns = pd.Index(
+        [_format_month_label(d) for d in footer_wide.columns]
+    )
+    for forecast in forecast_order:
+        if forecast not in footer_wide.index:
+            footer_wide.loc[forecast] = 0.0
+    return footer_wide
+
+
+def footer_row_frame(
+    label: str,
+    series: pd.Series,
+    month_col_labels: tuple[str, ...],
+    *,
+    include_budget_col: bool,
+    budget_col_value: float = float("nan"),
+) -> pd.DataFrame:
+    """Return a single-row footer frame keyed by *month_col_labels*.
+
+    The row carries every month column, a trailing ``Total``, and —
+    when *include_budget_col* is set — a ``Total Budget`` cell so the
+    footer aligns column-for-column with the pivot above it.
+    """
+    values = {c: round(float(series.get(c, 0.0)), 1) for c in month_col_labels}
+    values[TOTAL_COLUMN_LABEL] = round(
+        float(sum(series.get(c, 0.0) for c in month_col_labels)), 1,
+    )
+    if include_budget_col:
+        values[TOTAL_BUDGET_COLUMN_LABEL] = budget_col_value
+    return pd.DataFrame([{"Row Label": label, **values}])
+
+
+def chart_long_from_grouped(
+    grouped: pd.DataFrame, forecast_order: tuple[str, ...],
+) -> pd.DataFrame:
+    """Return the tidy ``(Month, Forecast Type, Pounds_M)`` chart frame.
+
+    Forecast Type is made an ordered categorical so the stacked-area
+    chart draws the series bottom-to-top in *forecast_order*.
+    """
+    chart_long = grouped.rename(
+        columns={"__forecast": "Forecast Type",
+                 "__month":    "Month",
+                 "__lbs_m":    "Pounds_M"},
+    )
+    chart_long["Pounds_M"] = chart_long["Pounds_M"].round(1)
+    chart_long["Forecast Type"] = pd.Categorical(
+        chart_long["Forecast Type"],
+        categories=list(forecast_order),
+        ordered=True,
+    )
+    return chart_long.sort_values(
+        ["Month", "Forecast Type"]
+    ).reset_index(drop=True)
+
+
+def monthly_budget_footer(
+    monthly: MonthlyBudgetLookup, month_col_labels: tuple[str, ...],
+) -> tuple[pd.DataFrame, dict[str, float], float]:
+    """Return the bundled **Total Budget (Base + R&O)** footer artifacts.
+
+    The monthly budget is static per month (never re-sliced by PMaj /
+    SFmt); only the visible month columns select which values appear.
+    Returns ``(budget_totals_df, budget_by_month, budget_total_m)`` so
+    both the classic Demand Pivot and the Demand MOM Summary render the
+    identical dotted-line reference budget without duplicating the
+    label + rounding logic.
+    """
+    budget_by_month = monthly.values_for_labels(month_col_labels)
+    budget_label = f"{TOTAL_BUDGET_COLUMN_LABEL} (Base + R&O)"
+    budget_totals_values: dict[str, float] = {}
+    for col in month_col_labels:
+        raw = budget_by_month.get(col, float("nan"))
+        budget_totals_values[col] = (
+            round(float(raw), 1) if pd.notna(raw) else float("nan")
+        )
+    budget_total_m = monthly.sum_for_labels(month_col_labels)
+    budget_totals_values[TOTAL_COLUMN_LABEL] = round(float(budget_total_m), 1)
+    if monthly.has_data:
+        budget_totals_values[TOTAL_BUDGET_COLUMN_LABEL] = round(
+            float(budget_total_m), 1,
+        )
+    budget_totals = pd.DataFrame(
+        [{"Row Label": budget_label, **budget_totals_values}]
+    )
+    return budget_totals, budget_by_month, float(budget_total_m)
+
+
 def build_demand_pivot(
     df: pd.DataFrame,
     filters: Optional[DemandPivotFilters] = None,
@@ -1549,223 +1934,47 @@ def build_demand_pivot(
     # ── Convert to millions in one vectorised pass ─────────────────
     long_df = long_df.assign(__lbs_m=lambda d: d["__lbs"] / _LBS_PER_MILLION)
 
-    # ── Wide pivot: rows = (PMaj, ForecastType, SFmt), cols = Month ─
-    grouped = (
-        long_df.groupby(["__pmaj", "__forecast", "__sfmt", "__month"],
-                        observed=True, dropna=False)["__lbs_m"]
-        .sum().reset_index()
-    )
-    wide = grouped.pivot_table(
-        index=["__pmaj", "__forecast", "__sfmt"],
-        columns="__month",
-        values="__lbs_m",
-        aggfunc="sum",
-        fill_value=0.0,
-        observed=True,
-    )
-    # ``pivot_table`` returns a DataFrame whose columns are date
-    # objects in ascending order — exactly what we want.  Rename to
-    # the display labels.
-    month_dates: list[date] = list(wide.columns)
-    wide.columns = pd.Index([_format_month_label(d) for d in month_dates])
-    month_col_labels = tuple(wide.columns.tolist())
-
-    visible_pmajs = {str(p) for p in wide.index.get_level_values(0).unique()}
-    visible_sfmts = {str(s) for s in wide.index.get_level_values(2).unique()}
-
-    # ── Walk the hierarchy to assemble the display rows ───────────
+    # ── Wide pivot + hierarchy walk (shared assembler) ─────────────
     #
-    # PMaj order: alphabetical, with ``(blank)`` always last (matches
-    # the Excel screenshot).  Within each PMaj: Base Plan first then
-    # R&O.  Within each (PMaj, Forecast Type): SFmt alphabetical.
-    pmaj_values = sorted({p for p in wide.index.get_level_values(0)})
-    if PMAJ_BLANK_LABEL in pmaj_values:
-        pmaj_values = [p for p in pmaj_values if p != PMAJ_BLANK_LABEL]
-        pmaj_values.append(PMAJ_BLANK_LABEL)
-
+    # The classic pivot walks Base Plan then R&O beneath each Portfolio
+    # Major; both branches carry an annual Total Budget.
     forecast_order = (FORECAST_BASE_PLAN, FORECAST_R_AND_O)
-
-    output_rows: list[dict] = []
-    next_row_id = 0
-
-    def _make_row(
-        label: str,
-        indent: int,
-        values: dict[str, float],
-        is_subtotal: bool,
-        budget_m: float,
-    ) -> dict:
-        nonlocal next_row_id
-        row = {
-            "Row Label": _build_indented_label(label, indent),
-            _COL_ROW_ID: next_row_id,
-            _COL_INDENT: indent,
-            _COL_IS_SUBTOTAL: is_subtotal,
-        }
-        next_row_id += 1
-        for c in month_col_labels:
-            row[c] = round(float(values.get(c, 0.0)), 1)
-        row[TOTAL_COLUMN_LABEL] = round(
-            float(sum(values.get(c, 0.0) for c in month_col_labels)), 1,
-        )
-        row[TOTAL_BUDGET_COLUMN_LABEL] = round(float(budget_m), 1)
-        return row
-
-    def _is_empty_values(values: dict[str, float]) -> bool:
-        return all(
-            abs(float(values.get(c, 0.0))) <= _EMPTY_ROW_TOLERANCE_M
-            for c in month_col_labels
-        )
-
-    for pmaj in pmaj_values:
-        # PMaj-level subtotal (sum across both Forecast Types + every SFmt).
-        try:
-            pmaj_slice = wide.xs(pmaj, level=0, drop_level=False)
-        except KeyError:
-            continue
-        pmaj_totals = pmaj_slice.sum(axis=0).to_dict()
-        if _is_empty_values(pmaj_totals):
-            # Skip the whole PMaj branch — saves rendering empty
-            # subtotals AND every empty leaf below.
-            continue
-
-        pmaj_budget_m = annual.slice_total(
-            pmaj_whitelist={pmaj}, sfmt_whitelist=visible_sfmts,
-        )
-        pmaj_idx = len(output_rows)
-        output_rows.append(_make_row(
-            pmaj, 0, pmaj_totals, is_subtotal=True, budget_m=pmaj_budget_m,
-        ))
-
-        pmaj_has_visible_child = False
-        for forecast in forecast_order:
-            # Forecast-Type subtotal (sum across every SFmt in this PMaj).
-            try:
-                f_slice = wide.xs((pmaj, forecast), level=(0, 1), drop_level=False)
-            except KeyError:
-                continue
-            f_totals = f_slice.sum(axis=0).to_dict()
-            if _is_empty_values(f_totals):
-                continue
-
-            f_budget_m = annual.slice_total(
-                forecast=forecast,
-                pmaj_whitelist={pmaj},
-                sfmt_whitelist=visible_sfmts,
-            )
-            output_rows.append(
-                _make_row(forecast, 1, f_totals, is_subtotal=True, budget_m=f_budget_m),
-            )
-
-            f_has_visible_leaf = False
-            sfmts = sorted({s for s in f_slice.index.get_level_values(2)})
-            if PMAJ_BLANK_LABEL in sfmts:
-                sfmts = [s for s in sfmts if s != PMAJ_BLANK_LABEL]
-                sfmts.append(PMAJ_BLANK_LABEL)
-            for sfmt in sfmts:
-                leaf_values = f_slice.xs(sfmt, level=2).iloc[0].to_dict()
-                if _is_empty_values(leaf_values):
-                    continue
-                leaf_budget_m = annual.lookup_leaf(pmaj, forecast, sfmt)
-                output_rows.append(
-                    _make_row(
-                        sfmt, 2, leaf_values, is_subtotal=False,
-                        budget_m=leaf_budget_m,
-                    ),
-                )
-                f_has_visible_leaf = True
-
-            if not f_has_visible_leaf:
-                # Forecast-Type subtotal is non-zero but every leaf
-                # rounded to zero — keep the subtotal anyway (we
-                # already vetted ``f_totals`` is non-empty).
-                pass
-            pmaj_has_visible_child = True
-
-        if not pmaj_has_visible_child:
-            # All forecast-type branches empty — pop the PMaj header
-            # we just added to keep the table tidy.  Roll back next_row_id
-            # so subsequent IDs stay densely packed.
-            output_rows.pop(pmaj_idx)
-            next_row_id -= 1
-
-    grand_budget_base_m = annual.slice_total(
-        forecast=FORECAST_BASE_PLAN,
-        pmaj_whitelist=visible_pmajs,
-        sfmt_whitelist=visible_sfmts,
+    wide, month_col_labels = build_month_wide(long_df)
+    assembled = assemble_hierarchical_pivot(
+        wide, month_col_labels, annual, forecast_order,
     )
-    grand_budget_ro_m = annual.slice_total(
-        forecast=FORECAST_R_AND_O,
-        pmaj_whitelist=visible_pmajs,
-        sfmt_whitelist=visible_sfmts,
+    pivot = assembled.pivot
+    grand_budget_base_m = assembled.grand_budget_by_forecast.get(
+        FORECAST_BASE_PLAN, 0.0,
     )
-    grand_budget_total_m = grand_budget_base_m + grand_budget_ro_m
+    grand_budget_ro_m = assembled.grand_budget_by_forecast.get(
+        FORECAST_R_AND_O, 0.0,
+    )
+    grand_budget_total_m = assembled.grand_budget_total_m
 
-    if output_rows:
-        grand_totals = wide.sum(axis=0).to_dict()
-        output_rows.append(
-            _make_row(
-                "Grand Total", 0, grand_totals, is_subtotal=True,
-                budget_m=grand_budget_total_m,
-            ),
-        )
-
-    pivot = pd.DataFrame(output_rows)
-
-    # ── Footer totals (Base Plan / R&O / Total Budget — dynamic per filter) ──
+    # ── Footer totals (Base Plan / R&O — dynamic per filter) ────────
     #
     # Built from the post-filter ``long_df`` so they always reconcile
-    # to whatever is currently on screen.  Stored as a single-row
-    # frame so the page can render them via ``st.dataframe`` with
-    # the exact same column_config as the pivot.
-    footer_grouped = (
-        long_df.groupby(["__forecast", "__month"], observed=True)["__lbs_m"]
-        .sum().reset_index()
-    )
-    footer_wide = footer_grouped.pivot_table(
-        index="__forecast", columns="__month",
-        values="__lbs_m", aggfunc="sum", fill_value=0.0,
-    )
-    footer_wide.columns = pd.Index(
-        [_format_month_label(d) for d in footer_wide.columns]
-    )
-    # Ensure both rows exist (a filter narrowing to one type would
-    # otherwise drop the other from the footer entirely).
-    for forecast in (FORECAST_BASE_PLAN, FORECAST_R_AND_O):
-        if forecast not in footer_wide.index:
-            footer_wide.loc[forecast] = 0.0
+    # to whatever is currently on screen (shared grouping feeds both
+    # the footer and the chart, so the two never drift apart).
+    grouped = forecast_month_grouped(long_df)
+    footer_wide = footer_wide_from_grouped(grouped, forecast_order)
 
-    def _row_to_footer_df(
-        label: str,
-        series: pd.Series,
-        *,
-        include_budget_col: bool,
-        budget_col_value: float = float("nan"),
-    ) -> pd.DataFrame:
-        """Return a single-row footer frame (dynamic demand subtotals)."""
-        values = {c: round(float(series.get(c, 0.0)), 1) for c in month_col_labels}
-        values[TOTAL_COLUMN_LABEL] = round(
-            float(sum(series.get(c, 0.0) for c in month_col_labels)), 1,
-        )
-        if include_budget_col:
-            values[TOTAL_BUDGET_COLUMN_LABEL] = budget_col_value
-        return pd.DataFrame([{"Row Label": label, **values}])
-
-    # Footer table shares one schema: annual values on Base/R&O rows,
-    # monthly values on the bundled Total Budget row.
     include_footer_budget_col = annual.has_data or monthly.has_data
-    base_plan_totals = _row_to_footer_df(
+    base_plan_totals = footer_row_frame(
         "Total Base Plan",
         footer_wide.loc[FORECAST_BASE_PLAN],
+        month_col_labels,
         include_budget_col=include_footer_budget_col,
         budget_col_value=(
             round(float(grand_budget_base_m), 1)
             if annual.has_data else float("nan")
         ),
     )
-    r_and_o_totals = _row_to_footer_df(
+    r_and_o_totals = footer_row_frame(
         "Total R&O",
         footer_wide.loc[FORECAST_R_AND_O],
+        month_col_labels,
         include_budget_col=include_footer_budget_col,
         budget_col_value=(
             round(float(grand_budget_ro_m), 1)
@@ -1775,46 +1984,16 @@ def build_demand_pivot(
 
     # Static Total Budget row — monthly millions from Fabric (not
     # re-sliced by PMaj / SFmt; only the visible month columns apply).
-    budget_by_month = monthly.values_for_labels(month_col_labels)
-    budget_label = f"{TOTAL_BUDGET_COLUMN_LABEL} (Base + R&O)"
-    budget_totals_values: dict[str, float] = {}
-    for col in month_col_labels:
-        raw = budget_by_month.get(col, float("nan"))
-        budget_totals_values[col] = (
-            round(float(raw), 1) if pd.notna(raw) else float("nan")
-        )
-    budget_total_m = monthly.sum_for_labels(month_col_labels)
-    budget_totals_values[TOTAL_COLUMN_LABEL] = round(float(budget_total_m), 1)
-    if monthly.has_data:
-        budget_totals_values[TOTAL_BUDGET_COLUMN_LABEL] = round(
-            float(budget_total_m), 1,
-        )
-    budget_totals = pd.DataFrame(
-        [{"Row Label": budget_label, **budget_totals_values}]
+    budget_totals, budget_by_month, budget_total_m = monthly_budget_footer(
+        monthly, month_col_labels,
     )
 
     # ── Long-form chart frame (Month × Forecast Type × Pounds_M) ──
     #
-    # The chart in the screenshot is a stacked area chart of Base
-    # Plan + R&O monthly totals.  Plotly Express's ``area`` consumes
-    # tidy / long-form data with one column per visual encoding, so
-    # we emit that shape directly here to avoid a second reshape in
-    # the page renderer.
-    chart_long = footer_grouped.rename(
-        columns={"__forecast": "Forecast Type",
-                 "__month":    "Month",
-                 "__lbs_m":    "Pounds_M"},
-    )
-    chart_long["Pounds_M"] = chart_long["Pounds_M"].round(1)
-    # Preserve a stable category order so Base Plan stacks on the
-    # bottom (largest series) and R&O sits on top — matches the
-    # screenshot's visual hierarchy.
-    chart_long["Forecast Type"] = pd.Categorical(
-        chart_long["Forecast Type"],
-        categories=[FORECAST_BASE_PLAN, FORECAST_R_AND_O],
-        ordered=True,
-    )
-    chart_long = chart_long.sort_values(["Month", "Forecast Type"]).reset_index(drop=True)
+    # A stacked area chart of Base Plan + R&O monthly totals; the shared
+    # helper emits the tidy shape Plotly consumes, with Base Plan ordered
+    # to the bottom of the stack and R&O on top (screenshot hierarchy).
+    chart_long = chart_long_from_grouped(grouped, forecast_order)
 
     return DemandPivotResult(
         pivot=pivot,
@@ -1878,4 +2057,17 @@ __all__ = [
     "build_supply_format_lookup",
     "list_available_filter_values",
     "pivot_for_download",
+    # Shared pivot-assembly primitives (reused by the Demand MOM Summary
+    # builder in demand_plan_comparison.py — one definition, no dup).
+    "AssembledPivot",
+    "build_month_wide",
+    "assemble_hierarchical_pivot",
+    "forecast_month_grouped",
+    "footer_wide_from_grouped",
+    "footer_row_frame",
+    "chart_long_from_grouped",
+    "monthly_budget_footer",
+    "_build_indented_label",
+    "_format_month_label",
+    "PMAJ_BLANK_LABEL",
 ]

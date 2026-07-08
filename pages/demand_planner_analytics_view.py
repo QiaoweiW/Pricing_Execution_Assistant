@@ -673,14 +673,13 @@ def _render_ro_comparison() -> None:
             history_df, dimitems_df, item_master_df, prior_month, le_month,
         )
 
-        # 3c. Explicit, on-demand regenerate button.  Rebuilds the output
-        #     from the current RO_History regardless of fingerprint state
-        #     (the auto-regen above only fires on a change).  Placed BEFORE
-        #     the build so a click's downstream invalidation is picked up by
-        #     ``_ensure_summary_in_session`` on the SAME render.
-        _render_ro_comparison_generate_button(
-            history_df, dimitems_df, item_master_df, prior_month, le_month,
-        )
+        # 3c. Explicit, on-demand regenerate button.  Force-reads the latest
+        #     RO_History from Fabric and rebuilds regardless of fingerprint
+        #     state (the auto-regen above only fires on a detected change,
+        #     and only if the cached read already surfaced fresh bytes).  It
+        #     reruns after writing, so the refreshed source flows through the
+        #     top-of-section fetch + ``_ensure_summary_in_session`` rebuild.
+        _render_ro_comparison_generate_button(prior_month, le_month)
 
         # 4. Build (and cache in session_state) the comparison frame.
         _ensure_summary_in_session(
@@ -1374,9 +1373,6 @@ def _render_ro_comparison_save_button(summary_df: pd.DataFrame) -> None:
 
 
 def _render_ro_comparison_generate_button(
-    history_df: pd.DataFrame,
-    dimitems_df: pd.DataFrame | None,
-    item_master_df: pd.DataFrame | None,
     prior_month: date,
     le_month: date,
 ) -> None:
@@ -1385,38 +1381,66 @@ def _render_ro_comparison_generate_button(
     Distinct from the other two write paths:
 
       * **Auto-regen** only fires when ``RO_History_Tracker.csv``'s
-        fingerprint drifts from the last-saved output.
+        fingerprint drifts from the last-saved output — and only if the
+        cached read already surfaced the fresh bytes.
       * **💾 Save** republishes the in-memory frame *including* any
         hand-edits made in the table.
 
-    This button ALWAYS rebuilds ``RO_Comparison_Output.csv`` **fresh from
-    the current RO_History (+ dp_dimitems / RO_Item_Master dims)** for the
-    selected Prior/LE months and overwrites it in Fabric — **discarding**
-    any manual cell edits — by reusing the data layer's unconditional
-    :func:`regenerate_comparison_output`.  Post-write it invalidates the
-    downstream cascade (same helper the auto-regen uses) and stashes the
-    one-shot banner, so the on-screen tables rebuild from the new baseline
-    on this same render.
+    This button **force-reads the latest `RO_History_Tracker.csv`
+    (+ dp_dimitems / RO_Item_Master dims) straight from Fabric**, rebuilds
+    the comparison for the selected Prior/LE months, and overwrites
+    ``RO_Comparison_Output.csv`` — **discarding** any manual cell edits.
+
+    The force-refresh is the crux: without it the button would regenerate
+    from whatever ``fetch_ro_history_df`` last cached, so a just-updated
+    ``RO_History_Tracker.csv`` could produce an identical table (the bug
+    this fixes).  After writing, it drops the cached comparison + the
+    auto-regen session guard and **reruns**, so the page re-reads the now-
+    fresh source at the top and every downstream table rebuilds from the
+    new baseline.
     """
     clicked = st.button(
         "🔁 Generate `RO_Comparison_Output.csv` from current RO_History",
         key="ro_cmp_generate_from_history",
         use_container_width=True,
         help=(
-            "Rebuilds the comparison for the selected Prior/LE months from "
-            "the current `RO_History_Tracker.csv` (which already reflects "
-            "`Distribution_Tracker_History.csv`) and overwrites "
-            "`Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`.  "
+            "Force-reads the latest `RO_History_Tracker.csv` from Fabric "
+            "(which already reflects `Distribution_Tracker_History.csv`), "
+            "rebuilds the comparison for the selected Prior/LE months, and "
+            "overwrites `Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`. "
             "Ignores any in-tab cell edits — use **💾 Save** to keep those."
         ),
     )
     if not clicked:
         return
 
+    # 1. Force a FRESH read of the required source, bypassing the ETag /
+    #    TTL cache entirely.  A stale cached frame is exactly why a
+    #    just-updated RO_History could regenerate an identical table.
+    try:
+        with st.spinner(
+            "Reading the latest RO_History_Tracker.csv from Microsoft Fabric…"
+        ):
+            history_df = fetch_ro_history_df(force_refresh=True)
+    except RoComparisonError as exc:
+        st.error(f"❌ Could not read the latest RO_History_Tracker.csv.\n\n{exc}")
+        return
     if history_df is None or history_df.empty:
         st.warning("RO_History_Tracker.csv is empty — nothing to generate from.")
         return
 
+    # 2. Best-effort fresh read of the soft dimension sources; a failure
+    #    just leaves the Portfolio / Supply-Format cascade to its fallback.
+    def _refresh_soft(fetcher) -> pd.DataFrame | None:
+        try:
+            return fetcher(force_refresh=True)
+        except RoComparisonError:
+            return None
+
+    dimitems_df = _refresh_soft(fetch_dimitems_df)
+    item_master_df = _refresh_soft(fetch_ro_item_master_df)
+
+    # 3. Rebuild + save unconditionally from the fresh frames.
     try:
         with st.spinner(
             "Generating RO_Comparison_Output.csv from current RO_History…"
@@ -1428,11 +1452,14 @@ def _render_ro_comparison_generate_button(
         st.error(f"❌ Could not generate RO_Comparison_Output.csv.\n\n{exc}")
         return
 
-    # Same downstream invalidation + one-shot banner the auto-regen uses, so
-    # the editor / drivers / Early-Start table / Summary Report all rebuild
-    # from the freshly-saved baseline on this render.
+    # 4. Drop the cached comparison + the auto-regen session guard, stash the
+    #    one-shot banner, and rerun.  On the rerun the top-of-section
+    #    ``fetch_ro_history_df()`` returns the now-fresh cache and
+    #    ``_ensure_summary_in_session`` rebuilds the on-screen table from it.
     _invalidate_ro_comparison_downstream()
+    st.session_state.pop(_SS_AUTO_REGEN_SIG, None)
     st.session_state[_SS_AUTO_REGEN_BANNER] = result
+    st.rerun()
 
 
 def _render_warnings_banner(w: ComparisonWarnings) -> None:

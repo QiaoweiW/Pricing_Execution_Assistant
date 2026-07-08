@@ -506,22 +506,27 @@ COL_PM_ACTUAL: str              = "pm_actual"
 COL_TOTAL_DELTA: str            = "total_delta"
 COL_LAST_PLAN: str              = "last_plan"
 COL_V_BUDGET: str               = "v_budget"
-# Reconciliation residual: Total Actuals − PM Actual − Base Plan delta −
-# R&O delta.  Should net to ~0 when the actuals fully reconcile against
-# the plan-delta components; a non-zero value flags an unexplained gap.
-COL_RECONCILIATION: str         = "reconciliation"
+# NB: COL_BASE_PLAN (declared above with the additive names for display
+# ordering) is a DERIVED residual — Total Delta − PM Actual − R&O — computed
+# in _assemble_table, NOT an independently-summed measure.  Defining it this
+# way makes the columns always reconcile: Base Plan + PM Actual + R&O ≡
+# Total Delta, so Base Plan absorbs any gap between the Current/Last plan
+# walk and the PM-Actual + R&O components.
 
 # Ratio columns — NOT additive; computed from each row's own derived
 # values after roll-up.
 COL_TOTAL_DELTA_PCT: str        = "total_delta_pct"
 COL_PCT: str                    = "pct"
 
-# The set of measures summed during subtotal roll-up.
+# The set of measures summed during subtotal roll-up.  Base Plan is
+# intentionally absent — it's a derived residual (see _assemble_table),
+# linear in these additive measures, so it rolls up correctly without
+# being summed independently.
 _ADDITIVE_COLS: tuple[str, ...] = (
     COL_TOTAL_ACTUALS, COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST,
     COL_LAST_PLAN_ACTUALS, COL_LAST_PLAN_FORECAST,
-    COL_BASE_PLAN, COL_R_AND_O, COL_BUDGET,
+    COL_R_AND_O, COL_BUDGET,
 )
 
 # Internal structural columns kept alongside the metrics for the page.
@@ -554,7 +559,6 @@ DISPLAY_LABELS: dict[str, str] = {
     COL_TOTAL_DELTA_PCT:       "Total Delta %",
     COL_BASE_PLAN:             "Base Plan",
     COL_R_AND_O:               "R&O",
-    COL_RECONCILIATION:        "Reconciliation",
     COL_V_BUDGET:              "v. Budget",
     COL_PCT:                   "%",
     COL_BUDGET:                "Budget",
@@ -564,21 +568,19 @@ DISPLAY_ORDER: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST, COL_LAST_PLAN,
     COL_CURRENT_PLAN, COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
-    COL_BASE_PLAN, COL_R_AND_O, COL_RECONCILIATION,
-    COL_V_BUDGET, COL_PCT, COL_BUDGET,
+    COL_BASE_PLAN, COL_R_AND_O, COL_V_BUDGET, COL_PCT, COL_BUDGET,
 )
 # Columns rendered as percentages (the rest are millions of lbs).
 PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT})
 
 # Metric columns hidden by default in the Streamlit table — planners can
-# expand them via a checkbox on the page.  Prior Month Actual through
-# Current Plan (Forecast), plus the Reconciliation residual.
+# expand them via a checkbox on the page.  Spans Prior Month Actual
+# through Current Plan (Forecast), inclusive.
 COLS_HIDDEN_BY_DEFAULT: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL,
     COL_CURRENT_PLAN_FORECAST,
-    COL_RECONCILIATION,
 )
 
 _LBS_PER_MILLION: float = 1_000_000.0
@@ -1863,10 +1865,9 @@ def _compute_leaf_measures(
     if not trk.empty:
         cur_cycle = trk["cycle"] == filters.current_cycle
         prior_cycle = trk["cycle"] == filters.prior_cycle
-        is_base = trk["forecast_type"] == FORECAST_BASE_PLAN
         is_base_or_ro = trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
     else:
-        cur_cycle = prior_cycle = is_base = is_base_or_ro = pd.Series([], dtype=bool)
+        cur_cycle = prior_cycle = is_base_or_ro = pd.Series([], dtype=bool)
 
     # ── Actuals (IBP Shipments — no forecast type) ───────────────────
     total_actuals = _sum_millions(ibp, ibp_mask & ibp_in_actual)
@@ -1895,18 +1896,14 @@ def _compute_leaf_measures(
     last_plan_forecast = _sum_millions(
         trk, trk_mask & prior_cycle & is_base_or_ro & trk_in_prior_forecast)
 
-    # ── Base Plan delta (Base Plan type only, forecast months) ───────
-    # current cycle base-plan forecast − prior cycle base-plan forecast.
-    base_plan = (
-        _sum_millions(trk, trk_mask & cur_cycle & is_base & trk_in_forecast)
-        - _sum_millions(trk, trk_mask & prior_cycle & is_base & trk_in_forecast)
-    )
-
     # ── R&O (RO Summary FY27 Total Delta, matched by label path) ─────
     r_and_o = 0.0
     if tpl.ro_summary_path is not None:
         r_and_o = float(ro_total_delta_by_path.get(tpl.ro_summary_path, 0.0))
 
+    # NOTE: Base Plan is NOT computed here.  Per the planner's spec it is a
+    # DERIVED residual — Total Delta − PM Actual − R&O — assembled in
+    # _assemble_table so the columns always sum to Total Delta.
     return {
         COL_TOTAL_ACTUALS: total_actuals,
         COL_PRIOR_MONTH_ACTUAL: prior_month_actual,
@@ -1915,7 +1912,6 @@ def _compute_leaf_measures(
         COL_CURRENT_PLAN_FORECAST: current_plan_forecast,
         COL_LAST_PLAN_ACTUALS: last_plan_actuals,
         COL_LAST_PLAN_FORECAST: last_plan_forecast,
-        COL_BASE_PLAN: base_plan,
         COL_R_AND_O: r_and_o,
         COL_BUDGET: tpl.budget_m,
     }
@@ -1965,20 +1961,15 @@ def _assemble_table(
         #                  forecast over the forecast window.
         #   Last Plan    = the two independent one-month-ago legs.
         #   Total Delta  = the walk between them (Current − Last).
-        # Base Plan / R&O / PM Actual remain as informational columns; they
-        # no longer have to sum to Total Delta under this definition.
+        #   Base Plan    = the DERIVED residual Total Delta − PM Actual − R&O,
+        #                  so Base Plan + PM Actual + R&O ≡ Total Delta.
         current_plan = m[COL_TOTAL_ACTUALS] + m[COL_CURRENT_PLAN_FORECAST]
         last_plan = m[COL_LAST_PLAN_ACTUALS] + m[COL_LAST_PLAN_FORECAST]
         pm_actual = m[COL_PRIOR_MONTH_ACTUAL] - m[COL_PRIOR_MONTH_FORECAST]
         total_delta = current_plan - last_plan
+        r_and_o = m[COL_R_AND_O]
+        base_plan = total_delta - pm_actual - r_and_o
         v_budget = current_plan - m[COL_BUDGET]
-        # Reconciliation residual: what's left of the actuals once the
-        # plan-delta components are backed out.  = Total Actuals − PM Actual
-        # − Base Plan delta − R&O delta (all additive, so this stays linear
-        # and rolls up as the sum of children).
-        reconciliation = (
-            m[COL_TOTAL_ACTUALS] - pm_actual - m[COL_BASE_PLAN] - m[COL_R_AND_O]
-        )
 
         # Ratio columns — guard divide-by-zero (blank when undefined).
         #   Total Delta %  = Total Delta as a share of Last Plan (the MoM move).
@@ -2001,9 +1992,8 @@ def _assemble_table(
             COL_PM_ACTUAL: pm_actual,
             COL_TOTAL_DELTA: total_delta,
             COL_TOTAL_DELTA_PCT: total_delta_pct,
-            COL_BASE_PLAN: m[COL_BASE_PLAN],
-            COL_R_AND_O: m[COL_R_AND_O],
-            COL_RECONCILIATION: reconciliation,
+            COL_BASE_PLAN: base_plan,
+            COL_R_AND_O: r_and_o,
             COL_V_BUDGET: v_budget,
             COL_PCT: pct,
             COL_BUDGET: m[COL_BUDGET],

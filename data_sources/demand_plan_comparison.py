@@ -93,6 +93,23 @@ from data_sources.demand_summary import (
     _resolve_column,
     FORECAST_BASE_PLAN,
     FORECAST_R_AND_O,
+    # Shared pivot-assembly primitives — the Demand MOM Summary reuses the
+    # exact hierarchy walk / footer / chart shaping the classic Demand
+    # Pivot uses, so the two views stay pixel-identical in layout.
+    BudgetLookup,
+    MonthlyBudgetLookup,
+    PMAJ_BLANK_LABEL,
+    assemble_hierarchical_pivot,
+    build_month_wide,
+    chart_long_from_grouped,
+    footer_row_frame,
+    footer_wide_from_grouped,
+    forecast_month_grouped,
+    monthly_budget_footer,
+    _format_month_label,
+    _COL_FORECAST_DIM,
+    _COL_PMAJ_DIM,
+    _COL_SFMT_DIM,
 )
 from data_sources.fabric_lakehouse_io import LakehouseIOError, read_bytes, read_csv
 
@@ -2418,6 +2435,578 @@ def _assemble_driver_result(
     prepared = _prepare_driver_bucket_frame(buckets)
     table = _build_driver_table(prepared, value_col)
     return DriverTableResult(table=table, buckets=prepared)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Demand MOM Summary (month-over-month: actuals stitched onto the forecast)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The Demand MOM Summary renders the SAME hierarchical pivot as the classic
+# Demand Pivot (Portfolio Major → Forecast Type → Supply Format, monthly
+# columns in millions of pounds) but stitches two sources onto one month
+# axis:
+#
+#   * ACTUAL months  → ``dbo.IBP Shipments`` (Shipped Qty lbs).  Surfaced
+#     under a third Forecast Type branch, ``"Actual"``, since shipments
+#     carry no Base/R&O split.
+#   * FORECAST months → ``qry_mgmt_plan_history_tracker.csv`` for the
+#     selected ``Cycle`` (Base Plan / R&O).
+#
+# The two windows are disjoint (see :func:`validate_mom_filters`), so on the
+# stitched month axis the Actual branch populates only actual-window columns
+# and the Base/R&O branches only forecast-window columns — one continuous
+# month-over-month view.  All hierarchy / footer / chart shaping is delegated
+# to the shared primitives in ``demand_summary`` so the MOM table is
+# pixel-identical in layout to the classic pivot.
+
+# The synthetic Forecast Type branch that carries IBP Shipments actuals.
+SERIES_ACTUAL: str = "Actual"
+
+# Row order beneath each Portfolio Major: actuals first (chronologically the
+# left-most months), then the two forecast branches.  Only the forecast
+# branches carry an annual Total Budget.
+MOM_FORECAST_ORDER: tuple[str, ...] = (
+    SERIES_ACTUAL, FORECAST_BASE_PLAN, FORECAST_R_AND_O,
+)
+_MOM_BUDGETED_FORECASTS: set[str] = {FORECAST_BASE_PLAN, FORECAST_R_AND_O}
+
+# Pounds → millions (grep-able single definition, matches demand_summary).
+_MOM_LBS_PER_MILLION: float = 1_000_000.0
+# "Row rounds to zero" tolerance in millions — mirrors demand_summary's
+# _EMPTY_ROW_TOLERANCE_M so "captured" here agrees with what the pivot draws.
+_MOM_ZERO_TOL_M: float = 0.05
+
+# Hidden dimension-breadcrumb columns on the assembled pivot (re-exported
+# from demand_summary so the page can resolve a clicked row → its
+# (Portfolio Major, Forecast Type, Supply Format) leaf for the drill-down).
+MOM_ROW_PMAJ: str     = _COL_PMAJ_DIM
+MOM_ROW_FORECAST: str = _COL_FORECAST_DIM
+MOM_ROW_SFMT: str     = _COL_SFMT_DIM
+
+# Display column names for the "not captured" reconciliation log.
+NC_COL_ITEM: str    = "Item"
+NC_COL_DESC: str    = "Item Description"
+NC_COL_PMAJ: str    = "Portfolio Major"
+NC_COL_SFMT: str    = "Supply Format"
+NC_COL_REASON: str  = "Reason"
+_NC_COLUMNS: tuple[str, ...] = (
+    NC_COL_ITEM, NC_COL_DESC, NC_COL_PMAJ, NC_COL_SFMT, NC_COL_REASON,
+)
+
+# The reasons a tracker item can be missing from the MOM Summary, most
+# actionable (data-quality) first.
+_NC_REASON_NO_MAPPING: str = "No Portfolio Major / Supply Format mapping (PDH)"
+_NC_REASON_FILTERED: str   = "Excluded by the active Portfolio Major / Supply Format filter"
+_NC_REASON_ZERO: str       = "Zero forecast pounds in the selected window"
+
+# SKU drill-down display column names.
+SKU_COL_ITEM: str = "Item"
+SKU_COL_DESC: str = "Item Description"
+SKU_COL_TOTAL: str = "Total"
+
+
+@dataclass(frozen=True)
+class DemandMomFilters:
+    """User selection driving the Demand MOM Summary.
+
+    Attributes
+    ----------
+    cycle
+        The tracker ``Cycle`` supplying the forecast months.
+    actual_start / actual_end
+        Inclusive first-of-month bounds for the **actual** window — pulled
+        from IBP Shipments.
+    forecast_start / forecast_end
+        Inclusive first-of-month bounds for the **forecast** window —
+        pulled from the tracker for *cycle*.  Must not overlap the actual
+        window (see :func:`validate_mom_filters`).
+    portfolio_majors / supply_formats
+        Optional whitelists (``None`` = include every value), applied
+        conjunctively — same semantics as the classic pivot's filters.
+    """
+    cycle: str
+    actual_start: date
+    actual_end: date
+    forecast_start: date
+    forecast_end: date
+    portfolio_majors: Optional[tuple[str, ...]] = None
+    supply_formats: Optional[tuple[str, ...]] = None
+
+
+@dataclass(frozen=True)
+class DemandMomResult:
+    """Output of :func:`build_demand_mom_pivot`.
+
+    Carries the same display artifacts as
+    :class:`demand_summary.DemandPivotResult` (so the page's pivot-table
+    and chart renderers consume them unchanged) plus three MOM-specific
+    additions: the ``Actual`` footer row, the item-level ``item_detail``
+    frame behind the drill-down, and the ``not_captured_items``
+    reconciliation log.
+    """
+    pivot: pd.DataFrame
+    month_columns: tuple[str, ...]
+    actual_month_columns: tuple[str, ...]
+    forecast_month_columns: tuple[str, ...]
+    actual_totals: pd.DataFrame
+    base_plan_totals: pd.DataFrame
+    r_and_o_totals: pd.DataFrame
+    budget_totals: pd.DataFrame
+    budget_by_month: dict[str, float]
+    budget_total_m: float
+    has_pivot_budget_data: bool
+    has_budget_data: bool
+    chart_long: pd.DataFrame
+    item_detail: pd.DataFrame
+    not_captured_items: pd.DataFrame
+    has_actuals: bool
+
+    def sku_detail_for(
+        self, pmaj: str = "", forecast: str = "", sfmt: str = "",
+    ) -> pd.DataFrame:
+        """Return the SKU-level detail behind a clicked pivot row.
+
+        Filters :attr:`item_detail` to the (Portfolio Major, Forecast
+        Type, Supply Format) breadcrumb of the selected row — an empty
+        string on any level means "don't pin that level" (so clicking a
+        Portfolio Major header returns every item under it, a Forecast
+        Type subtotal every item in that branch, a Supply Format leaf
+        just that leaf).  The result is pivoted to one row per Item ×
+        month + a ``Total`` column, ready to display and download.
+        """
+        detail = self.item_detail
+        if detail.empty:
+            return pd.DataFrame()
+
+        mask = pd.Series(True, index=detail.index)
+        if pmaj:
+            mask &= detail["__pmaj"] == pmaj
+        if forecast:
+            mask &= detail["__forecast"] == forecast
+        if sfmt:
+            mask &= detail["__sfmt"] == sfmt
+        sub = detail.loc[mask]
+        if sub.empty:
+            return pd.DataFrame()
+
+        wide = sub.pivot_table(
+            index=["item_key", "item_desc"],
+            columns="__month_label",
+            values="__lbs_m",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        month_cols = list(wide.columns)
+        wide = wide.reset_index().rename(
+            columns={"item_key": SKU_COL_ITEM, "item_desc": SKU_COL_DESC},
+        )
+        wide[SKU_COL_TOTAL] = wide[month_cols].sum(axis=1).round(1)
+        for c in month_cols:
+            wide[c] = wide[c].round(1)
+        # Heaviest items first — the planner scans top-down for movers.
+        wide = wide.sort_values(SKU_COL_TOTAL, ascending=False).reset_index(drop=True)
+        return wide[[SKU_COL_ITEM, SKU_COL_DESC, *month_cols, SKU_COL_TOTAL]]
+
+
+def validate_mom_filters(filters: DemandMomFilters) -> list[str]:
+    """Return human-readable validation errors for a MOM selection (empty = OK).
+
+    Enforces start ≤ end on each window and the planner's rule that the
+    actual and forecast windows must be disjoint (otherwise a month would
+    be sourced from both IBP Shipments and the tracker at once).
+    """
+    errors: list[str] = []
+    if filters.actual_start > filters.actual_end:
+        errors.append("Actual range: the beginning month is after the end month.")
+    if filters.forecast_start > filters.forecast_end:
+        errors.append("Forecast range: the beginning month is after the end month.")
+    overlap = (
+        filters.actual_start <= filters.forecast_end
+        and filters.forecast_start <= filters.actual_end
+    )
+    if overlap:
+        errors.append(
+            "Actual and forecast month ranges overlap.  A month can be an "
+            "actual OR a forecast, not both — adjust one of the ranges so "
+            "they are disjoint."
+        )
+    return errors
+
+
+def _norm_dim(value) -> str:
+    """Normalise a dimension value to the pivot's bucket key.
+
+    Trims whitespace and maps NaN / None / empty → the ``(blank)``
+    sentinel so unmapped items land in a clearly-labelled bucket rather
+    than a ``NaN`` group (matches demand_summary's ``_prepare_long_frame``).
+    """
+    try:
+        if value is None or pd.isna(value):
+            return PMAJ_BLANK_LABEL
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    return s if s else PMAJ_BLANK_LABEL
+
+
+def list_mom_filter_values(
+    tracker_df: Optional[pd.DataFrame], pdh_df: Optional[pd.DataFrame],
+) -> dict[str, list[str]]:
+    """Return the Portfolio Major / Supply Format options for the MOM filters.
+
+    Scoped to the items the tracker actually carries (joined to PDH dims)
+    so the planner's dropdowns list only relevant values.  Tracker items
+    with no PDH mapping contribute the ``(blank)`` sentinel so they remain
+    selectable.  Returns ``{"portfolio_majors": [...], "supply_formats":
+    [...]}`` (sorted, ``(blank)`` last).
+    """
+    empty = {"portfolio_majors": [], "supply_formats": []}
+    dim = build_item_dim_frame(pdh_df)
+    if tracker_df is None or tracker_df.empty or TRK_ITEM not in tracker_df.columns:
+        return empty
+
+    keys = set(_vectorised_item_key(tracker_df[TRK_ITEM]).tolist()) - {""}
+    if not keys:
+        return empty
+
+    if dim.empty:
+        # No dims at all — every item lands in the blank bucket.
+        return {
+            "portfolio_majors": [PMAJ_BLANK_LABEL],
+            "supply_formats": [PMAJ_BLANK_LABEL],
+        }
+
+    sub = dim.loc[dim["__item_key"].isin(keys)]
+    pmajs = {_norm_dim(v) for v in sub["pmaj"]}
+    sfmts = {_norm_dim(v) for v in sub["sfmt"]}
+    # Any tracker item missing from PDH → surface the blank bucket option.
+    if keys - set(dim["__item_key"]):
+        pmajs.add(PMAJ_BLANK_LABEL)
+        sfmts.add(PMAJ_BLANK_LABEL)
+
+    def _sorted_blank_last(values: set[str]) -> list[str]:
+        ordered = sorted(v for v in values if v != PMAJ_BLANK_LABEL)
+        if PMAJ_BLANK_LABEL in values:
+            ordered.append(PMAJ_BLANK_LABEL)
+        return ordered
+
+    return {
+        "portfolio_majors": _sorted_blank_last(pmajs),
+        "supply_formats": _sorted_blank_last(sfmts),
+    }
+
+
+def _mom_detail_columns() -> list[str]:
+    """The unified item-level detail column order (tracker + shipments)."""
+    return [
+        "item_key", "item_desc", "customer_name",
+        "__pmaj", "__sfmt", "__forecast", "month", "pounds",
+    ]
+
+
+def _empty_mom_result() -> DemandMomResult:
+    """A fully-shaped zero-row result so the page can bail without guards."""
+    empty = pd.DataFrame()
+    return DemandMomResult(
+        pivot=pd.DataFrame(),
+        month_columns=(),
+        actual_month_columns=(),
+        forecast_month_columns=(),
+        actual_totals=empty,
+        base_plan_totals=empty,
+        r_and_o_totals=empty,
+        budget_totals=empty,
+        budget_by_month={},
+        budget_total_m=0.0,
+        has_pivot_budget_data=False,
+        has_budget_data=False,
+        chart_long=pd.DataFrame(columns=["Month", "Forecast Type", "Pounds_M"]),
+        item_detail=pd.DataFrame(),
+        not_captured_items=pd.DataFrame(columns=list(_NC_COLUMNS)),
+        has_actuals=False,
+    )
+
+
+def _build_mom_not_captured(
+    trk_forecast_window: pd.DataFrame,
+    captured_keys: set[str],
+    filters: DemandMomFilters,
+) -> pd.DataFrame:
+    """Return the "in tracker but not captured in the MOM Summary" log.
+
+    Reference set = every distinct Item the tracker carries for the
+    selected ``Cycle`` inside the forecast window.  An item is *captured*
+    when it contributes non-zero forecast pounds to a real (non-``(blank)``)
+    Portfolio Major row that survives the active filters — i.e. it's
+    visible in the rendered pivot.  Everything else is reported here with a
+    reason, most-actionable (missing PDH mapping) first, so the planner can
+    reconcile the pivot back to the tracker at a glance.
+    """
+    if trk_forecast_window.empty:
+        return pd.DataFrame(columns=list(_NC_COLUMNS))
+
+    # One reference row per item: its dims (first seen) + total window pounds.
+    per_item = (
+        trk_forecast_window.groupby("item_key", as_index=False)
+        .agg(
+            item_desc=("item_desc", "first"),
+            pmaj=("__pmaj", "first"),
+            sfmt=("__sfmt", "first"),
+            pounds_m=("pounds", lambda s: float(s.sum()) / _MOM_LBS_PER_MILLION),
+        )
+    )
+
+    pmaj_filter = set(filters.portfolio_majors) if filters.portfolio_majors else None
+    sfmt_filter = set(filters.supply_formats) if filters.supply_formats else None
+
+    def _reason(row) -> Optional[str]:
+        if row["item_key"] in captured_keys:
+            return None  # Captured — not a miss.
+        if row["pmaj"] == PMAJ_BLANK_LABEL or row["sfmt"] == PMAJ_BLANK_LABEL:
+            return _NC_REASON_NO_MAPPING
+        if pmaj_filter is not None and row["pmaj"] not in pmaj_filter:
+            return _NC_REASON_FILTERED
+        if sfmt_filter is not None and row["sfmt"] not in sfmt_filter:
+            return _NC_REASON_FILTERED
+        if abs(row["pounds_m"]) <= _MOM_ZERO_TOL_M:
+            return _NC_REASON_ZERO
+        # In-window, mapped, passes filters, non-zero — but still absent.
+        # Should be rare; surface it rather than hide it.
+        return _NC_REASON_ZERO
+
+    per_item["__reason"] = per_item.apply(_reason, axis=1)
+    missed = per_item.loc[per_item["__reason"].notna()].copy()
+    if missed.empty:
+        return pd.DataFrame(columns=list(_NC_COLUMNS))
+
+    out = missed.rename(columns={
+        "item_key": NC_COL_ITEM,
+        "item_desc": NC_COL_DESC,
+        "pmaj": NC_COL_PMAJ,
+        "sfmt": NC_COL_SFMT,
+        "__reason": NC_COL_REASON,
+    })
+    # Group by reason (data-quality first), then item, for a stable read.
+    reason_rank = {
+        _NC_REASON_NO_MAPPING: 0, _NC_REASON_FILTERED: 1, _NC_REASON_ZERO: 2,
+    }
+    out["__rank"] = out[NC_COL_REASON].map(reason_rank).fillna(9)
+    out = out.sort_values(["__rank", NC_COL_ITEM]).reset_index(drop=True)
+    return out[list(_NC_COLUMNS)]
+
+
+def build_demand_mom_pivot(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    filters: DemandMomFilters,
+    *,
+    budget_lookup: Optional[BudgetLookup] = None,
+    monthly_budget: Optional[MonthlyBudgetLookup] = None,
+) -> DemandMomResult:
+    """Build the stitched actual-plus-forecast Demand MOM Summary.
+
+    Parameters
+    ----------
+    tracker_df
+        Raw ``qry_mgmt_plan_history_tracker.csv`` (the forecast source).
+    ibp_df
+        A slice of ``dbo.IBP Shipments`` (the actuals source) — ideally
+        already projected to the actual window by the caller.
+    pdh_df
+        ``qry_pdh.csv`` — supplies Portfolio Major / Supply Format per
+        item (the tracker + shipments carry neither).
+    filters
+        The :class:`DemandMomFilters` selection.
+    budget_lookup / monthly_budget
+        Same optional budget inputs as the classic pivot — the annual
+        leaf budget feeds the ``Total Budget`` column (forecast branches
+        only), the monthly budget the footer row + chart reference line.
+
+    Returns
+    -------
+    :class:`DemandMomResult`
+    """
+    annual = budget_lookup if budget_lookup is not None else BudgetLookup(
+        by_leaf={}, has_data=False,
+    )
+    monthly = monthly_budget if monthly_budget is not None else MonthlyBudgetLookup(
+        by_month={}, has_data=False,
+    )
+
+    # ── Enrich both sources with PDH dims (one shared dim frame) ────────
+    dim_frame = build_item_dim_frame(pdh_df)
+    trk = _enrich_tracker(tracker_df, dim_frame)
+    ibp = _enrich_ibp(ibp_df, dim_frame)
+
+    # ── Forecast side (tracker, selected cycle, forecast window) ────────
+    if not trk.empty:
+        trk = trk.assign(
+            __pmaj=trk["pmaj"].map(_norm_dim),
+            __sfmt=trk["sfmt"].map(_norm_dim),
+            # Collapse the tracker's Forecast Type into the two canonical
+            # buckets (unknown/blank → Base Plan, matching the classic pivot).
+            __forecast=trk["forecast_type"].eq(FORECAST_R_AND_O).map(
+                {True: FORECAST_R_AND_O, False: FORECAST_BASE_PLAN}
+            ),
+            customer_name="",  # tracker rows carry a party site, not a customer
+        )
+        trk_cycle = trk.loc[trk["cycle"] == filters.cycle]
+        fc_mask = (
+            (trk_cycle["month"] >= filters.forecast_start)
+            & (trk_cycle["month"] <= filters.forecast_end)
+        )
+        trk_forecast = trk_cycle.loc[fc_mask]
+    else:
+        trk_cycle = trk
+        trk_forecast = trk
+
+    # ── Actual side (IBP Shipments, actual window) ──────────────────────
+    if not ibp.empty:
+        ibp = ibp.assign(
+            __pmaj=ibp["pmaj"].map(_norm_dim),
+            __sfmt=ibp["sfmt"].map(_norm_dim),
+            __forecast=SERIES_ACTUAL,
+        )
+        act_mask = (
+            (ibp["month"] >= filters.actual_start)
+            & (ibp["month"] <= filters.actual_end)
+        )
+        ibp_actual = ibp.loc[act_mask]
+    else:
+        ibp_actual = ibp
+
+    # ── Unified item-level detail (pre user PMaj/SFmt filter) ───────────
+    cols = _mom_detail_columns()
+    parts = [
+        p[cols] for p in (trk_forecast, ibp_actual)
+        if p is not None and not p.empty
+    ]
+    detail_all = (
+        pd.concat(parts, ignore_index=True) if parts
+        else pd.DataFrame(columns=cols)
+    )
+
+    # Apply the user's Portfolio Major / Supply Format whitelists (AND).
+    detail = detail_all
+    if filters.portfolio_majors:
+        detail = detail.loc[detail["__pmaj"].isin(filters.portfolio_majors)]
+    if filters.supply_formats:
+        detail = detail.loc[detail["__sfmt"].isin(filters.supply_formats)]
+
+    if detail.empty:
+        return _empty_mom_result()
+
+    # ── Long frame for the shared assembler ─────────────────────────────
+    long_df = detail.rename(columns={"month": "__month"}).assign(
+        __lbs_m=lambda d: d["pounds"] / _MOM_LBS_PER_MILLION,
+    )
+
+    wide, month_col_labels = build_month_wide(long_df)
+    assembled = assemble_hierarchical_pivot(
+        wide, month_col_labels, annual, MOM_FORECAST_ORDER,
+        budgeted_forecasts=_MOM_BUDGETED_FORECASTS,
+    )
+
+    # ── Footer subtotals (Actual / Base Plan / R&O) ─────────────────────
+    grouped = forecast_month_grouped(long_df)
+    footer_wide = footer_wide_from_grouped(grouped, MOM_FORECAST_ORDER)
+    grand_base_m = assembled.grand_budget_by_forecast.get(FORECAST_BASE_PLAN, 0.0)
+    grand_ro_m = assembled.grand_budget_by_forecast.get(FORECAST_R_AND_O, 0.0)
+    include_budget_col = annual.has_data or monthly.has_data
+
+    actual_totals = footer_row_frame(
+        "Total Actual (Shipments)", footer_wide.loc[SERIES_ACTUAL],
+        month_col_labels, include_budget_col=include_budget_col,
+        budget_col_value=float("nan"),  # actuals carry no budget
+    )
+    base_plan_totals = footer_row_frame(
+        "Total Base Plan", footer_wide.loc[FORECAST_BASE_PLAN],
+        month_col_labels, include_budget_col=include_budget_col,
+        budget_col_value=(
+            round(float(grand_base_m), 1) if annual.has_data else float("nan")
+        ),
+    )
+    r_and_o_totals = footer_row_frame(
+        "Total R&O", footer_wide.loc[FORECAST_R_AND_O],
+        month_col_labels, include_budget_col=include_budget_col,
+        budget_col_value=(
+            round(float(grand_ro_m), 1) if annual.has_data else float("nan")
+        ),
+    )
+    budget_totals, budget_by_month, budget_total_m = monthly_budget_footer(
+        monthly, month_col_labels,
+    )
+
+    chart_long = chart_long_from_grouped(grouped, MOM_FORECAST_ORDER)
+
+    # ── Classify each visible month column as actual vs forecast ────────
+    actual_months = {
+        _format_month_label(m)
+        for m in _months_in_range(filters.actual_start, filters.actual_end)
+    }
+    forecast_months = {
+        _format_month_label(m)
+        for m in _months_in_range(filters.forecast_start, filters.forecast_end)
+    }
+    actual_month_columns = tuple(
+        c for c in month_col_labels if c in actual_months
+    )
+    forecast_month_columns = tuple(
+        c for c in month_col_labels if c in forecast_months
+    )
+
+    # ── Item-level detail for the drill-down ────────────────────────────
+    item_detail = (
+        long_df.assign(__month_label=long_df["__month"].map(_format_month_label))
+        .groupby(
+            ["__pmaj", "__forecast", "__sfmt", "item_key", "item_desc",
+             "__month_label"],
+            as_index=False,
+        )["__lbs_m"].sum()
+    )
+
+    # ── "Not captured" reconciliation log ───────────────────────────────
+    # Captured = contributes non-zero forecast pounds to a real (non-blank)
+    # Portfolio Major that survived the filters (i.e. drawn in the pivot).
+    forecast_detail = detail.loc[detail["__forecast"] != SERIES_ACTUAL]
+    captured_keys: set[str] = set()
+    if not forecast_detail.empty:
+        real = forecast_detail.loc[forecast_detail["__pmaj"] != PMAJ_BLANK_LABEL]
+        if not real.empty:
+            per_item_m = (
+                real.groupby("item_key")["pounds"].sum() / _MOM_LBS_PER_MILLION
+            )
+            captured_keys = set(
+                per_item_m.loc[per_item_m.abs() > _MOM_ZERO_TOL_M].index
+            )
+    not_captured_items = _build_mom_not_captured(
+        trk_forecast, captured_keys, filters,
+    )
+
+    return DemandMomResult(
+        pivot=assembled.pivot,
+        month_columns=month_col_labels,
+        actual_month_columns=actual_month_columns,
+        forecast_month_columns=forecast_month_columns,
+        actual_totals=actual_totals,
+        base_plan_totals=base_plan_totals,
+        r_and_o_totals=r_and_o_totals,
+        budget_totals=budget_totals,
+        budget_by_month={
+            k: round(float(v), 1)
+            for k, v in budget_by_month.items() if pd.notna(v)
+        },
+        budget_total_m=float(budget_total_m),
+        has_pivot_budget_data=bool(
+            annual.has_data and assembled.grand_budget_total_m > 0
+        ),
+        has_budget_data=bool(monthly.has_data and budget_total_m > 0),
+        chart_long=chart_long,
+        item_detail=item_detail,
+        not_captured_items=not_captured_items,
+        has_actuals=not ibp_actual.empty if ibp_actual is not None else False,
+    )
 
 
 def list_driver_buckets_for_group(

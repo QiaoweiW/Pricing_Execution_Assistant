@@ -59,9 +59,6 @@ logger = logging.getLogger(__name__)
 
 from data_sources.demand_summary import (
     BudgetLookup,
-    DemandPivotError,
-    DemandPivotFilters,
-    DemandPivotResult,
     DemandSummaryError,
     DemandSummarySnapshot,
     FORECAST_BASE_PLAN,
@@ -70,9 +67,7 @@ from data_sources.demand_summary import (
     TOTAL_BUDGET_COLUMN_LABEL,
     TOTAL_COLUMN_LABEL,
     build_budget_lookup,
-    build_demand_pivot,
     build_monthly_budget_lookup,
-    build_supply_format_lookup,
     demand_plan_comparison_blob_path,
     fetch_mgmt_plan_full,
     fetch_mgmt_plan_history_tracker,
@@ -83,7 +78,6 @@ from data_sources.demand_summary import (
     fetch_static_budget_monthly,
     fetch_static_budget_ro,
     fetch_total_item_level_demand,
-    list_available_filter_values,
     mgmt_plan_full_blob_path,
     pivot_for_download,
     total_item_level_demand_blob_path,
@@ -137,6 +131,17 @@ from data_sources.demand_plan_comparison import (
     list_tracker_cycles,
     list_tracker_months,
     validate_filters,
+    # Demand MOM Summary (actuals-stitched-onto-forecast pivot).
+    DemandMomFilters,
+    DemandMomResult,
+    DemandPlanComparisonError,
+    SERIES_ACTUAL,
+    MOM_ROW_PMAJ,
+    MOM_ROW_FORECAST,
+    MOM_ROW_SFMT,
+    build_demand_mom_pivot,
+    list_mom_filter_values,
+    validate_mom_filters,
 )
 from data_sources.ibp_official import (
     IBPOfficialSourceError,
@@ -3161,67 +3166,24 @@ def _render_demand_summary_file(
 # distinct ``ro_dp_`` prefix so a key collision can't accidentally
 # reset a planner's selection in another section.
 
-_SS_DP_PMAJ_FILTER:  str = "ro_dp_pmaj_filter"
-_SS_DP_SFMT_FILTER:  str = "ro_dp_sfmt_filter"
-_SS_DP_START_FILTER: str = "ro_dp_start_month_filter"
-_SS_DP_END_FILTER:   str = "ro_dp_end_month_filter"
+_SS_DP_PMAJ_FILTER:   str = "ro_dp_pmaj_filter"
+_SS_DP_SFMT_FILTER:   str = "ro_dp_sfmt_filter"
+_SS_DP_CYCLE_FILTER:  str = "ro_dp_cycle_filter"
+# Forecast window (tracker) and actual window (IBP Shipments) pickers.
+# Distinct key strings from the retired single date-range so a stale
+# session value from an older build can't collide with the new widgets.
+_SS_DP_FC_START_FILTER:  str = "ro_dp_forecast_start_filter"
+_SS_DP_FC_END_FILTER:    str = "ro_dp_forecast_end_filter"
+_SS_DP_ACT_START_FILTER: str = "ro_dp_actual_start_filter"
+_SS_DP_ACT_END_FILTER:   str = "ro_dp_actual_end_filter"
+# Native row-select key for the SKU drill-down.
+_SS_DP_PIVOT_TABLE:      str = "ro_dp_pivot_table_select"
 
 # Hidden columns owned by the pivot builder — kept in sync with
 # ``data_sources/demand_summary._HIDDEN_COLS``.  Listed locally so the
 # page doesn't need to reach into the private module surface to know
 # which columns to suppress from the editor.
 _DP_HIDDEN_COLS: tuple[str, ...] = ("_row_id", "_indent", "_is_subtotal")
-
-
-def _build_demand_pivot_supply_format_lookup() -> dict[str, str]:
-    """Return the per-item Supply Format lookup for the Demand Pivot Summary.
-
-    Composes two Fabric reads — ``qry_pdh.csv`` (primary) and
-    ``RO_Item_Master.csv`` (fallback) — into a single
-    ``{item -> supply_format}`` dict via
-    :func:`build_supply_format_lookup`.  Both reads are wrapped in
-    try/except so a transient outage on either source degrades the
-    cascade gracefully:
-
-    * ``qry_pdh.csv`` down → fallback alone populates the lookup.
-    * Both down                       → returns an empty dict (every item
-      shows up under the ``(blank)`` Supply Format sentinel — visible
-      to the planner but not blocking).
-
-    Failure logs are intentionally INFO-level (not warnings) because a
-    blank Supply Format column is recoverable and the user has plenty
-    of other visual cues in the pivot.
-    """
-    # Primary tier: qry_pdh.csv via the Demand Summary connector.
-    try:
-        pdh_snapshot = fetch_pdh()
-        pdh_df = pdh_snapshot.df
-    except DemandSummaryError as exc:
-        # Non-fatal — fallback will carry the lookup on its own.
-        logger.info(
-            "qry_pdh.csv unavailable for Demand Pivot Supply Format "
-            "lookup (will fall back to RO_Item_Master.csv only): %s",
-            exc,
-        )
-        pdh_df = None
-
-    # Fallback tier: RO_Item_Master.csv via the RO Comparison connector.
-    # Using the existing connector avoids a duplicate read + cache slot
-    # — Item Master is already loaded on the RO Comparison render path,
-    # so this is a cache hit in the common case.
-    try:
-        item_master_df = fetch_ro_item_master_df()
-    except RoComparisonError as exc:
-        # Non-fatal — pivot still renders with primary-tier-only or
-        # empty-lookup Supply Format.
-        logger.info(
-            "RO_Item_Master.csv unavailable for Demand Pivot Supply "
-            "Format fallback (continuing with primary tier only): %s",
-            exc,
-        )
-        item_master_df = None
-
-    return build_supply_format_lookup(pdh_df, item_master_df)
 
 
 def _build_demand_pivot_budget_lookup() -> BudgetLookup:
@@ -3268,219 +3230,356 @@ def _load_demand_pivot_monthly_budget() -> MonthlyBudgetLookup:
 
 
 def _render_demand_pivot_section() -> None:
-    """Render the Demand Pivot Summary header + delegate to the fragment.
+    """Render the Demand MOM Summary header + delegate to the fragment.
 
     The header (title + caption) stays OUTSIDE the fragment because
     it's static text — the fragment owns only the interactive widgets
     + table + chart so filter / date-range changes rerun only the
-    pivot view, not the surrounding headers.
+    MOM view, not the surrounding headers.
     """
     st.markdown("### 📊 Demand MOM Summary")
     st.caption(
-        "Hierarchical roll-up of **`qry_total_item_level_demand.csv`** "
-        "from Microsoft Fabric — Portfolio Major → Forecast Type → "
-        "Supply Format — with monthly columns in **millions of pounds**.  "
-        "Auto-refreshes whenever the source file changes in Fabric (same "
-        "freshness model as the raw preview above).  Use the filters to "
-        "narrow by Portfolio Major / Supply Format / month range; the "
-        "footer subtotals and the Base + RO chart below update live."
+        "Month-over-month roll-up (Portfolio Major → Forecast Type → "
+        "Supply Format), monthly columns in **millions of pounds**.  The "
+        "**Actual month range** pulls actuals from **`dbo.IBP Shipments`**; "
+        "the remaining **Forecast month range** pulls the plan for the "
+        "selected **Cycle** from **`qry_mgmt_plan_history_tracker.csv`** — "
+        "stitched onto one month axis (actuals for the closed months, "
+        "forecast beyond).  Auto-refreshes when the sources change in "
+        "Fabric.  The footer subtotals and the chart below update live; "
+        "**double-click a pivot row to drill into its SKUs**."
     )
     _render_demand_pivot_fragment()
 
 
 @st.fragment
 def _render_demand_pivot_fragment() -> None:
-    """Render the filters, hierarchical pivot table, footer subtotals, and chart.
+    """Render the filters, not-captured log, MOM pivot, footer, and chart.
 
     Why this is a ``@st.fragment``
     -------------------------------
-    The widget set (PMaj / SFmt multiselects + month-range pickers)
-    is interactive, but the surrounding sections of the page have
-    nothing to do with the pivot.  Wrapping this block in a
-    fragment scopes each filter change to a rerun of just this
-    function — no upstream Fabric reads, no RO Comparison rebuild.
+    The widget set (Cycle + PMaj / SFmt multiselects + the two month-
+    range pickers + the pivot's row-select) is interactive, but the
+    surrounding page sections have nothing to do with the MOM Summary.
+    Wrapping this block in a fragment scopes each interaction to a rerun
+    of just this function — no upstream Fabric reads for the rest of the
+    page, no RO Comparison rebuild.
 
     Sourcing model
     --------------
-    Reads the cached ``DemandSummarySnapshot`` from
-    :func:`fetch_total_item_level_demand`.  That fetcher is keyed by
-    blob etag/size/last_modified (see the connector), so any update
-    to the source CSV invalidates the cache and the pivot reflects
-    the fresh data on the same render — no manual refresh click
-    needed.
+    * **Forecast** — ``qry_mgmt_plan_history_tracker.csv`` via
+      :func:`fetch_mgmt_plan_history_tracker` (cached, blob-keyed).
+    * **Actuals**  — ``dbo.IBP Shipments`` via
+      :func:`fetch_ibp_shipments_slim_df`, projected to just the actual
+      window so OneLake returns the minimum rows.
+    * **Dims**     — ``qry_pdh.csv`` supplies Portfolio Major / Supply
+      Format (the tracker + shipments carry neither).
+    Any refresh of a source in Fabric invalidates its cache and the MOM
+    view reflects the fresh data on the next render — no manual refresh.
     """
-    # 1. Load the source frame (or surface an error + bail).
+    # 1. Forecast source (tracker) + dims (PDH) + budgets.
     try:
-        with st.spinner("Reading qry_total_item_level_demand.csv from Microsoft Fabric…"):
-            snapshot = fetch_total_item_level_demand()
+        with st.spinner("Reading qry_mgmt_plan_history_tracker.csv from Microsoft Fabric…"):
+            tracker = fetch_mgmt_plan_history_tracker()
     except DemandSummaryError as exc:
         st.error(
-            "❌ Could not load **qry_total_item_level_demand.csv** for "
-            f"the pivot.\n\n{exc}"
+            "❌ Could not load **qry_mgmt_plan_history_tracker.csv** for "
+            f"the Demand MOM Summary.\n\n{exc}"
         )
         return
-
-    if snapshot.df.empty:
+    if tracker.df.empty:
         st.info(
-            "ℹ️ `qry_total_item_level_demand.csv` is empty — nothing to "
+            "ℹ️ `qry_mgmt_plan_history_tracker.csv` is empty — nothing to "
             "roll up.  Check the upstream Fabric pipeline."
         )
         return
 
-    # 2. Build the per-item Supply Format lookup with the two-tier
-    #    cascade (qry_pdh primary, RO_Item_Master fallback).  Both
-    #    sources are non-fatal — a missing or empty tier just drops
-    #    out of the cascade, and items absent from BOTH tiers
-    #    surface in the pivot under the "(blank)" Supply Format
-    #    sentinel where the planner can spot them.
-    supply_format_lookup = _build_demand_pivot_supply_format_lookup()
-
-    # 2b. Annual budget → pivot table Total Budget column (unchanged).
+    pdh_df = _load_demand_comparison_pdh()          # non-fatal (dims blank on fail)
     budget_lookup = _build_demand_pivot_budget_lookup()
-    # 2c. Monthly budget → footer Total Budget row + chart only.
     monthly_budget = _load_demand_pivot_monthly_budget()
 
-    # 3. Discover the available filter values from the FULL frame so
-    #    a selection in one filter doesn't shrink the option list of
-    #    another (matches the planner's expectation when slicing).
-    try:
-        filter_values = list_available_filter_values(
-            snapshot.df, supply_format_lookup=supply_format_lookup,
+    # 2. Discover filter option lists.
+    cycles = list_tracker_cycles(tracker.df)
+    if not cycles:
+        st.warning(
+            "⚠️ The tracker carries no `Cycle` values — cannot pick a "
+            "forecast cycle.  Check the upstream export."
         )
-    except DemandPivotError as exc:
-        st.error(f"❌ Pivot source has an unexpected schema.\n\n{exc}")
+        return
+    tracker_months = list_tracker_months(tracker.df)
+    try:
+        actual_months = list(fetch_ibp_shipments_months())
+    except IBPOfficialSourceError as exc:
+        actual_months = []
+        st.warning(
+            "⚠️ Could not read the IBP Shipments month list "
+            f"({exc}) — falling back to the tracker's months for the "
+            "actual-range picker."
+        )
+    if not actual_months:
+        actual_months = tracker_months
+
+    field_options = list_mom_filter_values(tracker.df, pdh_df)
+
+    # 3. Render the filters (Cycle + Actual/Forecast ranges + PMaj/SFmt).
+    filters = _render_demand_mom_filters(
+        cycles, tracker_months, actual_months, field_options,
+    )
+
+    # 4. Validate the windows (disjoint + start ≤ end) before any read.
+    errors = validate_mom_filters(filters)
+    if errors:
+        for err in errors:
+            st.warning(f"⚠️ {err}")
         return
 
-    # 4. Render the filter row.
-    filters = _render_demand_pivot_filters(filter_values)
-
-    # 5. Build the pivot.
+    # 5. Load actuals for the actual window only (predicate-pushed slim read).
+    actual_window = tuple(sorted(
+        _months_in_range_local(filters.actual_start, filters.actual_end)
+    ))
+    ibp_df: Optional[pd.DataFrame] = None
     try:
-        with st.spinner("Building Demand Pivot Summary…"):
-            result = build_demand_pivot(
-                snapshot.df, filters,
-                supply_format_lookup=supply_format_lookup,
+        with st.spinner("Reading dbo.IBP Shipments actuals from Microsoft Fabric…"):
+            if actual_window:
+                ibp_df = fetch_ibp_shipments_slim_df(months=actual_window)
+    except IBPOfficialSourceError as exc:
+        st.warning(
+            "⚠️ Could not read IBP Shipments actuals "
+            f"({exc}) — the MOM view will show forecast months only."
+        )
+
+    # 6. Build the stitched MOM pivot.
+    try:
+        with st.spinner("Building Demand MOM Summary…"):
+            result = build_demand_mom_pivot(
+                tracker.df, ibp_df, pdh_df, filters,
                 budget_lookup=budget_lookup,
                 monthly_budget=monthly_budget,
             )
-    except DemandPivotError as exc:
-        st.error(f"❌ Could not build the Demand Pivot Summary.\n\n{exc}")
+    except DemandPlanComparisonError as exc:
+        st.error(f"❌ Could not build the Demand MOM Summary.\n\n{exc}")
         return
 
-    # 5. Empty-after-filter case — show a hint, don't render an empty
-    #    table or a degenerate empty chart.
+    # 7. Reconciliation log — surfaced at the TOP of the results so a
+    #    planner sees "what's missing" before reading the numbers.
+    _render_mom_not_captured_log(result.not_captured_items)
+
+    # 8. Empty-after-filter case — hint instead of a degenerate table/chart.
     if result.pivot.empty:
         st.info(
-            "No rows match the current Portfolio Major / Supply Format / "
-            "month range selection.  Widen one of the filters above to "
-            "see data."
+            "No rows match the current Cycle / Portfolio Major / Supply "
+            "Format / month-range selection.  Widen one of the filters "
+            "above to see data."
         )
         return
 
-    # 6. Render the pivot + footer totals + download button.
+    # 9. Pivot table + footer totals + download + SKU drill-down.
     _render_demand_pivot_table(result)
 
-    # 7. Stacked area chart of monthly Base Plan + R&O.
+    # 10. Stitched month-over-month chart (Actual → Base + R&O).
     st.markdown("---")
     _render_base_ro_summary_chart(result)
 
 
-def _render_demand_pivot_filters(
-    filter_values: dict[str, list],
-) -> DemandPivotFilters:
-    """Render the four filter widgets and return a :class:`DemandPivotFilters`.
+def _render_demand_mom_filters(
+    cycles: list[str],
+    tracker_months: list[date],
+    actual_months: list[date],
+    field_options: dict[str, list[str]],
+) -> DemandMomFilters:
+    """Render the MOM filter widgets and return a :class:`DemandMomFilters`.
 
     Layout
     ------
-    Four columns at typical browser widths — PMaj and SFmt get the
-    wider slots because their selected-chip lists grow with each
-    pick, while the month-range pickers are single-value widgets.
+    Row 1 — Portfolio Major / Supply Format multiselects + the Cycle
+    picker.  Row 2 — the **Actual month range** (IBP Shipments).  Row 3 —
+    the **Forecast month range** (tracker, selected Cycle).  Month pickers
+    are ``selectbox``es over the discrete month lists (mirrors the sibling
+    Demand Plan Comparison section rather than free-form date inputs).
 
     Defaults
     --------
-    * PMaj / SFmt multiselects start EMPTY, which the pivot builder
-      interprets as "include every value" (matches the screenshot
-      where no slicer is active by default).
-    * Month range defaults to the full available window so the table
-      shows the same dataset the Excel pivot does when first opened.
+    * PMaj / SFmt start EMPTY → "include every value".
+    * Cycle defaults to the newest (``cycles`` is in natural order).
+    * The month windows default to the planner's usual split — recent
+      closed months as actuals, the following months as forecast — and
+      fall back to a computed disjoint split when those exact months are
+      absent, so the two ranges never overlap on first render.
     """
-    pmaj_opts: list[str] = filter_values["portfolio_majors"]
-    sfmt_opts: list[str] = filter_values["supply_formats"]
-    month_opts: list[date] = filter_values["months"]
+    pmaj_opts: list[str] = field_options.get("portfolio_majors", [])
+    sfmt_opts: list[str] = field_options.get("supply_formats", [])
 
-    # Sensible default month bounds — full available window.
-    min_month: Optional[date] = month_opts[0]  if month_opts else None
-    max_month: Optional[date] = month_opts[-1] if month_opts else None
+    # Spell the month out ("Apr 2026") — the bare "4/2026" form is hard to
+    # scan.  Identity formatter for the cycle labels.
+    fmt_month = lambda d: d.strftime("%b %Y")  # noqa: E731
+    fmt_cycle = lambda c: c                     # noqa: E731
+
+    # ── Default indices ────────────────────────────────────────────────
+    n_fc = len(tracker_months)
+    last_fc_idx = max(0, n_fc - 1)
+
+    def _fc_idx(target: date, fallback: int) -> int:
+        return tracker_months.index(target) if target in tracker_months else fallback
+
+    def _act_idx(target: date, fallback: int) -> int:
+        return actual_months.index(target) if target in actual_months else fallback
+
+    last_actual_idx = max(0, len(actual_months) - 1)
+    # Preferred windows (match the sibling comparison section); fall back
+    # to a self-adjusting disjoint split when those months are absent.
+    fc_fallback_start = min(max(0, n_fc // 2), last_fc_idx)
+    act_start_idx = _act_idx(date(2026, 4, 1), 0)
+    act_end_idx = _act_idx(date(2026, 5, 1), last_actual_idx)
+    fc_start_idx = _fc_idx(date(2026, 6, 1), fc_fallback_start)
+    fc_end_idx = _fc_idx(date(2027, 3, 1), last_fc_idx)
 
     with st.expander("🔍 Filters", expanded=True):
-        cols = st.columns([2, 2, 1.2, 1.2])
-        with cols[0]:
+        row1 = st.columns([2, 2, 1.4])
+        with row1[0]:
             selected_pmaj = st.multiselect(
-                "Portfolio Major",
-                options=pmaj_opts,
-                key=_SS_DP_PMAJ_FILTER,
+                "Portfolio Major", options=pmaj_opts, key=_SS_DP_PMAJ_FILTER,
                 help=(
-                    "Limit the pivot to specific Portfolio Major "
-                    "value(s).  Empty = include every Portfolio Major."
+                    "Limit the pivot to specific Portfolio Major value(s).  "
+                    "Empty = include every Portfolio Major."
                 ),
             )
-        with cols[1]:
+        with row1[1]:
             selected_sfmt = st.multiselect(
-                "Supply Format",
-                options=sfmt_opts,
-                key=_SS_DP_SFMT_FILTER,
+                "Supply Format", options=sfmt_opts, key=_SS_DP_SFMT_FILTER,
                 help=(
-                    "Limit the pivot to specific Supply Format "
-                    "value(s).  Empty = include every Supply Format."
+                    "Limit the pivot to specific Supply Format value(s).  "
+                    "Empty = include every Supply Format."
                 ),
             )
-        with cols[2]:
-            start_month = st.date_input(
-                "Month range — start",
-                value=st.session_state.get(_SS_DP_START_FILTER, min_month),
-                min_value=min_month,
-                max_value=max_month,
-                key=_SS_DP_START_FILTER,
+        with row1[2]:
+            cycle = st.selectbox(
+                "Cycle (forecast)", options=cycles,
+                index=len(cycles) - 1, key=_SS_DP_CYCLE_FILTER,
+                format_func=fmt_cycle,
                 help=(
-                    "Inclusive lower bound on `Start of Month`.  Defaults "
-                    "to the earliest month available in the source CSV."
-                ),
-            )
-        with cols[3]:
-            end_month = st.date_input(
-                "Month range — end",
-                value=st.session_state.get(_SS_DP_END_FILTER, max_month),
-                min_value=min_month,
-                max_value=max_month,
-                key=_SS_DP_END_FILTER,
-                help=(
-                    "Inclusive upper bound on `Start of Month`.  Defaults "
-                    "to the latest month available in the source CSV."
+                    "Planning cycle whose forecast the MOM Summary pulls "
+                    "from `qry_mgmt_plan_history_tracker.csv`."
                 ),
             )
 
-    # Warn (don't block) on an inverted range — the pivot builder will
-    # simply return zero rows, which is correct but unhelpful without
-    # an explanation.
-    if (
-        isinstance(start_month, date)
-        and isinstance(end_month, date)
-        and start_month > end_month
-    ):
-        st.warning(
-            f"⚠️ Month-range start (`{start_month:%Y-%m}`) is after "
-            f"end (`{end_month:%Y-%m}`).  The pivot will be empty — "
-            "swap the two dates or widen the range."
+        st.markdown("**Actual month range** (pulled from `dbo.IBP Shipments`)")
+        row2 = st.columns(2)
+        with row2[0]:
+            actual_start = st.selectbox(
+                "Actual month — start", options=actual_months,
+                index=act_start_idx, key=_SS_DP_ACT_START_FILTER,
+                format_func=fmt_month,
+            )
+        with row2[1]:
+            actual_end = st.selectbox(
+                "Actual month — end", options=actual_months,
+                index=act_end_idx, key=_SS_DP_ACT_END_FILTER,
+                format_func=fmt_month,
+            )
+
+        st.markdown(
+            "**Forecast month range** (pulled from the tracker; must not "
+            "overlap the actual range)"
+        )
+        row3 = st.columns(2)
+        with row3[0]:
+            forecast_start = st.selectbox(
+                "Forecast month — start", options=tracker_months,
+                index=fc_start_idx, key=_SS_DP_FC_START_FILTER,
+                format_func=fmt_month,
+            )
+        with row3[1]:
+            forecast_end = st.selectbox(
+                "Forecast month — end", options=tracker_months,
+                index=fc_end_idx, key=_SS_DP_FC_END_FILTER,
+                format_func=fmt_month,
+            )
+
+        st.caption(
+            f"📌 **Actual** {fmt_month(actual_start)} – {fmt_month(actual_end)} "
+            f"(IBP Shipments)  ·  **Forecast** {fmt_month(forecast_start)} – "
+            f"{fmt_month(forecast_end)} (tracker, cycle **{cycle}**)"
         )
 
-    return DemandPivotFilters(
+    return DemandMomFilters(
+        cycle=cycle,
+        actual_start=actual_start,
+        actual_end=actual_end,
+        forecast_start=forecast_start,
+        forecast_end=forecast_end,
         portfolio_majors=tuple(selected_pmaj) or None,
         supply_formats=tuple(selected_sfmt) or None,
-        # Pickers are always-on and always return a date, so we forward
-        # them straight through — the builder treats Python ``date``
-        # values inclusively on both ends.
-        start_month=start_month if isinstance(start_month, date) else None,
-        end_month=end_month     if isinstance(end_month, date)   else None,
+    )
+
+
+def _render_mom_not_captured_log(not_captured: pd.DataFrame) -> None:
+    """Render the "in tracker but not captured in the MOM Summary" log.
+
+    Sits at the top of the results.  When every tracker item (selected
+    cycle, forecast window) made it into the pivot, a compact success
+    note confirms the reconciliation ran; otherwise an expanded warning
+    lists the missing items + reason, with a CSV download.
+    """
+    if not_captured is None or not_captured.empty:
+        st.caption(
+            "✅ Every tracker item in the forecast window is captured in "
+            "the MOM Summary below."
+        )
+        return
+
+    n = len(not_captured)
+    with st.expander(
+        f"⚠️ {n:,} tracker item(s) NOT captured in the MOM Summary",
+        expanded=True,
+    ):
+        st.caption(
+            "Items present in `qry_mgmt_plan_history_tracker.csv` for the "
+            "selected cycle + forecast window that do **not** appear in the "
+            "pivot below — with the reason (missing PDH Portfolio Major / "
+            "Supply Format mapping, excluded by an active filter, or zero "
+            "forecast pounds).  Reconcile these before trusting the totals."
+        )
+        st.dataframe(not_captured, use_container_width=True, hide_index=True)
+        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+        st.download_button(
+            label="⬇️ Download not-captured items (CSV)",
+            data=not_captured.to_csv(index=False).encode("utf-8"),
+            file_name=f"demand_mom_not_captured_{today}.csv",
+            mime="text/csv",
+            key="demand_mom_not_captured_download",
+        )
+
+
+def _render_mom_sku_drilldown(result: DemandMomResult, row: pd.Series) -> None:
+    """Render the SKU-level detail behind a selected pivot row + download.
+
+    Resolves the clicked row to its (Portfolio Major, Forecast Type,
+    Supply Format) breadcrumb via the hidden dimension columns and asks
+    the result for the matching item-level slice.  A Grand Total / header
+    row (blank breadcrumb) drills into everything beneath it.
+    """
+    pmaj = str(row.get(MOM_ROW_PMAJ, "") or "")
+    forecast = str(row.get(MOM_ROW_FORECAST, "") or "")
+    sfmt = str(row.get(MOM_ROW_SFMT, "") or "")
+    label = str(row.get("Row Label", "")).strip() or "selection"
+
+    sku = result.sku_detail_for(pmaj, forecast, sfmt)
+    st.markdown(f"**🔬 SKU detail — {label}**")
+    if sku.empty:
+        st.info("No SKU-level rows for this selection.")
+        return
+    st.dataframe(sku, use_container_width=True, hide_index=True)
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        label="⬇️ Download SKU detail (CSV)",
+        data=sku.to_csv(index=False).encode("utf-8"),
+        file_name=f"demand_mom_sku_detail_{today}.csv",
+        mime="text/csv",
+        key="demand_mom_sku_detail_download",
+    )
+    st.caption(
+        "Values in millions of pounds.  Select a different row to drill "
+        "into it."
     )
 
 
@@ -3524,15 +3623,15 @@ def _demand_pivot_column_config(
     return config
 
 
-def _render_demand_pivot_table(result: DemandPivotResult) -> None:
-    """Render the pivot table + dynamic footer subtotals + download button.
+def _render_demand_pivot_table(result: DemandMomResult) -> None:
+    """Render the MOM pivot + dynamic footer subtotals + download + drill-down.
 
-    The pivot itself is rendered with :func:`st.dataframe` (not
-    :func:`st.data_editor`) because the planner doesn't edit this
-    view — it's a pure roll-up of the source CSV.  ``column_order``
-    pins the Row Label first, then every month in ascending order,
-    then the Total column, then Total Budget when annual budget data
-    is available (same layout as before the monthly-budget change).
+    The pivot is rendered with :func:`st.dataframe` in single-row
+    ``on_select`` mode: it's read-only (a pure roll-up, not an editor),
+    but selecting a row reveals the SKU-level detail behind it.
+    ``column_order`` pins the Row Label first, then every month in
+    ascending order, then the Total column, then Total Budget when annual
+    budget data is available.
     """
     # ── Download button (above the table — "easy to find") ──────────
     #
@@ -3572,14 +3671,21 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
     # Pivot table.  Height sized so the typical 10-30 row range fits
     # without scrolling, capped so a wide filter doesn't dominate the
     # page.  Each row is ~35 px tall; header ~38 px.
+    #
+    # ``on_select="rerun"`` + single-row selection turns the read-only
+    # table into a drill-down handle: clicking a row reruns this fragment
+    # and the selected row's SKU detail renders below.
     table_height = min(35 * (len(result.pivot) + 1) + 38, 720)
-    st.dataframe(
+    selection = st.dataframe(
         result.pivot,
         use_container_width=True,
         hide_index=True,
         height=table_height,
         column_order=column_order,
         column_config=pivot_column_config,
+        key=_SS_DP_PIVOT_TABLE,
+        on_select="rerun",
+        selection_mode="single-row",
     )
 
     # ── Dynamic subtotals (Base Plan / R&O / bundled Total Budget) ───
@@ -3594,11 +3700,18 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
     # single glance answers "what's the budget across both Base and
     # R&O for the current filter window?" — same number that drives
     # the dotted line on the chart below.
+    # Footer order mirrors the row hierarchy: Actual first, then the two
+    # forecast branches, then the static bundled budget.
     st.markdown("**Dynamic subtotals** (live: reflects current filters)")
-    footer_parts = [result.base_plan_totals, result.r_and_o_totals]
+    footer_parts = [
+        result.actual_totals, result.base_plan_totals, result.r_and_o_totals,
+    ]
     if result.has_budget_data:
         footer_parts.append(result.budget_totals)
-    footer_df = pd.concat(footer_parts, ignore_index=True)
+    footer_df = pd.concat(
+        [p for p in footer_parts if p is not None and not p.empty],
+        ignore_index=True,
+    )
     st.dataframe(
         footer_df,
         use_container_width=True,
@@ -3613,19 +3726,31 @@ def _render_demand_pivot_table(result: DemandPivotResult) -> None:
             f"**{result.budget_total_m:,.1f} M lbs** "
             "for the visible month window (from "
             "`Static_Budget_Base&RO_by_Month.csv`; green line on the "
-            "Base + RO Summary chart below)."
+            "chart below)."
         )
 
+    # ── SKU drill-down (native single-row selection) ────────────────────
+    selected_rows = (
+        selection.selection.rows
+        if selection is not None and selection.selection else []
+    )
+    if selected_rows:
+        row = result.pivot.iloc[selected_rows[0]]
+        _render_mom_sku_drilldown(result, row)
+    else:
+        st.caption("💡 Select a row above to drill into its SKU-level values.")
 
-def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
-    """Render the Base + RO Summary stacked area chart + Total Budget line.
 
-    Mirrors the screenshot the planner shared: Base Plan stacked on
-    the bottom (dark blue), R&O on top (orange), x-axis = month,
-    y-axis = millions of pounds.  When monthly budget data is
-    available (see :attr:`DemandPivotResult.has_budget_data`), a
-    green dotted line plots the bundled budget per month from
-    ``Static_Budget_Base&RO_by_Month.csv``.
+def _render_base_ro_summary_chart(result: DemandMomResult) -> None:
+    """Render the stitched month-over-month chart (Actual → Base + R&O).
+
+    Actual months (IBP Shipments) render as the ``Actual`` area; the
+    forecast months render as the Base Plan (dark blue) + R&O (orange)
+    stack — and because the two windows are disjoint on the month axis,
+    each month is populated by exactly one branch, giving one continuous
+    month-over-month view.  When monthly budget data is available (see
+    :attr:`DemandMomResult.has_budget_data`), a green dotted line plots
+    the bundled budget per month from ``Static_Budget_Base&RO_by_Month.csv``.
 
     Why Plotly (not ``st.area_chart``)
     -----------------------------------
@@ -3644,19 +3769,22 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
         # anywhere in the future.
         return
 
-    st.markdown("**Base + RO Summary**")
+    st.markdown("**Month-over-Month: Actual → Forecast**")
     if result.has_budget_data:
         st.caption(
-            "Stacked area of monthly Base Plan + R&O totals in millions "
-            "of pounds, with a **green** dotted **Total Budget** line "
-            "from `Static_Budget_Base&RO_by_Month.csv`.  Demand subtotals "
-            "above update with filters; the budget line is static per month."
+            "Stitched monthly area in millions of pounds — **Actual** "
+            "(IBP Shipments) for the actual months, **Base Plan** + **R&O** "
+            "(tracker) for the forecast months — with a **green** dotted "
+            "**Total Budget** line from `Static_Budget_Base&RO_by_Month.csv`.  "
+            "Updates live with the filters above; the budget line is static "
+            "per month."
         )
     else:
         st.caption(
-            "Stacked area of monthly Base Plan + R&O totals in millions "
-            "of pounds.  Updates live with the filter selections above. "
-            "_Total Budget line unavailable — "
+            "Stitched monthly area in millions of pounds — **Actual** "
+            "(IBP Shipments) for the actual months, **Base Plan** + **R&O** "
+            "(tracker) for the forecast months.  Updates live with the "
+            "filters above.  _Total Budget line unavailable — "
             "`Static_Budget_Base&RO_by_Month.csv` could not be read "
             "from Fabric._"
         )
@@ -3685,10 +3813,30 @@ def _render_base_ro_summary_chart(result: DemandPivotResult) -> None:
 
     fig = go.Figure()
 
-    # Base Plan trace — dark blue, drawn first so it sits on the
-    # bottom of the stack.  ``stackgroup`` ties traces into the same
-    # stack; sharing one group across both series gives us the stacked-
-    # area look the planner expects.
+    # Actual trace — teal, drawn first (bottom of the stack).  Actual
+    # months carry shipment pounds while Base/R&O are zero there (and
+    # vice-versa for forecast months), so sharing ``stackgroup="one"``
+    # across all three series yields a single continuous month-over-month
+    # area: actuals on the left, forecast on the right, no double-count.
+    if SERIES_ACTUAL in wide.columns:
+        fig.add_trace(go.Scatter(
+            x=x_labels,
+            y=wide[SERIES_ACTUAL].tolist(),
+            name=SERIES_ACTUAL,
+            mode="lines",
+            stackgroup="one",
+            fillcolor="#2ca6a4",         # teal — distinct from Base/R&O
+            line=dict(width=0.5, color="#2ca6a4"),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                f"{SERIES_ACTUAL} (Shipments): "
+                "%{y:.1f} M lbs<extra></extra>"
+            ),
+        ))
+
+    # Base Plan trace — dark blue, drawn next.  ``stackgroup`` ties traces
+    # into the same stack; sharing one group across the series gives us
+    # the stitched stacked-area look the planner expects.
     if FORECAST_BASE_PLAN in wide.columns:
         fig.add_trace(go.Scatter(
             x=x_labels,

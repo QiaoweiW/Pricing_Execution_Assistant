@@ -489,6 +489,12 @@ COL_PRIOR_MONTH_ACTUAL: str     = "prior_month_actual"
 COL_PRIOR_MONTH_FORECAST: str   = "prior_month_forecast"
 COL_CURRENT_PLAN_ACTUAL: str    = "current_plan_actual"
 COL_CURRENT_PLAN_FORECAST: str  = "current_plan_forecast"
+# Last Plan's two independent legs — the "one-month-ago" snapshot:
+#   * actuals over [actual_start … actual_end − 1 month]
+#   * PRIOR-cycle forecast over [forecast_start − 1 month … forecast_end]
+# so Last Plan = last_plan_actuals + last_plan_forecast (see _assemble_table).
+COL_LAST_PLAN_ACTUALS: str      = "last_plan_actuals"
+COL_LAST_PLAN_FORECAST: str     = "last_plan_forecast"
 COL_BASE_PLAN: str              = "base_plan"
 COL_R_AND_O: str                = "r_and_o"
 COL_BUDGET: str                 = "budget"
@@ -510,6 +516,7 @@ COL_PCT: str                    = "pct"
 _ADDITIVE_COLS: tuple[str, ...] = (
     COL_TOTAL_ACTUALS, COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST,
+    COL_LAST_PLAN_ACTUALS, COL_LAST_PLAN_FORECAST,
     COL_BASE_PLAN, COL_R_AND_O, COL_BUDGET,
 )
 
@@ -521,9 +528,17 @@ COL_IS_SUBTOTAL: str = "_is_subtotal"
 COL_IS_MEMO: str     = "_is_memo"
 _META_COLS: tuple[str, ...] = (COL_ROW_ID, COL_INDENT, COL_IS_SUBTOTAL, COL_IS_MEMO)
 
+# Shared display column names for the "not captured" reconciliation logs —
+# used by BOTH the Demand MOM Summary log and the Demand Plan Comparison log,
+# so a planner reads one schema across the app.  Defined here (early) because
+# both consumers live later in the module.
+NC_COL_ITEM: str    = "Item"
+NC_COL_DESC: str    = "Item Description"
+NC_COL_PMAJ: str    = "Portfolio Major"
+NC_COL_SFMT: str    = "Supply Format"
+
 # Display order + labels (left → right, mirroring screenshot 1).
 DISPLAY_LABELS: dict[str, str] = {
-    COL_TOTAL_ACTUALS:         "Total Actuals",
     COL_PRIOR_MONTH_ACTUAL:    "Prior Month Actual",
     COL_PRIOR_MONTH_FORECAST:  "Prior Month Forecast",
     COL_CURRENT_PLAN_ACTUAL:   "Current Plan (Actual)",
@@ -541,7 +556,7 @@ DISPLAY_LABELS: dict[str, str] = {
 }
 # Left → right order of the metric columns in the rendered table.
 DISPLAY_ORDER: tuple[str, ...] = (
-    COL_TOTAL_ACTUALS, COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
+    COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST, COL_LAST_PLAN,
     COL_CURRENT_PLAN, COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
     COL_BASE_PLAN, COL_R_AND_O, COL_V_BUDGET, COL_PCT, COL_BUDGET,
@@ -550,10 +565,9 @@ DISPLAY_ORDER: tuple[str, ...] = (
 PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT})
 
 # Metric columns hidden by default in the Streamlit table — planners can
-# expand them via a checkbox on the page.  Spans Total Actuals through
-# Current Plan (Forecast), inclusive.
+# expand them via a checkbox on the page.  Spans Prior Month Actual
+# through Current Plan (Forecast), inclusive.
 COLS_HIDDEN_BY_DEFAULT: tuple[str, ...] = (
-    COL_TOTAL_ACTUALS,
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL,
@@ -1178,6 +1192,19 @@ def _leaf_mask(df: pd.DataFrame, tpl: TemplateRow) -> pd.Series:
     return mask
 
 
+def _prev_month(d: date) -> date:
+    """Return the first day of the calendar month before *d*.
+
+    Used to shift the Last-Plan windows back one month (the
+    "one-month-ago snapshot"): its actual window ends one month earlier
+    and its prior-cycle forecast window starts one month earlier.
+    """
+    first = d.replace(day=1)
+    if first.month == 1:
+        return first.replace(year=first.year - 1, month=12)
+    return first.replace(month=first.month - 1)
+
+
 def _months_in_range(start: date, end: date) -> set[date]:
     """Return the set of first-of-month dates from *start* to *end* inclusive."""
     months: set[date] = set()
@@ -1383,21 +1410,29 @@ def build_enriched_sources(
     ibp_df: Optional[pd.DataFrame],
     ibp_orders_df: Optional[pd.DataFrame],
     pdh_df: Optional[pd.DataFrame],
+    *,
+    item_master_df: Optional[pd.DataFrame] = None,
 ) -> EnrichedSources:
     """Build the shared enrichment bundle exactly once.
 
-    Performs the PDH dim frame build + vectorised tracker and IBP
+    Performs the dimension frame build + vectorised tracker and IBP
     enrichment in a single pass, so all three downstream builders
     (comparison + PM Actual drivers + Base Plan drivers) can reuse the
     output without redoing the work.
+
+    Dimensions come from a **PDH → RO_Item_Master cascade**
+    (:func:`build_item_dim_frame_cascade`): ``qry_pdh.csv`` is primary and
+    ``RO_Item_Master.csv`` (``item_master_df``) fills any item PDH can't
+    classify.  ``item_master_df=None`` degrades to PDH-only.
     """
-    dim_frame = build_item_dim_frame(pdh_df)
+    dim_frame = build_item_dim_frame_cascade(pdh_df, item_master_df)
     pdh_warning: Optional[str] = None
     if dim_frame.empty:
         pdh_warning = (
-            "PDH (qry_pdh.csv) was empty or missing its Item No column — "
-            "Portfolio Major / Supply Format / Brand could not be resolved, "
-            "so every row is zero.  Check the upstream PDH export."
+            "Neither PDH (qry_pdh.csv) nor RO_Item_Master.csv could resolve "
+            "any item — Portfolio Major / Supply Format / Brand are blank, "
+            "so every row is zero.  Check the upstream PDH / RO_Item_Master "
+            "exports."
         )
     trk = _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched()
     ibp = _enrich_ibp(ibp_df, dim_frame) if ibp_df is not None else _empty_enriched(actuals=True)
@@ -1592,6 +1627,7 @@ def build_demand_plan_comparison(
     pdh_df: Optional[pd.DataFrame],
     filters: ComparisonFilters,
     *,
+    item_master_df: Optional[pd.DataFrame] = None,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]] = None,
     enriched: Optional[EnrichedSources] = None,
     budget_by_row_id: Optional[dict[str, float]] = None,
@@ -1635,6 +1671,7 @@ def build_demand_plan_comparison(
     """
     artifacts = _build_runtime_artifacts(
         tracker_df, ibp_df, pdh_df, filters,
+        item_master_df=item_master_df,
         ro_total_delta_by_path=ro_total_delta_by_path,
         enriched=enriched,
         budget_by_row_id=budget_by_row_id,
@@ -1675,6 +1712,7 @@ def _build_runtime_artifacts(
     pdh_df: Optional[pd.DataFrame],
     filters: ComparisonFilters,
     *,
+    item_master_df: Optional[pd.DataFrame] = None,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
     enriched: Optional[EnrichedSources],
     budget_by_row_id: Optional[dict[str, float]] = None,
@@ -1683,7 +1721,9 @@ def _build_runtime_artifacts(
     warnings: list[str] = []
 
     if enriched is None:
-        enriched = build_enriched_sources(tracker_df, ibp_df, None, pdh_df)
+        enriched = build_enriched_sources(
+            tracker_df, ibp_df, None, pdh_df, item_master_df=item_master_df,
+        )
     if enriched.pdh_warning:
         warnings.append(enriched.pdh_warning)
     trk = enriched.tracker
@@ -1702,6 +1742,18 @@ def _build_runtime_artifacts(
     actual_months = _months_in_range(filters.actual_start, filters.actual_end)
     forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
     prior_month = filters.prior_month.replace(day=1)
+
+    # Last Plan = the "one-month-ago" snapshot, shifted back one calendar
+    # month on both legs (see COL_LAST_PLAN_ACTUALS / COL_LAST_PLAN_FORECAST):
+    #   * actuals drop the final realised month  → [actual_start … actual_end − 1]
+    #   * the just-closed month reverts to a prior-cycle forecast
+    #                                            → [forecast_start − 1 … forecast_end]
+    # An empty last-actual window (actual_start == actual_end) yields 0 —
+    # _months_in_range returns {} when start > end.
+    last_actual_months = _months_in_range(
+        filters.actual_start, _prev_month(filters.actual_end))
+    prior_forecast_months = _months_in_range(
+        _prev_month(filters.forecast_start), filters.forecast_end)
 
     # Guard: Prior Month Forecast benchmarks against the PRIOR cycle's plan
     # for the prior month.  If that cycle carries no Base/R&O rows for the
@@ -1737,6 +1789,8 @@ def _build_runtime_artifacts(
             tpl, trk, ibp, filters,
             actual_months=actual_months,
             forecast_months=forecast_months,
+            last_actual_months=last_actual_months,
+            prior_forecast_months=prior_forecast_months,
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
         )
@@ -1767,13 +1821,19 @@ def _compute_leaf_measures(
     *,
     actual_months: set[date],
     forecast_months: set[date],
+    last_actual_months: set[date],
+    prior_forecast_months: set[date],
     prior_month: date,
     ro_total_delta_by_path: dict[tuple[str, ...], float],
 ) -> dict[str, float]:
-    """Compute the eight additive measures for a single leaf row.
+    """Compute the additive measures for a single leaf row.
 
     All sums are in millions of lbs.  See the module docstring's column
     table for the exact business definition of each measure.
+
+    ``last_actual_months`` / ``prior_forecast_months`` are the
+    one-month-shifted Last-Plan windows (actuals minus the final month;
+    prior-cycle forecast starting one month earlier).
     """
     # Dimension masks (computed once, reused across month/cycle slices).
     trk_mask = _leaf_mask(trk, tpl)
@@ -1785,8 +1845,12 @@ def _compute_leaf_measures(
     trk_in_actual = trk_month.isin(actual_months) if not trk.empty else pd.Series([], dtype=bool)
     trk_in_forecast = trk_month.isin(forecast_months) if not trk.empty else pd.Series([], dtype=bool)
     trk_in_prior = (trk_month == prior_month) if not trk.empty else pd.Series([], dtype=bool)
+    trk_in_prior_forecast = (
+        trk_month.isin(prior_forecast_months) if not trk.empty else pd.Series([], dtype=bool))
     ibp_in_actual = ibp_month.isin(actual_months) if not ibp.empty else pd.Series([], dtype=bool)
     ibp_in_prior = (ibp_month == prior_month) if not ibp.empty else pd.Series([], dtype=bool)
+    ibp_in_last_actual = (
+        ibp_month.isin(last_actual_months) if not ibp.empty else pd.Series([], dtype=bool))
 
     # Cycle + forecast-type masks on the tracker.
     if not trk.empty:
@@ -1815,6 +1879,15 @@ def _compute_leaf_measures(
     current_plan_forecast = _sum_millions(
         trk, trk_mask & cur_cycle & is_base_or_ro & trk_in_forecast)
 
+    # ── Last Plan legs (the one-month-ago snapshot) ──────────────────
+    # Actuals over the shifted-back actual window; PRIOR-cycle forecast
+    # over the shifted-back forecast window (so the just-closed month is
+    # still a prior-cycle forecast here).  Last Plan itself is assembled
+    # as the sum of these two in _assemble_table.
+    last_plan_actuals = _sum_millions(ibp, ibp_mask & ibp_in_last_actual)
+    last_plan_forecast = _sum_millions(
+        trk, trk_mask & prior_cycle & is_base_or_ro & trk_in_prior_forecast)
+
     # ── Base Plan delta (Base Plan type only, forecast months) ───────
     # current cycle base-plan forecast − prior cycle base-plan forecast.
     base_plan = (
@@ -1833,6 +1906,8 @@ def _compute_leaf_measures(
         COL_PRIOR_MONTH_FORECAST: prior_month_forecast,
         COL_CURRENT_PLAN_ACTUAL: current_plan_actual,
         COL_CURRENT_PLAN_FORECAST: current_plan_forecast,
+        COL_LAST_PLAN_ACTUALS: last_plan_actuals,
+        COL_LAST_PLAN_FORECAST: last_plan_forecast,
         COL_BASE_PLAN: base_plan,
         COL_R_AND_O: r_and_o,
         COL_BUDGET: tpl.budget_m,
@@ -1879,14 +1954,22 @@ def _assemble_table(
         m = measures[tpl.row_id]
 
         # Derived (linear) columns.
+        #   Current Plan = actuals over the actual window + current-cycle
+        #                  forecast over the forecast window.
+        #   Last Plan    = the two independent one-month-ago legs.
+        #   Total Delta  = the walk between them (Current − Last).
+        # Base Plan / R&O / PM Actual remain as informational columns; they
+        # no longer have to sum to Total Delta under this definition.
         current_plan = m[COL_TOTAL_ACTUALS] + m[COL_CURRENT_PLAN_FORECAST]
+        last_plan = m[COL_LAST_PLAN_ACTUALS] + m[COL_LAST_PLAN_FORECAST]
         pm_actual = m[COL_PRIOR_MONTH_ACTUAL] - m[COL_PRIOR_MONTH_FORECAST]
-        total_delta = m[COL_BASE_PLAN] + m[COL_R_AND_O] + pm_actual
-        last_plan = current_plan - total_delta
+        total_delta = current_plan - last_plan
         v_budget = current_plan - m[COL_BUDGET]
 
         # Ratio columns — guard divide-by-zero (blank when undefined).
-        total_delta_pct = _safe_ratio(v_budget, current_plan)
+        #   Total Delta %  = Total Delta as a share of Last Plan (the MoM move).
+        #   %              = v. Budget as a share of Current Plan (unchanged).
+        total_delta_pct = _safe_ratio(total_delta, last_plan)
         pct = _safe_ratio(v_budget, current_plan)
 
         row = {
@@ -1895,7 +1978,6 @@ def _assemble_table(
             COL_IS_SUBTOTAL: tpl.is_subtotal,
             COL_IS_MEMO: tpl.is_memo,
             COL_LABEL: _make_indented_label(tpl.label, tpl.indent, tpl.is_memo),
-            COL_TOTAL_ACTUALS: m[COL_TOTAL_ACTUALS],
             COL_PRIOR_MONTH_ACTUAL: m[COL_PRIOR_MONTH_ACTUAL],
             COL_PRIOR_MONTH_FORECAST: m[COL_PRIOR_MONTH_FORECAST],
             COL_CURRENT_PLAN_ACTUAL: m[COL_CURRENT_PLAN_ACTUAL],
@@ -1928,6 +2010,132 @@ def _assemble_table(
     ordered = [*_META_COLS, COL_LABEL, *DISPLAY_ORDER]
     df = df.loc[:, ordered]
     return df.rename(columns=DISPLAY_LABELS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# "SKUs not captured in the comparison table" reconciliation log
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The comparison rolls up into a FIXED template (Total B2C → ESL / Cultured /
+# Fresh Milk / Butter → …), so a tracker SKU only appears if its dims match one
+# of the template leaves.  An item whose (Portfolio Major / Supply Format /
+# Brand / Portfolio Minor) — resolved through the PDH → RO_Item_Master cascade
+# — matches NO leaf silently drops out of every row.  This log surfaces those
+# items, per cycle, so the planner can reconcile the totals.
+
+# Extra display column (Item / Description / PMaj / SFmt reuse the MOM log's
+# NC_COL_* constants so both reconciliation logs speak the same schema).
+CNC_COL_FORECAST_M: str = "Forecast (M lbs)"
+_CNC_COLUMNS: tuple[str, ...] = (
+    NC_COL_ITEM, NC_COL_DESC, NC_COL_PMAJ, NC_COL_SFMT, CNC_COL_FORECAST_M,
+)
+
+
+@dataclass(frozen=True)
+class ComparisonNotCaptured:
+    """Per-cycle "not captured in the comparison" logs.
+
+    ``prior_cycle`` / ``current_cycle`` are display-ready frames (columns
+    :data:`_CNC_COLUMNS`) of the SKUs each cycle's forecast carries that
+    match no template leaf.  The ``*_label`` fields echo the cycle names
+    for the section headers.
+    """
+    prior_cycle: pd.DataFrame
+    current_cycle: pd.DataFrame
+    prior_cycle_label: str
+    current_cycle_label: str
+
+
+def _comparison_captured_mask(trk: pd.DataFrame) -> pd.Series:
+    """Return a per-row mask: True where the row matches ANY template leaf.
+
+    ORs every non-subtotal leaf's :func:`_leaf_mask` (memo leaves included —
+    they still appear in the table).  Subtotals are skipped: their masks are
+    unconstrained and would mark every row captured.
+    """
+    if trk is None or trk.empty:
+        return pd.Series([], dtype=bool)
+    captured = pd.Series(False, index=trk.index)
+    for tpl in COMPARISON_TEMPLATE:
+        if tpl.is_subtotal:
+            continue
+        captured |= _leaf_mask(trk, tpl)
+    return captured
+
+
+def _not_captured_frame(
+    trk: pd.DataFrame,
+    *,
+    cycle: str,
+    window_months: set[date],
+    captured_mask: pd.Series,
+) -> pd.DataFrame:
+    """Return uncaptured SKUs for one cycle × forecast window, aggregated by item."""
+    empty = pd.DataFrame(columns=list(_CNC_COLUMNS))
+    if trk is None or trk.empty or not window_months:
+        return empty
+
+    base_or_ro = trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+    mask = (
+        (trk["cycle"] == cycle)
+        & base_or_ro
+        & trk["month"].isin(window_months)
+        & (~captured_mask)
+    )
+    sub = trk.loc[mask]
+    if sub.empty:
+        return empty
+
+    grouped = sub.groupby("item_key", as_index=False).agg(
+        item_desc=("item_desc", "first"),
+        pmaj=("pmaj", "first"),
+        sfmt=("sfmt", "first"),
+        pounds=("pounds", "sum"),
+    )
+    grouped[NC_COL_PMAJ] = grouped["pmaj"].map(_norm_dim)
+    grouped[NC_COL_SFMT] = grouped["sfmt"].map(_norm_dim)
+    grouped[CNC_COL_FORECAST_M] = (
+        grouped["pounds"] / _LBS_PER_MILLION
+    ).round(3)
+    out = grouped.rename(
+        columns={"item_key": NC_COL_ITEM, "item_desc": NC_COL_DESC},
+    )
+    # Heaviest missing forecast first — that's what moves the totals most.
+    out = out.sort_values(CNC_COL_FORECAST_M, ascending=False).reset_index(drop=True)
+    return out[list(_CNC_COLUMNS)]
+
+
+def build_comparison_not_captured(
+    trk_enriched: pd.DataFrame, filters: ComparisonFilters,
+) -> ComparisonNotCaptured:
+    """Return the prior- and current-cycle "not captured" reconciliation logs.
+
+    An item is *not captured* when its cascade-resolved dims match no
+    template leaf, so its forecast pounds never reach a comparison row.
+    The two logs use each cycle's Last-Plan / Current-Plan forecast window:
+
+      * **current cycle** → ``[forecast_start … forecast_end]``
+      * **prior cycle**   → ``[forecast_start − 1 month … forecast_end]``
+        (matches Last Plan's shifted-back prior-cycle window)
+
+    ``trk_enriched`` is the cascade-enriched tracker from
+    :func:`build_enriched_sources` (dims already resolved via
+    PDH → RO_Item_Master), so categorisation honours RO_Item_Master.
+    """
+    captured = _comparison_captured_mask(trk_enriched)
+    current_window = _months_in_range(filters.forecast_start, filters.forecast_end)
+    prior_window = _months_in_range(
+        _prev_month(filters.forecast_start), filters.forecast_end)
+    return ComparisonNotCaptured(
+        prior_cycle=_not_captured_frame(
+            trk_enriched, cycle=filters.prior_cycle,
+            window_months=prior_window, captured_mask=captured),
+        current_cycle=_not_captured_frame(
+            trk_enriched, cycle=filters.current_cycle,
+            window_months=current_window, captured_mask=captured),
+        prior_cycle_label=filters.prior_cycle,
+        current_cycle_label=filters.current_cycle,
+    )
 
 
 def build_prior_month_actual_vs_fcst_table(
@@ -2531,11 +2739,8 @@ MOM_ROW_PMAJ: str     = _COL_PMAJ_DIM
 MOM_ROW_FORECAST: str = _COL_FORECAST_DIM
 MOM_ROW_SFMT: str     = _COL_SFMT_DIM
 
-# Display column names for the "not captured" reconciliation log.
-NC_COL_ITEM: str    = "Item"
-NC_COL_DESC: str    = "Item Description"
-NC_COL_PMAJ: str    = "Portfolio Major"
-NC_COL_SFMT: str    = "Supply Format"
+# MOM-log-specific reason column (Item / Description / PMaj / SFmt are the
+# shared NC_COL_* constants defined earlier in the module).
 NC_COL_REASON: str  = "Reason"
 _NC_COLUMNS: tuple[str, ...] = (
     NC_COL_ITEM, NC_COL_DESC, NC_COL_PMAJ, NC_COL_SFMT, NC_COL_REASON,

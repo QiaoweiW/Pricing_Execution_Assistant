@@ -673,6 +673,15 @@ def _render_ro_comparison() -> None:
             history_df, dimitems_df, item_master_df, prior_month, le_month,
         )
 
+        # 3c. Explicit, on-demand regenerate button.  Rebuilds the output
+        #     from the current RO_History regardless of fingerprint state
+        #     (the auto-regen above only fires on a change).  Placed BEFORE
+        #     the build so a click's downstream invalidation is picked up by
+        #     ``_ensure_summary_in_session`` on the SAME render.
+        _render_ro_comparison_generate_button(
+            history_df, dimitems_df, item_master_df, prior_month, le_month,
+        )
+
         # 4. Build (and cache in session_state) the comparison frame.
         _ensure_summary_in_session(
             history_df, dimitems_df, item_master_df,
@@ -1083,6 +1092,37 @@ def _render_month_filters(months: list) -> tuple:
     return prior, le
 
 
+def _invalidate_ro_comparison_downstream() -> None:
+    """Drop cached comparison state so the next build rebuilds from source.
+
+    Shared by the fingerprint-driven auto-regen and the explicit
+    "Generate" button — after ``RO_Comparison_Output.csv`` is rewritten,
+    everything derived from it must be recomputed:
+
+      * ``_SS_SUMMARY_DF`` / ``_SS_MONTHS_SIG`` — drop so
+        :func:`_ensure_summary_in_session` rebuilds the in-memory
+        comparison frame instead of serving the stale pre-regen copy that
+        still matches the (Prior, LE) signature.  Without this the editor
+        + per-Format driver table + Subtotal would render OLD numbers even
+        though the saved CSV is fresh.
+      * ``_SS_SUMMARY_REPORT_*`` — pop so the Summary Report fragment's
+        "rebuild iff signature drifted" guard recomputes from the new
+        ``_SS_SUMMARY_DF``.
+      * :func:`clear_comparison_output_cache` — invalidates the shared
+        ``@st.cache_data`` slot read by the Early-Start-Date Programs
+        section (and any other consumer of the published CSV), which would
+        otherwise serve the previous baseline for up to 15 minutes.
+    """
+    for key in (
+        _SS_SUMMARY_DF, _SS_MONTHS_SIG, _SS_WARNINGS, _SS_DIMITEMS_ERROR,
+        _SS_SUMMARY_REPORT_DF, _SS_SUMMARY_REPORT_LOADED_AT,
+        _SS_SUMMARY_REPORT_WARNINGS, _SS_SUMMARY_REPORT_RAW_DF,
+        _SS_SUMMARY_REPORT_SIG, _SS_SUMMARY_REPORT_TEMPLATE,
+    ):
+        st.session_state.pop(key, None)
+    clear_comparison_output_cache()
+
+
 def _maybe_auto_regenerate_comparison_output(
     history_df: pd.DataFrame,
     dimitems_df: pd.DataFrame | None,
@@ -1159,37 +1199,9 @@ def _maybe_auto_regenerate_comparison_output(
         return
 
     # Invalidate the entire downstream cascade so this render rebuilds
-    # end-to-end from the fresh History snapshot:
-    #
-    #   * ``_SS_SUMMARY_DF`` / ``_SS_MONTHS_SIG`` — drop so
-    #     ``_ensure_summary_in_session`` (called immediately below)
-    #     rebuilds the in-memory comparison frame instead of serving
-    #     the stale pre-regen copy that still matches the (Prior, LE)
-    #     signature.  Without this drop the editor + per-Format driver
-    #     table + Subtotal would silently render OLD numbers even though
-    #     the saved CSV is fresh.
-    #   * ``_SS_SUMMARY_REPORT_*`` — pop so the Summary Report
-    #     fragment's "rebuild iff signature drifted" guard sees a fresh
-    #     signature and recomputes from the new ``_SS_SUMMARY_DF``.
-    #   * ``clear_comparison_output_cache()`` — invalidates the shared
-    #     ``@st.cache_data`` slot read by the Early-Start-Date Programs
-    #     section AND any other consumer of the published
-    #     ``RO_Comparison_Output.csv``.  Without this clear, the
-    #     drilldown would keep serving the previous baseline from cache
-    #     for up to 15 minutes after the underlying CSV was overwritten.
-    #
-    # Net effect: a single source-CSV update on Fabric → next page
-    # render → auto-regen → editor / drivers / Subtotal / Early-Start-
-    # Date table / Summary Report all reflect the new baseline on the
-    # SAME render.  No manual refresh click required.
-    for key in (
-        _SS_SUMMARY_DF, _SS_MONTHS_SIG, _SS_WARNINGS, _SS_DIMITEMS_ERROR,
-        _SS_SUMMARY_REPORT_DF, _SS_SUMMARY_REPORT_LOADED_AT,
-        _SS_SUMMARY_REPORT_WARNINGS, _SS_SUMMARY_REPORT_RAW_DF,
-        _SS_SUMMARY_REPORT_SIG, _SS_SUMMARY_REPORT_TEMPLATE,
-    ):
-        st.session_state.pop(key, None)
-    clear_comparison_output_cache()
+    # end-to-end from the fresh History snapshot (see
+    # :func:`_invalidate_ro_comparison_downstream` for the per-key rationale).
+    _invalidate_ro_comparison_downstream()
 
     # Stash the banner payload — rendered ONCE by
     # ``_render_auto_regen_banner_once`` later in the page flow.
@@ -1359,6 +1371,68 @@ def _render_ro_comparison_save_button(summary_df: pd.DataFrame) -> None:
         _signature_for(summary_df),
     )
     st.success(f"✅ Saved to `Files/{blob_path}` ({len(summary_df):,} rows).")
+
+
+def _render_ro_comparison_generate_button(
+    history_df: pd.DataFrame,
+    dimitems_df: pd.DataFrame | None,
+    item_master_df: pd.DataFrame | None,
+    prior_month: date,
+    le_month: date,
+) -> None:
+    """Render an explicit "regenerate from source" button.
+
+    Distinct from the other two write paths:
+
+      * **Auto-regen** only fires when ``RO_History_Tracker.csv``'s
+        fingerprint drifts from the last-saved output.
+      * **💾 Save** republishes the in-memory frame *including* any
+        hand-edits made in the table.
+
+    This button ALWAYS rebuilds ``RO_Comparison_Output.csv`` **fresh from
+    the current RO_History (+ dp_dimitems / RO_Item_Master dims)** for the
+    selected Prior/LE months and overwrites it in Fabric — **discarding**
+    any manual cell edits — by reusing the data layer's unconditional
+    :func:`regenerate_comparison_output`.  Post-write it invalidates the
+    downstream cascade (same helper the auto-regen uses) and stashes the
+    one-shot banner, so the on-screen tables rebuild from the new baseline
+    on this same render.
+    """
+    clicked = st.button(
+        "🔁 Generate `RO_Comparison_Output.csv` from current RO_History",
+        key="ro_cmp_generate_from_history",
+        use_container_width=True,
+        help=(
+            "Rebuilds the comparison for the selected Prior/LE months from "
+            "the current `RO_History_Tracker.csv` (which already reflects "
+            "`Distribution_Tracker_History.csv`) and overwrites "
+            "`Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`.  "
+            "Ignores any in-tab cell edits — use **💾 Save** to keep those."
+        ),
+    )
+    if not clicked:
+        return
+
+    if history_df is None or history_df.empty:
+        st.warning("RO_History_Tracker.csv is empty — nothing to generate from.")
+        return
+
+    try:
+        with st.spinner(
+            "Generating RO_Comparison_Output.csv from current RO_History…"
+        ):
+            result = regenerate_comparison_output(
+                history_df, dimitems_df, item_master_df, prior_month, le_month,
+            )
+    except RoComparisonError as exc:
+        st.error(f"❌ Could not generate RO_Comparison_Output.csv.\n\n{exc}")
+        return
+
+    # Same downstream invalidation + one-shot banner the auto-regen uses, so
+    # the editor / drivers / Early-Start table / Summary Report all rebuild
+    # from the freshly-saved baseline on this render.
+    _invalidate_ro_comparison_downstream()
+    st.session_state[_SS_AUTO_REGEN_BANNER] = result
 
 
 def _render_warnings_banner(w: ComparisonWarnings) -> None:

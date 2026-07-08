@@ -4074,12 +4074,32 @@ def _render_demand_plan_comparison_section() -> None:
     st.caption(
         "Cycle-over-cycle comparison from "
         "**`qry_mgmt_plan_history_tracker.csv`** (plan), **`dbo.IBP "
-        "Shipments`** (actuals), and **`qry_pdh.csv`** (Portfolio Major / "
-        "Supply Format / Brand).  Pick a current vs prior cycle, the "
-        "actual and forecast month ranges (which must not overlap), and "
-        "the month treated as *Prior Month*.  The **R&O** column reads "
-        "*FY27 Total Delta* from the saved RO Summary Report.  All values "
-        "are in **millions of pounds**."
+        "Shipments`** (actuals), and **`qry_pdh.csv` → `RO_Item_Master.csv`** "
+        "(Portfolio Major / Supply Format / Brand).  Pick a current vs prior "
+        "cycle, the actual and forecast month ranges (which must not "
+        "overlap), and the month treated as *Prior Month*.  All values are "
+        "in **millions of pounds**."
+    )
+    # Spell out exactly how the two plan columns are built — planners kept
+    # asking what "Current Plan" vs "Last Plan" (a.k.a. Prior Plan) mean.
+    st.markdown(
+        "**How the plan columns are built** "
+        "_(Actual window = `[Actual Start … Actual End]`, "
+        "Forecast window = `[Forecast Start … Forecast End]`)_\n"
+        "- **Current Plan** = **actual shipments** over the Actual window "
+        "**＋** the **current-cycle** forecast over the Forecast window.\n"
+        "- **Last Plan** _(the prior / one-month-ago estimate)_ = **actual "
+        "shipments** over the Actual window shifted back one month "
+        "`[Actual Start … Actual End − 1]` **＋** the **prior-cycle** "
+        "forecast over the Forecast window shifted back one month "
+        "`[Forecast Start − 1 … Forecast End]` — i.e. the month that just "
+        "closed is still a prior-cycle forecast here.\n"
+        "- **Total Delta** = Current Plan − Last Plan.\n"
+        "- **Base Plan** = Total Delta − PM Actual − R&O _(residual, so "
+        "Base Plan + PM Actual + R&O = Total Delta)_.\n"
+        "- **PM Actual** = Prior-Month actual shipments − prior-cycle "
+        "forecast for the selected Prior Month.\n"
+        "- **R&O** = *FY27 Total Delta* from the saved RO Summary Report."
     )
     _render_demand_plan_comparison_fragment()
 

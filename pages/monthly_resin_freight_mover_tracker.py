@@ -3843,17 +3843,19 @@ def _render_milk_autoupdate_status() -> None:
             st.rerun()
 
 
-# ── Milk Commodity Cost summary table (Start vs End month) ───────────────────
+# ── Milk Commodity Cost summary table (End vs Start month) ───────────────────
 #
 # Rendered directly below the milk chart: a compact comparison of the five
 # FMMO advanced-price components for the two months chosen in the chart's time
-# slicer — the **Start Month** populates the "Current Month" column and the
-# **End Month** the "Last Month" column — plus the change between them.  Driving
-# it from the slicer (rather than always the latest two months) keeps the table
-# in lockstep with what the operator is looking at on the chart.  The five
-# display metrics are HTST Class I, ESL Class I, and Class II rows — because
-# Class I skim differs by Category (HTST vs ESL) while Class I butterfat and
-# both Class II rates are single FMMO prices shared across families.
+# slicer.  The table leads with the **End Month** (the operator's headline
+# month) and follows with the **Start Month**, so the two value columns carry
+# the selected month names (e.g. "$/lbs Jul 2026" then "$/lbs May 2026") plus
+# the change between them (``End − Start``).  Driving it from the slicer
+# (rather than always the latest two months) keeps the table in lockstep with
+# what the operator is looking at on the chart.  The five display metrics are
+# HTST Class I, ESL Class I, and Class II rows — because Class I skim differs
+# by Category (HTST vs ESL) while Class I butterfat and both Class II rates are
+# single FMMO prices shared across families.
 #
 # Each metric: (display label, preferred Category, Class token, rate column).
 # Category is a *preference*: the lookup falls back to any other family
@@ -3866,31 +3868,39 @@ _MILK_SUMMARY_METRICS: tuple[tuple[str, str, str, str], ...] = (
     ("Class II Butterfat", "ESL",  "II", _milk_store.COL_BUTTERFAT),
 )
 
-# Column order for the summary table; index 0 is the row-label column.
+# Stable *internal* column keys for the summary frame.  The two value columns
+# are ordered End-then-Start; these fixed keys keep the builder month-name-
+# agnostic — the render layer swaps them for the selected month labels (and
+# falls back to these very strings when a month is unset).  Index 0 is the
+# row-label column.
+_MILK_COL_END:    str = "$/lbs End Month"
+_MILK_COL_START:  str = "$/lbs Start Month"
+_MILK_COL_CHANGE: str = "Change"
 _MILK_SUMMARY_COLS: tuple[str, str, str, str] = (
-    "Metric", "$/lbs Current Month", "$/lbs Last Month", "Change",
+    "Metric", _MILK_COL_END, _MILK_COL_START, _MILK_COL_CHANGE,
 )
 
 
 def _build_milk_commodity_summary(
     milk_df: pd.DataFrame,
-    current_month: Optional[pd.Timestamp],
-    last_month: Optional[pd.Timestamp],
+    end_month: Optional[pd.Timestamp],
+    start_month: Optional[pd.Timestamp],
 ) -> pd.DataFrame:
     """Build the milk commodity summary for two explicit months.
 
-    Resolves the five FMMO advanced-price components for ``current_month``
-    (the "$/lbs Current Month" column) and ``last_month`` (the "$/lbs Last
-    Month" column), plus the change (``current − last``).  The two months are
-    the chart slicer's **Start** and **End** values, so the table tracks the
-    operator's selection rather than always showing the latest two months.
+    Resolves the five FMMO advanced-price components for ``end_month`` (the
+    leading :data:`_MILK_COL_END` column) and ``start_month`` (the following
+    :data:`_MILK_COL_START` column), plus the change (``end − start``).  The
+    two months are the chart slicer's **End** and **Start** values, so the
+    table tracks the operator's selection rather than always showing the
+    latest two months.
 
     A ``None`` month — or one with no matching rows — yields blank rates for
     that column (and a blank change), so a partial / single-month selection
     never errors.  Returns a DataFrame with the columns in
     :data:`_MILK_SUMMARY_COLS` holding **numeric** rates (``None`` where
-    unavailable); currency formatting is left to the page layer.  An empty /
-    malformed frame yields a header-only table.
+    unavailable); currency formatting and the month-name headers are left to
+    the page layer.  An empty / malformed frame yields a header-only table.
 
     Pure function on a copy — never mutates ``milk_df``.
     """
@@ -3932,33 +3942,42 @@ def _build_milk_commodity_summary(
         val = pd.to_numeric(pick.iloc[0][col], errors="coerce")
         return None if pd.isna(val) else float(val)
 
-    label_col, cur_col, last_col, chg_col = _MILK_SUMMARY_COLS
+    label_col, end_col, start_col, chg_col = _MILK_SUMMARY_COLS
     rows_out: list[dict] = []
     for label, pref_cat, cls, rate_key in _MILK_SUMMARY_METRICS:
-        cur = _rate(current_month, pref_cat, cls, rate_key)
-        last = _rate(last_month, pref_cat, cls, rate_key)
-        change = None if cur is None or last is None else cur - last
-        rows_out.append(
-            {label_col: label, cur_col: cur, last_col: last, chg_col: change}
+        end_rate = _rate(end_month, pref_cat, cls, rate_key)
+        start_rate = _rate(start_month, pref_cat, cls, rate_key)
+        change = (
+            None if end_rate is None or start_rate is None
+            else end_rate - start_rate
         )
+        rows_out.append({
+            label_col: label,
+            end_col: end_rate,
+            start_col: start_rate,
+            chg_col: change,
+        })
 
     return pd.DataFrame(rows_out, columns=_MILK_SUMMARY_COLS)
 
 
 def _render_milk_commodity_summary_table(
     milk_df: pd.DataFrame,
-    current_month: Optional[pd.Timestamp],
-    last_month: Optional[pd.Timestamp],
+    start_month: Optional[pd.Timestamp],
+    end_month: Optional[pd.Timestamp],
 ) -> None:
     """Render the milk commodity summary for the slicer's Start / End months.
 
-    ``current_month`` is the slicer's **Start Month** (the "Current Month"
-    column + caption) and ``last_month`` its **End Month** ("Last Month").
-    Formats rates as ``$ x.xxxx`` and renders the change finance-style — a
-    decrease is parenthesised.  Silently no-ops when the milk JSON yields no
-    rows.
+    The table leads with the slicer's **End Month** and follows with its
+    **Start Month**, so the two value-column headers carry the selected month
+    names (e.g. ``$/lbs Jul 2026`` then ``$/lbs May 2026``); ``Change`` is
+    ``End − Start``.  When a month is unset the header falls back to the
+    neutral ``$/lbs End/Start Month`` label.  Formats rates as ``$ x.xxxx``
+    and renders the change finance-style — a decrease is parenthesised.
+    Silently no-ops when the milk JSON yields no rows.
     """
-    summary = _build_milk_commodity_summary(milk_df, current_month, last_month)
+    # Builder leads with the End month (headline) and follows with Start.
+    summary = _build_milk_commodity_summary(milk_df, end_month, start_month)
     if summary.empty:
         return
 
@@ -3971,21 +3990,35 @@ def _render_milk_commodity_summary_table(
         v = float(v)
         return f"({abs(v):,.4f})" if v < 0 else f"{v:,.4f}"
 
-    label_col, cur_col, last_col, chg_col = _MILK_SUMMARY_COLS
+    label_col, end_col, start_col, chg_col = _MILK_SUMMARY_COLS
     display = summary.copy()
-    display[cur_col] = display[cur_col].map(_money)
-    display[last_col] = display[last_col].map(_money)
+    display[end_col] = display[end_col].map(_money)
+    display[start_col] = display[start_col].map(_money)
     display[chg_col] = display[chg_col].map(_change)
+
+    # Swap the fixed internal keys for the selected month names.  A ``None``
+    # month keeps the neutral fallback label so a single-month selection still
+    # renders a sane header.
+    def _month_header(month: Optional[pd.Timestamp], fallback: str) -> str:
+        return f"$/lbs {month:%b %Y}" if month is not None else fallback
+
+    display = display.rename(columns={
+        end_col: _month_header(end_month, end_col),
+        start_col: _month_header(start_month, start_col),
+    })
     # Row labels become the (header-less) index, mirroring the snapshot.
     display = display.rename(columns={label_col: ""}).set_index("")
 
     months = [
-        f"Current Month = {m:%b %Y}" if i == 0 else f"Last Month = {m:%b %Y}"
-        for i, m in enumerate((current_month, last_month))
+        f"End Month = {m:%b %Y}" if i == 0 else f"Start Month = {m:%b %Y}"
+        for i, m in enumerate((end_month, start_month))
         if m is not None
     ]
     if months:
-        st.caption("  ·  ".join(months) + "  ·  source: FMMO milk (HTST) JSON")
+        st.caption(
+            "  ·  ".join(months)
+            + "  ·  Change = End − Start  ·  source: FMMO milk (HTST) JSON"
+        )
     st.table(display)
 
 
@@ -4078,11 +4111,11 @@ def _render_milk_commodity(
             ),
         )
 
-    # FMMO component summary for the slicer's Start / End months: the "Current
-    # Month" column tracks the Start Month and "Last Month" the End Month, so
-    # the table stays in lockstep with the operator's selection above.  (The
-    # Category / Class knobs remain chart-only — the summary always shows every
-    # family via the metric table's own Category preference + fallback.)
+    # FMMO component summary for the slicer's Start / End months: the table
+    # leads with the End Month column and follows with the Start Month, so it
+    # stays in lockstep with the operator's selection above.  (The Category /
+    # Class knobs remain chart-only — the summary always shows every family
+    # via the metric table's own Category preference + fallback.)
     _render_milk_commodity_summary_table(milk.df, start_month, end_month)
 
 

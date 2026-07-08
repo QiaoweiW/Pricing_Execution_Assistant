@@ -114,8 +114,10 @@ from data_sources.demand_plan_comparison import (
     PMAF_COL_SHIPPED_PCT,
     EnrichedSources,
     build_base_plan_driver_table,
+    build_comparison_not_captured,
     build_demand_plan_comparison,
     build_enriched_sources,
+    ComparisonNotCaptured,
     DIAG_COL_LBS,
     DIAG_COL_MLBS,
     DIAG_COL_PMAJ,
@@ -4155,19 +4157,25 @@ def _signature_for(df: Optional[pd.DataFrame]) -> tuple[int, int]:
 @st.cache_resource(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_enriched_sources(
     tracker_sig: tuple, ibp_sig: tuple, ibp_orders_sig: tuple, pdh_sig: tuple,
+    item_master_sig: tuple,
     _tracker_df: pd.DataFrame,
     _ibp_df: Optional[pd.DataFrame],
     _ibp_orders_df: Optional[pd.DataFrame],
     _pdh_df: Optional[pd.DataFrame],
+    _item_master_df: Optional[pd.DataFrame],
 ) -> EnrichedSources:
-    """Cache the shared PDH-joined tracker + IBP frames (by reference).
+    """Cache the shared dim-joined tracker + IBP frames (by reference).
 
-    Built once per unique ``(tracker, ibp, pdh)`` signature, shared by
-    the comparison builder and BOTH driver builders.  Leading-underscore
+    Built once per unique ``(tracker, ibp, pdh, RO_Item_Master)`` signature,
+    shared by the comparison builder and BOTH driver builders.  Dimensions
+    resolve through the PDH → RO_Item_Master cascade.  Leading-underscore
     arg names tell Streamlit to skip hashing the DataFrames themselves
     (we already key on their signature tuples).
     """
-    return build_enriched_sources(_tracker_df, _ibp_df, _ibp_orders_df, _pdh_df)
+    return build_enriched_sources(
+        _tracker_df, _ibp_df, _ibp_orders_df, _pdh_df,
+        item_master_df=_item_master_df,
+    )
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
@@ -4364,6 +4372,7 @@ def _render_demand_plan_comparison_fragment() -> None:
     #    loader is independent so a single failing source doesn't
     #    short-circuit the others; the builder degrades gracefully.
     pdh_df = _load_demand_comparison_pdh()
+    item_master_df = _load_mom_item_master()   # RO_Item_Master fallback dims
     actual_months = _months_in_range_local(
         filters.actual_start, filters.actual_end)
     prior_month_set = {filters.prior_month.replace(day=1)}
@@ -4387,14 +4396,15 @@ def _render_demand_plan_comparison_fragment() -> None:
     ibp_sig = _signature_for(ibp_df)
     ibp_orders_sig = _signature_for(ibp_orders_df)
     pdh_sig = _signature_for(pdh_df)
+    item_master_sig = _signature_for(item_master_df)
     dim_sig = _signature_for(dim_df)
     ro_sig = _ro_lookup_signature(ro_lookup)
-    enrich_sig = (tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig)
+    enrich_sig = (tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig, item_master_sig)
 
     with st.spinner("Building Demand Plan Comparison Summary…"):
         enriched = _cached_enriched_sources(
-            tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig,
-            tracker_df, ibp_df, ibp_orders_df, pdh_df,
+            tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig, item_master_sig,
+            tracker_df, ibp_df, ibp_orders_df, pdh_df, item_master_df,
         )
         table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
             enrich_sig + (ro_sig, budget_lookup_key),
@@ -4425,6 +4435,14 @@ def _render_demand_plan_comparison_fragment() -> None:
     warnings.extend(budget_warnings)
     for msg in warnings:
         st.warning(f"⚠️ {msg}")
+
+    # 6b. "SKUs not captured" reconciliation logs (prior + current cycle),
+    #     surfaced above the table so the planner reconciles before trusting
+    #     the totals.  Categorised via the same PDH → RO_Item_Master cascade
+    #     that enriched the tracker.
+    _render_comparison_not_captured_logs(
+        build_comparison_not_captured(enriched.tracker, filters),
+    )
 
     # 7. Render the comparison table + download / save.
     _render_demand_comparison_table(result)
@@ -4463,6 +4481,67 @@ def _months_in_range_local(start: date, end: date) -> set[date]:
         else:
             cur = cur.replace(month=cur.month + 1)
     return out
+
+
+def _render_comparison_not_captured_logs(nc: ComparisonNotCaptured) -> None:
+    """Render the prior- and current-cycle 'SKUs not captured' logs.
+
+    Two foldable sections (one per cycle) listing the forecast SKUs whose
+    dims match no comparison-template family — with a jump link to
+    RO_Item_Master.csv in Fabric and a CSV download each.
+    """
+    _render_one_comparison_not_captured(
+        nc.prior_cycle, cycle_label=nc.prior_cycle_label,
+        role="prior", key_suffix="prior",
+    )
+    _render_one_comparison_not_captured(
+        nc.current_cycle, cycle_label=nc.current_cycle_label,
+        role="current", key_suffix="current",
+    )
+
+
+def _render_one_comparison_not_captured(
+    df: pd.DataFrame, *, cycle_label: str, role: str, key_suffix: str,
+) -> None:
+    """Render a single cycle's not-captured log (success note when empty)."""
+    if df is None or df.empty:
+        st.caption(
+            f"✅ Every {role}-cycle (**{cycle_label}**) forecast SKU is "
+            "captured in the comparison below."
+        )
+        return
+
+    n = len(df)
+    with st.expander(
+        f"⚠️ {n:,} {role}-cycle ({cycle_label}) forecast SKU(s) NOT captured "
+        "in the comparison",
+        expanded=False,
+    ):
+        st.caption(
+            f"SKUs in the **{cycle_label}** ({role} cycle) forecast whose "
+            "Portfolio Major / Supply Format — resolved via "
+            "PDH → RO_Item_Master — match no comparison-template family, so "
+            "their forecast pounds never reach a row.  Classify them in "
+            "RO_Item_Master to fold them in."
+        )
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        col_link, col_dl = st.columns(2)
+        with col_link:
+            st.link_button(
+                "🔎 Open RO_Item_Master.csv in Fabric",
+                _RO_ITEM_MASTER_FABRIC_URL,
+                use_container_width=True,
+            )
+        with col_dl:
+            today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+            st.download_button(
+                label="⬇️ Download not-captured items (CSV)",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"comparison_not_captured_{key_suffix}_{today}.csv",
+                mime="text/csv",
+                key=f"cmp_not_captured_dl_{key_suffix}",
+                use_container_width=True,
+            )
 
 
 def _render_demand_comparison_filters(

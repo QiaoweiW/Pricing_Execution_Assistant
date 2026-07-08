@@ -14,6 +14,8 @@ import datetime as dt
 import pandas as pd
 
 from data_sources.demand_plan_comparison import (
+    COL_LAST_PLAN_ACTUALS,
+    COL_LAST_PLAN_FORECAST,
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
     DIAG_COL_LBS,
@@ -21,9 +23,15 @@ from data_sources.demand_plan_comparison import (
     DIAG_COL_SFMT,
     DIAG_UNMAPPED,
     FORECAST_BASE_PLAN,
+    NC_COL_ITEM,
+    NC_COL_PMAJ,
     ComparisonFilters,
+    ComparisonNotCaptured,
+    EnrichedSources,
     TemplateRow,
     _compute_leaf_measures,
+    build_comparison_not_captured,
+    build_demand_plan_comparison,
     build_prior_month_shipment_diagnostic,
     _vectorised_start_of_month as som,
 )
@@ -99,6 +107,8 @@ def test_prior_month_forecast_uses_prior_cycle():
         tpl, trk, ibp, filters,
         actual_months={dt.date(2026, 4, 1), dt.date(2026, 5, 1), prior_month},
         forecast_months={dt.date(2026, 7, 1)},
+        last_actual_months={dt.date(2026, 4, 1), dt.date(2026, 5, 1)},
+        prior_forecast_months={dt.date(2026, 6, 1), dt.date(2026, 7, 1)},
         prior_month=prior_month,
         ro_total_delta_by_path={},
     )
@@ -153,3 +163,123 @@ def test_shipment_diagnostic_empty_when_no_prior_month_rows():
     ])
     out = build_prior_month_shipment_diagnostic(ibp, dt.date(2026, 6, 1))
     assert out.empty
+
+
+# ── Last Plan (independent, one-month-shifted) + Total Delta = Current − Last ─
+
+_APR, _MAY, _JUN, _JUL = (
+    dt.date(2026, 4, 1), dt.date(2026, 5, 1),
+    dt.date(2026, 6, 1), dt.date(2026, 7, 1),
+)
+
+
+def _filters_apr_jun_actual() -> ComparisonFilters:
+    """Actual Apr–Jun, Forecast Jul–Mar, current C4 vs prior C3, PM = Jun."""
+    return ComparisonFilters(
+        current_cycle="C4", prior_cycle="C3",
+        actual_start=_APR, actual_end=_JUN,
+        forecast_start=_JUL, forecast_end=dt.date(2027, 3, 1),
+        prior_month=_JUN,
+    )
+
+
+def test_last_plan_measures_use_shifted_windows():
+    """Last-Plan legs shift one month: actuals drop Jun; prior forecast adds Jun."""
+    filters = _filters_apr_jun_actual()
+    base = dict(item_key="100", item_desc="X", party_site="1",
+                pmaj="", sfmt="", pminor="", brand="", forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([
+        {**base, "month": _JUN, "cycle": "C3", "pounds": 8_000_000.0},  # prior, in prior-fcst window
+        {**base, "month": _JUL, "cycle": "C3", "pounds": 9_000_000.0},  # prior, in prior-fcst window
+        {**base, "month": _JUL, "cycle": "C4", "pounds": 10_000_000.0},  # current forecast
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "X", "customer_no": "1", "customer_name": "C",
+         "month": m, "pounds": p, "pmaj": "", "sfmt": "", "pminor": "", "brand": ""}
+        for m, p in ((_APR, 1_000_000.0), (_MAY, 2_000_000.0), (_JUN, 4_000_000.0))
+    ])
+    tpl = TemplateRow(row_id="r", label="R", indent=0)  # no dim constraints
+
+    m = _compute_leaf_measures(
+        tpl, trk, ibp, filters,
+        actual_months={_APR, _MAY, _JUN},
+        forecast_months={_JUL},
+        last_actual_months={_APR, _MAY},          # Jun dropped
+        prior_forecast_months={_JUN, _JUL},        # Jun added (Forecast Start − 1)
+        prior_month=_JUN,
+        ro_total_delta_by_path={},
+    )
+    # Last-Plan actuals exclude Jun: 1 + 2 = 3.0 (Jun's 4.0 excluded).
+    assert m[COL_LAST_PLAN_ACTUALS] == 3.0
+    # Last-Plan forecast = PRIOR cycle (C3) over Jun+Jul: 8 + 9 = 17.0.
+    assert m[COL_LAST_PLAN_FORECAST] == 17.0
+
+
+def _enriched_sources(trk: pd.DataFrame, ibp: pd.DataFrame) -> EnrichedSources:
+    empty = _enriched_ibp([])
+    return EnrichedSources(tracker=trk, ibp=ibp, ibp_orders=empty, pdh_warning=None)
+
+
+def test_current_last_total_delta_and_total_actuals_removed():
+    """End-to-end on the ESL Large Carton / Branded leaf."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded",
+               forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([
+        {**esl, "month": _JUL, "cycle": "C4", "pounds": 10_000_000.0},  # current fcst
+        {**esl, "month": _JUN, "cycle": "C3", "pounds": 8_000_000.0},   # prior fcst (shifted)
+        {**esl, "month": _JUL, "cycle": "C3", "pounds": 9_000_000.0},   # prior fcst
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": m, "pounds": p,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
+        for m, p in ((_APR, 1_000_000.0), (_MAY, 2_000_000.0), (_JUN, 4_000_000.0))
+    ])
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(trk, ibp), ro_total_delta_by_path={},
+    )
+    table = result.table
+    assert "Total Actuals" not in table.columns          # column removed
+    row = table.loc[table["_row_id"] == "esl_lc_branded"].iloc[0]
+    # Current Plan = actuals(7) + current forecast(10) = 17.
+    assert float(row["Current Plan"]) == 17.0
+    # Last Plan = last-actuals(3) + prior forecast(8+9=17) = 20.
+    assert float(row["Last Plan"]) == 20.0
+    # Total Delta = Current − Last = 17 − 20 = −3.
+    assert float(row["Total Delta"]) == -3.0
+
+
+def test_not_captured_flags_items_outside_the_template():
+    """A 'Whey/Bag' SKU (no template family) is logged for both cycles."""
+    filters = ComparisonFilters(
+        current_cycle="C4", prior_cycle="C3",
+        actual_start=_APR, actual_end=_JUN,
+        forecast_start=_JUL, forecast_end=dt.date(2026, 8, 1),
+        prior_month=_JUN,
+    )
+    captured = dict(item_key="100", item_desc="DG Milk", party_site="1",
+                    pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded",
+                    forecast_type=FORECAST_BASE_PLAN)
+    uncaptured = dict(item_key="900", item_desc="Whey Powder", party_site="9",
+                      pmaj="Whey", sfmt="Bag", pminor="", brand="",
+                      forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([
+        {**captured, "month": _JUL, "cycle": "C4", "pounds": 5_000_000.0},
+        {**captured, "month": _JUN, "cycle": "C3", "pounds": 3_000_000.0},
+        {**uncaptured, "month": _JUL, "cycle": "C4", "pounds": 2_000_000.0},  # current window
+        {**uncaptured, "month": _JUN, "cycle": "C3", "pounds": 1_000_000.0},  # prior window (Jul−1)
+    ])
+    nc: ComparisonNotCaptured = build_comparison_not_captured(trk, filters)
+
+    cur_items = set(nc.current_cycle[NC_COL_ITEM].astype(str))
+    prior_items = set(nc.prior_cycle[NC_COL_ITEM].astype(str))
+    assert "900" in cur_items and "900" in prior_items   # uncaptured, both cycles
+    assert "100" not in cur_items and "100" not in prior_items  # captured
+    # Categorised via the (cascade-resolved) dims.
+    whey_row = nc.current_cycle.loc[
+        nc.current_cycle[NC_COL_ITEM].astype(str) == "900"].iloc[0]
+    assert whey_row[NC_COL_PMAJ] == "Whey"
+    assert nc.current_cycle_label == "C4" and nc.prior_cycle_label == "C3"

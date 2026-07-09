@@ -4,8 +4,7 @@ Sections
 --------
 1. Source URLs                    (module-level constants)
 2. Section renderers              (_render_instructions,
-                                   _render_demand_planning_dashboard,
-                                   _render_distribution_tracker,
+                                   _render_ibp_supporting_files,
                                    _render_ro_comparison,
                                    _render_demand_summary,
                                    _render_product_line_review)
@@ -304,10 +303,6 @@ from data_sources.demand_plan_pipeline import (
 )
 from data_sources.fabric_lakehouse_io import LakehouseIOError
 from utils import fabric_signin_widget
-from utils.embed_helpers import (
-    render_embedded_resource,
-    to_sharepoint_excel_embed_url,
-)
 from utils.ui_helpers import apply_custom_css
 
 
@@ -316,6 +311,23 @@ from utils.ui_helpers import apply_custom_css
 # Kept as module-level constants — these are the canonical, share-link URLs
 # the user pastes from SharePoint / OneDrive.  They are *not* secrets;
 # access is gated by SharePoint's own permission model.
+
+# SharePoint-hosted RFP Tracker workbook.  Pasted verbatim (an
+# AccessDenied redirect that carries the real file in its Source= param and
+# auto-redirects once the user is signed in to the tenant).
+_RFP_TRACKER_URL = (
+    "https://darigold1com.sharepoint.com/sites/ChannelsDevelopment/"
+    "_layouts/15/AccessDenied.aspx?Source=https%3A%2F%2Fdarigold1com."
+    "sharepoint.com%2F%3Ax%3A%2Fr%2Fsites%2FChannelsDevelopment%2FShared"
+    "+Documents%2FGeneral%2F1-+Weekly+Update+and+RFP+Tracker%2FRFP+Tracker"
+    ".xlsx%3Fd%3Dw3d0cc19e7a474dd0be606d7713a242b9%26csf%3D1%26web%3D1%26e"
+    "%3DRc9urc%26OR%3DTEAMS-WEB.undefined_ns.rwc%26wdExp%3DTEAMS-TREATMENT"
+    "%26CT%3D1783616217454%26web%3D1%26TeamsCID%3D7dde02c1-b4f7-49ef-838e-"
+    "d6871a3e5d8a%26linkOpenTime%3D1783616217487&correlation=c79f25a2-d0dc-"
+    "0000-df1c-a05bccb0b039&Type=item&name=76866e00-dfc5-46eb-a6b4-"
+    "b570035af43a&listItemId=828&listItemUniqueId=3d0cc19e-7a47-4dd0-be60-"
+    "6d7713a242b9&allowautoredirecttosource=true"
+)
 
 # SharePoint-hosted Power BI desktop file (.pbix) — Demand Planning data model.
 _DEMAND_PLANNING_PBIX_URL = (
@@ -382,6 +394,9 @@ _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
         "7d03fb42-73c9-48c3-8ebf-b2dffceed69d/8e711805f364f2606729"
         "?ctid=c9a55ced-3b88-408c-ab99-8db8b9b90286&experience=power-bi",
     ),
+    ("RFP tracker", _RFP_TRACKER_URL),
+    ("Demand Planning BI Dashboard", _DEMAND_PLANNING_PBIX_URL),
+    ("Sales Distribution Tracker", _DISTRIBUTION_TRACKER_URL),
 )
 
 
@@ -394,55 +409,6 @@ def _render_ibp_supporting_files() -> None:
     with st.expander("📅 IBP Cadence and Supporting files", expanded=False):
         for label, url in _IBP_SUPPORTING_FILES:
             st.markdown(f"- [{label}]({url})")
-
-
-def _render_demand_planning_dashboard() -> None:
-    """Embed the SharePoint Power BI desktop (``.pbix``) file as a live preview.
-
-    SharePoint's Power BI viewer renders ``.pbix`` files in a read-only
-    web preview when the URL is loaded directly.  We pass the canonical
-    share-link URL through unchanged because the Power BI online
-    viewer does the right thing with the ``:u:/r/`` resource prefix —
-    no embed-mode rewrite is necessary.
-    """
-    with st.expander("📊 Demand Planning BI Dashboard", expanded=False):
-        render_embedded_resource(
-            url=_DEMAND_PLANNING_PBIX_URL,
-            title="Demand Planning Data Model v3",
-            # No URL transform: SharePoint's Power BI preview handler
-            # accepts the share-link form as-is.
-            embed_url=None,
-            height=820,
-            fallback_note=(
-                "This is the live Demand Planning Power BI model hosted in "
-                "SharePoint. If the embed below is blank, your browser "
-                "session may not be signed in to the Darigold tenant — "
-                "use the button below to open it in a new tab."
-            ),
-        )
-
-
-def _render_distribution_tracker() -> None:
-    """Embed the SharePoint Excel workbook (Office-Online read-mode).
-
-    Icon: 🚚 — distribution / route-to-market; distinct from 📊 (BI
-    dashboard) and 📋 (Product Line Review) elsewhere on this page.
-    """
-    with st.expander("🚚 Sales Distribution Tracker (RO Details)", expanded=False):
-        render_embedded_resource(
-            url=_DISTRIBUTION_TRACKER_URL,
-            title="Sales Distribution Tracker (RO Details)",
-            # Rewrite ``action=default`` → ``action=embedview`` so Office
-            # Online renders a chrome-less, read-only embed.
-            embed_url=to_sharepoint_excel_embed_url(_DISTRIBUTION_TRACKER_URL),
-            height=820,
-            fallback_note=(
-                "This is the live Sales Distribution Tracker (RO Details) "
-                "workbook hosted in SharePoint, rendered through Office "
-                "Online in read-only embed mode. Use the button below to "
-                "open it in Excel Online with full editing rights."
-            ),
-        )
 
 
 # ── RO Comparison ────────────────────────────────────────────────────────────
@@ -7083,9 +7049,3 @@ def render() -> None:
     st.markdown("---")
 
     _render_product_line_review()
-    st.markdown("---")
-
-    _render_distribution_tracker()
-    st.markdown("---")
-
-    _render_demand_planning_dashboard()

@@ -222,6 +222,10 @@ from data_sources.ship_to_sites import (
 )
 from data_sources.holistic_demand_plan_aps import (
     HolisticDemandPlanError,
+    MATCH_COL_STATUS,
+    MATCH_EXACT,
+    MATCH_FUZZY,
+    MATCH_UNMAPPED,
     generate_holistic_demand_plan_aps,
 )
 from data_sources.product_line_review import (
@@ -3247,6 +3251,10 @@ def _render_demand_summary_aps() -> None:
             )
             return
 
+        # Fuzzy-match log FIRST (top of the results) so the planner sees what
+        # didn't match before trusting / downloading the file.
+        _render_hdp_match_log(result.customer_match_log)
+
         frame = result.frame
         if frame.empty:
             st.info(
@@ -3271,28 +3279,47 @@ def _render_demand_summary_aps() -> None:
             with st.expander("👁️ Preview (first 100 rows)", expanded=False):
                 st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
 
-        # Reconciliation aid: RO customers that didn't resolve to a corp group.
-        if result.unmapped_customers:
-            with st.expander(
-                f"⚠️ {len(result.unmapped_customers):,} RO customer(s) not "
-                "mapped to a Corporate Group",
-                expanded=False,
-            ):
-                st.caption(
-                    "These `RO_Seed` Customer names didn't fuzzy-match "
-                    "`dp_dimcustomernames`; their R&O rows are tagged "
-                    "`(Unmapped)`.  Reconcile in the customer master."
-                )
-                st.dataframe(
-                    pd.DataFrame({"Customer": list(result.unmapped_customers)}),
-                    use_container_width=True, hide_index=True,
-                )
-
         # Rebuild = drop the cached result + Fabric caches, then re-fetch fresh.
         if st.button("🔄 Rebuild (refresh from Fabric)", key="hdp_aps_rebuild"):
             st.session_state.pop(_HDP_APS_RESULT_KEY, None)
             st.cache_data.clear()
             st.rerun()
+
+
+def _render_hdp_match_log(match_log: pd.DataFrame) -> None:
+    """Render the R&O Customer → Corporate Group fuzzy-match log.
+
+    Foldable, at the top of the Holistic Demand Plan results.  Auto-expands
+    when anything is Unmapped so the planner immediately sees what to
+    hand-fix in the downloaded file.  Offers the log as its own CSV.
+    """
+    if match_log is None or match_log.empty:
+        return
+    status = match_log[MATCH_COL_STATUS]
+    n_unmapped = int((status == MATCH_UNMAPPED).sum())
+    n_fuzzy = int((status == MATCH_FUZZY).sum())
+    n_exact = int((status == MATCH_EXACT).sum())
+    with st.expander(
+        f"🔗 R&O Customer → Corporate Group match log — "
+        f"{n_unmapped} unmapped · {n_fuzzy} fuzzy · {n_exact} exact",
+        expanded=n_unmapped > 0,
+    ):
+        st.caption(
+            "How each **R&O** Customer resolved to a Corporate Group (APS "
+            "rows use `dp_factscurrentaps`'s own `corporate_group_code`).  "
+            "Rows marked **Unmapped** are tagged `(Unmapped)` in the file — "
+            "hand-fix their Corporate Group in the downloaded "
+            "`qry_mgmt_plan_full_aps.csv`.  Sorted Unmapped → Fuzzy → Exact."
+        )
+        st.dataframe(match_log, use_container_width=True, hide_index=True)
+        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+        st.download_button(
+            label="⬇️ Download match log (CSV)",
+            data=match_log.to_csv(index=False).encode("utf-8"),
+            file_name=f"holistic_demand_plan_match_log_{today}.csv",
+            mime="text/csv",
+            key="hdp_aps_match_log_download",
+        )
 
 
 def _render_demand_summary_file(

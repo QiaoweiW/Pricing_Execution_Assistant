@@ -223,37 +223,44 @@ def _scan(sql: str, table_uri: str) -> pd.DataFrame:
         ) from exc
 
 
-@st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
-def _cached_factscurrentaps(_cache_token: str) -> pd.DataFrame:
-    """Streamlit-cached slim read of ``dbo.dp_factscurrentaps``.
+# Native Corporate Group column on dp_factscurrentaps.  Used ONLY by the
+# Holistic Demand Plan (APS) build, which the planner explicitly wants keyed
+# on the fact table's own corporate_group_code (unlike the Plan-Lift metric,
+# which re-derives Corporate Group via dp_dimcustomernames for today-boundary
+# consistency — see the module docstring).
+_APS_CORP_GROUP_CANDIDATES = (
+    "corporate_group_code", "Corporate Group Code", "CorporateGroupCode",
+    "corporate_group", "Corporate Group",
+)
 
-    Projects only the four columns the metric needs (month, party site,
-    item, consensus plan lbs).  Column names are resolved from a cheap
-    ``DESCRIBE`` probe so an upstream casing drift degrades to a clear
-    error rather than a wrong-column silent join.
+# One projection spec = (source-name candidates, internal dst name, label).
+# ``label`` names the column in the "missing column" error.
+_ApsProjection = tuple[tuple[str, ...], str, str]
+
+
+def _read_factscurrentaps(projection: tuple[_ApsProjection, ...]) -> pd.DataFrame:
+    """Read ``dbo.dp_factscurrentaps`` projected to *projection*.
+
+    Shared by every ``dp_factscurrentaps`` reader so the DESCRIBE probe,
+    tolerant column resolution, missing-column error, and ``SELECT`` build
+    live in exactly one place.  A cheap ``DESCRIBE`` (Delta metadata only,
+    no row scan) resolves each spec's source column against the live schema
+    — an upstream casing/spelling drift degrades to a clear error rather
+    than a wrong-column silent join.
     """
     table_uri = _build_table_uri(_TABLE_FACTS)
-    # Cheap schema probe — DESCRIBE reads Delta metadata only, no row scan.
     schema = _scan(f"DESCRIBE SELECT * FROM delta_scan('{table_uri}')", table_uri)
-    # Resolve against the column LIST directly: ``_resolve_column`` short-
-    # circuits to None on a zero-row frame, so a column-only shim would
-    # spuriously report every column missing.
     available = tuple(schema["column_name"].astype(str))
     available_set = set(available)
 
-    def _pick(candidates: tuple[str, ...]) -> Optional[str]:
-        return next((c for c in candidates if c in available_set), None)
-
-    month_col = _pick(_APS_MONTH_CANDIDATES)
-    party_col = _pick(_APS_PARTY_SITE_CANDIDATES)
-    item_col = _pick(_APS_ITEM_CANDIDATES)
-    plan_col = _pick(_APS_PLAN_CANDIDATES)
-    missing = [
-        name for name, col in (
-            ("month", month_col), ("party_site_code", party_col),
-            ("item_code", item_col), ("consensus_plan_lbs", plan_col),
-        ) if col is None
-    ]
+    resolved: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for candidates, dst, label in projection:
+        src = next((c for c in candidates if c in available_set), None)
+        if src is None:
+            missing.append(label)
+        else:
+            resolved.append((src, dst))
     if missing:
         raise PlanLiftError(
             f"{_TABLE_FACTS} is missing expected column(s): {', '.join(missing)}. "
@@ -261,13 +268,20 @@ def _cached_factscurrentaps(_cache_token: str) -> pd.DataFrame:
         )
 
     select = ", ".join(
-        f"{_quote_ident(src)} AS {_quote_ident(dst)}"
-        for src, dst in (
-            (month_col, COL_MONTH), (party_col, "party_site_code"),
-            (item_col, COL_ITEM_CODE), (plan_col, COL_PLAN_LBS),
-        )
+        f"{_quote_ident(src)} AS {_quote_ident(dst)}" for src, dst in resolved
     )
-    df = _scan(f"SELECT {select} FROM delta_scan('{table_uri}')", table_uri)
+    return _scan(f"SELECT {select} FROM delta_scan('{table_uri}')", table_uri)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_factscurrentaps(_cache_token: str) -> pd.DataFrame:
+    """Slim read (month, party site, item, consensus plan lbs) for Plan Lift."""
+    df = _read_factscurrentaps((
+        (_APS_MONTH_CANDIDATES, COL_MONTH, "month"),
+        (_APS_PARTY_SITE_CANDIDATES, "party_site_code", "party_site_code"),
+        (_APS_ITEM_CANDIDATES, COL_ITEM_CODE, "item_code"),
+        (_APS_PLAN_CANDIDATES, COL_PLAN_LBS, "consensus_plan_lbs"),
+    ))
     logger.info("Loaded %s slim: %s rows.", _TABLE_FACTS, len(df))
     return df
 
@@ -285,58 +299,20 @@ def fetch_factscurrentaps_slim_df(*, force_refresh: bool = False) -> pd.DataFram
     return _cached_factscurrentaps("default")
 
 
-# Native Corporate Group column on dp_factscurrentaps.  Used ONLY by the
-# Holistic Demand Plan (APS) build, which the planner explicitly wants keyed
-# on the fact table's own corporate_group_code (unlike the Plan-Lift metric,
-# which re-derives Corporate Group via dp_dimcustomernames for today-boundary
-# consistency — see the module docstring).
-_APS_CORP_GROUP_CANDIDATES = (
-    "corporate_group_code", "Corporate Group Code", "CorporateGroupCode",
-    "corporate_group", "Corporate Group",
-)
-
-
 @st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_factscurrentaps_holistic(_cache_token: str) -> pd.DataFrame:
-    """Cached read of ``dp_factscurrentaps`` for the Holistic Demand Plan.
+    """Holistic read (month, item, consensus plan lbs, native corp group).
 
-    Projects ``month``, ``item_code``, ``consensus_plan_lbs`` and the native
-    ``corporate_group_code`` (renamed to internal names ``month``,
-    ``item_code``, ``plan_lbs``, ``corporate_group``).  Party site is not
-    needed — Corporate Group comes straight off the fact row here.
+    Party site isn't needed — Corporate Group comes straight off the fact
+    row here (the Holistic Demand Plan keeps the table's own
+    ``corporate_group_code``).
     """
-    table_uri = _build_table_uri(_TABLE_FACTS)
-    schema = _scan(f"DESCRIBE SELECT * FROM delta_scan('{table_uri}')", table_uri)
-    available = tuple(schema["column_name"].astype(str))
-    available_set = set(available)
-
-    def _pick(candidates: tuple[str, ...]) -> Optional[str]:
-        return next((c for c in candidates if c in available_set), None)
-
-    month_col = _pick(_APS_MONTH_CANDIDATES)
-    item_col = _pick(_APS_ITEM_CANDIDATES)
-    plan_col = _pick(_APS_PLAN_CANDIDATES)
-    corp_col = _pick(_APS_CORP_GROUP_CANDIDATES)
-    missing = [
-        name for name, col in (
-            ("month", month_col), ("item_code", item_col),
-            ("consensus_plan_lbs", plan_col), ("corporate_group_code", corp_col),
-        ) if col is None
-    ]
-    if missing:
-        raise PlanLiftError(
-            f"{_TABLE_FACTS} is missing expected column(s): {', '.join(missing)}. "
-            f"Available columns: {', '.join(available)}."
-        )
-
-    select = ", ".join(
-        f"{_quote_ident(src)} AS {_quote_ident(dst)}"
-        for src, dst in (
-            (month_col, COL_MONTH), (item_col, COL_ITEM_CODE),
-            (plan_col, COL_PLAN_LBS), (corp_col, COL_CORP_GROUP),
-        )
-    )
-    df = _scan(f"SELECT {select} FROM delta_scan('{table_uri}')", table_uri)
+    df = _read_factscurrentaps((
+        (_APS_MONTH_CANDIDATES, COL_MONTH, "month"),
+        (_APS_ITEM_CANDIDATES, COL_ITEM_CODE, "item_code"),
+        (_APS_PLAN_CANDIDATES, COL_PLAN_LBS, "consensus_plan_lbs"),
+        (_APS_CORP_GROUP_CANDIDATES, COL_CORP_GROUP, "corporate_group_code"),
+    ))
     logger.info("Loaded %s holistic: %s rows.", _TABLE_FACTS, len(df))
     return df
 

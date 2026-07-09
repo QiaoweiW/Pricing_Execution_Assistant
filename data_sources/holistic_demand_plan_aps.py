@@ -41,7 +41,6 @@ import pandas as pd
 # spirit (one definition of the Format×Month math, no duplication).
 from data_sources.demand_plan_pipeline import (
     _DEFAULT_ANCHOR_MONTH,
-    _N_MONTHS,
     _PDH_BLOB,
     _RO_ITEMS_BLOB,
     _RO_SEED_BLOB,
@@ -50,6 +49,7 @@ from data_sources.demand_plan_pipeline import (
     _build_tbl_ro_input,
     _norm_item,
     _parse_dates,
+    _ro_input_to_long,
 )
 from data_sources.customer_dims import (
     CORPORATE_GROUP_CANDIDATES,
@@ -82,6 +82,20 @@ HDP_COLUMNS: tuple[str, ...] = (
 FORECAST_APS_BASE_PLAN: str = "APS Base Plan"
 FORECAST_R_AND_O: str       = "R&O"
 
+# Customer → Corporate Group fuzzy-match log (one row per distinct RO_Seed
+# Customer in the R&O output).  Surfaced so the planner can eyeball what
+# matched and hand-fix the Unmapped ones in the downloaded qry_aps file.
+MATCH_COL_CUSTOMER: str = "Customer"
+MATCH_COL_CORP: str     = "Corporate Group"
+MATCH_COL_STATUS: str   = "Match"
+MATCH_COLUMNS: tuple[str, ...] = (MATCH_COL_CUSTOMER, MATCH_COL_CORP, MATCH_COL_STATUS)
+
+MATCH_EXACT: str    = "Exact"
+MATCH_FUZZY: str     = "Fuzzy"
+MATCH_UNMAPPED: str = "Unmapped"
+# Sort order for the log — most actionable (needs a manual fix) first.
+_MATCH_RANK: dict[str, int] = {MATCH_UNMAPPED: 0, MATCH_FUZZY: 1, MATCH_EXACT: 2}
+
 # Read source CSVs as raw strings (pipeline parity — we do our own typing).
 _STR_READ_KW: dict = {"dtype": str, "keep_default_na": False}
 
@@ -98,16 +112,26 @@ class HolisticPlanResult:
     ----------
     frame
         The unified :data:`HDP_COLUMNS` DataFrame (APS Base Plan + R&O).
-    unmapped_customers
-        RO_Seed Customer names that fuzzy-matching could not resolve to a
-        Corporate Group (surfaced so the planner can reconcile them).
+    customer_match_log
+        One row per distinct RO_Seed Customer in the R&O output
+        (:data:`MATCH_COLUMNS`): the Corporate Group it resolved to and the
+        match status (Exact / Fuzzy / Unmapped), most-actionable first.
     aps_rows, ro_rows
         Row counts per leg (post-aggregation) for the run summary.
     """
     frame: pd.DataFrame
-    unmapped_customers: tuple[str, ...]
+    customer_match_log: pd.DataFrame
     aps_rows: int
     ro_rows: int
+
+    @property
+    def unmapped_customers(self) -> tuple[str, ...]:
+        """RO_Seed Customer names that did not resolve to a Corporate Group."""
+        log = self.customer_match_log
+        if log is None or log.empty:
+            return ()
+        unmapped = log.loc[log[MATCH_COL_STATUS] == MATCH_UNMAPPED, MATCH_COL_CUSTOMER]
+        return tuple(unmapped.astype(str))
 
 
 # ── Small helpers ────────────────────────────────────────────────────────────
@@ -177,34 +201,62 @@ def _build_name_to_corp(customer_names_df: Optional[pd.DataFrame]) -> dict[str, 
     return lookup
 
 
-def _map_customers_to_corp(
+def _resolve_one(
+    raw: object, name_to_corp: dict[str, str], keys_by_len: list[str],
+) -> tuple[str, str]:
+    """Resolve one Customer name → ``(corporate_group, match_status)``.
+
+    Exact match on the normalised name first; then a containment fallback
+    (a dim name contained in the customer or vice-versa, longest dim name
+    preferred); else ``(Unmapped)``.
+    """
+    norm = _normalize_name(raw)
+    if not norm:
+        return CORP_GROUP_UNMAPPED, MATCH_UNMAPPED
+    corp = name_to_corp.get(norm)
+    if corp is not None:
+        return corp, MATCH_EXACT
+    for key in keys_by_len:  # longest first → most specific containment wins
+        if key in norm or norm in key:
+            return name_to_corp[key], MATCH_FUZZY
+    return CORP_GROUP_UNMAPPED, MATCH_UNMAPPED
+
+
+def _resolve_customer_corp(
     customers: pd.Series, name_to_corp: dict[str, str],
-) -> tuple[pd.Series, set[str]]:
-    """Map a Customer-name series → Corporate Group; collect unmapped names."""
-    # Longest keys first so a containment match prefers the most specific name.
+) -> tuple[pd.Series, pd.DataFrame]:
+    """Return ``(corp-group series aligned to *customers*, distinct match log)``.
+
+    Resolves each distinct Customer once (cached), so the row-level mapping
+    and the audit log stay perfectly consistent.  The log has one row per
+    distinct Customer (:data:`MATCH_COLUMNS`), sorted most-actionable first.
+    """
     keys_by_len = sorted(name_to_corp, key=len, reverse=True)
-    resolved_cache: dict[str, str] = {}
-    unmapped: set[str] = set()
+    # stripped customer -> (corp, status)
+    resolved: dict[str, tuple[str, str]] = {}
 
-    def _resolve(raw: object) -> str:
-        norm = _normalize_name(raw)
-        if not norm:
-            return CORP_GROUP_UNMAPPED
-        if norm in resolved_cache:
-            return resolved_cache[norm]
-        corp = name_to_corp.get(norm)
-        if corp is None:  # containment fallback (either direction)
-            for key in keys_by_len:
-                if key in norm or norm in key:
-                    corp = name_to_corp[key]
-                    break
-        result = corp or CORP_GROUP_UNMAPPED
-        resolved_cache[norm] = result
-        if result == CORP_GROUP_UNMAPPED:
-            unmapped.add(str(raw).strip())
-        return result
+    def _lookup(raw: object) -> str:
+        cust = str(raw).strip()
+        if cust not in resolved:
+            resolved[cust] = _resolve_one(raw, name_to_corp, keys_by_len)
+        return resolved[cust][0]
 
-    return customers.map(_resolve), unmapped
+    corp_series = customers.map(_lookup)
+    log = pd.DataFrame(
+        [
+            {MATCH_COL_CUSTOMER: cust, MATCH_COL_CORP: corp, MATCH_COL_STATUS: status}
+            for cust, (corp, status) in resolved.items()
+        ],
+        columns=list(MATCH_COLUMNS),
+    )
+    if not log.empty:
+        log = (
+            log.assign(_rank=log[MATCH_COL_STATUS].map(_MATCH_RANK).fillna(9))
+            .sort_values(["_rank", MATCH_COL_CUSTOMER])
+            .drop(columns="_rank")
+            .reset_index(drop=True)
+        )
+    return corp_series, log
 
 
 # ── Leg builders ─────────────────────────────────────────────────────────────
@@ -257,6 +309,10 @@ def _filter_b2c(
     return df[bu == "B2C"]
 
 
+def _empty_match_log() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(MATCH_COLUMNS))
+
+
 def _build_ro_leg(
     ro_seed_df: Optional[pd.DataFrame],
     tbl_months_df: Optional[pd.DataFrame],
@@ -264,58 +320,40 @@ def _build_ro_leg(
     ro_master_df: Optional[pd.DataFrame],
     name_to_corp: dict[str, str],
     anchor_month: date,
-) -> tuple[pd.DataFrame, set[str]]:
-    """Expand RO_Seed → long R&O rows, corp-group by Customer, B2C-filtered."""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Expand RO_Seed → long R&O rows, corp-group by Customer, B2C-filtered.
+
+    Returns ``(grouped R&O frame, customer match log)``.
+    """
     if ro_seed_df is None or ro_seed_df.empty or tbl_months_df is None:
-        return _empty_frame(), set()
+        return _empty_frame(), _empty_match_log()
 
-    # Reuse the pipeline's Format×Month 36-month expansion (keeps Customer).
+    # Reuse the pipeline's Format×Month 36-month expansion (keeps Customer)
+    # AND its melt→month-map reshape, requesting the extra Customer id column
+    # so each R&O row can carry its own Corporate Group.
     ro_input = _build_tbl_ro_input(ro_seed_df, anchor_month, _NullLog())
-    month_cols = [f"Month {i}" for i in range(1, _N_MONTHS + 1)]
-
     qry_months = tbl_months_df.copy()
     qry_months["Start of Month"] = _parse_dates(qry_months["Start of Month"])
     qry_months["Month Number"] = qry_months["Month Number"].astype(str).str.strip()
 
-    ro_long = (
-        ro_input[["Item #", "Item Desc", "Customer"] + month_cols]
-        .melt(
-            id_vars=["Item #", "Item Desc", "Customer"], value_vars=month_cols,
-            var_name="Attribute", value_name="Value",
-        )
-        .assign(
-            Attribute=lambda d: d["Attribute"].astype(str).str.strip(),
-            Value=lambda d: pd.to_numeric(
-                d["Value"].astype(str).str.replace(",", "", regex=False)
-                          .str.replace("-", "0", regex=False).str.strip(),
-                errors="coerce").fillna(0),
-        )
-        # Grain KEEPS Customer (unlike the IBP portion, which collapses it) so
-        # each R&O row can carry its own Corporate Group.
-        .groupby(["Item #", "Item Desc", "Customer", "Attribute"], as_index=False)
-        .agg(Pounds=("Value", "sum"))
-        .merge(qry_months, left_on="Attribute", right_on="Month Number", how="left")
-        .rename(columns={
-            "Item #": HDP_COL_ITEM, "Pounds": HDP_COL_POUNDS,
-            "Start of Month": HDP_COL_MONTH,
-        })
-        .assign(**{HDP_COL_ITEM: lambda d: _norm_item(d[HDP_COL_ITEM])})
-    )
+    ro_long = _ro_input_to_long(
+        ro_input, qry_months, extra_id_cols=("Customer",),
+    ).rename(columns={"Start of Month": HDP_COL_MONTH})
     ro_long = ro_long[(ro_long[HDP_COL_POUNDS] > 0) & ro_long[HDP_COL_MONTH].notna()]
     if ro_long.empty:
-        return _empty_frame(), set()
+        return _empty_frame(), _empty_match_log()
 
     ro_long = _filter_b2c(ro_long, pdh_df, ro_master_df)
     if ro_long.empty:
-        return _empty_frame(), set()
+        return _empty_frame(), _empty_match_log()
 
-    corp, unmapped = _map_customers_to_corp(ro_long["Customer"], name_to_corp)
+    corp, match_log = _resolve_customer_corp(ro_long["Customer"], name_to_corp)
     ro_long = ro_long.assign(**{
         HDP_COL_CORP: corp.values,
         HDP_COL_FORECAST: FORECAST_R_AND_O,
     })
     ro_long[HDP_COL_MONTH] = ro_long[HDP_COL_MONTH].dt.normalize()
-    return _group(ro_long), unmapped
+    return _group(ro_long), match_log
 
 
 # ── Public builder + orchestrator ────────────────────────────────────────────
@@ -333,13 +371,13 @@ def build_holistic_demand_plan_aps(
     """Merge the APS Base Plan + R&O legs into the unified plan (pure)."""
     name_to_corp = _build_name_to_corp(customer_names_df)
     aps_leg = _build_aps_leg(aps_df)
-    ro_leg, unmapped = _build_ro_leg(
+    ro_leg, match_log = _build_ro_leg(
         ro_seed_df, tbl_months_df, pdh_df, ro_master_df, name_to_corp, anchor_month,
     )
     frame = pd.concat([aps_leg, ro_leg], ignore_index=True)[list(HDP_COLUMNS)]
     return HolisticPlanResult(
         frame=frame,
-        unmapped_customers=tuple(sorted(unmapped)),
+        customer_match_log=match_log,
         aps_rows=len(aps_leg),
         ro_rows=len(ro_leg),
     )
@@ -379,6 +417,8 @@ __all__ = [
     "HDP_COLUMNS", "HDP_COL_MONTH", "HDP_COL_ITEM", "HDP_COL_CORP",
     "HDP_COL_POUNDS", "HDP_COL_FORECAST",
     "FORECAST_APS_BASE_PLAN", "FORECAST_R_AND_O",
+    "MATCH_COLUMNS", "MATCH_COL_CUSTOMER", "MATCH_COL_CORP", "MATCH_COL_STATUS",
+    "MATCH_EXACT", "MATCH_FUZZY", "MATCH_UNMAPPED",
     "HolisticDemandPlanError", "HolisticPlanResult",
     "build_holistic_demand_plan_aps", "generate_holistic_demand_plan_aps",
 ]

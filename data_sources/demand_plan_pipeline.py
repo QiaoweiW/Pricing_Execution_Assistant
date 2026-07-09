@@ -210,6 +210,46 @@ def _build_tbl_ro_input(
     return wide
 
 
+def _ro_input_to_long(
+    ro_input: pd.DataFrame,
+    qry_months: pd.DataFrame,
+    *,
+    extra_id_cols: tuple[str, ...] = (),
+) -> pd.DataFrame:
+    """Melt the wide ``tbl_ro_input`` (Month 1..36) into long R&O rows.
+
+    Shared by the IBP mgmt-plan build (``extra_id_cols=()`` — collapses
+    across customers, one row per Item × month) and the APS Holistic Demand
+    Plan build (``extra_id_cols=("Customer",)`` — keeps per-customer rows so
+    each can carry its own Corporate Group).  ``qry_months`` supplies the
+    ``Month Number → Start of Month`` mapping (parsed by the caller).
+
+    Returns columns ``[*extra_id_cols, Item, Item Description,
+    Start of Month, Demand Plan Pounds]``.
+    """
+    month_cols = [f"Month {i}" for i in range(1, _N_MONTHS + 1)]
+    id_cols = ["Item #", "Item Desc", *extra_id_cols]
+    return (
+        ro_input[id_cols + month_cols]
+        .melt(id_vars=id_cols, value_vars=month_cols,
+              var_name="Attribute", value_name="Value")
+        .assign(
+            Attribute=lambda d: d["Attribute"].astype(str).str.strip(),
+            Value=lambda d: pd.to_numeric(
+                d["Value"].astype(str).str.replace(",", "", regex=False)
+                          .str.replace("-", "0", regex=False).str.strip(),
+                errors="coerce").fillna(0),
+        )
+        .groupby(id_cols + ["Attribute"], as_index=False).agg(Pounds=("Value", "sum"))
+        .merge(qry_months, left_on="Attribute", right_on="Month Number", how="left")
+        .rename(columns={"Item #": "Item", "Item Desc": "Item Description",
+                         "Pounds": "Demand Plan Pounds"})
+        .assign(**{"Item": lambda d: _norm_item(d["Item"])})
+        [[*extra_id_cols, "Item", "Item Description",
+          "Start of Month", "Demand Plan Pounds"]]
+    )
+
+
 # ── Stage 2: Base Plan + R&O → mgmt_plan_full + item×customer detail ──────────
 
 def _build_mgmt_plan_and_detail(
@@ -228,6 +268,7 @@ def _build_mgmt_plan_and_detail(
     base-plan branch), exactly like the source notebook cell — so the heavy
     work is done once. Returns ``(mgmt_full, detail)``.
     """
+    # Still needed by the detail branch (_build_detail) below.
     month_cols = [f"Month {i}" for i in range(1, _N_MONTHS + 1)]
 
     # Month-number → Start-of-Month lookup.
@@ -254,26 +295,10 @@ def _build_mgmt_plan_and_detail(
         })
     )
 
-    # --- R&O branch → unpivot Month 1..36 to long ----------------------------
+    # --- R&O branch → unpivot Month 1..36 to long (shared helper) ------------
     ro_long = (
-        ro_input[["Item #", "Item Desc"] + month_cols]
-        .melt(id_vars=["Item #", "Item Desc"], value_vars=month_cols,
-              var_name="Attribute", value_name="Value")
-        .assign(
-            Attribute=lambda d: d["Attribute"].astype(str).str.strip(),
-            Value=lambda d: pd.to_numeric(
-                d["Value"].astype(str).str.replace(",", "", regex=False)
-                          .str.replace("-", "0", regex=False).str.strip(),
-                errors="coerce").fillna(0),
-        )
-        .groupby(["Item #", "Item Desc", "Attribute"], as_index=False)
-        .agg(Pounds=("Value", "sum"))
-        .merge(qry_months, left_on="Attribute", right_on="Month Number", how="left")
-        .drop(columns=["Attribute", "Month Number"])
-        .rename(columns={"Item #": "Item", "Item Desc": "Item Description",
-                         "Pounds": "Demand Plan Pounds"})
-        .assign(**{"Item": lambda d: _norm_item(d["Item"]),
-                   "Forecast Type": "R&O", "_ibp_row_id": pd.NA})
+        _ro_input_to_long(ro_input, qry_months)
+        .assign(**{"Forecast Type": "R&O", "_ibp_row_id": pd.NA})
         [["_ibp_row_id", "Item", "Item Description", "Start of Month",
           "Forecast Type", "Demand Plan Pounds"]]
     )

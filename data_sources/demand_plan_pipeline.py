@@ -48,6 +48,7 @@ from .ro_seed_pipeline import LogEntry, _Log
 from .fabric_lakehouse_io import (
     LakehouseIOError,
     archive_bytes,
+    read_bytes,
     read_csv,
     write_bytes,
     write_csv,
@@ -70,6 +71,9 @@ _MGMT_PLAN_FULL_BLOB: str = f"{_BASE}/qry_mgmt_plan_full.csv"
 _DETAIL_BLOB: str = f"{_BASE}/qry_demand_item_customer_detail.csv"
 _TOTAL_ITEM_BLOB: str = f"{_BASE}/qry_total_item_level_demand.csv"
 _HISTORY_TRACKER_BLOB: str = f"{_BASE}/qry_mgmt_plan_history_tracker.csv"
+# Timestamped copies of the plan CSVs are dropped here before each overwrite
+# (audit / rollback), mirroring the base-plan upload archive above.
+_DEMAND_PLAN_ARCHIVE_DIR: str = f"{_BASE}/Archive"
 
 # Read every CSV as raw strings, blanks preserved — the pipeline does its own
 # typing (notebook parity).
@@ -90,14 +94,22 @@ _BASE_PLAN_REQUIRED = [
     "Start of Month", "Item", "Item Description", "Value", "Total",
     "Corporate Group", "month", "Cycle",
 ]
-# qry_mgmt_plan_full.csv schema (also the history tracker minus Cycle).
+# Item-level attributes resolved PDH-first, RO-master-fallback (per field).
+_ATTR_COLS = ["Portfolio Major", "Portfolio Minor", "Supply Format"]
+# Carried on qry_mgmt_plan_full + the history tracker so the Demand Plan
+# Comparison reads its categorisation dims straight off the file instead of
+# re-joining PDH + RO_Item_Master.  All three PDH dims travel; Brand is NOT
+# carried — the comparison derives it from the Item Description (already on the
+# file), so there is no need to persist it.
+_MGMT_ATTR_COLS = list(_ATTR_COLS)
+# qry_mgmt_plan_full.csv schema (also the history tracker minus Cycle).  The
+# two attribute columns are appended LAST so any legacy reader that indexes by
+# name still works and a plain column-order diff stays readable.
 _MGMT_FULL_COLUMNS = [
     "Start of Month", "Item", "Item Description", "Party Site Number",
     "Demand Plan Pounds", "Forecast Type", "Business Unit",
-]
+] + _MGMT_ATTR_COLS
 _TRACKER_COLUMNS = _MGMT_FULL_COLUMNS + ["Cycle"]
-# Item-level attributes resolved PDH-first, RO-master-fallback (per field).
-_ATTR_COLS = ["Portfolio Major", "Portfolio Minor", "Supply Format"]
 
 
 @dataclass
@@ -147,6 +159,47 @@ def _lbs(series: pd.Series) -> pd.Series:
     """Coerce a possibly comma-formatted pounds column to numeric."""
     return pd.to_numeric(
         series.astype(str).str.replace(",", "", regex=False), errors="coerce")
+
+
+def _attach_item_attrs(
+    df: pd.DataFrame,
+    pdh: pd.DataFrame,
+    ro_master: pd.DataFrame,
+    *,
+    cols: list[str] = _ATTR_COLS,
+) -> pd.DataFrame:
+    """Attach item attributes to *df* on ``Item``, PDH-primary → RO-master fallback.
+
+    Per-field coalesce (PDH wins, RO_Item_Master fills blanks) exactly as the
+    detail branch has always done — extracted to module scope so both the
+    ``qry_mgmt_plan_full`` slice and the ``qry_demand_item_customer_detail``
+    branch share ONE definition (no duplicated merge logic).  *cols* selects
+    which attributes to bring across (e.g. just Portfolio Major + Supply Format
+    for the mgmt-plan/tracker files).  Missing source columns degrade to blank.
+    """
+    def _lookup(src: pd.DataFrame, item_col: str, suffix: str) -> pd.DataFrame:
+        present = [c for c in cols if c in src.columns]
+        if item_col not in src.columns or not present:
+            return pd.DataFrame(columns=["Item", *[f"{c}_{suffix}" for c in cols]])
+        out = (
+            src[[item_col, *present]].dropna(subset=[item_col])
+            .assign(**{item_col: lambda d: _norm_item(d[item_col])})
+            .drop_duplicates(item_col, keep="first")
+            .rename(columns={item_col: "Item", **{c: f"{c}_{suffix}" for c in present}})
+        )
+        for c in cols:                       # keep a stable, complete column set
+            if f"{c}_{suffix}" not in out.columns:
+                out[f"{c}_{suffix}"] = pd.NA
+        return out
+
+    d = (
+        df.merge(_lookup(pdh, "Item No", "pdh"), on="Item", how="left")
+          .merge(_lookup(ro_master, "Item #", "ro"), on="Item", how="left")
+    )
+    for c in cols:
+        d[c] = (d[f"{c}_pdh"].astype("string").str.strip()
+                  .combine_first(d[f"{c}_ro"].astype("string").str.strip()))
+    return d.drop(columns=[f"{c}_pdh" for c in cols] + [f"{c}_ro" for c in cols])
 
 
 def _single_value(series: pd.Series, label: str) -> str:
@@ -331,6 +384,10 @@ def _build_mgmt_plan_and_detail(
     combined = combined.drop(columns=["Business Unit_pdh"])
     combined = combined[combined["Business Unit"] == "B2C"].reset_index(drop=True)
 
+    # Attach Portfolio Major + Supply Format so the file is self-describing and
+    # the Demand Plan Comparison no longer re-joins PDH/RO_Item_Master.
+    combined = _attach_item_attrs(combined, pdh, ro_master, cols=_MGMT_ATTR_COLS)
+
     mgmt_full = combined[_MGMT_FULL_COLUMNS].copy()
     assert mgmt_full["Forecast Type"].notna().all(), "Forecast Type has nulls!"
     assert (mgmt_full["Business Unit"] == "B2C").all(), "Non-B2C rows leaked through!"
@@ -371,22 +428,8 @@ def _build_detail(
         return d[d["Business Unit"] == "B2C"].drop(columns=["Business Unit"]).reset_index(drop=True)
 
     def _attach_attrs(df: pd.DataFrame) -> pd.DataFrame:
-        pdh_attr = (
-            pdh[["Item No"] + _ATTR_COLS].dropna(subset=["Item No"])
-            .assign(**{"Item No": lambda d: _norm_item(d["Item No"])})
-            .drop_duplicates("Item No", keep="first")
-            .rename(columns={"Item No": "Item", **{c: f"{c}_pdh" for c in _ATTR_COLS}}))
-        ro_attr = (
-            ro_master[["Item #"] + _ATTR_COLS].dropna(subset=["Item #"])
-            .assign(**{"Item #": lambda d: _norm_item(d["Item #"])})
-            .drop_duplicates("Item #", keep="first")
-            .rename(columns={"Item #": "Item", **{c: f"{c}_ro" for c in _ATTR_COLS}}))
-        d = df.merge(pdh_attr, on="Item", how="left").merge(ro_attr, on="Item", how="left")
-        for c in _ATTR_COLS:
-            d[c] = (d[f"{c}_pdh"].astype("string").str.strip()
-                      .combine_first(d[f"{c}_ro"].astype("string").str.strip()))
-        return d.drop(columns=[f"{c}_pdh" for c in _ATTR_COLS]
-                              + [f"{c}_ro" for c in _ATTR_COLS])
+        # Full attribute set (incl. Portfolio Minor) for the item×customer detail.
+        return _attach_item_attrs(df, pdh, ro_master, cols=_ATTR_COLS)
 
     # A. Base-plan detail — Customer Name = Corporate Group via _ibp_row_id.
     ibp_cust = base_plan[["_ibp_row_id", "Corporate Group"]].copy()
@@ -513,6 +556,13 @@ def _append_history_tracker(
         "Demand Plan Pounds": mgmt_full["Demand Plan Pounds"].astype("string").str.replace(r"\.0$", "", regex=True).to_numpy(),
         "Forecast Type":      mgmt_full["Forecast Type"].astype("string").str.strip().to_numpy(),
         "Business Unit":      mgmt_full["Business Unit"].astype("string").str.strip().to_numpy(),
+        # Portfolio Major / Supply Format carried through from mgmt_full so the
+        # tracker is self-describing (comparison reads them directly).  Tolerant
+        # of a legacy mgmt_full that predates these columns → blank.
+        **{c: (mgmt_full[c] if c in mgmt_full.columns
+               else pd.Series("", index=mgmt_full.index))
+              .astype("string").str.strip().fillna("").to_numpy()
+           for c in _MGMT_ATTR_COLS},
         "Cycle":              cycle_label,
     })[_TRACKER_COLUMNS]
 
@@ -650,6 +700,21 @@ def run_demand_plan_pipeline(
         total_item = _build_total_item_level_demand(mgmt_full, pdh, ro_master, log)
         history_combined = _append_history_tracker(mgmt_full, cycle, log)
 
+        # ---- Archive the CURRENT plan CSVs before overwriting them ----------
+        # A timestamped copy of each file about to be replaced lands in the
+        # Archive folder (audit / rollback), same contract as the base-plan
+        # upload archive above.  Best-effort: a missing file or archive hiccup
+        # is logged, never fatal.
+        for blob, leaf in ((_MGMT_PLAN_FULL_BLOB, "qry_mgmt_plan_full.csv"),
+                           (_HISTORY_TRACKER_BLOB, "qry_mgmt_plan_history_tracker.csv")):
+            try:
+                prev, _etag = read_bytes(_SECRETS_SECTION, blob)
+                if prev is not None:
+                    dest = archive_bytes(_SECRETS_SECTION, _DEMAND_PLAN_ARCHIVE_DIR, leaf, prev)
+                    log.info(f"Archived previous '{leaf}' → 'Files/{dest}'.")
+            except LakehouseIOError as exc:
+                log.warn(f"Could not archive previous '{leaf}' (continuing): {exc}")
+
         # ---- Write outputs (only after every compute step succeeded) --------
         iso = {"date_format": "%Y-%m-%d"}
         write_csv(_SECRETS_SECTION, _TBL_RO_INPUT_BLOB, tbl_ro_input, etag=None, to_csv_kwargs=iso)
@@ -681,4 +746,104 @@ def run_demand_plan_pipeline(
         return result
 
 
-__all__ = ["DemandPlanResult", "run_demand_plan_pipeline"]
+@dataclass
+class BackfillResult:
+    """Outcome of :func:`backfill_plan_attribute_columns` (per file)."""
+    ok: bool
+    log: list[LogEntry] = field(default_factory=list)
+    mgmt_full_rows: Optional[int] = None
+    tracker_rows: Optional[int] = None
+    mgmt_full_archived: Optional[str] = None
+    tracker_archived: Optional[str] = None
+
+
+def _backfill_one(
+    df: pd.DataFrame, columns: list[str], pdh: pd.DataFrame, ro_master: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return *df* with Portfolio Major / Supply Format present + populated.
+
+    Existing non-blank values are preserved (manual fixes win); blanks and
+    missing columns are filled from the PDH → RO_Item_Master cascade.  Column
+    order is normalised to *columns* (mgmt-full or tracker schema).
+    """
+    out = df.copy()
+    out["Item"] = _norm_item(out["Item"])
+    cascade = _attach_item_attrs(
+        out[["Item"]].copy(), pdh, ro_master, cols=_MGMT_ATTR_COLS)
+    for c in _MGMT_ATTR_COLS:
+        existing = (out[c].astype("string").str.strip()
+                    if c in out.columns else pd.Series(pd.NA, index=out.index, dtype="string"))
+        filled = cascade[c].astype("string").str.strip()
+        out[c] = existing.where(existing.fillna("") != "", filled).fillna("")
+    for c in columns:                     # tolerate any other legacy-missing column
+        if c not in out.columns:
+            out[c] = ""
+    return out[columns]
+
+
+def backfill_plan_attribute_columns() -> BackfillResult:
+    """One-shot: add Portfolio Major + Supply Format to the two live plan CSVs.
+
+    For migrating the EXISTING ``qry_mgmt_plan_full.csv`` and
+    ``qry_mgmt_plan_history_tracker.csv`` in place (no base-plan re-run needed).
+    Steps, per file: archive a timestamped copy to the Archive folder, enrich
+    with the two attribute columns (PDH-primary → RO_Item_Master fallback,
+    preserving any existing values), and write it back with the columns in the
+    canonical schema order.  Idempotent — safe to re-run.  Never raises;
+    failures come back as ``ok=False`` with an error log entry.
+    """
+    log = _Log()
+    result = BackfillResult(ok=False, log=log.entries)
+    try:
+        pdh, _ = read_csv(_SECRETS_SECTION, _PDH_BLOB, read_csv_kwargs=_STR_READ_KW)
+        if pdh is None:
+            pdh = pd.DataFrame(columns=["Item No"] + _ATTR_COLS)
+            log.warn(f"'Files/{_PDH_BLOB}' not found — Portfolio Major/Supply Format "
+                     "will fill only from RO_Item_Master.")
+        ro_master, _ = read_csv(_SECRETS_SECTION, _RO_ITEMS_BLOB, read_csv_kwargs=_STR_READ_KW)
+        if ro_master is None:
+            ro_master = pd.DataFrame(columns=["Item #"] + _ATTR_COLS)
+            log.warn(f"'Files/{_RO_ITEMS_BLOB}' not found — RO_Item_Master fallback unavailable.")
+
+        for blob, leaf, columns, is_tracker in (
+            (_MGMT_PLAN_FULL_BLOB, "qry_mgmt_plan_full.csv", _MGMT_FULL_COLUMNS, False),
+            (_HISTORY_TRACKER_BLOB, "qry_mgmt_plan_history_tracker.csv", _TRACKER_COLUMNS, True),
+        ):
+            df, _ = read_csv(_SECRETS_SECTION, blob, read_csv_kwargs=_STR_READ_KW)
+            if df is None or df.empty:
+                log.warn(f"'Files/{leaf}' is missing or empty — skipped.")
+                continue
+            prev_bytes, _ = read_bytes(_SECRETS_SECTION, blob)
+            if prev_bytes is not None:
+                dest = archive_bytes(_SECRETS_SECTION, _DEMAND_PLAN_ARCHIVE_DIR, leaf, prev_bytes)
+                log.info(f"Archived '{leaf}' → 'Files/{dest}'.")
+                if is_tracker:
+                    result.tracker_archived = dest
+                else:
+                    result.mgmt_full_archived = dest
+            enriched = _backfill_one(df, columns, pdh, ro_master)
+            # Preserve on-disk text style (already strings) — no date reformat.
+            write_csv(_SECRETS_SECTION, blob, enriched, etag=None)
+            filled = int((enriched[_MGMT_ATTR_COLS].apply(
+                lambda s: s.astype(str).str.strip() != "").any(axis=1)).sum())
+            log.ok(f"{leaf}: wrote {len(enriched):,} rows, {filled:,} with a "
+                   f"Portfolio Major/Supply Format value.")
+            if is_tracker:
+                result.tracker_rows = len(enriched)
+            else:
+                result.mgmt_full_rows = len(enriched)
+
+        result.ok = True
+        return result
+    except LakehouseIOError as exc:
+        log.err(f"Fabric I/O error during backfill: {exc}")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        log.err(f"Backfill failed: {exc}")
+        return result
+
+
+__all__ = [
+    "DemandPlanResult", "run_demand_plan_pipeline",
+    "BackfillResult", "backfill_plan_attribute_columns",
+]

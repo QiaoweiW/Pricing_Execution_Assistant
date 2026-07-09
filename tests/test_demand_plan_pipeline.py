@@ -60,6 +60,9 @@ def _patch_io(monkeypatch, reads: dict) -> dict:
     monkeypatch.setattr(dp, "read_csv",
                         lambda sec, path, read_csv_kwargs=None:
                         (reads[path].copy() if path in reads else None, "e"))
+    # The orchestrator archives the previous plan CSVs (read_bytes → archive_bytes)
+    # before overwriting; simulate a prior copy existing so the archive path runs.
+    monkeypatch.setattr(dp, "read_bytes", lambda sec, path: (b"prev", "e"))
     monkeypatch.setattr(dp, "write_csv",
                         lambda sec, path, df, etag=None, to_csv_kwargs=None:
                         (written.__setitem__(path, df.copy()), "e")[1])
@@ -82,6 +85,10 @@ def test_pipeline_builds_all_outputs_and_filters_b2c(monkeypatch):
 
     mgmt = written[dp._MGMT_PLAN_FULL_BLOB]
     assert list(mgmt.columns) == dp._MGMT_FULL_COLUMNS
+    # Portfolio Major + Supply Format now travel on the file itself.
+    assert {"Portfolio Major", "Supply Format"} <= set(mgmt.columns)
+    row = mgmt[mgmt["Item"] == "310180"].iloc[0]
+    assert row["Portfolio Major"] == "Butter" and row["Supply Format"] == "Carton"
     assert (mgmt["Business Unit"] == "B2C").all()
     # Unknown item 999999 (no PDH/RO match → no BU) is dropped.
     assert "999999" not in set(mgmt["Item"])
@@ -96,11 +103,15 @@ def test_pipeline_upserts_history_with_authored_cycle(monkeypatch):
     assert res.ok
 
     hist = written[dp._HISTORY_TRACKER_BLOB]
+    assert list(hist.columns) == dp._TRACKER_COLUMNS      # PMaj/SFmt + Cycle carried
     assert set(hist["Cycle"]) == {"C4", "C5"}            # C4 kept, C5 appended
     c5 = hist[hist["Cycle"] == "C5"]
     # Tracker text style: M/D/YYYY dates, trailing .0 stripped.
     assert "6/1/2026" in set(c5["Start of Month"])
     assert "1944" in set(c5["Demand Plan Pounds"])
+    # New rows carry Portfolio Major / Supply Format from the enriched mgmt_full.
+    assert set(c5["Portfolio Major"]) == {"Butter"}
+    assert set(c5["Supply Format"]) == {"Carton"}
 
 
 def test_pipeline_idempotent_on_same_cycle(monkeypatch):
@@ -134,6 +145,33 @@ def test_pipeline_skips_write_when_seed_missing(monkeypatch):
     res = dp.run_demand_plan_pipeline(_base_plan_bytes())
     assert not res.ok
     assert dp._MGMT_PLAN_FULL_BLOB not in written        # nothing written
+
+
+def test_backfill_adds_attribute_columns_and_archives(monkeypatch):
+    """backfill_plan_attribute_columns enriches both files in place + archives first."""
+    src = _sources()
+    # Existing files on the LEGACY schema (no Portfolio Major / Supply Format).
+    legacy_mgmt = pd.DataFrame({
+        "Start of Month": ["2026-06-01"], "Item": ["310180"], "Item Description": ["DG"],
+        "Party Site Number": ["10036"], "Demand Plan Pounds": ["2000"],
+        "Forecast Type": ["Base Plan"], "Business Unit": ["B2C"],
+    })
+    legacy_trk = legacy_mgmt.assign(Cycle="C5")
+    reads = {dp._PDH_BLOB: src[dp._PDH_BLOB], dp._RO_ITEMS_BLOB: src[dp._RO_ITEMS_BLOB],
+             dp._MGMT_PLAN_FULL_BLOB: legacy_mgmt, dp._HISTORY_TRACKER_BLOB: legacy_trk}
+    written = _patch_io(monkeypatch, reads)
+
+    res = dp.backfill_plan_attribute_columns()
+    assert res.ok, res.errors
+    assert res.mgmt_full_archived and res.tracker_archived   # archived before write
+
+    mgmt = written[dp._MGMT_PLAN_FULL_BLOB]
+    assert list(mgmt.columns) == dp._MGMT_FULL_COLUMNS
+    assert mgmt.iloc[0]["Portfolio Major"] == "Butter"
+    assert mgmt.iloc[0]["Supply Format"] == "Carton"
+    trk = written[dp._HISTORY_TRACKER_BLOB]
+    assert list(trk.columns) == dp._TRACKER_COLUMNS
+    assert trk.iloc[0]["Supply Format"] == "Carton"
 
 
 def test_history_tracker_dedupes_identical_rows(monkeypatch):

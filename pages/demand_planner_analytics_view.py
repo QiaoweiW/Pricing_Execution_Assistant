@@ -222,10 +222,15 @@ from data_sources.ship_to_sites import (
 )
 from data_sources.holistic_demand_plan_aps import (
     HolisticDemandPlanError,
+    MATCH_COL_CORP,
+    MATCH_COL_CUSTOMER,
     MATCH_COL_STATUS,
     MATCH_EXACT,
     MATCH_FUZZY,
+    MATCH_OVERRIDE,
     MATCH_UNMAPPED,
+    apply_customer_corp_overrides,
+    filter_needs_review,
     generate_holistic_demand_plan_aps,
 )
 from data_sources.product_line_review import (
@@ -277,11 +282,10 @@ from data_sources.ro_summary_report import (
     COL_DELTA_EXIT as SR_COL_DELTA_EXIT,
     COL_DELTA_NEW as SR_COL_DELTA_NEW,
     COL_CURRENT_PLAN as SR_COL_CURRENT_PLAN,
-    COL_DIM_BCAT as SR_COL_DIM_BCAT,
-    COL_DIM_PMAJ as SR_COL_DIM_PMAJ,
-    COL_DIM_PMINOR as SR_COL_DIM_PMINOR,
-    COL_DIM_SFMT as SR_COL_DIM_SFMT,
+    COL_INDENT as SR_COL_INDENT,
+    COL_IS_SUBTOTAL as SR_COL_IS_SUBTOTAL,
     COL_LABEL as SR_COL_LABEL,
+    COL_PRIOR_PLAN as SR_COL_PRIOR_PLAN,
     COL_ROW_ID as SR_COL_ROW_ID,
     COL_TOTAL_DELTA as SR_COL_TOTAL_DELTA,
     COL_Y1_CHANGE as SR_COL_Y1_CHANGE,
@@ -2313,10 +2317,12 @@ def _render_summary_report_section() -> None:
     st.caption(
         "Hierarchical roll-up of the **current in-memory comparison** — "
         "FY27 Probabilized Lbs in millions, by Portfolio / Supply Format / "
-        "Brand Category.  Independent of the field filters above; "
-        "automatically rebuilds when you change the Prior / LE month "
-        "pickers.  All-zero rows are hidden by default — tick **Show "
-        "empty rows** to enter values into a row that currently has none."
+        "Brand Category.  **Reacts to the field filters and the Prior / LE "
+        "month pickers above** — narrow the filters and the table below "
+        "recomputes.  Read-only presentation (edit values in the RO "
+        "Comparison editor above); all-zero rows are hidden by default.  "
+        "The Download / Save actions always publish the **full, unfiltered** "
+        "30-row report so downstream consumers keep a stable shape."
     )
     _render_summary_report_fragment()
 
@@ -2413,8 +2419,8 @@ def _render_summary_report_fragment() -> None:
             key="ro_sr_show_empty_toggle",
             help=(
                 "By default, rows whose every column is zero are hidden. "
-                "Tick to reveal them — useful if you want to enter a "
-                "value into a row that has no upstream match."
+                "Tick to reveal them — useful to see a row that currently "
+                "has no upstream match under the active filters."
             ),
         )
 
@@ -2430,72 +2436,57 @@ def _render_summary_report_fragment() -> None:
     report_warnings: list[str] = st.session_state.get(_SS_SUMMARY_REPORT_WARNINGS, [])
     _render_summary_report_warnings(report_warnings)
 
-    # ── Render the editor ────────────────────────────────────────
-    view_df = full_df if show_empty else drop_all_zero_rows(full_df)
-    if view_df.empty:
-        # No visible rows, but the full template may still exist in
-        # session — offer download/save of the all-zero shape.
-        export_ready = recompute_subtotals(
-            full_df,
-            st.session_state.get(_SS_SUMMARY_REPORT_TEMPLATE),
+    # ── Dynamic display frame — react to the RO Comparison filters ─
+    #
+    # The persisted report (full_df) is ALWAYS built from the unfiltered
+    # comparison so the Download/Save shape stays stable for downstream
+    # consumers.  For the on-screen table only, we re-roll the report over
+    # the field-filtered comparison so the planner sees exactly the slice
+    # their filters select.  Cheap (≤30-row template) so it's fine to do
+    # every render; skipped entirely when no filter is active.
+    filter_state = _read_filter_state_from_session()
+    filters_active = any(sel for sel in filter_state.values())
+    if filters_active:
+        try:
+            display_full, _fw, _ft = build_summary_report(
+                _apply_filters(summary_df, filter_state)
+            )
+        except RoSummaryReportError as exc:
+            st.warning(
+                "Could not apply the field filters to the report "
+                f"({exc}); showing the unfiltered roll-up."
+            )
+            display_full = full_df
+    else:
+        display_full = full_df
+
+    display_df = display_full if show_empty else drop_all_zero_rows(display_full)
+
+    if filters_active:
+        st.caption(
+            f"🔎 Filtered by the field filters above — showing "
+            f"**{len(drop_all_zero_rows(display_full))}** non-empty rows."
         )
-        _render_summary_report_actions(export_ready)
+
+    # ── Render the read-only, screenshot-styled report ────────────
+    if display_df.empty:
         st.info(
-            "Every row is zero — nothing to display.  Tick **Show empty "
-            "rows** to edit the template directly, or change the Prior / "
-            "LE pickers above to a month pair with comparison data."
+            "No rows match the current filters / month pair.  Clear a "
+            "field filter above, tick **Show empty rows**, or change the "
+            "Prior / LE pickers to a month pair with comparison data."
         )
-        return
+    else:
+        _render_ro_summary_html(display_df)
 
-    editor_cols = _summary_report_column_order()
-    editor_df = view_df.loc[:, [c for c in editor_cols if c in view_df.columns]]
-    sr_row_ids = (
-        view_df[SR_COL_ROW_ID].tolist()
-        if SR_COL_ROW_ID in view_df.columns
-        else []
-    )
-    sr_labels = (
-        view_df[SR_COL_LABEL].tolist()
-        if SR_COL_LABEL in view_df.columns
-        else []
-    )
-
-    def _style_ro_row(row: pd.Series) -> list[str]:
-        return _style_ro_summary_editor_row(
-            row, row_ids=sr_row_ids, labels=sr_labels,
-        )
-
-    styled_editor_df = editor_df.style.apply(_style_ro_row, axis=1)
-    edited_view = st.data_editor(
-        styled_editor_df,
-        key="ro_sr_editor",
-        num_rows="fixed",
-        use_container_width=True,
-        # Header (38) + per-row (35) sized to fit the whole template
-        # without scrolling for the common ~10-30 visible row range,
-        # capped so a huge template doesn't dominate the page.
-        height=min(35 * (len(editor_df) + 1) + 38, 900),
-        column_config=_summary_report_column_config(),
-        column_order=editor_cols,
-        hide_index=True,
-    )
-
-    # Merge the (possibly-edited) view back into the full template
-    # frame, then ALWAYS recompute subtotals so the displayed totals
-    # and the saved CSV match — even if a planner edited a subtotal
-    # cell directly (Streamlit's data_editor can't disable per-cell,
-    # only per-column, so subtotal edits are technically allowed).
-    merged = full_df.copy()
-    overlap = [c for c in edited_view.columns if c in merged.columns]
-    merged.loc[edited_view.index, overlap] = edited_view[overlap].values
-    merged = recompute_subtotals(
-        merged,
+    # ── Download + Save — always the FULL, unfiltered report ─────
+    #
+    # Read-only display, so nothing is merged back; recompute subtotals
+    # defensively (idempotent) so a session-reloaded frame still balances.
+    export_ready = recompute_subtotals(
+        full_df,
         st.session_state.get(_SS_SUMMARY_REPORT_TEMPLATE),
     )
-    st.session_state[_SS_SUMMARY_REPORT_DF] = merged
-
-    # ── Download + Save (after editor — reflects live edits) ─────
-    _render_summary_report_actions(merged)
+    _render_summary_report_actions(export_ready)
 
 
 def _render_summary_report_actions(export_df: pd.DataFrame) -> None:
@@ -2652,71 +2643,124 @@ def _render_diag_value_table(df: pd.DataFrame) -> None:
     )
 
 
-def _summary_report_column_order() -> list[str]:
-    """Return the editor's left-to-right column order.
+# ── RO Summary Report — read-only screenshot-styled presentation ─────────────
+#
+# Column groups exactly as the planner's screenshot: three banded groups over
+# nine metric columns, plus the indented hierarchy label.  A native
+# st.dataframe / st.data_editor cannot render a two-row grouped header band or
+# the vertical dividers bracketing the Delta Breakdown, so the table is
+# emitted as a small, self-contained HTML block (read-only by nature — edits
+# happen in the RO Comparison editor above, which feeds this roll-up).
+_RO_SR_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("FY27 Probabilized", (
+        (SR_COL_PRIOR_PLAN, "Prior Plan"),
+        (SR_COL_CURRENT_PLAN, "Current Plan"),
+        (SR_COL_TOTAL_DELTA, "Total Δ"),
+    )),
+    ("Delta Breakdown", (
+        (SR_COL_DELTA_NEW, "New"),
+        (SR_COL_DELTA_EXIT, "Exit"),
+        (SR_COL_DELTA_CHANGE, "Change"),
+    )),
+    ("Year 1 Probabilized", (
+        (SR_COL_Y1_PRIOR, "Prior"),
+        (SR_COL_Y1_CHANGE, "Change"),
+        (SR_COL_Y1_LATEST, "Latest"),
+    )),
+)
+# First metric column of each group carries the vertical divider.
+_RO_SR_GROUP_START_COLS: frozenset[str] = frozenset(
+    cols[0][0] for _grp, cols in _RO_SR_GROUPS
+)
+# Scoped CSS — navy header band, light-blue Total B2C, orange section rows,
+# bold subtotals, group dividers.  Explicit light-surface colours so the
+# table reads the same in either Streamlit theme.
+_RO_SR_CSS: str = """
+<style>
+.ro-sr {overflow-x:auto; margin:0.25rem 0 0.75rem;}
+.ro-sr table {border-collapse:collapse; width:100%;
+  font-size:0.82rem; background:#ffffff; color:#1a1a1a;}
+.ro-sr th, .ro-sr td {padding:4px 10px; white-space:nowrap;}
+.ro-sr thead th {background:#1f3864; color:#ffffff; font-weight:700;
+  text-align:center; border:1px solid #2f4a7a;}
+.ro-sr tbody td {border-bottom:1px solid #e8e8e8; text-align:right;}
+.ro-sr td.lbl {text-align:left;}
+.ro-sr .grp {border-left:2px solid #1f3864;}
+.ro-sr tr.total td {background:#dce6f1; font-weight:700;}
+.ro-sr tr.section td {background:#f8cbad; font-weight:700;}
+.ro-sr tr.subtotal td {font-weight:700;}
+</style>
+"""
 
-    Per planner direction we **hide the four dimension columns**
-    (Portfolio Major, Supply Format, Portfolio Minor, Brand Category)
-    in the editor — they're internal match keys that just clutter the
-    on-screen table.  The dim values still live in the underlying
-    template DataFrame (and are therefore saved to
-    ``RO_Summary_Report.csv``); they're simply omitted from
-    ``column_order``, which Streamlit interprets as "don't render".
 
-    The *🔬 Diagnostic* expander remains the planner's one-click way
-    to inspect the raw dim literals when troubleshooting matches.
+def _fmt_ro_sr_num(value: object) -> str:
+    """Format a millions value like the screenshot: '-' / '46.1' / '(17.8)'."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if pd.isna(num) or abs(num) < 0.05:  # rounds to zero at 1-dp display
+        return "-"
+    return f"({abs(num):.1f})" if num < 0 else f"{num:.1f}"
+
+
+def _esc_html(text: object) -> str:
+    """Minimal HTML escape (NBSP indent in labels is preserved verbatim)."""
+    return (
+        str(text)
+        .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def _ro_sr_row_class(row: pd.Series) -> str:
+    """CSS class for one report row: Total B2C / section / subtotal / leaf."""
+    if str(row.get(SR_COL_ROW_ID, "")) == "total_b2c":
+        return "total"
+    is_subtotal = bool(row.get(SR_COL_IS_SUBTOTAL, False))
+    if is_subtotal and int(row.get(SR_COL_INDENT, 0) or 0) == 1:
+        return "section"  # ESL / Aseptic / Cultured / Fresh Milk / Butter
+    return "subtotal" if is_subtotal else ""
+
+
+def _render_ro_summary_html(df: pd.DataFrame) -> None:
+    """Render the RO Summary Report as the screenshot-styled, read-only table.
+
+    Two-row banded header (FY27 Probabilized · Delta Breakdown · Year 1
+    Probabilized) over the nine metric columns, vertical dividers between
+    groups, a light-blue Total B2C row, orange section rows, and bold
+    subtotal numbers.  Values are millions, formatted '-' / '46.1' / '(17.8)'.
     """
-    return [
-        SR_COL_LABEL,
-        SR_COL_CURRENT_PLAN, SR_COL_TOTAL_DELTA,
-        SR_COL_DELTA_NEW, SR_COL_DELTA_EXIT, SR_COL_DELTA_CHANGE,
-        SR_COL_Y1_PRIOR, SR_COL_Y1_CHANGE, SR_COL_Y1_LATEST,
-    ]
+    data_cols = [col for _grp, cols in _RO_SR_GROUPS for col, _lbl in cols]
 
+    # ── Header: group band + sub-column row ───────────────────────
+    band = ['<th></th>']
+    for group_name, cols in _RO_SR_GROUPS:
+        band.append(
+            f'<th class="grp" colspan="{len(cols)}">{_esc_html(group_name)}</th>'
+        )
+    subhead = ['<th class="lbl">Millions of lbs.</th>']
+    for _grp, cols in _RO_SR_GROUPS:
+        for col, label in cols:
+            cls = ' class="grp"' if col in _RO_SR_GROUP_START_COLS else ""
+            subhead.append(f'<th{cls}>{_esc_html(label)}</th>')
 
-def _summary_report_column_config() -> dict:
-    """Return the ``column_config`` mapping for the RO Summary Report editor.
+    # ── Body rows ─────────────────────────────────────────────────
+    body: list[str] = []
+    for _idx, row in df.iterrows():
+        row_cls = _ro_sr_row_class(row)
+        tr_open = f'<tr class="{row_cls}">' if row_cls else "<tr>"
+        cells = [f'<td class="lbl">{_esc_html(row.get(SR_COL_LABEL, ""))}</td>']
+        for col in data_cols:
+            grp = " grp" if col in _RO_SR_GROUP_START_COLS else ""
+            cells.append(f'<td class="{grp.strip()}">{_fmt_ro_sr_num(row.get(col))}</td>')
+        body.append(tr_open + "".join(cells) + "</tr>")
 
-    Display labels match the planner's screenshot column groups; the
-    "Change" collision (which appears under both Delta Breakdown and
-    Year 1 Probabilized) is disambiguated by prefixing the Year 1
-    instance with ``Y1`` so the editor renders a unique label per
-    column.
-
-    Internal metadata columns (``_row_id``, ``_indent``, ``_is_subtotal``)
-    are hidden via ``column_order`` (omitted from the visible list).
-
-    Data columns use ``format="%.1f"`` (NOT accounting) because the
-    saved-CSV values are in MILLIONS already — accounting would render
-    "47" instead of "47.8" and strip the decimal precision the planner
-    cares about at this scale.  Negatives in parentheses are mimicked
-    via the planner reading the leading minus sign; Streamlit's
-    Number format string doesn't have an "accounting-with-decimals"
-    preset.
-    """
-    cc = st.column_config
-    money_fmt = "%.1f"
-
-    return {
-        # Dimension columns — read-only display strings.
-        SR_COL_DIM_PMAJ:   cc.TextColumn("Portfolio Major", width="small", disabled=True),
-        SR_COL_DIM_SFMT:   cc.TextColumn("Supply Format",   width="small", disabled=True),
-        SR_COL_DIM_PMINOR: cc.TextColumn("Portfolio Minor", width="small", disabled=True),
-        SR_COL_DIM_BCAT:   cc.TextColumn("Brand Category",  width="small", disabled=True),
-        # Indented hierarchy label — read-only.
-        SR_COL_LABEL:      cc.TextColumn("Millions of lbs.", width="medium", disabled=True),
-        # FY27 Probabilized.
-        SR_COL_CURRENT_PLAN: cc.NumberColumn("FY27 Current Plan", format=money_fmt),
-        SR_COL_TOTAL_DELTA:  cc.NumberColumn("FY27 Total Δ",      format=money_fmt),
-        # Delta Breakdown.
-        SR_COL_DELTA_NEW:    cc.NumberColumn("Δ: New",    format=money_fmt),
-        SR_COL_DELTA_EXIT:   cc.NumberColumn("Δ: Exit",   format=money_fmt),
-        SR_COL_DELTA_CHANGE: cc.NumberColumn("Δ: Change", format=money_fmt),
-        # Year 1 Probabilized — "Y1" prefix disambiguates the Change collision.
-        SR_COL_Y1_PRIOR:  cc.NumberColumn("Y1 Prior",  format=money_fmt),
-        SR_COL_Y1_CHANGE: cc.NumberColumn("Y1 Δ",      format=money_fmt),
-        SR_COL_Y1_LATEST: cc.NumberColumn("Y1 Latest", format=money_fmt),
-    }
+    html = (
+        f'{_RO_SR_CSS}<div class="ro-sr"><table>'
+        f'<thead><tr>{"".join(band)}</tr><tr>{"".join(subhead)}</tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ── Demand Summary (Fabric CSV preview + download) ──────────────────────────
@@ -3183,6 +3227,14 @@ def _render_demand_summary() -> None:
 # Session key holding the last-built Holistic Demand Plan result so download /
 # preview interactions don't re-run the heavy Fabric build.
 _HDP_APS_RESULT_KEY: str = "holistic_demand_plan_aps_result"
+# Planner's manual Customer → Corporate Group overrides for the R&O leg
+# ({stripped Customer -> corp}).  Applied in-memory to every R&O row of that
+# Customer; survives reruns and Fabric rebuilds until explicitly cleared.
+_HDP_APS_OVERRIDES_KEY: str = "holistic_demand_plan_aps_overrides"
+# Bumped whenever the underlying data changes (fresh Generate) or the planner
+# clears overrides, so the keyed mapping editor re-initialises cleanly instead
+# of replaying stale cell edits onto a different row set.
+_HDP_APS_EDITOR_NONCE_KEY: str = "holistic_demand_plan_aps_editor_nonce"
 
 
 def _render_demand_summary_aps() -> None:
@@ -3235,6 +3287,10 @@ def _render_demand_summary_aps() -> None:
                 with st.spinner("Building Holistic Demand Plan (APS) from Microsoft Fabric…"):
                     result = generate_holistic_demand_plan_aps()
                 st.session_state[_HDP_APS_RESULT_KEY] = result
+                # Fresh data → reset the mapping editor's widget state.
+                st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
+                    st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
+                )
             except (
                 HolisticDemandPlanError, PlanLiftError, CustomerDimsError,
                 LakehouseIOError, ValueError,
@@ -3251,11 +3307,14 @@ def _render_demand_summary_aps() -> None:
             )
             return
 
-        # Fuzzy-match log FIRST (top of the results) so the planner sees what
-        # didn't match before trusting / downloading the file.
-        _render_hdp_match_log(result.customer_match_log)
+        # Editable Customer → Corporate Group mapping FIRST (top of the
+        # results) so the planner can fix mis-matches before trusting /
+        # downloading the file.  Returns the merged overrides after applying
+        # any inline edits; the download below reflects them immediately.
+        overrides = _render_hdp_match_editor(result)
+        effective = apply_customer_corp_overrides(result, overrides)
 
-        frame = result.frame
+        frame = effective.frame
         if frame.empty:
             st.info(
                 "The build produced no rows — check that `dp_factscurrentaps` "
@@ -3264,7 +3323,7 @@ def _render_demand_summary_aps() -> None:
         else:
             st.success(
                 f"✅ Built **{len(frame):,}** rows — "
-                f"{result.aps_rows:,} APS Base Plan + {result.ro_rows:,} R&O."
+                f"{effective.aps_rows:,} APS Base Plan + {effective.ro_rows:,} R&O."
             )
             today = pd.Timestamp.utcnow().strftime("%Y%m%d")
             st.download_button(
@@ -3275,51 +3334,164 @@ def _render_demand_summary_aps() -> None:
                 key="hdp_aps_download",
                 type="primary",
                 use_container_width=True,
+                help=(
+                    "Reflects your Corporate Group edits above — each override "
+                    "is applied to every R&O row of that Customer."
+                ),
             )
             with st.expander("👁️ Preview (first 100 rows)", expanded=False):
                 st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
 
-        # Rebuild = drop the cached result + Fabric caches, then re-fetch fresh.
+        # Rebuild = drop the cached result + Fabric caches, then re-fetch
+        # fresh.  Manual overrides are KEPT (re-applied to the new data) —
+        # use the "Clear overrides" button in the editor to discard them.
         if st.button("🔄 Rebuild (refresh from Fabric)", key="hdp_aps_rebuild"):
             st.session_state.pop(_HDP_APS_RESULT_KEY, None)
             st.cache_data.clear()
             st.rerun()
 
 
-def _render_hdp_match_log(match_log: pd.DataFrame) -> None:
-    """Render the R&O Customer → Corporate Group fuzzy-match log.
+def _render_hdp_match_editor(result) -> dict[str, str]:
+    """Render the editable R&O Customer → Corporate Group mapping + match log.
 
-    Foldable, at the top of the Holistic Demand Plan results.  Auto-expands
-    when anything is Unmapped so the planner immediately sees what to
-    hand-fix in the downloaded file.  Offers the log as its own CSV.
+    Foldable, at the top of the Holistic Demand Plan results.  Shows — by
+    default — only the rows that need a look (Fuzzy / Unmapped / blank
+    Corporate Group / already-overridden); a toggle reveals every Customer.
+    The **Corporate Group** cell is editable: typing a value overrides that
+    Customer's group for **all** its R&O rows in the downloaded file.
+    Auto-expands when there is anything to review.
+
+    Returns the merged ``{stripped Customer -> corp}`` override dict (also
+    persisted to session) so the caller can re-apply it to the frame.
     """
-    if match_log is None or match_log.empty:
-        return
-    status = match_log[MATCH_COL_STATUS]
+    overrides: dict[str, str] = dict(st.session_state.get(_HDP_APS_OVERRIDES_KEY, {}))
+    base_log = result.customer_match_log
+    if base_log is None or base_log.empty:
+        return overrides
+
+    # Original resolution per Customer — the yardstick for "is this an edit?".
+    base_corp = {
+        str(c).strip(): str(g)
+        for c, g in zip(base_log[MATCH_COL_CUSTOMER], base_log[MATCH_COL_CORP])
+    }
+    status = base_log[MATCH_COL_STATUS]
     n_unmapped = int((status == MATCH_UNMAPPED).sum())
     n_fuzzy = int((status == MATCH_FUZZY).sum())
     n_exact = int((status == MATCH_EXACT).sum())
+
     with st.expander(
-        f"🔗 R&O Customer → Corporate Group match log — "
-        f"{n_unmapped} unmapped · {n_fuzzy} fuzzy · {n_exact} exact",
-        expanded=n_unmapped > 0,
+        f"🔗 R&O Customer → Corporate Group mapping — "
+        f"{n_unmapped} unmapped · {n_fuzzy} fuzzy · {n_exact} exact"
+        + (f" · {len(overrides)} edited" if overrides else ""),
+        expanded=(n_unmapped > 0 or n_fuzzy > 0 or bool(overrides)),
     ):
         st.caption(
             "How each **R&O** Customer resolved to a Corporate Group (APS "
             "rows use `dp_factscurrentaps`'s own `corporate_group_code`).  "
-            "Rows marked **Unmapped** are tagged `(Unmapped)` in the file — "
-            "hand-fix their Corporate Group in the downloaded "
-            "`qry_mgmt_plan_full_aps.csv`.  Sorted Unmapped → Fuzzy → Exact."
+            "**Edit the Corporate Group cell to fix a mapping** — the change "
+            "applies to *every* R&O row of that Customer in the downloaded "
+            "`qry_mgmt_plan_full_aps.csv`.  By default this shows only rows "
+            "needing review (Fuzzy / Unmapped / blank); edited rows are "
+            "tagged **Override**."
         )
-        st.dataframe(match_log, use_container_width=True, hide_index=True)
+
+        top_l, top_r = st.columns([3, 1.4])
+        with top_l:
+            show_all = st.toggle(
+                "Show all customers",
+                value=False,
+                key="hdp_aps_show_all",
+                help=(
+                    "Off (default): only rows needing review.  On: every "
+                    "distinct R&O Customer — use it to re-map a Customer that "
+                    "matched confidently but to the wrong group."
+                ),
+            )
+        with top_r:
+            if overrides and st.button(
+                "↩️ Clear overrides",
+                key="hdp_aps_clear_overrides",
+                use_container_width=True,
+                help="Discard all manual Corporate Group edits.",
+            ):
+                st.session_state.pop(_HDP_APS_OVERRIDES_KEY, None)
+                st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
+                    st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
+                )
+                st.rerun()
+
+        display_log = base_log if show_all else filter_needs_review(base_log)
+
+        if display_log is None or display_log.empty:
+            st.success(
+                "✅ Every R&O Customer resolved to a real Corporate Group — "
+                "nothing to review.  Tick **Show all customers** to re-map one "
+                "anyway."
+            )
+        else:
+            # Seed the editable frame with the CURRENT effective group
+            # (override if set, else the resolved group; blanks for Unmapped
+            # so the planner types into an empty cell).
+            def _display_corp(cust: object) -> str:
+                key = str(cust).strip()
+                val = overrides.get(key, base_corp.get(key, ""))
+                return "" if val == CORP_GROUP_UNMAPPED else str(val)
+
+            view = display_log[[MATCH_COL_CUSTOMER, MATCH_COL_STATUS]].copy()
+            view[MATCH_COL_CORP] = display_log[MATCH_COL_CUSTOMER].map(_display_corp)
+
+            editor_nonce = st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0)
+            edited = st.data_editor(
+                view,
+                hide_index=True,
+                use_container_width=True,
+                num_rows="fixed",
+                # Key varies with the row set (show_all) and a reset nonce so
+                # stale cell edits never replay onto a different set of rows.
+                key=f"hdp_aps_match_editor_{int(show_all)}_{editor_nonce}",
+                column_config={
+                    MATCH_COL_CUSTOMER: st.column_config.TextColumn(
+                        "Customer", disabled=True),
+                    MATCH_COL_STATUS: st.column_config.TextColumn(
+                        "Match", disabled=True, width="small"),
+                    MATCH_COL_CORP: st.column_config.TextColumn(
+                        "Corporate Group",
+                        help=(
+                            "Type to override — applied to ALL R&O rows of "
+                            "this Customer. Leave blank to keep it unmapped."
+                        ),
+                    ),
+                },
+                column_order=[MATCH_COL_CUSTOMER, MATCH_COL_STATUS, MATCH_COL_CORP],
+            )
+
+            # Fold the visible edits into the override set: a cell that now
+            # differs from the original resolution is an override; one reset
+            # back to the original (or blanked) drops any prior override.
+            for _, r in edited.iterrows():
+                cust = str(r[MATCH_COL_CUSTOMER]).strip()
+                val = str(r[MATCH_COL_CORP]).strip()
+                base = str(base_corp.get(cust, "")).strip()
+                # A real value that differs from the original resolution is an
+                # override; blank / "(Unmapped)" / unchanged drops any prior one.
+                if val and val != CORP_GROUP_UNMAPPED and val != base:
+                    overrides[cust] = val
+                else:
+                    overrides.pop(cust, None)
+
+        st.session_state[_HDP_APS_OVERRIDES_KEY] = overrides
+
+        # Download the mapping AS APPLIED (overrides folded in) for the record.
+        applied_log = apply_customer_corp_overrides(result, overrides).customer_match_log
         today = pd.Timestamp.utcnow().strftime("%Y%m%d")
         st.download_button(
-            label="⬇️ Download match log (CSV)",
-            data=match_log.to_csv(index=False).encode("utf-8"),
+            label="⬇️ Download mapping log (CSV)",
+            data=applied_log.to_csv(index=False).encode("utf-8"),
             file_name=f"holistic_demand_plan_match_log_{today}.csv",
             mime="text/csv",
             key="hdp_aps_match_log_download",
         )
+    return overrides
 
 
 def _render_demand_summary_file(
@@ -4913,7 +5085,6 @@ _ROW_STYLE_MEMO = "font-style: italic; color: #555555"
 _ROW_STYLE_PLR_CUSTOMER = "background-color: #e3f2fd"
 
 _DPC_HIGHLIGHT_ROW_IDS: frozenset[str] = frozenset({"butter"})
-_RO_HIGHLIGHT_ROW_IDS: frozenset[str] = frozenset({"butter", "but"})
 _PLR_HIGHLIGHT_LABELS: frozenset[str] = frozenset({"Branded", "Private", "Grand Total"})
 
 
@@ -4958,25 +5129,6 @@ def _style_comparison_hierarchy_row(
         return [_ROW_STYLE_SUBTOTAL] * n
     if idx < len(memo_flags) and memo_flags[idx]:
         return [_ROW_STYLE_MEMO] * n
-    return [""] * n
-
-
-def _style_ro_summary_editor_row(
-    row: pd.Series,
-    *,
-    row_ids: list[str],
-    labels: list[str],
-) -> list[str]:
-    """Highlight the Butter row in the RO Summary editor (match DPC by name)."""
-    idx = int(row.name)
-    n = len(row)
-    if _is_butter_highlight_row(
-        idx,
-        row_ids=row_ids,
-        labels=labels,
-        highlight_row_ids=_RO_HIGHLIGHT_ROW_IDS,
-    ):
-        return [_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD] * n
     return [""] * n
 
 

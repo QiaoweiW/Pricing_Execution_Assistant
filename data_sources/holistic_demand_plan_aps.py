@@ -90,11 +90,17 @@ MATCH_COL_CORP: str     = "Corporate Group"
 MATCH_COL_STATUS: str   = "Match"
 MATCH_COLUMNS: tuple[str, ...] = (MATCH_COL_CUSTOMER, MATCH_COL_CORP, MATCH_COL_STATUS)
 
-MATCH_EXACT: str    = "Exact"
+MATCH_EXACT: str     = "Exact"
 MATCH_FUZZY: str     = "Fuzzy"
-MATCH_UNMAPPED: str = "Unmapped"
+MATCH_UNMAPPED: str  = "Unmapped"
+MATCH_OVERRIDE: str  = "Override"  # planner set the Corporate Group by hand
 # Sort order for the log — most actionable (needs a manual fix) first.
-_MATCH_RANK: dict[str, int] = {MATCH_UNMAPPED: 0, MATCH_FUZZY: 1, MATCH_EXACT: 2}
+# Overrides sort with the confident Exact rows (the planner already fixed them).
+_MATCH_RANK: dict[str, int] = {
+    MATCH_UNMAPPED: 0, MATCH_FUZZY: 1, MATCH_OVERRIDE: 2, MATCH_EXACT: 3,
+}
+# Statuses that always warrant a manual look in the match log.
+_REVIEW_STATUSES: frozenset[str] = frozenset({MATCH_FUZZY, MATCH_UNMAPPED, MATCH_OVERRIDE})
 
 # Read source CSVs as raw strings (pipeline parity — we do our own typing).
 _STR_READ_KW: dict = {"dtype": str, "keep_default_na": False}
@@ -115,14 +121,25 @@ class HolisticPlanResult:
     customer_match_log
         One row per distinct RO_Seed Customer in the R&O output
         (:data:`MATCH_COLUMNS`): the Corporate Group it resolved to and the
-        match status (Exact / Fuzzy / Unmapped), most-actionable first.
+        match status (Exact / Fuzzy / Unmapped / Override), most-actionable
+        first.
     aps_rows, ro_rows
         Row counts per leg (post-aggregation) for the run summary.
+    aps_leg
+        The grouped APS Base Plan leg, kept so a Customer→Corporate Group
+        override can be re-applied to the R&O leg and re-merged in-memory
+        (no Fabric re-fetch) — see :func:`apply_customer_corp_overrides`.
+    ro_detail
+        The B2C-filtered R&O rows *before* Corporate Group attribution and
+        grouping (``Month | Item | Customer | Demand Plan Pounds``).  The
+        override re-map keys off ``Customer`` here.
     """
     frame: pd.DataFrame
     customer_match_log: pd.DataFrame
     aps_rows: int
     ro_rows: int
+    aps_leg: pd.DataFrame
+    ro_detail: pd.DataFrame
 
     @property
     def unmapped_customers(self) -> tuple[str, ...]:
@@ -313,6 +330,16 @@ def _empty_match_log() -> pd.DataFrame:
     return pd.DataFrame(columns=list(MATCH_COLUMNS))
 
 
+# R&O detail schema (pre-grouping, Customer retained for corp attribution).
+_RO_DETAIL_COLS: tuple[str, ...] = (
+    HDP_COL_MONTH, HDP_COL_ITEM, "Customer", HDP_COL_POUNDS,
+)
+
+
+def _empty_ro_detail() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(_RO_DETAIL_COLS))
+
+
 def _build_ro_leg(
     ro_seed_df: Optional[pd.DataFrame],
     tbl_months_df: Optional[pd.DataFrame],
@@ -321,12 +348,15 @@ def _build_ro_leg(
     name_to_corp: dict[str, str],
     anchor_month: date,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Expand RO_Seed → long R&O rows, corp-group by Customer, B2C-filtered.
+    """Expand RO_Seed → long, B2C-filtered R&O detail + the match log.
 
-    Returns ``(grouped R&O frame, customer match log)``.
+    Returns ``(ro_detail, match_log)`` where *ro_detail* has
+    :data:`_RO_DETAIL_COLS` (Customer retained, Corporate Group NOT yet
+    applied and NOT grouped) so the caller — and later a planner override —
+    can attribute the Corporate Group and aggregate via :func:`_ro_frame`.
     """
     if ro_seed_df is None or ro_seed_df.empty or tbl_months_df is None:
-        return _empty_frame(), _empty_match_log()
+        return _empty_ro_detail(), _empty_match_log()
 
     # Reuse the pipeline's Format×Month 36-month expansion (keeps Customer)
     # AND its melt→month-map reshape, requesting the extra Customer id column
@@ -341,19 +371,40 @@ def _build_ro_leg(
     ).rename(columns={"Start of Month": HDP_COL_MONTH})
     ro_long = ro_long[(ro_long[HDP_COL_POUNDS] > 0) & ro_long[HDP_COL_MONTH].notna()]
     if ro_long.empty:
-        return _empty_frame(), _empty_match_log()
+        return _empty_ro_detail(), _empty_match_log()
 
     ro_long = _filter_b2c(ro_long, pdh_df, ro_master_df)
     if ro_long.empty:
-        return _empty_frame(), _empty_match_log()
+        return _empty_ro_detail(), _empty_match_log()
 
-    corp, match_log = _resolve_customer_corp(ro_long["Customer"], name_to_corp)
-    ro_long = ro_long.assign(**{
+    ro_long[HDP_COL_MONTH] = ro_long[HDP_COL_MONTH].dt.normalize()
+    # Match log is computed once here (against the un-overridden dim) so the
+    # audit reflects how each Customer resolved before any manual fix.
+    _corp, match_log = _resolve_customer_corp(ro_long["Customer"], name_to_corp)
+    return ro_long[list(_RO_DETAIL_COLS)].copy(), match_log
+
+
+def _ro_frame(
+    ro_detail: pd.DataFrame, corp_by_customer: dict[str, str],
+) -> pd.DataFrame:
+    """Attribute a Corporate Group per Customer and group into the schema.
+
+    *corp_by_customer* maps a **stripped** Customer name → Corporate Group.
+    Customers absent from the map fall back to :data:`CORP_GROUP_UNMAPPED`.
+    Pure + in-memory, so it serves both the initial build and a re-map with
+    planner overrides.
+    """
+    if ro_detail is None or ro_detail.empty:
+        return _empty_frame()
+    corp = (
+        ro_detail["Customer"].astype(str).str.strip()
+        .map(lambda c: corp_by_customer.get(c) or CORP_GROUP_UNMAPPED)
+    )
+    shaped = ro_detail.assign(**{
         HDP_COL_CORP: corp.values,
         HDP_COL_FORECAST: FORECAST_R_AND_O,
     })
-    ro_long[HDP_COL_MONTH] = ro_long[HDP_COL_MONTH].dt.normalize()
-    return _group(ro_long), match_log
+    return _group(shaped)
 
 
 # ── Public builder + orchestrator ────────────────────────────────────────────
@@ -371,16 +422,105 @@ def build_holistic_demand_plan_aps(
     """Merge the APS Base Plan + R&O legs into the unified plan (pure)."""
     name_to_corp = _build_name_to_corp(customer_names_df)
     aps_leg = _build_aps_leg(aps_df)
-    ro_leg, match_log = _build_ro_leg(
+    ro_detail, match_log = _build_ro_leg(
         ro_seed_df, tbl_months_df, pdh_df, ro_master_df, name_to_corp, anchor_month,
     )
+    # Default Corporate Group per Customer = how the match log resolved it.
+    base_corp = _corp_by_customer(match_log)
+    ro_leg = _ro_frame(ro_detail, base_corp)
     frame = pd.concat([aps_leg, ro_leg], ignore_index=True)[list(HDP_COLUMNS)]
     return HolisticPlanResult(
         frame=frame,
         customer_match_log=match_log,
         aps_rows=len(aps_leg),
         ro_rows=len(ro_leg),
+        aps_leg=aps_leg,
+        ro_detail=ro_detail,
     )
+
+
+def _corp_by_customer(match_log: pd.DataFrame) -> dict[str, str]:
+    """``{stripped Customer -> Corporate Group}`` from a match log."""
+    if match_log is None or match_log.empty:
+        return {}
+    return {
+        str(cust).strip(): str(corp)
+        for cust, corp in zip(
+            match_log[MATCH_COL_CUSTOMER], match_log[MATCH_COL_CORP],
+        )
+    }
+
+
+def _clean_overrides(overrides: Optional[dict[str, str]]) -> dict[str, str]:
+    """Normalise a raw override dict → ``{stripped Customer -> non-blank corp}``."""
+    if not overrides:
+        return {}
+    cleaned: dict[str, str] = {}
+    for cust, corp in overrides.items():
+        key = str(cust).strip()
+        val = str(corp).strip()
+        if key and val and val != CORP_GROUP_UNMAPPED:
+            cleaned[key] = val
+    return cleaned
+
+
+def apply_customer_corp_overrides(
+    result: HolisticPlanResult, overrides: Optional[dict[str, str]],
+) -> HolisticPlanResult:
+    """Return a new result with manual Customer→Corporate Group overrides applied.
+
+    *overrides* maps a Customer name → the Corporate Group the planner wants
+    for **every** R&O row of that Customer.  The R&O leg is re-attributed and
+    re-grouped in-memory (no Fabric re-fetch); overridden Customers are
+    re-tagged :data:`MATCH_OVERRIDE` in the match log with their new group.
+    Blank / ``(Unmapped)`` override values are ignored (treated as "leave as
+    resolved").  Returns *result* unchanged when there is nothing to apply.
+    """
+    clean = _clean_overrides(overrides)
+    if not clean:
+        return result
+
+    effective = {**_corp_by_customer(result.customer_match_log), **clean}
+    ro_leg = _ro_frame(result.ro_detail, effective)
+    frame = pd.concat([result.aps_leg, ro_leg], ignore_index=True)[list(HDP_COLUMNS)]
+
+    log = result.customer_match_log.copy()
+    if not log.empty:
+        touched = log[MATCH_COL_CUSTOMER].astype(str).str.strip().isin(clean)
+        log.loc[touched, MATCH_COL_CORP] = (
+            log.loc[touched, MATCH_COL_CUSTOMER].astype(str).str.strip().map(clean)
+        )
+        log.loc[touched, MATCH_COL_STATUS] = MATCH_OVERRIDE
+        log = (
+            log.assign(_rank=log[MATCH_COL_STATUS].map(_MATCH_RANK).fillna(9))
+            .sort_values(["_rank", MATCH_COL_CUSTOMER])
+            .drop(columns="_rank")
+            .reset_index(drop=True)
+        )
+    return HolisticPlanResult(
+        frame=frame,
+        customer_match_log=log,
+        aps_rows=len(result.aps_leg),
+        ro_rows=len(ro_leg),
+        aps_leg=result.aps_leg,
+        ro_detail=result.ro_detail,
+    )
+
+
+def filter_needs_review(match_log: pd.DataFrame) -> pd.DataFrame:
+    """Return only the match-log rows that warrant a manual look.
+
+    A row needs review when its status is Fuzzy / Unmapped / Override, OR its
+    Corporate Group is blank / ``(Unmapped)`` (the "matched but no group" case
+    the planner asked to surface).  Confident Exact rows that resolved to a
+    real group are hidden.
+    """
+    if match_log is None or match_log.empty:
+        return match_log
+    corp = match_log[MATCH_COL_CORP].astype(str).str.strip()
+    blank = corp.eq("") | corp.eq(CORP_GROUP_UNMAPPED)
+    review = match_log[MATCH_COL_STATUS].isin(_REVIEW_STATUSES) | blank
+    return match_log[review].reset_index(drop=True)
 
 
 def _read_seed_csv(blob_path: str) -> pd.DataFrame:
@@ -418,7 +558,8 @@ __all__ = [
     "HDP_COL_POUNDS", "HDP_COL_FORECAST",
     "FORECAST_APS_BASE_PLAN", "FORECAST_R_AND_O",
     "MATCH_COLUMNS", "MATCH_COL_CUSTOMER", "MATCH_COL_CORP", "MATCH_COL_STATUS",
-    "MATCH_EXACT", "MATCH_FUZZY", "MATCH_UNMAPPED",
+    "MATCH_EXACT", "MATCH_FUZZY", "MATCH_UNMAPPED", "MATCH_OVERRIDE",
     "HolisticDemandPlanError", "HolisticPlanResult",
     "build_holistic_demand_plan_aps", "generate_holistic_demand_plan_aps",
+    "apply_customer_corp_overrides", "filter_needs_review",
 ]

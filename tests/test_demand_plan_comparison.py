@@ -23,8 +23,13 @@ from data_sources.demand_plan_comparison import (
     DIAG_COL_SFMT,
     DIAG_UNMAPPED,
     FORECAST_BASE_PLAN,
+    FORECAST_R_AND_O,
     NC_COL_ITEM,
     NC_COL_PMAJ,
+    TRK_ITEM,
+    TRK_ITEM_DESCRIPTION,
+    TRK_PMAJ,
+    TRK_SFMT,
     ComparisonFilters,
     ComparisonNotCaptured,
     EnrichedSources,
@@ -32,7 +37,9 @@ from data_sources.demand_plan_comparison import (
     _compute_leaf_measures,
     build_comparison_not_captured,
     build_demand_plan_comparison,
+    build_item_dim_frame_from_tracker,
     build_prior_month_shipment_diagnostic,
+    list_tracker_dim_values,
     _vectorised_start_of_month as som,
 )
 
@@ -215,9 +222,14 @@ def test_last_plan_measures_use_shifted_windows():
     assert m[COL_LAST_PLAN_FORECAST] == 17.0
 
 
-def _enriched_sources(trk: pd.DataFrame, ibp: pd.DataFrame) -> EnrichedSources:
+def _enriched_sources(
+    trk: pd.DataFrame, ibp: pd.DataFrame, py: pd.DataFrame | None = None,
+) -> EnrichedSources:
     empty = _enriched_ibp([])
-    return EnrichedSources(tracker=trk, ibp=ibp, ibp_orders=empty, pdh_warning=None)
+    return EnrichedSources(
+        tracker=trk, ibp=ibp, ibp_orders=empty, pdh_warning=None,
+        ibp_py=py if py is not None else _enriched_ibp([]),
+    )
 
 
 def test_current_last_total_delta_and_total_actuals_removed():
@@ -258,6 +270,101 @@ def test_current_last_total_delta_and_total_actuals_removed():
     assert float(row["Base Plan"]) == 1.0
     # Identity holds by construction: Base + PM Actual + R&O == Total Delta.
     assert float(row["Base Plan"]) + float(row["PM Actual"]) + float(row["R&O"]) == -3.0
+
+
+def test_current_plan_split_o_pct_and_py_actual():
+    """Current Plan (Base)/(R&O) split, O% = R&O/Current Plan, and PY Actual."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4",
+         "pounds": 10_000_000.0},                       # current Base
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4",
+         "pounds": 2_000_000.0},                        # current R&O
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": m, "pounds": p,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
+        for m, p in ((_APR, 1_000_000.0), (_MAY, 2_000_000.0), (_JUN, 4_000_000.0))
+    ])
+    # Prior-year shipments frame (already scoped to the PY window by the fetch).
+    py = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": dt.date(2025, 7, 1), "pounds": 6_000_000.0,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"},
+    ])
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(trk, ibp, py), ro_total_delta_by_path={},
+    )
+    row = result.table.loc[result.table["_row_id"] == "esl_lc_branded"].iloc[0]
+    assert float(row["Current Plan (Base)"]) == 10.0
+    assert float(row["Current Plan (R&O)"]) == 2.0
+    # Current Plan = actuals(7) + Base(10) + R&O(2) = 19.
+    assert float(row["Current Plan"]) == 19.0
+    # O% of Current Plan = R&O(2) / 19.
+    assert round(float(row["O% of Current Plan"]), 4) == round(2.0 / 19.0, 4)
+    assert float(row["PY Actual"]) == 6.0
+    assert "Current Plan (Forecast)" not in result.table.columns
+
+
+def test_pmaj_filter_narrows_rollup():
+    """Selecting only ESL zeroes the Cultured branch (and Total B2C reflects it)."""
+    filters = ComparisonFilters(
+        current_cycle="C4", prior_cycle="C3",
+        actual_start=_APR, actual_end=_JUN,
+        forecast_start=_JUL, forecast_end=dt.date(2027, 3, 1),
+        prior_month=_JUN, pmaj_filter=frozenset({"ESL"}),
+    )
+    trk = _enriched_trk([
+        {"item_key": "1", "item_desc": "", "party_site": "1", "pmaj": "ESL",
+         "sfmt": "Large Carton", "pminor": "", "brand": "Branded",
+         "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4",
+         "pounds": 10_000_000.0},
+        {"item_key": "2", "item_desc": "", "party_site": "1", "pmaj": "Cultured",
+         "sfmt": "Large Tub", "pminor": "", "brand": "",
+         "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4",
+         "pounds": 5_000_000.0},
+    ])
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(trk, _enriched_ibp([])), ro_total_delta_by_path={},
+    )
+    t = result.table
+    esl = float(t.loc[t["_row_id"] == "esl_lc_branded", "Current Plan"].iloc[0])
+    cult = float(t.loc[t["_row_id"] == "cult_large_tub", "Current Plan"].iloc[0])
+    b2c = float(t.loc[t["_row_id"] == "total_b2c", "Current Plan"].iloc[0])
+    assert esl == 10.0
+    assert cult == 0.0            # Cultured filtered out
+    assert b2c == 10.0            # Total B2C reflects only the ESL slice
+
+
+def test_dim_frame_from_tracker_reads_columns_and_derives_brand():
+    trk = pd.DataFrame({
+        TRK_ITEM: ["100", "200"],
+        TRK_ITEM_DESCRIPTION: ["DG Whole Milk", "Store Brand Milk"],
+        TRK_PMAJ: ["ESL", "Cultured"],
+        TRK_SFMT: ["Large Carton", "Large Tub"],
+        "Portfolio Minor": ["", "Cottage Cheese"],
+    })
+    dim = build_item_dim_frame_from_tracker(trk)
+    by_item = {r["__item_key"]: r for _, r in dim.iterrows()}
+    assert by_item["100"]["pmaj"] == "ESL" and by_item["100"]["sfmt"] == "Large Carton"
+    assert by_item["100"]["brand"] == "Branded"      # "DG ..." → Branded
+    assert by_item["200"]["brand"] == "Private"       # no "DG" prefix
+    assert by_item["200"]["pminor"] == "Cottage Cheese"
+    # Options helper surfaces the distinct dims for the widgets (raw tracker).
+    pmajs, sfmts = list_tracker_dim_values(trk)
+    assert pmajs == ["Cultured", "ESL"]
+    assert sfmts == ["Large Carton", "Large Tub"]
+
+
+def test_dim_frame_from_tracker_empty_signals_fallback():
+    """A legacy tracker with no dim columns returns empty → caller falls back."""
+    trk = pd.DataFrame({TRK_ITEM: ["100"], TRK_ITEM_DESCRIPTION: ["x"]})
+    assert build_item_dim_frame_from_tracker(trk).empty
 
 
 def test_not_captured_flags_items_outside_the_template():

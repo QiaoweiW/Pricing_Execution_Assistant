@@ -142,6 +142,14 @@ TRK_DEMAND_LBS: str     = "Demand Plan Pounds"
 TRK_FORECAST_TYPE: str  = "Forecast Type"
 TRK_BUSINESS_UNIT: str  = "Business Unit"
 TRK_CYCLE: str          = "Cycle"
+# Categorisation dims now carried ON the tracker file (written by the Demand
+# Plan pipeline).  When present the comparison reads them straight off the
+# file instead of re-joining PDH / RO_Item_Master; Brand is NOT a column — it
+# is derived from the Item Description exactly as before.
+TRK_PMAJ: str           = "Portfolio Major"
+TRK_SFMT: str           = "Supply Format"
+TRK_PMINOR: str         = "Portfolio Minor"
+_TRK_DIM_COLS: tuple[str, ...] = (TRK_PMAJ, TRK_SFMT, TRK_PMINOR)
 
 # IBP Shipments (dbo.IBP Shipments).  Column names probed from a small
 # whitelist because the Delta table's spelling has historically wobbled
@@ -488,7 +496,14 @@ COL_TOTAL_ACTUALS: str          = "total_actuals"
 COL_PRIOR_MONTH_ACTUAL: str     = "prior_month_actual"
 COL_PRIOR_MONTH_FORECAST: str   = "prior_month_forecast"
 COL_CURRENT_PLAN_ACTUAL: str    = "current_plan_actual"
-COL_CURRENT_PLAN_FORECAST: str  = "current_plan_forecast"
+# Current-cycle forecast over the forecast window, SPLIT by Forecast Type into
+# its Base Plan and R&O legs (replaces the old single "Current Plan (Forecast)"
+# column).  Current Plan = actuals + Base + R&O.
+COL_CURRENT_PLAN_BASE: str      = "current_plan_base"
+COL_CURRENT_PLAN_RO: str        = "current_plan_ro"
+# Prior-Year Actual: shipments over the plan's full horizon shifted back 12
+# months — [actual_start − 1yr … forecast_end − 1yr].  Additive.
+COL_PY_ACTUAL: str              = "py_actual"
 # Last Plan's two independent legs — the "one-month-ago" snapshot:
 #   * actuals over [actual_start … actual_end − 1 month]
 #   * PRIOR-cycle forecast over [forecast_start − 1 month … forecast_end]
@@ -517,14 +532,18 @@ COL_V_BUDGET: str               = "v_budget"
 # values after roll-up.
 COL_TOTAL_DELTA_PCT: str        = "total_delta_pct"
 COL_PCT: str                    = "pct"
+# O% of Current Plan = Current Plan (R&O) ÷ Current Plan (the whole current
+# plan: actuals + Base + R&O).  The R&O ("opportunity") share of the plan.
+COL_O_PCT: str                  = "o_pct"
 
 # The set of measures summed during subtotal roll-up.  Base Plan is
 # intentionally absent — it's a derived residual (see _assemble_table),
 # linear in these additive measures, so it rolls up correctly without
 # being summed independently.
 _ADDITIVE_COLS: tuple[str, ...] = (
-    COL_TOTAL_ACTUALS, COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
-    COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST,
+    COL_TOTAL_ACTUALS, COL_PY_ACTUAL,
+    COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
+    COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_BASE, COL_CURRENT_PLAN_RO,
     COL_LAST_PLAN_ACTUALS, COL_LAST_PLAN_FORECAST,
     COL_R_AND_O, COL_BUDGET,
 )
@@ -551,9 +570,12 @@ DISPLAY_LABELS: dict[str, str] = {
     COL_PRIOR_MONTH_ACTUAL:    "Prior Month Actual",
     COL_PRIOR_MONTH_FORECAST:  "Prior Month Forecast",
     COL_CURRENT_PLAN_ACTUAL:   "Current Plan (Actual)",
-    COL_CURRENT_PLAN_FORECAST: "Current Plan (Forecast)",
+    COL_CURRENT_PLAN_BASE:     "Current Plan (Base)",
+    COL_CURRENT_PLAN_RO:       "Current Plan (R&O)",
+    COL_PY_ACTUAL:             "PY Actual",
     COL_LAST_PLAN:             "Last Plan",
     COL_CURRENT_PLAN:          "Current Plan",
+    COL_O_PCT:                 "O% of Current Plan",
     COL_PM_ACTUAL:             "PM Actual",
     COL_TOTAL_DELTA:           "Total Delta",
     COL_TOTAL_DELTA_PCT:       "Total Delta %",
@@ -563,24 +585,28 @@ DISPLAY_LABELS: dict[str, str] = {
     COL_PCT:                   "%",
     COL_BUDGET:                "Budget",
 }
-# Left → right order of the metric columns in the rendered table.
+# Left → right order of the metric columns in the rendered table.  The two
+# Current Plan legs (Base / R&O) sit where the single forecast column used to;
+# O% follows Current Plan (it is R&O ÷ Current Plan); PY Actual sits with the
+# actual-side measures.
 DISPLAY_ORDER: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
-    COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_FORECAST, COL_LAST_PLAN,
-    COL_CURRENT_PLAN, COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
+    COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_BASE, COL_CURRENT_PLAN_RO,
+    COL_PY_ACTUAL, COL_LAST_PLAN, COL_CURRENT_PLAN, COL_O_PCT,
+    COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
     COL_BASE_PLAN, COL_R_AND_O, COL_V_BUDGET, COL_PCT, COL_BUDGET,
 )
 # Columns rendered as percentages (the rest are millions of lbs).
-PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT})
+PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT, COL_O_PCT})
 
 # Metric columns hidden by default in the Streamlit table — planners can
-# expand them via a checkbox on the page.  Spans Prior Month Actual
-# through Current Plan (Forecast), inclusive.
+# expand them via a checkbox on the page.  Current Plan (Base)/(R&O), PY
+# Actual and O% are shown by default (per planner direction); only the raw
+# prior-month + current-actual detail columns start hidden.
 COLS_HIDDEN_BY_DEFAULT: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL,
-    COL_CURRENT_PLAN_FORECAST,
 )
 
 _LBS_PER_MILLION: float = 1_000_000.0
@@ -623,6 +649,11 @@ class ComparisonFilters:
     prior_month
         The single month treated as "Prior Month" for the PM Actual /
         Prior Month Forecast columns.
+    pmaj_filter / sfmt_filter
+        Optional whitelists of Portfolio Major / Supply Format values to
+        include.  Empty = include everything (the default).  When set, the
+        tracker + actuals are narrowed to those dims before roll-up, so the
+        whole summary (incl. Total B2C) reflects only the selected slice.
     """
     current_cycle: str
     prior_cycle: str
@@ -631,6 +662,8 @@ class ComparisonFilters:
     forecast_start: date
     forecast_end: date
     prior_month: date
+    pmaj_filter: frozenset = frozenset()
+    sfmt_filter: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -843,6 +876,81 @@ def build_item_dim_frame_cascade(
         merged[col] = primary_vals.where(primary_vals != "", fallback_vals)
 
     return merged[["__item_key", *_DIM_CASCADE_FIELDS]].reset_index(drop=True)
+
+
+def build_item_dim_frame_from_tracker(tracker_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Return the per-item dim frame read STRAIGHT off the tracker file.
+
+    The Demand Plan pipeline now writes Portfolio Major / Supply Format /
+    Portfolio Minor onto ``qry_mgmt_plan_history_tracker.csv``, so the
+    comparison can categorise from the file itself — no PDH / RO_Item_Master
+    join.  Brand is derived from the Item Description (``_vectorised_brand``),
+    identical to the PDH path, so the leaf Brand splits are unchanged.
+
+    Returns the same ``__item_key, pmaj, sfmt, pminor, brand, desc`` shape as
+    :func:`build_item_dim_frame`.  Returns an EMPTY frame when the tracker
+    carries NONE of the dim columns (a legacy file that predates them) — the
+    caller then falls back to the PDH → RO_Item_Master cascade.
+    """
+    empty = pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
+    if tracker_df is None or tracker_df.empty or TRK_ITEM not in tracker_df.columns:
+        return empty
+    if not any(c in tracker_df.columns for c in _TRK_DIM_COLS):
+        return empty  # unmigrated tracker → signal fallback
+
+    n = len(tracker_df)
+    blank = pd.Series([""] * n, index=tracker_df.index, dtype="object")
+
+    def _col(name: str) -> pd.Series:
+        return _vectorised_clean_str(tracker_df[name]) if name in tracker_df.columns else blank
+
+    desc = _col(TRK_ITEM_DESCRIPTION)
+    out = pd.DataFrame({
+        "__item_key": _vectorised_item_key(tracker_df[TRK_ITEM]),
+        "pmaj":   _col(TRK_PMAJ),
+        "sfmt":   _col(TRK_SFMT),
+        "pminor": _col(TRK_PMINOR),
+        "brand":  _vectorised_brand(desc),
+        "desc":   desc,
+    })
+    out = out.loc[out["__item_key"] != ""]
+    # One row per item; last non-empty dims win (the pipeline writes them
+    # consistently per item, so any row is representative).
+    return out.drop_duplicates(subset="__item_key", keep="last").reset_index(drop=True)
+
+
+def _apply_dim_filter(df: pd.DataFrame, filters: "ComparisonFilters") -> pd.DataFrame:
+    """Narrow an enriched frame to the selected Portfolio Major / Supply Format.
+
+    Empty whitelists = keep everything (default).  Operates on the enriched
+    ``pmaj`` / ``sfmt`` columns, so it works identically for tracker + actuals.
+    """
+    if df is None or df.empty or not (filters.pmaj_filter or filters.sfmt_filter):
+        return df
+    mask = pd.Series(True, index=df.index)
+    if filters.pmaj_filter and "pmaj" in df.columns:
+        mask &= df["pmaj"].isin(filters.pmaj_filter)
+    if filters.sfmt_filter and "sfmt" in df.columns:
+        mask &= df["sfmt"].isin(filters.sfmt_filter)
+    return df.loc[mask]
+
+
+def list_tracker_dim_values(
+    tracker_df: pd.DataFrame,
+) -> tuple[list[str], list[str]]:
+    """Return ``(portfolio_majors, supply_formats)`` for the filter widgets.
+
+    Reads the RAW tracker's ``Portfolio Major`` / ``Supply Format`` columns
+    (present since the pipeline now writes them), so the page can populate the
+    multiselects BEFORE the enrichment pass runs.  Sorted distinct non-blank
+    values; empty lists for a legacy tracker that lacks the columns.
+    """
+    def _distinct(col: str) -> list[str]:
+        if tracker_df is None or tracker_df.empty or col not in tracker_df.columns:
+            return []
+        vals = tracker_df[col].astype("string").str.strip()
+        return sorted({v for v in vals.dropna() if v})
+    return _distinct(TRK_PMAJ), _distinct(TRK_SFMT)
 
 
 # ── Vectorised primitives (used by the enrichment helpers) ──────────────────
@@ -1412,6 +1520,9 @@ class EnrichedSources:
     ibp: pd.DataFrame
     ibp_orders: pd.DataFrame
     pdh_warning: Optional[str] = None
+    # Prior-year shipments (same tidy shape as ``ibp``) for the PY Actual
+    # column; empty when the caller doesn't request it.
+    ibp_py: pd.DataFrame = field(default_factory=lambda: _empty_enriched(actuals=True))
 
 
 def build_enriched_sources(
@@ -1421,6 +1532,7 @@ def build_enriched_sources(
     pdh_df: Optional[pd.DataFrame],
     *,
     item_master_df: Optional[pd.DataFrame] = None,
+    ibp_py_df: Optional[pd.DataFrame] = None,
 ) -> EnrichedSources:
     """Build the shared enrichment bundle exactly once.
 
@@ -1429,20 +1541,29 @@ def build_enriched_sources(
     (comparison + PM Actual drivers + Base Plan drivers) can reuse the
     output without redoing the work.
 
-    Dimensions come from a **PDH → RO_Item_Master cascade**
-    (:func:`build_item_dim_frame_cascade`): ``qry_pdh.csv`` is primary and
-    ``RO_Item_Master.csv`` (``item_master_df``) fills any item PDH can't
-    classify.  ``item_master_df=None`` degrades to PDH-only.
+    Dimensions come **straight off the tracker file** — the Demand Plan
+    pipeline writes Portfolio Major / Supply Format / Portfolio Minor onto
+    ``qry_mgmt_plan_history_tracker.csv`` (Brand is derived from the Item
+    Description), so no PDH / RO_Item_Master join is needed.  For a LEGACY
+    tracker that predates those columns we fall back to the old
+    **PDH → RO_Item_Master cascade** so the section keeps working until the
+    files are regenerated.  ``pdh_df`` / ``item_master_df`` are therefore only
+    consulted on that fallback path.
     """
-    dim_frame = build_item_dim_frame_cascade(pdh_df, item_master_df)
+    dim_frame = build_item_dim_frame_from_tracker(tracker_df)
     pdh_warning: Optional[str] = None
     if dim_frame.empty:
-        pdh_warning = (
-            "Neither PDH (qry_pdh.csv) nor RO_Item_Master.csv could resolve "
-            "any item — Portfolio Major / Supply Format / Brand are blank, "
-            "so every row is zero.  Check the upstream PDH / RO_Item_Master "
-            "exports."
-        )
+        # Legacy tracker (no dim columns yet) → re-join PDH/RO_Item_Master.
+        dim_frame = build_item_dim_frame_cascade(pdh_df, item_master_df)
+        if dim_frame.empty:
+            pdh_warning = (
+                "The tracker carries no Portfolio Major / Supply Format / "
+                "Portfolio Minor columns and neither PDH (qry_pdh.csv) nor "
+                "RO_Item_Master.csv could resolve any item — categorisation "
+                "is blank, so every row is zero.  Regenerate the Demand Plan "
+                "files (they now carry these columns) or check the PDH / "
+                "RO_Item_Master exports."
+            )
     trk = _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched()
     ibp = _enrich_ibp(ibp_df, dim_frame) if ibp_df is not None else _empty_enriched(actuals=True)
     ibp_orders = (
@@ -1450,8 +1571,15 @@ def build_enriched_sources(
         if ibp_orders_df is not None
         else _empty_enriched(actuals=True)
     )
+    # Prior-year shipments share the SAME dim frame → an item categorises to
+    # the same leaf across current and prior-year actuals.
+    ibp_py = (
+        _enrich_ibp(ibp_py_df, dim_frame) if ibp_py_df is not None
+        else _empty_enriched(actuals=True)
+    )
     return EnrichedSources(
         tracker=trk, ibp=ibp, ibp_orders=ibp_orders, pdh_warning=pdh_warning,
+        ibp_py=ibp_py,
     )
 
 
@@ -1640,6 +1768,7 @@ def build_demand_plan_comparison(
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]] = None,
     enriched: Optional[EnrichedSources] = None,
     budget_by_row_id: Optional[dict[str, float]] = None,
+    ibp_py_df: Optional[pd.DataFrame] = None,
 ) -> ComparisonResult:
     """Build the Demand Plan Comparison Summary table.
 
@@ -1684,6 +1813,7 @@ def build_demand_plan_comparison(
         ro_total_delta_by_path=ro_total_delta_by_path,
         enriched=enriched,
         budget_by_row_id=budget_by_row_id,
+        ibp_py_df=ibp_py_df,
     )
 
     # 4 + 5. Assemble the display frame.
@@ -1725,6 +1855,7 @@ def _build_runtime_artifacts(
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
     enriched: Optional[EnrichedSources],
     budget_by_row_id: Optional[dict[str, float]] = None,
+    ibp_py_df: Optional[pd.DataFrame] = None,
 ) -> _RuntimeBuildArtifacts:
     """Build reusable runtime artifacts for comparison-style rollups."""
     warnings: list[str] = []
@@ -1732,11 +1863,16 @@ def _build_runtime_artifacts(
     if enriched is None:
         enriched = build_enriched_sources(
             tracker_df, ibp_df, None, pdh_df, item_master_df=item_master_df,
+            ibp_py_df=ibp_py_df,
         )
     if enriched.pdh_warning:
         warnings.append(enriched.pdh_warning)
-    trk = enriched.tracker
-    ibp = enriched.ibp
+    # Portfolio Major / Supply Format filter — narrow every source frame up
+    # front so the template roll-up (incl. Total B2C) reflects only the
+    # selected slice.  No-op when both whitelists are empty (the default).
+    trk = _apply_dim_filter(enriched.tracker, filters)
+    ibp = _apply_dim_filter(enriched.ibp, filters)
+    ibp_py = _apply_dim_filter(enriched.ibp_py, filters)
 
     if ro_total_delta_by_path is None:
         ro_total_delta_by_path = fetch_ro_summary_total_delta_by_path()
@@ -1802,6 +1938,7 @@ def _build_runtime_artifacts(
             prior_forecast_months=prior_forecast_months,
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
+            ibp_py=ibp_py,
         )
         if budget_by_row_id and tpl.row_id in budget_by_row_id:
             measures[tpl.row_id][COL_BUDGET] = float(
@@ -1834,6 +1971,7 @@ def _compute_leaf_measures(
     prior_forecast_months: set[date],
     prior_month: date,
     ro_total_delta_by_path: dict[tuple[str, ...], float],
+    ibp_py: Optional[pd.DataFrame] = None,
 ) -> dict[str, float]:
     """Compute the additive measures for a single leaf row.
 
@@ -1842,7 +1980,9 @@ def _compute_leaf_measures(
 
     ``last_actual_months`` / ``prior_forecast_months`` are the
     one-month-shifted Last-Plan windows (actuals minus the final month;
-    prior-cycle forecast starting one month earlier).
+    prior-cycle forecast starting one month earlier).  ``ibp_py`` is the
+    prior-year shipments frame (already scoped to the PY window by the
+    caller's fetch), summed whole for the PY Actual column.
     """
     # Dimension masks (computed once, reused across month/cycle slices).
     trk_mask = _leaf_mask(trk, tpl)
@@ -1873,6 +2013,13 @@ def _compute_leaf_measures(
     total_actuals = _sum_millions(ibp, ibp_mask & ibp_in_actual)
     prior_month_actual = _sum_millions(ibp, ibp_mask & ibp_in_prior)
 
+    # Prior-Year Actual: the whole PY frame is already the shifted-back
+    # window, so sum every row that matches this leaf.
+    if ibp_py is not None and not ibp_py.empty:
+        py_actual = _sum_millions(ibp_py, _leaf_mask(ibp_py, tpl))
+    else:
+        py_actual = 0.0
+
     # ── Plan buckets (tracker, Base + R&O) ───────────────────────────
     # Prior Month Forecast benchmarks the prior-month actual against the
     # forecast that was live BEFORE the month closed — i.e. the PRIOR
@@ -1884,8 +2031,17 @@ def _compute_leaf_measures(
         trk, trk_mask & prior_cycle & is_base_or_ro & trk_in_prior)
     current_plan_actual = _sum_millions(
         trk, trk_mask & cur_cycle & is_base_or_ro & trk_in_actual)
-    current_plan_forecast = _sum_millions(
-        trk, trk_mask & cur_cycle & is_base_or_ro & trk_in_forecast)
+    # Current-cycle forecast SPLIT into its Base Plan and R&O legs (was one
+    # "Current Plan (Forecast)" column).  Current Plan = actuals + Base + R&O.
+    if not trk.empty:
+        is_base = trk["forecast_type"] == FORECAST_BASE_PLAN
+        is_ro = trk["forecast_type"] == FORECAST_R_AND_O
+    else:
+        is_base = is_ro = pd.Series([], dtype=bool)
+    current_plan_base = _sum_millions(
+        trk, trk_mask & cur_cycle & is_base & trk_in_forecast)
+    current_plan_ro = _sum_millions(
+        trk, trk_mask & cur_cycle & is_ro & trk_in_forecast)
 
     # ── Last Plan legs (the one-month-ago snapshot) ──────────────────
     # Actuals over the shifted-back actual window; PRIOR-cycle forecast
@@ -1906,10 +2062,12 @@ def _compute_leaf_measures(
     # _assemble_table so the columns always sum to Total Delta.
     return {
         COL_TOTAL_ACTUALS: total_actuals,
+        COL_PY_ACTUAL: py_actual,
         COL_PRIOR_MONTH_ACTUAL: prior_month_actual,
         COL_PRIOR_MONTH_FORECAST: prior_month_forecast,
         COL_CURRENT_PLAN_ACTUAL: current_plan_actual,
-        COL_CURRENT_PLAN_FORECAST: current_plan_forecast,
+        COL_CURRENT_PLAN_BASE: current_plan_base,
+        COL_CURRENT_PLAN_RO: current_plan_ro,
         COL_LAST_PLAN_ACTUALS: last_plan_actuals,
         COL_LAST_PLAN_FORECAST: last_plan_forecast,
         COL_R_AND_O: r_and_o,
@@ -1963,7 +2121,11 @@ def _assemble_table(
         #   Total Delta  = the walk between them (Current − Last).
         #   Base Plan    = the DERIVED residual Total Delta − PM Actual − R&O,
         #                  so Base Plan + PM Actual + R&O ≡ Total Delta.
-        current_plan = m[COL_TOTAL_ACTUALS] + m[COL_CURRENT_PLAN_FORECAST]
+        #   Current Plan = actuals over the actual window + the current-cycle
+        #                  forecast (Base + R&O) over the forecast window.
+        current_plan_base = m[COL_CURRENT_PLAN_BASE]
+        current_plan_ro = m[COL_CURRENT_PLAN_RO]
+        current_plan = m[COL_TOTAL_ACTUALS] + current_plan_base + current_plan_ro
         last_plan = m[COL_LAST_PLAN_ACTUALS] + m[COL_LAST_PLAN_FORECAST]
         pm_actual = m[COL_PRIOR_MONTH_ACTUAL] - m[COL_PRIOR_MONTH_FORECAST]
         total_delta = current_plan - last_plan
@@ -1972,10 +2134,12 @@ def _assemble_table(
         v_budget = current_plan - m[COL_BUDGET]
 
         # Ratio columns — guard divide-by-zero (blank when undefined).
-        #   Total Delta %  = Total Delta as a share of Last Plan (the MoM move).
-        #   %              = v. Budget as a share of Current Plan (unchanged).
+        #   Total Delta %       = Total Delta as a share of Last Plan (MoM move).
+        #   %                   = v. Budget as a share of Current Plan.
+        #   O% of Current Plan  = Current Plan (R&O) as a share of Current Plan.
         total_delta_pct = _safe_ratio(total_delta, last_plan)
         pct = _safe_ratio(v_budget, current_plan)
+        o_pct = _safe_ratio(current_plan_ro, current_plan)
 
         row = {
             COL_ROW_ID: tpl.row_id,
@@ -1986,9 +2150,12 @@ def _assemble_table(
             COL_PRIOR_MONTH_ACTUAL: m[COL_PRIOR_MONTH_ACTUAL],
             COL_PRIOR_MONTH_FORECAST: m[COL_PRIOR_MONTH_FORECAST],
             COL_CURRENT_PLAN_ACTUAL: m[COL_CURRENT_PLAN_ACTUAL],
-            COL_CURRENT_PLAN_FORECAST: m[COL_CURRENT_PLAN_FORECAST],
+            COL_CURRENT_PLAN_BASE: current_plan_base,
+            COL_CURRENT_PLAN_RO: current_plan_ro,
+            COL_PY_ACTUAL: m[COL_PY_ACTUAL],
             COL_LAST_PLAN: last_plan,
             COL_CURRENT_PLAN: current_plan,
+            COL_O_PCT: o_pct,
             COL_PM_ACTUAL: pm_actual,
             COL_TOTAL_DELTA: total_delta,
             COL_TOTAL_DELTA_PCT: total_delta_pct,

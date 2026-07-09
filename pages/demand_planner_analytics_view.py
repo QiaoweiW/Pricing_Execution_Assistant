@@ -130,6 +130,7 @@ from data_sources.demand_plan_comparison import (
     list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
+    list_tracker_dim_values,
     list_tracker_months,
     validate_filters,
     # Demand MOM Summary (actuals-stitched-onto-forecast pivot).
@@ -3568,8 +3569,6 @@ _SS_DP_FC_START_FILTER:  str = "ro_dp_forecast_start_filter"
 _SS_DP_FC_END_FILTER:    str = "ro_dp_forecast_end_filter"
 _SS_DP_ACT_START_FILTER: str = "ro_dp_actual_start_filter"
 _SS_DP_ACT_END_FILTER:   str = "ro_dp_actual_end_filter"
-# Native row-select key for the SKU drill-down.
-_SS_DP_PIVOT_TABLE:      str = "ro_dp_pivot_table_select"
 
 # Hidden columns owned by the pivot builder — kept in sync with
 # ``data_sources/demand_summary._HIDDEN_COLS``.  Listed locally so the
@@ -4058,6 +4057,123 @@ def _demand_pivot_column_config(
     return config
 
 
+def _fmt_mom_num(value: object) -> str:
+    """Format a millions value to 1 dp; blank/NaN → '-'."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if pd.isna(num):
+        return "-"
+    return f"{num:,.1f}"
+
+
+def _render_mom_pivot_html(result: DemandMomResult, *, show_budget: bool) -> None:
+    """Render the MOM pivot as a foldable, dark-styled, read-only HTML table.
+
+    Matches the planner's target layout: a dark-gray/white header, dark-gray
+    layer-1 (Portfolio Major) rows, and dark-gray Total + Total Budget columns
+    on every row.  Layer-1 and layer-2 (Forecast Type) rows are
+    ``<details>/<summary>`` disclosures so the planner can fold a whole
+    Portfolio Major — or one Forecast-Type branch — down to a single row.
+    Columns are a fixed CSS grid so every row (summary or leaf) stays aligned.
+    """
+    pivot = result.pivot
+    months = list(result.month_columns)
+    data_cols = [*months, TOTAL_COLUMN_LABEL]
+    if show_budget:
+        data_cols.append(TOTAL_BUDGET_COLUMN_LABEL)
+    # Fixed column widths → identical across every <details> block, so the
+    # grid lines up even though rows live in separate disclosure elements.
+    grid = "230px " + " ".join(["52px"] * len(months)) + " 60px" + (" 74px" if show_budget else "")
+    min_w = 230 + 52 * len(months) + 60 + (74 if show_budget else 0)
+
+    tot_cols = {TOTAL_COLUMN_LABEL, TOTAL_BUDGET_COLUMN_LABEL}
+
+    def _cells(row: pd.Series, *, indent: int, foldable: bool) -> str:
+        label = str(row.get("Row Label", "")).replace(" ", "").strip()
+        tri = '<span class="tri"></span>' if foldable else ""
+        pad = 8 + indent * 16
+        out = [f'<div class="lbl" style="padding-left:{pad}px">{tri}{_esc_html(label)}</div>']
+        for c in data_cols:
+            klass = "cell tot" if c in tot_cols else "cell"
+            out.append(f'<div class="{klass}">{_fmt_mom_num(row.get(c))}</div>')
+        return "".join(out)
+
+    def _norm(label: object) -> str:
+        return str(label).replace(" ", " ").strip()
+
+    # Header row.
+    head = [f'<div class="lbl">Row Labels</div>']
+    for c in data_cols:
+        head.append(f'<div>{_esc_html(c)}</div>')
+    parts = [f'<div class="r hdr">{"".join(head)}</div>']
+
+    rows = [r for _, r in pivot.iterrows()]
+    n = len(rows)
+    i = 0
+    while i < n:
+        row = rows[i]
+        indent = int(row.get("_indent", 0) or 0)
+        is_sub = bool(row.get("_is_subtotal", False))
+        if _norm(row.get("Row Label")) == "Grand Total":
+            parts.append(f'<div class="r grand">{_cells(row, indent=0, foldable=False)}</div>')
+            i += 1
+            continue
+        if indent == 0 and is_sub:
+            # Layer-1 Portfolio Major → foldable, dark row.
+            parts.append(f'<details class="g1" open><summary class="r l1">'
+                         f'{_cells(row, indent=0, foldable=True)}</summary>')
+            i += 1
+            while i < n and int(rows[i].get("_indent", 0) or 0) > 0 \
+                    and _norm(rows[i].get("Row Label")) != "Grand Total":
+                r2 = rows[i]
+                if int(r2.get("_indent", 0) or 0) == 1 and bool(r2.get("_is_subtotal", False)):
+                    # Layer-2 Forecast Type → foldable.
+                    parts.append(f'<details class="g2" open><summary class="r l2">'
+                                 f'{_cells(r2, indent=1, foldable=True)}</summary>')
+                    i += 1
+                    while i < n and int(rows[i].get("_indent", 0) or 0) >= 2:
+                        parts.append(f'<div class="r">{_cells(rows[i], indent=2, foldable=False)}</div>')
+                        i += 1
+                    parts.append("</details>")
+                else:
+                    # A layer-1 with no forecast-type subtotal (rare) → plain row.
+                    parts.append(f'<div class="r">{_cells(r2, indent=1, foldable=False)}</div>')
+                    i += 1
+            parts.append("</details>")
+        else:
+            parts.append(f'<div class="r">{_cells(row, indent=indent, foldable=False)}</div>')
+            i += 1
+
+    css = f"""
+<style>
+.mom {{overflow-x:auto; margin:.25rem 0 .5rem; font-size:.8rem;
+  color:#1a1a1a;}}
+.mom .tbl {{min-width:{min_w}px;}}
+.mom .r {{display:grid; grid-template-columns:{grid}; align-items:center;}}
+.mom .r > div {{padding:3px 6px; white-space:nowrap; text-align:right;
+  border-bottom:1px solid #ededed; overflow:hidden; text-overflow:ellipsis;
+  background:#ffffff;}}
+.mom .r > .lbl {{text-align:left;}}
+.mom .r > .tot {{background:#404040; color:#ffffff;}}
+.mom .hdr > div {{background:#404040; color:#ffffff; font-weight:700;
+  border-bottom:1px solid #2b2b2b;}}
+.mom .l1 > div {{background:#404040; color:#ffffff; font-weight:700;}}
+.mom .l2 > div {{font-weight:600;}}
+.mom .grand > div {{background:#2b2b2b; color:#ffffff; font-weight:700;}}
+.mom details {{border:0; margin:0;}}
+.mom summary {{list-style:none;}}
+.mom summary.r {{cursor:pointer;}}
+.mom summary::-webkit-details-marker {{display:none;}}
+.mom .tri::before {{content:'\\25B8\\00a0';}}
+.mom details[open] > summary .tri::before {{content:'\\25BE\\00a0';}}
+</style>
+"""
+    html = css + f'<div class="mom"><div class="tbl">{"".join(parts)}</div></div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def _render_demand_pivot_table(result: DemandMomResult) -> None:
     """Render the MOM pivot + dynamic footer subtotals + download + drill-down.
 
@@ -4103,25 +4219,12 @@ def _render_demand_pivot_table(result: DemandMomResult) -> None:
     # Footer uses the same columns; monthly Total Budget row fills month cells.
     footer_column_config = pivot_column_config
 
-    # Pivot table.  Height sized so the typical 10-30 row range fits
-    # without scrolling, capped so a wide filter doesn't dominate the
-    # page.  Each row is ~35 px tall; header ~38 px.
-    #
-    # ``on_select="rerun"`` + single-row selection turns the read-only
-    # table into a drill-down handle: clicking a row reruns this fragment
-    # and the selected row's SKU detail renders below.
-    table_height = min(35 * (len(result.pivot) + 1) + 38, 720)
-    selection = st.dataframe(
-        result.pivot,
-        use_container_width=True,
-        hide_index=True,
-        height=table_height,
-        column_order=column_order,
-        column_config=pivot_column_config,
-        key=_SS_DP_PIVOT_TABLE,
-        on_select="rerun",
-        selection_mode="single-row",
-    )
+    # Pivot table — a read-only, FOLDABLE, dark-styled HTML table (Streamlit's
+    # st.dataframe can render neither a dark header/row band nor collapsible
+    # hierarchy).  Layer-1 (Portfolio Major) and layer-2 (Forecast Type) rows
+    # are <details>/<summary> disclosures, so a click folds e.g. Butter — or
+    # Butter → Actual — down to a single row.
+    _render_mom_pivot_html(result, show_budget=show_budget_col)
 
     # ── Dynamic subtotals (Base Plan / R&O / bundled Total Budget) ───
     #
@@ -4164,16 +4267,32 @@ def _render_demand_pivot_table(result: DemandMomResult) -> None:
             "chart below)."
         )
 
-    # ── SKU drill-down (native single-row selection) ────────────────────
-    selected_rows = (
-        selection.selection.rows
-        if selection is not None and selection.selection else []
-    )
-    if selected_rows:
-        row = result.pivot.iloc[selected_rows[0]]
-        _render_mom_sku_drilldown(result, row)
-    else:
-        st.caption("💡 Select a row above to drill into its SKU-level values.")
+    # ── SKU drill-down (picker) ─────────────────────────────────────────
+    # The foldable HTML table can't post a row click back to Python, so the
+    # drill-down is driven by a compact picker of the pivot's rows.
+    pivot = result.pivot
+    if not pivot.empty:
+        def _breadcrumb(idx: int) -> str:
+            r = pivot.iloc[idx]
+            parts = [str(r.get(c, "") or "").strip()
+                     for c in (MOM_ROW_PMAJ, MOM_ROW_FORECAST, MOM_ROW_SFMT)]
+            parts = [p for p in parts if p]
+            return " › ".join(parts) or str(r.get("Row Label", "")).strip() or "Grand Total"
+
+        options = [-1, *range(len(pivot))]
+        sel = st.selectbox(
+            "🔬 Drill into a row (SKU-level detail)",
+            options=options,
+            index=0,
+            format_func=lambda i: "— none —" if i < 0 else _breadcrumb(i),
+            key="ro_dp_pivot_drill_select",
+            help="Pick a Portfolio Major / Forecast Type / Supply Format row to "
+                 "see the SKUs behind it.",
+        )
+        if sel is not None and sel >= 0:
+            _render_mom_sku_drilldown(result, pivot.iloc[sel])
+        else:
+            st.caption("💡 Pick a row above to drill into its SKU-level values.")
 
 
 def _render_base_ro_summary_chart(result: DemandMomResult) -> None:
@@ -4361,21 +4480,30 @@ def _render_demand_plan_comparison_section() -> None:
     st.markdown("### 🔀 Demand Plan Comparison Summary")
     st.caption(
         "Cycle-over-cycle comparison from "
-        "**`qry_mgmt_plan_history_tracker.csv`** (plan), **`dbo.IBP "
-        "Shipments`** (actuals), and **`qry_pdh.csv` → `RO_Item_Master.csv`** "
-        "(Portfolio Major / Supply Format / Brand).  Pick a current vs prior "
-        "cycle, the actual and forecast month ranges (which must not "
-        "overlap), and the month treated as *Prior Month*.  All values are "
-        "in **millions of pounds**."
+        "**`qry_mgmt_plan_history_tracker.csv`** (plan — now carrying "
+        "Portfolio Major / Supply Format / Portfolio Minor) and **`dbo.IBP "
+        "Shipments`** (actuals).  Pick a current vs prior cycle, the actual "
+        "and forecast month ranges (which must not overlap), the month "
+        "treated as *Prior Month*, and optionally filter by Portfolio Major "
+        "/ Supply Format.  All values are in **millions of pounds**."
     )
-    # Spell out exactly how the two plan columns are built — planners kept
-    # asking what "Current Plan" vs "Last Plan" (a.k.a. Prior Plan) mean.
+    # Spell out exactly how each column is built — planners kept asking what
+    # "Current Plan" vs "Last Plan" (a.k.a. Prior Plan) mean.
     st.markdown(
-        "**How the plan columns are built** "
+        "**How the columns are built** "
         "_(Actual window = `[Actual Start … Actual End]`, "
         "Forecast window = `[Forecast Start … Forecast End]`)_\n"
+        "- **Current Plan (Base)** / **Current Plan (R&O)** = the "
+        "**current-cycle** forecast over the Forecast window, split by "
+        "Forecast Type (Base Plan vs R&O).\n"
         "- **Current Plan** = **actual shipments** over the Actual window "
-        "**＋** the **current-cycle** forecast over the Forecast window.\n"
+        "**＋** Current Plan (Base) **＋** Current Plan (R&O).\n"
+        "- **O% of Current Plan** = Current Plan (R&O) ÷ Current Plan _(the "
+        "R&O / opportunity share of the plan)_.\n"
+        "- **PY Actual** = **prior-year shipments** over the plan's full "
+        "horizon shifted back **12 months** — window "
+        "`[Actual Start − 1yr … Forecast End − 1yr]`.  E.g. Actual begins "
+        "Apr 2026 and Forecast ends Mar 2027 → PY = **Apr 2025 … Mar 2026**.\n"
         "- **Last Plan** _(the prior / one-month-ago estimate)_ = **actual "
         "shipments** over the Actual window shifted back one month "
         "`[Actual Start … Actual End − 1]` **＋** the **prior-cycle** "
@@ -4464,11 +4592,12 @@ def _signature_for(df: Optional[pd.DataFrame]) -> tuple[int, int]:
 
 @st.cache_resource(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_enriched_sources(
-    tracker_sig: tuple, ibp_sig: tuple, ibp_orders_sig: tuple, pdh_sig: tuple,
-    item_master_sig: tuple,
+    tracker_sig: tuple, ibp_sig: tuple, ibp_orders_sig: tuple, ibp_py_sig: tuple,
+    pdh_sig: tuple, item_master_sig: tuple,
     _tracker_df: pd.DataFrame,
     _ibp_df: Optional[pd.DataFrame],
     _ibp_orders_df: Optional[pd.DataFrame],
+    _ibp_py_df: Optional[pd.DataFrame],
     _pdh_df: Optional[pd.DataFrame],
     _item_master_df: Optional[pd.DataFrame],
 ) -> EnrichedSources:
@@ -4482,7 +4611,7 @@ def _cached_enriched_sources(
     """
     return build_enriched_sources(
         _tracker_df, _ibp_df, _ibp_orders_df, _pdh_df,
-        item_master_df=_item_master_df,
+        item_master_df=_item_master_df, ibp_py_df=_ibp_py_df,
     )
 
 
@@ -4637,7 +4766,11 @@ def _render_demand_plan_comparison_fragment() -> None:
     if not actual_months:
         actual_months = months
 
-    filters = _render_demand_comparison_filters(cycles, months, actual_months)
+    # Portfolio Major / Supply Format options come straight off the tracker
+    # file (it now carries them) so the filter widgets render pre-enrichment.
+    pmaj_options, sfmt_options = list_tracker_dim_values(tracker_df)
+    filters = _render_demand_comparison_filters(
+        cycles, months, actual_months, pmaj_options, sfmt_options)
     errors = validate_filters(filters)
     if errors:
         for msg in errors:
@@ -4689,6 +4822,15 @@ def _render_demand_plan_comparison_fragment() -> None:
     ibp_orders_df, ibp_orders_warning = _load_demand_comparison_ibp_orders(
         months=tuple(sorted(prior_month_set)),
     )
+    # Prior-Year Actual window: the plan's full horizon (actual start →
+    # forecast end) shifted back 12 months — e.g. actual Apr 2026 … forecast
+    # Mar 2027 → PY Apr 2025 … Mar 2026.  Shipments over that window feed the
+    # PY Actual column.
+    py_window = tuple(sorted(_months_in_range_local(
+        _shift_year_back(filters.actual_start),
+        _shift_year_back(filters.forecast_end),
+    )))
+    ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
     ro_lookup = fetch_ro_summary_total_delta_by_path()
     dim_df, dim_warning = _load_demand_comparison_dim()
 
@@ -4703,16 +4845,18 @@ def _render_demand_plan_comparison_fragment() -> None:
     tracker_sig = _signature_for(tracker_df)
     ibp_sig = _signature_for(ibp_df)
     ibp_orders_sig = _signature_for(ibp_orders_df)
+    ibp_py_sig = _signature_for(ibp_py_df)
     pdh_sig = _signature_for(pdh_df)
     item_master_sig = _signature_for(item_master_df)
     dim_sig = _signature_for(dim_df)
     ro_sig = _ro_lookup_signature(ro_lookup)
-    enrich_sig = (tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig, item_master_sig)
+    enrich_sig = (
+        tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig, pdh_sig, item_master_sig)
 
     with st.spinner("Building Demand Plan Comparison Summary…"):
         enriched = _cached_enriched_sources(
-            tracker_sig, ibp_sig, ibp_orders_sig, pdh_sig, item_master_sig,
-            tracker_df, ibp_df, ibp_orders_df, pdh_df, item_master_df,
+            tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig, pdh_sig, item_master_sig,
+            tracker_df, ibp_df, ibp_orders_df, ibp_py_df, pdh_df, item_master_df,
         )
         table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
             enrich_sig + (ro_sig, budget_lookup_key),
@@ -4775,6 +4919,11 @@ def _render_demand_plan_comparison_fragment() -> None:
         _render_demand_comparison_driver_tables_cached(
             enrich_sig, filters, dim_sig, enriched, dim_df,
         )
+
+
+def _shift_year_back(d: date) -> date:
+    """Return the same month one year earlier (first-of-month)."""
+    return date(d.year - 1, d.month, 1)
 
 
 def _months_in_range_local(start: date, end: date) -> set[date]:
@@ -4854,6 +5003,8 @@ def _render_one_comparison_not_captured(
 
 def _render_demand_comparison_filters(
     cycles: list[str], months: list[date], actual_months: list[date],
+    pmaj_options: list[str] | None = None,
+    sfmt_options: list[str] | None = None,
 ) -> ComparisonFilters:
     """Render the cycle + month-range pickers; return a filter selection.
 
@@ -4963,6 +5114,38 @@ def _render_demand_comparison_filters(
         help="The single month used for the Prior-Month columns.",
     )
 
+    # ── Portfolio Major / Supply Format filter ──────────────────────────
+    # Multiselects default to EVERYTHING selected; deselecting narrows the
+    # whole summary (incl. Total B2C) to the chosen slice.  A full (or empty)
+    # selection means "no filter" so the default view is unchanged.
+    pmaj_options = pmaj_options or []
+    sfmt_options = sfmt_options or []
+    pmaj_filter: frozenset = frozenset()
+    sfmt_filter: frozenset = frozenset()
+    if pmaj_options or sfmt_options:
+        st.markdown("**Filter by Portfolio Major / Supply Format** "
+                    "_(all selected = no filter; deselect to remove)_")
+        frow = st.columns(2)
+        with frow[0]:
+            pmaj_sel = st.multiselect(
+                "Portfolio Major", options=pmaj_options, default=pmaj_options,
+                key="dpc_pmaj_filter",
+                help="Rows outside the selected Portfolio Majors are removed "
+                     "and the subtotals recompute.",
+            )
+        with frow[1]:
+            sfmt_sel = st.multiselect(
+                "Supply Format", options=sfmt_options, default=sfmt_options,
+                key="dpc_sfmt_filter",
+                help="Rows outside the selected Supply Formats are removed "
+                     "and the subtotals recompute.",
+            )
+        # Only narrow on a strict, non-empty subset.
+        if pmaj_sel and set(pmaj_sel) != set(pmaj_options):
+            pmaj_filter = frozenset(pmaj_sel)
+        if sfmt_sel and set(sfmt_sel) != set(sfmt_options):
+            sfmt_filter = frozenset(sfmt_sel)
+
     # Plain-language echo of the current selection — makes the active
     # window obvious at a glance regardless of dropdown contrast.
     #
@@ -4993,6 +5176,8 @@ def _render_demand_comparison_filters(
         forecast_start=forecast_start,
         forecast_end=forecast_end,
         prior_month=prior_month,
+        pmaj_filter=pmaj_filter,
+        sfmt_filter=sfmt_filter,
     )
 
 
@@ -5239,8 +5424,8 @@ def _render_demand_comparison_table(result) -> None:
         DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT
     }
     show_detail_cols = st.checkbox(
-        "Show actuals & month detail columns "
-        "(Total Actuals through Current Plan (Forecast))",
+        "Show prior-month & current-actual detail columns "
+        "(Prior Month Actual / Forecast, Current Plan (Actual))",
         value=False,
         key=_DPC_SHOW_DETAIL_COLS_KEY,
         help=(

@@ -4085,8 +4085,12 @@ def _render_mom_pivot_html(result: DemandMomResult, *, show_budget: bool) -> Non
         data_cols.append(TOTAL_BUDGET_COLUMN_LABEL)
     # Fixed column widths → identical across every <details> block, so the
     # grid lines up even though rows live in separate disclosure elements.
-    grid = "230px " + " ".join(["52px"] * len(months)) + " 60px" + (" 74px" if show_budget else "")
-    min_w = 230 + 52 * len(months) + 60 + (74 if show_budget else 0)
+    # Months are 66px so a full "2026-04" label fits without truncation;
+    # Total Budget is 96px so its header reads in full.
+    _month_w, _tot_w, _bud_w = 66, 62, 96
+    grid = ("230px " + " ".join([f"{_month_w}px"] * len(months))
+            + f" {_tot_w}px" + (f" {_bud_w}px" if show_budget else ""))
+    min_w = 230 + _month_w * len(months) + _tot_w + (_bud_w if show_budget else 0)
 
     tot_cols = {TOTAL_COLUMN_LABEL, TOTAL_BUDGET_COLUMN_LABEL}
 
@@ -4158,7 +4162,8 @@ def _render_mom_pivot_html(result: DemandMomResult, *, show_budget: bool) -> Non
 .mom .r > .lbl {{text-align:left;}}
 .mom .r > .tot {{background:#404040; color:#ffffff;}}
 .mom .hdr > div {{background:#404040; color:#ffffff; font-weight:700;
-  border-bottom:1px solid #2b2b2b;}}
+  border-bottom:1px solid #2b2b2b;
+  white-space:normal; overflow:visible; text-overflow:clip; line-height:1.15;}}
 .mom .l1 > div {{background:#404040; color:#ffffff; font-weight:700;}}
 .mom .l2 > div {{font-weight:600;}}
 .mom .grand > div {{background:#2b2b2b; color:#ffffff; font-weight:700;}}

@@ -20,6 +20,12 @@ from data_sources.holistic_demand_plan_aps import (
     HDP_COL_MONTH,
     HDP_COL_POUNDS,
     HDP_COLUMNS,
+    MATCH_COL_CORP,
+    MATCH_COL_CUSTOMER,
+    MATCH_COL_STATUS,
+    MATCH_EXACT,
+    MATCH_FUZZY,
+    MATCH_UNMAPPED,
     build_holistic_demand_plan_aps,
 )
 
@@ -82,7 +88,10 @@ def _ro_master_df() -> pd.DataFrame:
 def _customer_names_df() -> pd.DataFrame:
     return pd.DataFrame({
         "customer_num": ["1", "2"],
-        "customer_name": ["Winco", "Albertsons/Safeway"],   # note punctuation vs seed
+        # "Winco Foods" → seed "Winco" resolves by CONTAINMENT (Fuzzy);
+        # "Albertsons/Safeway" → seed "Albertsons Safeway" is EXACT once
+        # punctuation is normalised to a space.
+        "customer_name": ["Winco Foods", "Albertsons/Safeway"],
         "corporate_group": ["WINCO", "ALBERTSONS"],
     })
 
@@ -118,8 +127,8 @@ def test_ro_leg_corp_group_fuzzy_and_pounds():
     res = _build()
     ro = res.frame[res.frame[HDP_COL_FORECAST] == FORECAST_R_AND_O]
     corp_by_item = dict(zip(ro[HDP_COL_ITEM].astype(str), ro[HDP_COL_CORP]))
-    assert corp_by_item["310180"] == "WINCO"          # exact
-    assert corp_by_item["66"] == "ALBERTSONS"          # fuzzy ("Albertsons Safeway" ≈ "Albertsons/Safeway")
+    assert corp_by_item["310180"] == "WINCO"          # fuzzy: "Winco" ⊂ "Winco Foods"
+    assert corp_by_item["66"] == "ALBERTSONS"          # exact after normalising "/"→" "
     assert corp_by_item["999"] == "(Unmapped)"         # no match
     # April 2026 (Month 1) Winco/310180 = 1.0 * 365000 / 365 * 30 days = 30000.
     apr = ro[(ro[HDP_COL_ITEM].astype(str) == "310180")
@@ -130,6 +139,20 @@ def test_ro_leg_corp_group_fuzzy_and_pounds():
 def test_unmapped_customers_reported():
     res = _build()
     assert res.unmapped_customers == ("Mystery Mart",)
+
+
+def test_customer_match_log_classifies_and_sorts():
+    res = _build()
+    log = res.customer_match_log
+    status = dict(zip(log[MATCH_COL_CUSTOMER], log[MATCH_COL_STATUS]))
+    corp = dict(zip(log[MATCH_COL_CUSTOMER], log[MATCH_COL_CORP]))
+    assert status["Winco"] == MATCH_FUZZY and corp["Winco"] == "WINCO"
+    assert status["Albertsons Safeway"] == MATCH_EXACT
+    assert corp["Albertsons Safeway"] == "ALBERTSONS"
+    assert status["Mystery Mart"] == MATCH_UNMAPPED
+    assert corp["Mystery Mart"] == "(Unmapped)"
+    # Most-actionable first: the Unmapped row leads the log.
+    assert log.iloc[0][MATCH_COL_STATUS] == MATCH_UNMAPPED
 
 
 def test_non_b2c_items_dropped():

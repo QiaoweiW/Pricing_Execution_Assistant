@@ -285,6 +285,76 @@ def fetch_factscurrentaps_slim_df(*, force_refresh: bool = False) -> pd.DataFram
     return _cached_factscurrentaps("default")
 
 
+# Native Corporate Group column on dp_factscurrentaps.  Used ONLY by the
+# Holistic Demand Plan (APS) build, which the planner explicitly wants keyed
+# on the fact table's own corporate_group_code (unlike the Plan-Lift metric,
+# which re-derives Corporate Group via dp_dimcustomernames for today-boundary
+# consistency — see the module docstring).
+_APS_CORP_GROUP_CANDIDATES = (
+    "corporate_group_code", "Corporate Group Code", "CorporateGroupCode",
+    "corporate_group", "Corporate Group",
+)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_factscurrentaps_holistic(_cache_token: str) -> pd.DataFrame:
+    """Cached read of ``dp_factscurrentaps`` for the Holistic Demand Plan.
+
+    Projects ``month``, ``item_code``, ``consensus_plan_lbs`` and the native
+    ``corporate_group_code`` (renamed to internal names ``month``,
+    ``item_code``, ``plan_lbs``, ``corporate_group``).  Party site is not
+    needed — Corporate Group comes straight off the fact row here.
+    """
+    table_uri = _build_table_uri(_TABLE_FACTS)
+    schema = _scan(f"DESCRIBE SELECT * FROM delta_scan('{table_uri}')", table_uri)
+    available = tuple(schema["column_name"].astype(str))
+    available_set = set(available)
+
+    def _pick(candidates: tuple[str, ...]) -> Optional[str]:
+        return next((c for c in candidates if c in available_set), None)
+
+    month_col = _pick(_APS_MONTH_CANDIDATES)
+    item_col = _pick(_APS_ITEM_CANDIDATES)
+    plan_col = _pick(_APS_PLAN_CANDIDATES)
+    corp_col = _pick(_APS_CORP_GROUP_CANDIDATES)
+    missing = [
+        name for name, col in (
+            ("month", month_col), ("item_code", item_col),
+            ("consensus_plan_lbs", plan_col), ("corporate_group_code", corp_col),
+        ) if col is None
+    ]
+    if missing:
+        raise PlanLiftError(
+            f"{_TABLE_FACTS} is missing expected column(s): {', '.join(missing)}. "
+            f"Available columns: {', '.join(available)}."
+        )
+
+    select = ", ".join(
+        f"{_quote_ident(src)} AS {_quote_ident(dst)}"
+        for src, dst in (
+            (month_col, COL_MONTH), (item_col, COL_ITEM_CODE),
+            (plan_col, COL_PLAN_LBS), (corp_col, COL_CORP_GROUP),
+        )
+    )
+    df = _scan(f"SELECT {select} FROM delta_scan('{table_uri}')", table_uri)
+    logger.info("Loaded %s holistic: %s rows.", _TABLE_FACTS, len(df))
+    return df
+
+
+def fetch_factscurrentaps_holistic_df(*, force_refresh: bool = False) -> pd.DataFrame:
+    """Return ``dp_factscurrentaps`` with its native Corporate Group.
+
+    Columns (internal names): ``month``, ``item_code``, ``plan_lbs``
+    (= ``consensus_plan_lbs``), ``corporate_group`` (= native
+    ``corporate_group_code``).  Feeds the Holistic Demand Plan (APS) build.
+
+    Raises :class:`PlanLiftError` on any read failure.
+    """
+    if force_refresh:
+        _cached_factscurrentaps_holistic.clear()
+    return _cached_factscurrentaps_holistic("default")
+
+
 @st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
 def _cached_dimcalendar(_cache_token: str) -> pd.DataFrame:
     """Streamlit-cached full read of ``dbo.dp_dimcalendar``.

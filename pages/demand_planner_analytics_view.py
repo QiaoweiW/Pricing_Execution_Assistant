@@ -220,6 +220,10 @@ from data_sources.ship_to_sites import (
     ShipToSitesSourceError,
     fetch_dimshiptosites_df,
 )
+from data_sources.holistic_demand_plan_aps import (
+    HolisticDemandPlanError,
+    generate_holistic_demand_plan_aps,
+)
 from data_sources.product_line_review import (
     cy_full_year_months as _plr_cy_full_year_months,
 )
@@ -3074,7 +3078,7 @@ def _render_demand_summary() -> None:
     planner sees the same "Sign in via Home" hint instead of an
     exception stack.
     """
-    with st.expander("📈 Demand Summary", expanded=False):
+    with st.expander("📈 Demand Summary (IBP)", expanded=False):
         st.caption(
             "Latest **Demand Plan** CSV exports from Microsoft Fabric.  "
             f"Each table below is just an **example extract** "
@@ -3170,6 +3174,125 @@ def _render_demand_summary() -> None:
         # dimensions/brand from PDH — see ``demand_plan_comparison``.
         st.markdown("---")
         _render_demand_plan_comparison_section()
+
+
+# Session key holding the last-built Holistic Demand Plan result so download /
+# preview interactions don't re-run the heavy Fabric build.
+_HDP_APS_RESULT_KEY: str = "holistic_demand_plan_aps_result"
+
+
+def _render_demand_summary_aps() -> None:
+    """Render the Demand Summary (APS) section — the Holistic Demand Plan build.
+
+    A foldable, self-contained section: one **Generate Holistic Demand
+    Plan** button pulls ``dp_factscurrentaps`` (APS Base Plan) + expands
+    ``RO_Seed.csv`` into the R&O portion, merges them into
+    ``qry_mgmt_plan_full_aps.csv`` (Month · Item · Corporate Group ·
+    Demand Plan Pounds · Forecast Type), and offers it as a **download**
+    (never written back to Fabric).  The built result is cached in
+    ``st.session_state`` so download / preview clicks don't rebuild.
+    """
+    with st.expander("📈 Demand Summary (APS)", expanded=False):
+        st.caption(
+            "**Holistic Demand Plan** — merges the **APS Base Plan** "
+            "(`dbo.dp_factscurrentaps`, consensus plan tagged *APS Base "
+            "Plan*) with the **R&O** portion expanded from `RO_Seed.csv` "
+            "into one file **`qry_mgmt_plan_full_aps.csv`** "
+            "(Month · Item · Corporate Group · Demand Plan Pounds · "
+            "Forecast Type).  R&O rows are attributed to a Corporate Group "
+            "by fuzzy-matching RO_Seed's Customer name to "
+            "`dp_dimcustomernames`.  Download-only — nothing is written "
+            "back to Fabric."
+        )
+
+        # Auth gate — match every other Fabric-backed section here.
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.warning(
+                "🔒 **Microsoft Fabric is not connected.**  Sign in via "
+                "**Home & Fabric Sign-in** in the sidebar, then return here."
+            )
+            return
+
+        generate_clicked = st.button(
+            "▶️ Generate Holistic Demand Plan",
+            key="hdp_aps_generate",
+            type="primary",
+            use_container_width=True,
+            help=(
+                "Pulls dp_factscurrentaps + RO_Seed + supporting dims from "
+                "Fabric and builds qry_mgmt_plan_full_aps.csv.  Heavy (full "
+                "APS scan + 36-month RO expansion) — runs only on click."
+            ),
+        )
+
+        result = st.session_state.get(_HDP_APS_RESULT_KEY)
+        if generate_clicked:
+            try:
+                with st.spinner("Building Holistic Demand Plan (APS) from Microsoft Fabric…"):
+                    result = generate_holistic_demand_plan_aps()
+                st.session_state[_HDP_APS_RESULT_KEY] = result
+            except (
+                HolisticDemandPlanError, PlanLiftError, CustomerDimsError,
+                LakehouseIOError, ValueError,
+            ) as exc:
+                st.session_state.pop(_HDP_APS_RESULT_KEY, None)
+                st.error(f"❌ Could not build the Holistic Demand Plan.\n\n{exc}")
+                return
+
+        if result is None:
+            st.caption(
+                "_Click **Generate Holistic Demand Plan** to build the merged "
+                "APS + R&O file.  It reads the current Fabric data (cached ~15 "
+                "min); nothing is written back._"
+            )
+            return
+
+        frame = result.frame
+        if frame.empty:
+            st.info(
+                "The build produced no rows — check that `dp_factscurrentaps` "
+                "and `RO_Seed.csv` are populated in Fabric."
+            )
+        else:
+            st.success(
+                f"✅ Built **{len(frame):,}** rows — "
+                f"{result.aps_rows:,} APS Base Plan + {result.ro_rows:,} R&O."
+            )
+            today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+            st.download_button(
+                label="⬇️ Download `qry_mgmt_plan_full_aps.csv`",
+                data=frame.to_csv(index=False).encode("utf-8"),
+                file_name=f"qry_mgmt_plan_full_aps_{today}.csv",
+                mime="text/csv",
+                key="hdp_aps_download",
+                type="primary",
+                use_container_width=True,
+            )
+            with st.expander("👁️ Preview (first 100 rows)", expanded=False):
+                st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
+
+        # Reconciliation aid: RO customers that didn't resolve to a corp group.
+        if result.unmapped_customers:
+            with st.expander(
+                f"⚠️ {len(result.unmapped_customers):,} RO customer(s) not "
+                "mapped to a Corporate Group",
+                expanded=False,
+            ):
+                st.caption(
+                    "These `RO_Seed` Customer names didn't fuzzy-match "
+                    "`dp_dimcustomernames`; their R&O rows are tagged "
+                    "`(Unmapped)`.  Reconcile in the customer master."
+                )
+                st.dataframe(
+                    pd.DataFrame({"Customer": list(result.unmapped_customers)}),
+                    use_container_width=True, hide_index=True,
+                )
+
+        # Rebuild = drop the cached result + Fabric caches, then re-fetch fresh.
+        if st.button("🔄 Rebuild (refresh from Fabric)", key="hdp_aps_rebuild"):
+            st.session_state.pop(_HDP_APS_RESULT_KEY, None)
+            st.cache_data.clear()
+            st.rerun()
 
 
 def _render_demand_summary_file(
@@ -7046,6 +7169,9 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
+    st.markdown("---")
+
+    _render_demand_summary_aps()
     st.markdown("---")
 
     _render_product_line_review()

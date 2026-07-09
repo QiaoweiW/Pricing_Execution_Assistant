@@ -25,8 +25,11 @@ from data_sources.holistic_demand_plan_aps import (
     MATCH_COL_STATUS,
     MATCH_EXACT,
     MATCH_FUZZY,
+    MATCH_OVERRIDE,
     MATCH_UNMAPPED,
+    apply_customer_corp_overrides,
     build_holistic_demand_plan_aps,
+    filter_needs_review,
 )
 
 _ANCHOR = dt.date(2026, 4, 1)
@@ -172,3 +175,47 @@ def test_empty_aps_still_builds_ro():
     assert res.aps_rows == 0
     assert res.ro_rows > 0
     assert set(res.frame[HDP_COL_FORECAST]) == {FORECAST_R_AND_O}
+
+
+def _ro_corp_by_item(res) -> dict:
+    ro = res.frame[res.frame[HDP_COL_FORECAST] == FORECAST_R_AND_O]
+    return dict(zip(ro[HDP_COL_ITEM].astype(str), ro[HDP_COL_CORP]))
+
+
+def test_filter_needs_review_hides_confident_exacts():
+    res = _build()
+    review = filter_needs_review(res.customer_match_log)
+    custs = set(review[MATCH_COL_CUSTOMER])
+    assert "Winco" in custs             # Fuzzy → needs review
+    assert "Mystery Mart" in custs      # Unmapped → needs review
+    assert "Albertsons Safeway" not in custs  # Exact w/ real corp → hidden
+
+
+def test_apply_overrides_remaps_customer_and_relabels_log():
+    res = _build()
+    out = apply_customer_corp_overrides(res, {"Winco": "WINCO GROUP"})
+    # Every R&O row of Winco's item picks up the override.
+    assert _ro_corp_by_item(out)["310180"] == "WINCO GROUP"
+    # Log row is re-tagged Override with the new group.
+    row = out.customer_match_log.set_index(MATCH_COL_CUSTOMER).loc["Winco"]
+    assert row[MATCH_COL_STATUS] == MATCH_OVERRIDE
+    assert row[MATCH_COL_CORP] == "WINCO GROUP"
+    # APS leg is untouched by an R&O override.
+    aps = out.frame[out.frame[HDP_COL_FORECAST] == FORECAST_APS_BASE_PLAN]
+    assert float(aps.iloc[0][HDP_COL_POUNDS]) == 25.0
+    # Original result is not mutated.
+    assert _ro_corp_by_item(res)["310180"] == "WINCO"
+
+
+def test_apply_overrides_can_map_a_previously_unmapped_customer():
+    res = _build()
+    assert res.unmapped_customers == ("Mystery Mart",)
+    out = apply_customer_corp_overrides(res, {"Mystery Mart": "MYSTERY CORP"})
+    assert _ro_corp_by_item(out)["999"] == "MYSTERY CORP"
+    assert out.unmapped_customers == ()
+
+
+def test_apply_overrides_is_noop_for_empty_or_blank():
+    res = _build()
+    assert apply_customer_corp_overrides(res, {}) is res
+    assert apply_customer_corp_overrides(res, {"Winco": "  "}) is res

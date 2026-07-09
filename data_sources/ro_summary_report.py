@@ -153,6 +153,7 @@ _COMPARISON_OUTPUT_CACHE_TTL_SECONDS: int = 15 * 60
 # DataFrames don't tolerate duplicate column names; the column_config
 # in the page maps these IDs to clean display labels.
 
+COL_PRIOR_PLAN: str   = "_fy27_prior_plan"
 COL_CURRENT_PLAN: str = "_fy27_current_plan"
 COL_TOTAL_DELTA: str  = "_fy27_total_delta"
 COL_DELTA_NEW: str    = "_delta_new"
@@ -163,7 +164,7 @@ COL_Y1_CHANGE: str    = "_y1_change"
 COL_Y1_LATEST: str    = "_y1_latest"
 
 DATA_COLS: tuple[str, ...] = (
-    COL_CURRENT_PLAN, COL_TOTAL_DELTA,
+    COL_PRIOR_PLAN, COL_CURRENT_PLAN, COL_TOTAL_DELTA,
     COL_DELTA_NEW, COL_DELTA_EXIT, COL_DELTA_CHANGE,
     COL_Y1_PRIOR, COL_Y1_CHANGE, COL_Y1_LATEST,
 )
@@ -171,6 +172,7 @@ DATA_COLS: tuple[str, ...] = (
 # Display labels for the saved CSV — the planner / downstream
 # consumers see these (grouped form), not the internal IDs.
 SAVED_COLUMN_LABELS: dict[str, str] = {
+    COL_PRIOR_PLAN:   "FY27 Probabilized | Prior Plan",
     COL_CURRENT_PLAN: "FY27 Probabilized | Current Plan",
     COL_TOTAL_DELTA:  "FY27 Probabilized | Total Delta",
     COL_DELTA_NEW:    "Delta Breakdown | New",
@@ -730,9 +732,17 @@ def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
     prior_y1  = float(sub[YEAR1_PROB_PRIOR].sum())
     latest_y1 = float(sub[YEAR1_PROB_LE].sum())
 
+    current_plan = float(sub[CUR_FISCAL_PROB_LE].sum())
+    total_delta  = new_val + exit_val + change_val
+
     return {
-        COL_CURRENT_PLAN: float(sub[CUR_FISCAL_PROB_LE].sum()),
-        COL_TOTAL_DELTA:  new_val + exit_val + change_val,
+        # Prior Plan is the FY27 plan before this cycle's deltas.  Total
+        # Delta = Current − Prior, so Prior = Current − Total Delta —
+        # derived (no separate source column) and additive, so it rolls
+        # up through subtotals exactly like the other columns.
+        COL_PRIOR_PLAN:   current_plan - total_delta,
+        COL_CURRENT_PLAN: current_plan,
+        COL_TOTAL_DELTA:  total_delta,
         COL_DELTA_NEW:    new_val,
         COL_DELTA_EXIT:   exit_val,
         COL_DELTA_CHANGE: change_val,
@@ -1173,7 +1183,7 @@ __all__ = [
     "DIM_COLS",
     "META_COLS",
     "SAVED_COLUMN_LABELS",
-    "COL_CURRENT_PLAN", "COL_TOTAL_DELTA",
+    "COL_PRIOR_PLAN", "COL_CURRENT_PLAN", "COL_TOTAL_DELTA",
     "COL_DELTA_NEW", "COL_DELTA_EXIT", "COL_DELTA_CHANGE",
     "COL_Y1_PRIOR", "COL_Y1_CHANGE", "COL_Y1_LATEST",
     "COL_LABEL",

@@ -112,7 +112,9 @@ from data_sources.demand_plan_comparison import (
     PMAF_COL_ORDERED_PCT,
     PMAF_COL_SHIPPED_PCT,
     EnrichedSources,
+    ComparisonKpis,
     build_base_plan_driver_table,
+    build_comparison_kpis,
     build_comparison_not_captured,
     build_demand_plan_comparison,
     build_enriched_sources,
@@ -4493,10 +4495,11 @@ def _render_demand_plan_comparison_section() -> None:
         "/ Supply Format.  All values are in **millions of pounds**."
     )
     # Spell out exactly how each column is built — planners kept asking what
-    # "Current Plan" vs "Last Plan" (a.k.a. Prior Plan) mean.
-    st.markdown(
-        "**How the columns are built** "
-        "_(Actual window = `[Actual Start … Actual End]`, "
+    # "Current Plan" vs "Last Plan" (a.k.a. Prior Plan) mean.  Foldable so the
+    # reference text doesn't crowd the metrics + table (collapsed by default).
+    with st.expander("ℹ️ How the columns are built", expanded=False):
+        st.markdown(
+            "_(Actual window = `[Actual Start … Actual End]`, "
         "Forecast window = `[Forecast Start … Forecast End]`)_\n"
         "- **Current Plan (Base)** / **Current Plan (R&O)** = the "
         "**current-cycle** forecast over the Forecast window, split by "
@@ -4598,11 +4601,14 @@ def _signature_for(df: Optional[pd.DataFrame]) -> tuple[int, int]:
 @st.cache_resource(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_enriched_sources(
     tracker_sig: tuple, ibp_sig: tuple, ibp_orders_sig: tuple, ibp_py_sig: tuple,
+    ibp_recent_sig: tuple, ibp_recent_py_sig: tuple,
     pdh_sig: tuple, item_master_sig: tuple,
     _tracker_df: pd.DataFrame,
     _ibp_df: Optional[pd.DataFrame],
     _ibp_orders_df: Optional[pd.DataFrame],
     _ibp_py_df: Optional[pd.DataFrame],
+    _ibp_recent_df: Optional[pd.DataFrame],
+    _ibp_recent_py_df: Optional[pd.DataFrame],
     _pdh_df: Optional[pd.DataFrame],
     _item_master_df: Optional[pd.DataFrame],
 ) -> EnrichedSources:
@@ -4617,6 +4623,7 @@ def _cached_enriched_sources(
     return build_enriched_sources(
         _tracker_df, _ibp_df, _ibp_orders_df, _pdh_df,
         item_master_df=_item_master_df, ibp_py_df=_ibp_py_df,
+        ibp_recent_df=_ibp_recent_df, ibp_recent_py_df=_ibp_recent_py_df,
     )
 
 
@@ -4774,8 +4781,11 @@ def _render_demand_plan_comparison_fragment() -> None:
     # Portfolio Major / Supply Format options come straight off the tracker
     # file (it now carries them) so the filter widgets render pre-enrichment.
     pmaj_options, sfmt_options = list_tracker_dim_values(tracker_df)
-    filters = _render_demand_comparison_filters(
-        cycles, months, actual_months, pmaj_options, sfmt_options)
+    # Foldable filters — wrapping the call renders every picker inside the
+    # expander.  Expanded by default so the active window is visible.
+    with st.expander("🔍 Filters", expanded=True):
+        filters = _render_demand_comparison_filters(
+            cycles, months, actual_months, pmaj_options, sfmt_options)
     errors = validate_filters(filters)
     if errors:
         for msg in errors:
@@ -4836,6 +4846,13 @@ def _render_demand_plan_comparison_fragment() -> None:
         _shift_year_back(filters.forecast_end),
     )))
     ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
+    # Trailing-6-month shipments (current + prior year), anchored on the Actual
+    # end month, for the T3M / T6M YoY KPI tiles.  T3M = last 3 of these 6.
+    recent_cur = _last_n_months_local(filters.actual_end, 6)
+    recent_window = tuple(sorted(recent_cur))
+    recent_py_window = tuple(sorted(_shift_year_back(m) for m in recent_cur))
+    ibp_recent_df, _ = _load_demand_comparison_ibp(months=recent_window)
+    ibp_recent_py_df, _ = _load_demand_comparison_ibp(months=recent_py_window)
     ro_lookup = fetch_ro_summary_total_delta_by_path()
     dim_df, dim_warning = _load_demand_comparison_dim()
 
@@ -4851,17 +4868,22 @@ def _render_demand_plan_comparison_fragment() -> None:
     ibp_sig = _signature_for(ibp_df)
     ibp_orders_sig = _signature_for(ibp_orders_df)
     ibp_py_sig = _signature_for(ibp_py_df)
+    ibp_recent_sig = _signature_for(ibp_recent_df)
+    ibp_recent_py_sig = _signature_for(ibp_recent_py_df)
     pdh_sig = _signature_for(pdh_df)
     item_master_sig = _signature_for(item_master_df)
     dim_sig = _signature_for(dim_df)
     ro_sig = _ro_lookup_signature(ro_lookup)
     enrich_sig = (
-        tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig, pdh_sig, item_master_sig)
+        tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig,
+        ibp_recent_sig, ibp_recent_py_sig, pdh_sig, item_master_sig)
 
     with st.spinner("Building Demand Plan Comparison Summary…"):
         enriched = _cached_enriched_sources(
-            tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig, pdh_sig, item_master_sig,
-            tracker_df, ibp_df, ibp_orders_df, ibp_py_df, pdh_df, item_master_df,
+            tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig,
+            ibp_recent_sig, ibp_recent_py_sig, pdh_sig, item_master_sig,
+            tracker_df, ibp_df, ibp_orders_df, ibp_py_df,
+            ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df,
         )
         table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
             enrich_sig + (ro_sig, budget_lookup_key),
@@ -4901,6 +4923,14 @@ def _render_demand_plan_comparison_fragment() -> None:
         build_comparison_not_captured(enriched.tracker, filters),
     )
 
+    # 6c. Executive KPI strip (headline metrics) — sits directly above the
+    #     table so the reader gets the top-line story before the detail.
+    _render_comparison_kpis(
+        build_comparison_kpis(
+            result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
+        )
+    )
+
     # 7. Render the comparison table + download / save.
     _render_demand_comparison_table(result)
 
@@ -4933,6 +4963,17 @@ def _render_demand_plan_comparison_fragment() -> None:
 def _shift_year_back(d: date) -> date:
     """Return the same month one year earlier (first-of-month)."""
     return date(d.year - 1, d.month, 1)
+
+
+def _last_n_months_local(end: date, n: int) -> set[date]:
+    """Return the set of *n* first-of-month dates ending at *end* (inclusive)."""
+    months: set[date] = set()
+    cur = end.replace(day=1)
+    for _ in range(max(0, n)):
+        months.add(cur)
+        cur = cur.replace(year=cur.year - 1, month=12) if cur.month == 1 \
+            else cur.replace(month=cur.month - 1)
+    return months
 
 
 def _months_in_range_local(start: date, end: date) -> set[date]:
@@ -5345,6 +5386,67 @@ def _demand_comparison_column_config(percent_labels: list[str]) -> dict:
         else:
             config[label] = st.column_config.NumberColumn(label, format="%.2f")
     return config
+
+
+# Executive KPI strip shown above the Demand Plan Comparison table.  Four
+# tiles read left→right as a narrative: current reality → recent trend → the
+# plan's full-year assumption → the R&O aspiration baked into the plan.
+_DPC_KPI_CSS = """
+<style>
+.dpc-kpis {display:flex; gap:14px; flex-wrap:wrap; margin:.15rem 0 1rem;}
+.dpc-kpi {flex:1 1 180px; min-width:165px; background:#ffffff;
+  border:1px solid #e4e0d8; border-top:3px solid #1f4e79; border-radius:10px;
+  padding:12px 16px 11px; box-shadow:0 1px 3px rgba(40,50,70,.07);}
+.dpc-kpi .k-label {font-size:.72rem; font-weight:700; letter-spacing:.04em;
+  text-transform:uppercase; color:#5a6472;}
+.dpc-kpi .k-value {font-size:1.85rem; font-weight:800; line-height:1.15;
+  margin:.12rem 0 .12rem; color:#1f4e79;}
+.dpc-kpi .k-value.up {color:#1b7f3a;}
+.dpc-kpi .k-value.down {color:#c0392b;}
+.dpc-kpi .k-value.flat {color:#5a6472;}
+.dpc-kpi .k-desc {font-size:.7rem; font-style:italic; color:#8a8f98;}
+</style>
+"""
+
+
+def _fmt_yoy(value: Optional[float]) -> tuple[str, str]:
+    """Signed whole-ish percent for a YoY fraction → (text, css-class)."""
+    if value is None or pd.isna(value):
+        return "—", "flat"
+    cls = "up" if value > 0 else "down" if value < 0 else "flat"
+    return f"{value * 100:+.1f}%", cls
+
+
+def _fmt_share(value: Optional[float]) -> tuple[str, str]:
+    """Unsigned percent for a share fraction → (text, neutral class)."""
+    if value is None or pd.isna(value):
+        return "—", "flat"
+    return f"{value * 100:.1f}%", ""
+
+
+def _render_comparison_kpis(kpis: ComparisonKpis) -> None:
+    """Render the four headline KPI tiles above the comparison table."""
+    t3m = _fmt_yoy(kpis.t3m_yoy)
+    t6m = _fmt_yoy(kpis.t6m_yoy)
+    fy = _fmt_yoy(kpis.full_year_yoy)
+    ro = _fmt_share(kpis.ro_pct)
+    # (label, (value_text, css_class), descriptor) — narrative left→right.
+    tiles = (
+        ("T3M YoY", t3m, "Current reality"),
+        ("T6M YoY", t6m, "Recent trend"),
+        ("Full-Year YoY", fy, "Plan assumption"),
+        ("R&O % of Current Plan", ro, "Aspiration"),
+    )
+    cards = "".join(
+        f'<div class="dpc-kpi"><div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value {cls}">{_esc_html(text)}</div>'
+        f'<div class="k-desc">{_esc_html(desc)}</div></div>'
+        for label, (text, cls), desc in tiles
+    )
+    st.markdown(
+        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_demand_comparison_table(result) -> None:

@@ -37,6 +37,7 @@ from data_sources.demand_plan_comparison import (
     _compute_leaf_measures,
     build_comparison_not_captured,
     build_demand_plan_comparison,
+    build_comparison_kpis,
     build_item_dim_frame_from_tracker,
     build_prior_month_shipment_diagnostic,
     list_tracker_dim_values,
@@ -308,6 +309,56 @@ def test_current_plan_split_o_pct_and_py_actual():
     assert round(float(row["O% of Current Plan"]), 4) == round(2.0 / 19.0, 4)
     assert float(row["PY Actual"]) == 6.0
     assert "Current Plan (Forecast)" not in result.table.columns
+
+
+def test_build_comparison_kpis():
+    """T3M/T6M YoY from trailing shipments; Full-Year YoY + RO% from the table."""
+    filters = _filters_apr_jun_actual()  # actual Apr–Jun 2026 → T-anchor = Jun 2026
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4",
+         "pounds": 10_000_000.0},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4",
+         "pounds": 2_000_000.0},
+    ])
+    ship = lambda m, p: {  # noqa: E731
+        "item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+        "customer_name": "C", "month": m, "pounds": p,
+        "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
+    ibp = _enriched_ibp([ship(_APR, 1e6), ship(_MAY, 2e6), ship(_JUN, 4e6)])  # actuals=7
+    py = _enriched_ibp([ship(dt.date(2025, 7, 1), 6e6)])                      # PY Actual=6
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(trk, ibp, py), ro_total_delta_by_path={},
+    )
+
+    # Trailing-6-month shipments ending Jun 2026 (T3M = Apr–Jun).
+    def _m(y, mo):
+        return dt.date(y, mo, 1)
+    recent = _enriched_ibp([ship(_m(2026, mo), 4e6) for mo in (4, 5, 6)]      # T3M cur=12
+                           + [ship(_m(2026, mo), 2e6) for mo in (1, 2, 3)])   # +6 → T6M cur=18
+    recent_py = _enriched_ibp([ship(_m(2025, mo), 3e6) for mo in (4, 5, 6)]   # T3M py=9
+                              + [ship(_m(2025, mo), 1e6) for mo in (1, 2, 3)])  # +3 → T6M py=12
+
+    kpis = build_comparison_kpis(result.table, recent, recent_py, filters)
+    assert round(kpis.t3m_yoy, 4) == round((12 - 9) / 9, 4)     # +33.3%
+    assert round(kpis.t6m_yoy, 4) == round((18 - 12) / 12, 4)   # +50%
+    # Current Plan = actuals(7)+Base(10)+R&O(2)=19; PY Actual=6.
+    assert round(kpis.full_year_yoy, 4) == round((19 - 6) / 6, 4)
+    assert round(kpis.ro_pct, 4) == round(2 / 19, 4)
+
+
+def test_kpis_none_when_denominator_zero():
+    filters = _filters_apr_jun_actual()
+    empty = _enriched_ibp([])
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(_enriched_trk([]), empty), ro_total_delta_by_path={},
+    )
+    kpis = build_comparison_kpis(result.table, empty, empty, filters)
+    assert kpis.t3m_yoy is None and kpis.t6m_yoy is None
+    assert kpis.full_year_yoy is None       # PY Actual = 0 → undefined
 
 
 def test_pmaj_filter_narrows_rollup():

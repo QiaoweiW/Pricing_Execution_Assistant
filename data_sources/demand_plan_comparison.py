@@ -1337,6 +1337,21 @@ def _months_in_range(start: date, end: date) -> set[date]:
     return months
 
 
+def _shift_year_back(d: date) -> date:
+    """Return the same month one calendar year earlier (first-of-month)."""
+    return date(d.year - 1, d.month, 1)
+
+
+def _last_n_months(end: date, n: int) -> set[date]:
+    """Return the set of *n* first-of-month dates ending at *end* (inclusive)."""
+    cur = end.replace(day=1)
+    months: set[date] = set()
+    for _ in range(max(0, n)):
+        months.add(cur)
+        cur = _prev_month(cur)
+    return months
+
+
 def _sum_millions(df: pd.DataFrame, mask: pd.Series) -> float:
     """Return Σ pounds (in millions) over *df* rows where *mask* is True."""
     if df.empty or not mask.any():
@@ -1523,6 +1538,10 @@ class EnrichedSources:
     # Prior-year shipments (same tidy shape as ``ibp``) for the PY Actual
     # column; empty when the caller doesn't request it.
     ibp_py: pd.DataFrame = field(default_factory=lambda: _empty_enriched(actuals=True))
+    # Trailing-6-month shipments (current + prior-year) for the T3M/T6M YoY
+    # KPI tiles; empty when the caller doesn't request them.
+    ibp_recent: pd.DataFrame = field(default_factory=lambda: _empty_enriched(actuals=True))
+    ibp_recent_py: pd.DataFrame = field(default_factory=lambda: _empty_enriched(actuals=True))
 
 
 def build_enriched_sources(
@@ -1533,6 +1552,8 @@ def build_enriched_sources(
     *,
     item_master_df: Optional[pd.DataFrame] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
+    ibp_recent_df: Optional[pd.DataFrame] = None,
+    ibp_recent_py_df: Optional[pd.DataFrame] = None,
 ) -> EnrichedSources:
     """Build the shared enrichment bundle exactly once.
 
@@ -1571,15 +1592,16 @@ def build_enriched_sources(
         if ibp_orders_df is not None
         else _empty_enriched(actuals=True)
     )
-    # Prior-year shipments share the SAME dim frame → an item categorises to
-    # the same leaf across current and prior-year actuals.
-    ibp_py = (
-        _enrich_ibp(ibp_py_df, dim_frame) if ibp_py_df is not None
-        else _empty_enriched(actuals=True)
-    )
+    # Prior-year + trailing-6-month shipments share the SAME dim frame → an
+    # item categorises to the same leaf across every actuals window.
+    def _enrich_opt(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        return _enrich_ibp(df, dim_frame) if df is not None else _empty_enriched(actuals=True)
+
     return EnrichedSources(
         tracker=trk, ibp=ibp, ibp_orders=ibp_orders, pdh_warning=pdh_warning,
-        ibp_py=ibp_py,
+        ibp_py=_enrich_opt(ibp_py_df),
+        ibp_recent=_enrich_opt(ibp_recent_df),
+        ibp_recent_py=_enrich_opt(ibp_recent_py_df),
     )
 
 
@@ -2307,6 +2329,95 @@ def build_comparison_not_captured(
             window_months=current_window, captured_mask=captured),
         prior_cycle_label=filters.prior_cycle,
         current_cycle_label=filters.current_cycle,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Executive KPI tiles (headline metrics above the comparison table)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ComparisonKpis:
+    """Headline metrics for the KPI strip above the Demand Plan Comparison.
+
+    Every value is a FRACTION (e.g. 0.03 = +3%) or ``None`` when it can't be
+    computed (missing/zero denominator).  All are at the **Total B2C** level
+    and honour the section's Portfolio Major / Supply Format filter.
+
+    * ``t3m_yoy`` / ``t6m_yoy`` — trailing 3- / 6-month actual shipments vs the
+      same months a year ago (anchored on the Actual-window end month).
+    * ``full_year_yoy`` — (Current Plan − PY Actual) / PY Actual.
+    * ``ro_pct`` — Current Plan (R&O) / Current Plan (the R&O share of plan).
+    """
+    t3m_yoy: Optional[float]
+    t6m_yoy: Optional[float]
+    full_year_yoy: Optional[float]
+    ro_pct: Optional[float]
+
+
+def _b2c_shipments_millions(
+    enriched_ibp: pd.DataFrame, months: set[date], filters: "ComparisonFilters",
+) -> float:
+    """Σ (millions) of Total-B2C shipments in *months* — captured leaves only.
+
+    Applies the section's PMaj/SFmt filter first so the KPI matches the
+    (possibly filtered) table, then the template capture mask so only B2C
+    rows count, then the month window.
+    """
+    if enriched_ibp is None or enriched_ibp.empty or not months:
+        return 0.0
+    df = _apply_dim_filter(enriched_ibp, filters)
+    if df.empty:
+        return 0.0
+    mask = _comparison_captured_mask(df) & df["month"].isin(months)
+    return _sum_millions(df, mask)
+
+
+def build_comparison_kpis(
+    table: pd.DataFrame,
+    ibp_recent: pd.DataFrame,
+    ibp_recent_py: pd.DataFrame,
+    filters: ComparisonFilters,
+) -> ComparisonKpis:
+    """Compute the four headline KPIs shown above the comparison table.
+
+    ``table`` is the assembled comparison frame (supplies Current Plan, PY
+    Actual and O% at the Total B2C row).  ``ibp_recent`` / ``ibp_recent_py``
+    are the enriched trailing-6-month shipments (current + prior year); the
+    trailing-3-month figures are the last three of those six months.  The
+    windows anchor on ``filters.actual_end``:
+    e.g. Actual ends Jun 2026 → T3M = Apr–Jun 2026 vs Apr–Jun 2025.
+    """
+    # ── Trailing-window YoY (from shipments) ─────────────────────────
+    t_end = filters.actual_end.replace(day=1)
+    m3_cur = _last_n_months(t_end, 3)
+    m6_cur = _last_n_months(t_end, 6)
+    m3_py = {_shift_year_back(m) for m in m3_cur}
+    m6_py = {_shift_year_back(m) for m in m6_cur}
+
+    t3m_cur = _b2c_shipments_millions(ibp_recent, m3_cur, filters)
+    t3m_py = _b2c_shipments_millions(ibp_recent_py, m3_py, filters)
+    t6m_cur = _b2c_shipments_millions(ibp_recent, m6_cur, filters)
+    t6m_py = _b2c_shipments_millions(ibp_recent_py, m6_py, filters)
+    t3m_yoy = _safe_ratio(t3m_cur - t3m_py, t3m_py) if t3m_py else None
+    t6m_yoy = _safe_ratio(t6m_cur - t6m_py, t6m_py) if t6m_py else None
+
+    # ── Plan-level KPIs (from the Total B2C row of the table) ────────
+    full_year_yoy: Optional[float] = None
+    ro_pct: Optional[float] = None
+    if table is not None and not table.empty and COL_ROW_ID in table.columns:
+        tot = table.loc[table[COL_ROW_ID] == "total_b2c"]
+        if not tot.empty:
+            row = tot.iloc[0]
+            cur_plan = float(row.get(DISPLAY_LABELS[COL_CURRENT_PLAN], 0.0) or 0.0)
+            py_actual = float(row.get(DISPLAY_LABELS[COL_PY_ACTUAL], 0.0) or 0.0)
+            full_year_yoy = _safe_ratio(cur_plan - py_actual, py_actual) if py_actual else None
+            ro_val = row.get(DISPLAY_LABELS[COL_O_PCT])
+            ro_pct = None if ro_val is None or pd.isna(ro_val) else float(ro_val)
+
+    return ComparisonKpis(
+        t3m_yoy=t3m_yoy, t6m_yoy=t6m_yoy,
+        full_year_yoy=full_year_yoy, ro_pct=ro_pct,
     )
 
 
@@ -3764,6 +3875,8 @@ __all__ = [
     "EnrichedSources",
     "build_item_dim_frame",
     "build_demand_plan_comparison",
+    "build_comparison_kpis",
+    "ComparisonKpis",
     "build_prior_month_actual_vs_fcst_table",
     "build_prior_month_shipment_diagnostic",
     "DIAG_UNMAPPED",

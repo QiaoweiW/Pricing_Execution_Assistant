@@ -5835,7 +5835,9 @@ def _render_pmaf_html(table: pd.DataFrame, *, prior_cycle: str, prior_month: dat
         is_memo = bool(row.get("_is_memo", False))
         if row_id == "total_b2c":
             cls = "total"
-        elif is_sub and indent == 1:
+        elif indent == 1:
+            # Every indent-1 row is a Portfolio Major section (orange + bold),
+            # whether it's a subtotal (ESL, Cultured, …) or a leaf (Butter).
             cls = "section"
         elif is_sub:
             cls = "sub"

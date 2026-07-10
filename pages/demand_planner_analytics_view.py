@@ -134,6 +134,7 @@ from data_sources.demand_plan_comparison import (
     list_tracker_cycles,
     list_tracker_dim_values,
     list_tracker_months,
+    tracker_has_dim_columns,
     validate_filters,
     # Demand MOM Summary (actuals-stitched-onto-forecast pivot).
     DemandMomFilters,
@@ -314,6 +315,7 @@ from data_sources.ro_seed_pipeline import (
 )
 from data_sources.demand_plan_pipeline import (
     DemandPlanResult,
+    backfill_plan_attribute_columns,
     run_demand_plan_pipeline,
 )
 from data_sources.fabric_lakehouse_io import LakehouseIOError
@@ -4551,6 +4553,48 @@ def _render_demand_plan_comparison_section() -> None:
 _DPC_ENABLED_KEY: str = "demand_plan_comparison_enabled"
 # When False, hide Total Actuals … Current Plan (Forecast) in the table.
 _DPC_SHOW_DETAIL_COLS_KEY: str = "demand_plan_comparison_show_detail_cols"
+# One-shot flag: force the tracker re-read on the next fragment run (set by
+# the Generate / Regenerate action so it always pulls the LATEST file).
+_DPC_FORCE_TRACKER_REFRESH_KEY: str = "demand_plan_comparison_force_tracker"
+# One-shot success banner shown after a backfill (survives the rerun).
+_DPC_BACKFILL_BANNER_KEY: str = "demand_plan_comparison_backfill_banner"
+
+
+def _dpc_generate(tracker_df: pd.DataFrame) -> None:
+    """Run the *Generate Demand Plan Comparison Summary* action, then rerun.
+
+    1. If the history tracker is missing Portfolio Major / Supply Format /
+       Portfolio Minor, backfill them (archive the previous files, fill from
+       PDH → RO_Item_Master, save) via
+       :func:`backfill_plan_attribute_columns` — persisted so the comparison
+       reads the dims straight off the file thereafter.
+    2. Force a fresh tracker read on the coming rerun (pull the LATEST file,
+       incl. any columns just written) and mark the section enabled.
+
+    Shared by the first-time Generate button and the Regenerate button so the
+    backfill-then-build logic lives in exactly one place.
+    """
+    if not tracker_has_dim_columns(tracker_df):
+        with st.spinner(
+            "Adding Portfolio Major / Minor / Supply Format to the tracker "
+            "(PDH → RO_Item_Master) and archiving the previous file…"
+        ):
+            res = backfill_plan_attribute_columns()
+        if res.ok:
+            st.session_state[_DPC_BACKFILL_BANNER_KEY] = (
+                "✅ Added Portfolio Major / Minor / Supply Format to "
+                "`qry_mgmt_plan_history_tracker.csv` and `qry_mgmt_plan_full.csv` "
+                "(previous copies archived)."
+            )
+        else:
+            st.error(
+                "❌ Could not add the categorisation columns to the tracker.\n\n"
+                + "\n".join(res.errors)
+            )
+            return
+    st.session_state[_DPC_FORCE_TRACKER_REFRESH_KEY] = True
+    st.session_state[_DPC_ENABLED_KEY] = True
+    st.rerun(scope="fragment")
 
 # TTL for the derived (build) outputs.  60 minutes — matches the bumped
 # raw-CSV TTL so the build cache never out-lives its inputs.  The "🔄
@@ -4732,10 +4776,14 @@ def _render_demand_plan_comparison_fragment() -> None:
     5. Shared :class:`EnrichedSources` is cached and reused by all three
        builders so the PDH-merge cost is paid exactly once per signature.
     """
-    # 1. Tracker (cheap CSV read, lives behind the 60-min cache).
+    # 1. Tracker (cheap CSV read, lives behind the 60-min cache).  The
+    #    Generate button sets a one-shot force-refresh flag so a click always
+    #    pulls the LATEST tracker (and picks up columns just written by a
+    #    backfill).
+    force_tracker = bool(st.session_state.pop(_DPC_FORCE_TRACKER_REFRESH_KEY, False))
     try:
         with st.spinner("Reading qry_mgmt_plan_history_tracker.csv from Microsoft Fabric…"):
-            tracker_snapshot = fetch_mgmt_plan_history_tracker()
+            tracker_snapshot = fetch_mgmt_plan_history_tracker(force_refresh=force_tracker)
     except DemandSummaryError as exc:
         st.error(
             "❌ Could not load **qry_mgmt_plan_history_tracker.csv** for "
@@ -4792,37 +4840,58 @@ def _render_demand_plan_comparison_fragment() -> None:
             st.error(f"❌ {msg}")
         return
 
-    # 3. Opt-in gate.  Expensive builds (PDH-merge over the 356k-row
-    #    tracker + IBP slim read + RO Summary read + 3 build passes) only
-    #    happen once the planner explicitly asks for them — and stay
-    #    enabled across reruns so picker changes don't require re-clicking.
+    # 3. Generate gate.  The heavy build (dim-enrich the 356k-row tracker +
+    #    IBP slim read + RO Summary read + build passes) runs only when the
+    #    planner clicks Generate, and stays live across reruns so picker /
+    #    filter changes refine the view without re-clicking.
     enabled = st.session_state.get(_DPC_ENABLED_KEY, False)
     if not enabled:
-        st.warning(
-            "Hit the saving the RO_Summary_Report Button ABOVE Before "
-            "Generate this Summary"
+        st.markdown(
+            "**Generate Demand Plan Comparison Summary** — what this does:\n"
+            "1. Reads the **latest `qry_mgmt_plan_history_tracker.csv`** from "
+            "the lakehouse.\n"
+            "2. If it's missing **Portfolio Major / Portfolio Minor / Supply "
+            "Format**, adds those columns and fills them (PDH → "
+            "RO_Item_Master), **archiving the previous file first**, then "
+            "saves — so categorisation lives on the file itself.\n"
+            "3. Builds the comparison table, the headline KPI tiles, and the "
+            "**not-captured** reconciliation logs (prior cycle · current "
+            "cycle · actual shipments).\n\n"
+            "_Tip: **Save the RO Summary Report above first** so the **R&O** "
+            "column is populated._\n\n"
+            "_The other way to refresh this data is to upload a new Base Plan "
+            "in **Demand Plan Generation** — that regenerates "
+            "`qry_mgmt_plan_full`, the item-level query and the history "
+            "tracker (all with the categorisation dims) from source._"
         )
         if st.button(
-            "▶ Load Demand Plan Comparison (uses tracker + IBP + PDH)",
+            "▶ Generate Demand Plan Comparison Summary",
             key="demand_plan_comparison_enable",
             type="primary",
             width="stretch",
             help=(
-                "Pulls the supporting sources and builds the comparison + "
-                "driver tables.  Once loaded, the section stays live for "
-                "the rest of this session — picker changes rebuild only "
-                "the comparison, not the underlying enrichment."
+                "Pulls the latest tracker (adding the categorisation columns "
+                "if missing) and builds the comparison, KPIs and not-captured "
+                "logs.  Stays live for the session; picker / filter changes "
+                "then refine the view."
             ),
         ):
-            st.session_state[_DPC_ENABLED_KEY] = True
-            st.rerun(scope="fragment")
-        st.caption(
-            "_The Demand Plan Comparison + driver tables are heavy "
-            "(joins the 356k-row tracker against PDH and the IBP Delta "
-            "table).  They're loaded on demand to keep the rest of the "
-            "Demand Summary section snappy._"
-        )
+            _dpc_generate(tracker_df)
         return
+
+    # One-shot backfill confirmation (set by _dpc_generate, survives the rerun).
+    backfill_banner = st.session_state.pop(_DPC_BACKFILL_BANNER_KEY, None)
+    if backfill_banner:
+        st.success(backfill_banner)
+
+    # Regenerate — re-pull the latest tracker (and re-check / backfill the
+    # categorisation columns), then rebuild.
+    if st.button(
+        "🔄 Regenerate (re-pull latest tracker)",
+        key="demand_plan_comparison_regenerate",
+        help="Re-reads the latest qry_mgmt_plan_history_tracker.csv and rebuilds.",
+    ):
+        _dpc_generate(tracker_df)
 
     # 4. Heavy supporting sources — loaded only post opt-in.  Each
     #    loader is independent so a single failing source doesn't
@@ -4915,12 +4984,13 @@ def _render_demand_plan_comparison_fragment() -> None:
     for msg in warnings:
         st.warning(f"⚠️ {msg}")
 
-    # 6b. "SKUs not captured" reconciliation logs (prior + current cycle),
-    #     surfaced above the table so the planner reconciles before trusting
-    #     the totals.  Categorised via the same PDH → RO_Item_Master cascade
-    #     that enriched the tracker.
+    # 6b. "SKUs not captured" reconciliation logs (prior cycle · current
+    #     cycle · actual shipments), surfaced above the table so the planner
+    #     reconciles before trusting the totals.  Categorised off the dims
+    #     carried on the tracker (filled from PDH → RO_Item_Master).
     _render_comparison_not_captured_logs(
-        build_comparison_not_captured(enriched.tracker, filters),
+        build_comparison_not_captured(
+            enriched.tracker, filters, ibp_enriched=enriched.ibp),
     )
 
     # 6c. Executive KPI strip (headline metrics) — sits directly above the
@@ -4991,46 +5061,52 @@ def _months_in_range_local(start: date, end: date) -> set[date]:
 
 
 def _render_comparison_not_captured_logs(nc: ComparisonNotCaptured) -> None:
-    """Render the prior- and current-cycle 'SKUs not captured' logs.
+    """Render the three 'SKUs not captured' logs (prior · current · actuals).
 
-    Two foldable sections (one per cycle) listing the forecast SKUs whose
-    dims match no comparison-template family — with a jump link to
-    RO_Item_Master.csv in Fabric and a CSV download each.
+    A SKU is *not captured* when its Portfolio Major / Supply Format / Brand /
+    Portfolio Minor match no comparison-template family, so its pounds never
+    reach a row — the exact gap between a raw source total and the table.
+    One foldable, clearly-labelled section per leg, each with a jump link to
+    RO_Item_Master.csv and a CSV download.
     """
-    _render_one_comparison_not_captured(
-        nc.prior_cycle, cycle_label=nc.prior_cycle_label,
-        role="prior", key_suffix="prior",
+    st.markdown("**🧾 SKUs not captured in the comparison**")
+    st.caption(
+        "Why a SKU is *not captured*: its **Portfolio Major / Supply Format / "
+        "Portfolio Minor / Brand** (carried on the tracker, filled from PDH → "
+        "RO_Item_Master) match **no** comparison-template family, so its "
+        "forecast (cycles) or shipped (actuals) pounds never roll into a row. "
+        "Classify these items in RO_Item_Master — or fix their PDH dims — to "
+        "fold them in.  Each leg is listed explicitly below."
     )
     _render_one_comparison_not_captured(
-        nc.current_cycle, cycle_label=nc.current_cycle_label,
-        role="current", key_suffix="current",
+        nc.prior_cycle,
+        title=f"Prior cycle ({nc.prior_cycle_label}) — forecast SKUs",
+        empty_note=f"Every **prior-cycle ({nc.prior_cycle_label})** forecast SKU is captured.",
+        key_suffix="prior",
+    )
+    _render_one_comparison_not_captured(
+        nc.current_cycle,
+        title=f"Current cycle ({nc.current_cycle_label}) — forecast SKUs",
+        empty_note=f"Every **current-cycle ({nc.current_cycle_label})** forecast SKU is captured.",
+        key_suffix="current",
+    )
+    _render_one_comparison_not_captured(
+        nc.actuals,
+        title=f"Actual shipments ({nc.actual_window_label}) — shipped SKUs",
+        empty_note=f"Every **actual-shipment ({nc.actual_window_label})** SKU is captured.",
+        key_suffix="actuals",
     )
 
 
 def _render_one_comparison_not_captured(
-    df: pd.DataFrame, *, cycle_label: str, role: str, key_suffix: str,
+    df: pd.DataFrame, *, title: str, empty_note: str, key_suffix: str,
 ) -> None:
-    """Render a single cycle's not-captured log (success note when empty)."""
+    """Render one not-captured leg (success note when empty)."""
     if df is None or df.empty:
-        st.caption(
-            f"✅ Every {role}-cycle (**{cycle_label}**) forecast SKU is "
-            "captured in the comparison below."
-        )
+        st.caption(f"✅ {empty_note}")
         return
 
-    n = len(df)
-    with st.expander(
-        f"⚠️ {n:,} {role}-cycle ({cycle_label}) forecast SKU(s) NOT captured "
-        "in the comparison",
-        expanded=False,
-    ):
-        st.caption(
-            f"SKUs in the **{cycle_label}** ({role} cycle) forecast whose "
-            "Portfolio Major / Supply Format — resolved via "
-            "PDH → RO_Item_Master — match no comparison-template family, so "
-            "their forecast pounds never reach a row.  Classify them in "
-            "RO_Item_Master to fold them in."
-        )
+    with st.expander(f"⚠️ {len(df):,} {title} NOT captured", expanded=False):
         st.dataframe(df, use_container_width=True, hide_index=True)
         col_link, col_dl = st.columns(2)
         with col_link:

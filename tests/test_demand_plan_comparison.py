@@ -22,6 +22,7 @@ from data_sources.demand_plan_comparison import (
     DIAG_COL_PMAJ,
     DIAG_COL_SFMT,
     DIAG_UNMAPPED,
+    CNC_COL_SHIPPED_M,
     FORECAST_BASE_PLAN,
     FORECAST_R_AND_O,
     NC_COL_ITEM,
@@ -29,6 +30,7 @@ from data_sources.demand_plan_comparison import (
     TRK_ITEM,
     TRK_ITEM_DESCRIPTION,
     TRK_PMAJ,
+    TRK_PMINOR,
     TRK_SFMT,
     ComparisonFilters,
     ComparisonNotCaptured,
@@ -41,6 +43,7 @@ from data_sources.demand_plan_comparison import (
     build_item_dim_frame_from_tracker,
     build_prior_month_shipment_diagnostic,
     list_tracker_dim_values,
+    tracker_has_dim_columns,
     _vectorised_start_of_month as som,
 )
 
@@ -449,3 +452,42 @@ def test_not_captured_flags_items_outside_the_template():
         nc.current_cycle[NC_COL_ITEM].astype(str) == "900"].iloc[0]
     assert whey_row[NC_COL_PMAJ] == "Whey"
     assert nc.current_cycle_label == "C4" and nc.prior_cycle_label == "C3"
+    assert nc.actuals.empty              # no ibp passed → actuals leg empty
+
+
+def test_not_captured_actual_shipments_leg():
+    """Uncaptured SHIPPED SKUs over the actual window populate the actuals leg."""
+    filters = ComparisonFilters(
+        current_cycle="C4", prior_cycle="C3",
+        actual_start=_APR, actual_end=_JUN,
+        forecast_start=_JUL, forecast_end=dt.date(2026, 8, 1),
+        prior_month=_JUN,
+    )
+    ibp = _enriched_ibp([
+        # Captured (ESL LC Branded) — should NOT appear.
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": _MAY, "pounds": 5e6,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"},
+        # Uncaptured (Whey/Bag) in the actual window — SHOULD appear.
+        {"item_key": "900", "item_desc": "Whey Powder", "customer_no": "9",
+         "customer_name": "W", "month": _JUN, "pounds": 2e6,
+         "pmaj": "Whey", "sfmt": "Bag", "pminor": "", "brand": ""},
+        # Uncaptured but OUTSIDE the actual window — excluded.
+        {"item_key": "901", "item_desc": "Whey Two", "customer_no": "9",
+         "customer_name": "W", "month": _JUL, "pounds": 9e6,
+         "pmaj": "Whey", "sfmt": "Bag", "pminor": "", "brand": ""},
+    ])
+    nc = build_comparison_not_captured(_enriched_trk([]), filters, ibp_enriched=ibp)
+    items = set(nc.actuals[NC_COL_ITEM].astype(str))
+    assert items == {"900"}                        # captured + out-of-window excluded
+    assert CNC_COL_SHIPPED_M in nc.actuals.columns  # shipped measure, not forecast
+    assert nc.actual_window_label == "Apr 2026 – Jun 2026"
+
+
+def test_tracker_has_dim_columns():
+    assert tracker_has_dim_columns(pd.DataFrame({
+        TRK_ITEM: ["1"], TRK_PMAJ: ["ESL"], TRK_SFMT: ["Large Carton"],
+        TRK_PMINOR: [""],
+    }))
+    assert not tracker_has_dim_columns(pd.DataFrame({TRK_ITEM: ["1"]}))  # legacy
+    assert not tracker_has_dim_columns(None)

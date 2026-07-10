@@ -2217,27 +2217,38 @@ def _assemble_table(
 # — matches NO leaf silently drops out of every row.  This log surfaces those
 # items, per cycle, so the planner can reconcile the totals.
 
-# Extra display column (Item / Description / PMaj / SFmt reuse the MOM log's
-# NC_COL_* constants so both reconciliation logs speak the same schema).
+# Extra display columns (Item / Description / PMaj / SFmt reuse the MOM log's
+# NC_COL_* constants so both reconciliation logs speak the same schema).  The
+# measure column differs by leg: forecast pounds for the two cycles, shipped
+# pounds for the actuals leg.
 CNC_COL_FORECAST_M: str = "Forecast (M lbs)"
-_CNC_COLUMNS: tuple[str, ...] = (
-    NC_COL_ITEM, NC_COL_DESC, NC_COL_PMAJ, NC_COL_SFMT, CNC_COL_FORECAST_M,
-)
+CNC_COL_SHIPPED_M: str = "Shipped (M lbs)"
+
+
+def _not_captured_columns(measure_label: str) -> tuple[str, ...]:
+    return (NC_COL_ITEM, NC_COL_DESC, NC_COL_PMAJ, NC_COL_SFMT, measure_label)
 
 
 @dataclass(frozen=True)
 class ComparisonNotCaptured:
-    """Per-cycle "not captured in the comparison" logs.
+    """"Not captured in the comparison" reconciliation logs (three legs).
 
-    ``prior_cycle`` / ``current_cycle`` are display-ready frames (columns
-    :data:`_CNC_COLUMNS`) of the SKUs each cycle's forecast carries that
-    match no template leaf.  The ``*_label`` fields echo the cycle names
-    for the section headers.
+    Each frame lists the SKUs whose dims match no template leaf, so their
+    pounds never reach a comparison row:
+
+    * ``prior_cycle`` / ``current_cycle`` — each cycle's FORECAST SKUs
+      (measure = :data:`CNC_COL_FORECAST_M`).
+    * ``actuals`` — prior-month..actual-window SHIPPED SKUs
+      (measure = :data:`CNC_COL_SHIPPED_M`).
+
+    The ``*_label`` fields echo the cycle names / actual window for headers.
     """
     prior_cycle: pd.DataFrame
     current_cycle: pd.DataFrame
+    actuals: pd.DataFrame
     prior_cycle_label: str
     current_cycle_label: str
+    actual_window_label: str
 
 
 def _comparison_captured_mask(trk: pd.DataFrame) -> pd.Series:
@@ -2245,7 +2256,8 @@ def _comparison_captured_mask(trk: pd.DataFrame) -> pd.Series:
 
     ORs every non-subtotal leaf's :func:`_leaf_mask` (memo leaves included —
     they still appear in the table).  Subtotals are skipped: their masks are
-    unconstrained and would mark every row captured.
+    unconstrained and would mark every row captured.  Works on any enriched
+    frame (tracker or IBP) — both carry the same ``pmaj/sfmt/pminor/brand``.
     """
     if trk is None or trk.empty:
         return pd.Series([], dtype=bool)
@@ -2257,29 +2269,20 @@ def _comparison_captured_mask(trk: pd.DataFrame) -> pd.Series:
     return captured
 
 
-def _not_captured_frame(
-    trk: pd.DataFrame,
-    *,
-    cycle: str,
-    window_months: set[date],
-    captured_mask: pd.Series,
+def _aggregate_not_captured(
+    df: pd.DataFrame, mask: pd.Series, *, measure_label: str,
 ) -> pd.DataFrame:
-    """Return uncaptured SKUs for one cycle × forecast window, aggregated by item."""
-    empty = pd.DataFrame(columns=list(_CNC_COLUMNS))
-    if trk is None or trk.empty or not window_months:
-        return empty
+    """Aggregate the *mask*-selected rows of *df* into a not-captured table.
 
-    base_or_ro = trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
-    mask = (
-        (trk["cycle"] == cycle)
-        & base_or_ro
-        & trk["month"].isin(window_months)
-        & (~captured_mask)
-    )
-    sub = trk.loc[mask]
-    if sub.empty:
+    Groups by item, sums pounds → millions under *measure_label*, and sorts
+    heaviest-first (that's what moves the totals most).  Shared by every leg
+    (forecast + actuals) so the shaping lives in one place.
+    """
+    cols = _not_captured_columns(measure_label)
+    empty = pd.DataFrame(columns=list(cols))
+    if df is None or df.empty or mask is None or not bool(mask.any()):
         return empty
-
+    sub = df.loc[mask]
     grouped = sub.groupby("item_key", as_index=False).agg(
         item_desc=("item_desc", "first"),
         pmaj=("pmaj", "first"),
@@ -2288,48 +2291,76 @@ def _not_captured_frame(
     )
     grouped[NC_COL_PMAJ] = grouped["pmaj"].map(_norm_dim)
     grouped[NC_COL_SFMT] = grouped["sfmt"].map(_norm_dim)
-    grouped[CNC_COL_FORECAST_M] = (
-        grouped["pounds"] / _LBS_PER_MILLION
-    ).round(3)
-    out = grouped.rename(
-        columns={"item_key": NC_COL_ITEM, "item_desc": NC_COL_DESC},
-    )
-    # Heaviest missing forecast first — that's what moves the totals most.
-    out = out.sort_values(CNC_COL_FORECAST_M, ascending=False).reset_index(drop=True)
-    return out[list(_CNC_COLUMNS)]
+    grouped[measure_label] = (grouped["pounds"] / _LBS_PER_MILLION).round(3)
+    out = grouped.rename(columns={"item_key": NC_COL_ITEM, "item_desc": NC_COL_DESC})
+    out = out.sort_values(measure_label, ascending=False).reset_index(drop=True)
+    return out[list(cols)]
 
 
 def build_comparison_not_captured(
-    trk_enriched: pd.DataFrame, filters: ComparisonFilters,
+    trk_enriched: pd.DataFrame,
+    filters: ComparisonFilters,
+    *,
+    ibp_enriched: Optional[pd.DataFrame] = None,
 ) -> ComparisonNotCaptured:
-    """Return the prior- and current-cycle "not captured" reconciliation logs.
+    """Return the not-captured reconciliation logs (prior, current, actuals).
 
-    An item is *not captured* when its cascade-resolved dims match no
-    template leaf, so its forecast pounds never reach a comparison row.
-    The two logs use each cycle's Last-Plan / Current-Plan forecast window:
+    An item is *not captured* when its dims (Portfolio Major / Supply Format /
+    Portfolio Minor / Brand — carried on the tracker, filled from PDH →
+    RO_Item_Master) match no template leaf, so its pounds never reach a
+    comparison row.  Windows:
 
-      * **current cycle** → ``[forecast_start … forecast_end]``
-      * **prior cycle**   → ``[forecast_start − 1 month … forecast_end]``
-        (matches Last Plan's shifted-back prior-cycle window)
-
-    ``trk_enriched`` is the cascade-enriched tracker from
-    :func:`build_enriched_sources` (dims already resolved via
-    PDH → RO_Item_Master), so categorisation honours RO_Item_Master.
+      * **current cycle** forecast → ``[forecast_start … forecast_end]``
+      * **prior cycle**   forecast → ``[forecast_start − 1 month … forecast_end]``
+      * **actual shipments** (``ibp_enriched``) → ``[actual_start … actual_end]``
     """
-    captured = _comparison_captured_mask(trk_enriched)
+    captured_trk = _comparison_captured_mask(trk_enriched)
+
+    def _trk_leg(cycle: str, window: set[date]) -> pd.DataFrame:
+        if trk_enriched is None or trk_enriched.empty or not window:
+            return pd.DataFrame(columns=list(_not_captured_columns(CNC_COL_FORECAST_M)))
+        base_or_ro = trk_enriched["forecast_type"].isin(
+            (FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+        mask = (
+            (trk_enriched["cycle"] == cycle)
+            & base_or_ro
+            & trk_enriched["month"].isin(window)
+            & (~captured_trk)
+        )
+        return _aggregate_not_captured(trk_enriched, mask, measure_label=CNC_COL_FORECAST_M)
+
     current_window = _months_in_range(filters.forecast_start, filters.forecast_end)
     prior_window = _months_in_range(
         _prev_month(filters.forecast_start), filters.forecast_end)
+
+    # Actual-shipments leg: shipped SKUs over the actual window that match no leaf.
+    actual_window = _months_in_range(filters.actual_start, filters.actual_end)
+    actuals = pd.DataFrame(columns=list(_not_captured_columns(CNC_COL_SHIPPED_M)))
+    if ibp_enriched is not None and not ibp_enriched.empty and actual_window:
+        captured_ibp = _comparison_captured_mask(ibp_enriched)
+        amask = ibp_enriched["month"].isin(actual_window) & (~captured_ibp)
+        actuals = _aggregate_not_captured(ibp_enriched, amask, measure_label=CNC_COL_SHIPPED_M)
+
     return ComparisonNotCaptured(
-        prior_cycle=_not_captured_frame(
-            trk_enriched, cycle=filters.prior_cycle,
-            window_months=prior_window, captured_mask=captured),
-        current_cycle=_not_captured_frame(
-            trk_enriched, cycle=filters.current_cycle,
-            window_months=current_window, captured_mask=captured),
+        prior_cycle=_trk_leg(filters.prior_cycle, prior_window),
+        current_cycle=_trk_leg(filters.current_cycle, current_window),
+        actuals=actuals,
         prior_cycle_label=filters.prior_cycle,
         current_cycle_label=filters.current_cycle,
+        actual_window_label=f"{filters.actual_start:%b %Y} – {filters.actual_end:%b %Y}",
     )
+
+
+def tracker_has_dim_columns(tracker_df: Optional[pd.DataFrame]) -> bool:
+    """True when the tracker already carries all three categorisation dims.
+
+    Drives the *Generate* button's decision to backfill: a tracker missing
+    Portfolio Major / Supply Format / Portfolio Minor must be enriched (and
+    persisted) before the comparison can categorise straight off the file.
+    """
+    if tracker_df is None or tracker_df.empty:
+        return False
+    return all(c in tracker_df.columns for c in (TRK_PMAJ, TRK_SFMT, TRK_PMINOR))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3877,6 +3908,7 @@ __all__ = [
     "build_demand_plan_comparison",
     "build_comparison_kpis",
     "ComparisonKpis",
+    "tracker_has_dim_columns",
     "build_prior_month_actual_vs_fcst_table",
     "build_prior_month_shipment_diagnostic",
     "DIAG_UNMAPPED",

@@ -4840,58 +4840,55 @@ def _render_demand_plan_comparison_fragment() -> None:
             st.error(f"❌ {msg}")
         return
 
-    # 3. Generate gate.  The heavy build (dim-enrich the 356k-row tracker +
-    #    IBP slim read + RO Summary read + build passes) runs only when the
-    #    planner clicks Generate, and stays live across reruns so picker /
-    #    filter changes refine the view without re-clicking.
+    # 3. Generate control — ALWAYS visible at the top of the section (both
+    #    first build and re-generate use this one button), separate from the
+    #    Base-Plan "append new history" uploader.  The heavy build runs only
+    #    after a click and stays live across reruns so picker / filter changes
+    #    refine the view without re-clicking.
     enabled = st.session_state.get(_DPC_ENABLED_KEY, False)
-    if not enabled:
-        st.markdown(
-            "**Generate Demand Plan Comparison Summary** — what this does:\n"
-            "1. Reads the **latest `qry_mgmt_plan_history_tracker.csv`** from "
-            "the lakehouse.\n"
-            "2. If it's missing **Portfolio Major / Portfolio Minor / Supply "
-            "Format**, adds those columns and fills them (PDH → "
-            "RO_Item_Master), **archiving the previous file first**, then "
-            "saves — so categorisation lives on the file itself.\n"
-            "3. Builds the comparison table, the headline KPI tiles, and the "
-            "**not-captured** reconciliation logs (prior cycle · current "
-            "cycle · actual shipments).\n\n"
-            "_Tip: **Save the RO Summary Report above first** so the **R&O** "
-            "column is populated._\n\n"
-            "_The other way to refresh this data is to upload a new Base Plan "
-            "in **Demand Plan Generation** — that regenerates "
-            "`qry_mgmt_plan_full`, the item-level query and the history "
-            "tracker (all with the categorisation dims) from source._"
-        )
-        if st.button(
-            "▶ Generate Demand Plan Comparison Summary",
-            key="demand_plan_comparison_enable",
-            type="primary",
-            width="stretch",
-            help=(
-                "Pulls the latest tracker (adding the categorisation columns "
-                "if missing) and builds the comparison, KPIs and not-captured "
-                "logs.  Stays live for the session; picker / filter changes "
-                "then refine the view."
-            ),
-        ):
-            _dpc_generate(tracker_df)
-        return
 
     # One-shot backfill confirmation (set by _dpc_generate, survives the rerun).
     backfill_banner = st.session_state.pop(_DPC_BACKFILL_BANNER_KEY, None)
     if backfill_banner:
         st.success(backfill_banner)
 
-    # Regenerate — re-pull the latest tracker (and re-check / backfill the
-    # categorisation columns), then rebuild.
+    with st.expander("ℹ️ What the Generate button does", expanded=not enabled):
+        st.markdown(
+            "Builds this Comparison Summary **from the existing "
+            "`qry_mgmt_plan_history_tracker.csv`** (does NOT append a new "
+            "cycle — that's the Base-Plan uploader in Demand Summary):\n"
+            "1. Reads the **latest** history tracker from the lakehouse.\n"
+            "2. If it's missing **Portfolio Major / Portfolio Minor / Supply "
+            "Format**, adds those columns and fills them (PDH → "
+            "RO_Item_Master), **archiving the previous file first**, then "
+            "saves — so categorisation lives on the file itself.\n"
+            "3. Builds the comparison table, the headline KPI tiles, and the "
+            "**not-captured** logs (prior cycle · current cycle · actual "
+            "shipments).\n\n"
+            "_Tip: **Save the RO Summary Report above first** so the **R&O** "
+            "column is populated._"
+        )
+
     if st.button(
-        "🔄 Regenerate (re-pull latest tracker)",
-        key="demand_plan_comparison_regenerate",
-        help="Re-reads the latest qry_mgmt_plan_history_tracker.csv and rebuilds.",
+        ("🔄 Regenerate Demand Plan Comparison Summary (re-pull latest tracker)"
+         if enabled else "▶ Generate Demand Plan Comparison Summary"),
+        key="demand_plan_comparison_generate",
+        type="primary",
+        width="stretch",
+        help=(
+            "Uses the EXISTING qry_mgmt_plan_history_tracker.csv — adds the "
+            "Portfolio Major / Minor / Supply Format columns if missing, then "
+            "builds the comparison, KPIs and not-captured logs."
+        ),
     ):
         _dpc_generate(tracker_df)
+
+    if not enabled:
+        st.info(
+            "👆 Click **Generate Demand Plan Comparison Summary** to build the "
+            "table from the latest history tracker."
+        )
+        return
 
     # 4. Heavy supporting sources — loaded only post opt-in.  Each
     #    loader is independent so a single failing source doesn't

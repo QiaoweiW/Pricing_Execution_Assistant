@@ -4905,7 +4905,11 @@ def _render_demand_plan_comparison_fragment() -> None:
     _render_demand_comparison_table(result)
 
     # 8. Prior Month Actual vs Fcst summary (between comparison and drivers).
-    _render_prior_month_actual_vs_fcst_table(prior_month_vs_fcst)
+    _render_prior_month_actual_vs_fcst_table(
+        prior_month_vs_fcst,
+        prior_cycle=filters.prior_cycle,
+        prior_month=filters.prior_month,
+    )
 
     # 8b. Prior-Month Shipment Diagnostic (reconciliation) — foldable and
     #     read-only.  Reuses the already-built enriched shipments
@@ -5730,16 +5734,144 @@ def _render_demand_driver_drill_down(
         )
 
 
-def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
+# Prior Month Actual vs Fcst — screenshot-styled presentation.
+#   * "same dark blue on UI" = #1f4e79 (the stitched MoM chart's dark blue,
+#     used just below this table), light-blue Total B2C, light-orange section
+#     rows — a banded Total / Difference / % header, like the source workbook.
+_PMAF_NAVY = "#1f4e79"
+_PMAF_CSS = f"""
+<style>
+.pmaf {{overflow-x:auto; margin:.25rem 0 .75rem;}}
+.pmaf table {{border-collapse:collapse; width:100%; font-size:.8rem;
+  background:#ffffff; color:#1a1a1a;}}
+.pmaf th, .pmaf td {{padding:4px 10px; white-space:nowrap;}}
+.pmaf thead th {{background:{_PMAF_NAVY}; color:#ffffff; font-weight:700;
+  text-align:right; border:1px solid #2f5f8f;}}
+.pmaf thead th.lbl {{text-align:left;}}
+.pmaf tbody td {{border-bottom:1px solid #e8e8e8; text-align:right;
+  background:#ffffff;}}
+.pmaf td.lbl {{text-align:left;}}
+.pmaf .grp {{border-left:2px solid {_PMAF_NAVY};}}
+.pmaf tr.total td {{background:#dce6f1; font-weight:700;}}
+.pmaf tr.section td {{background:#f8cbad; font-weight:700;}}
+.pmaf tr.sub td {{font-weight:600;}}
+.pmaf tr.memo td {{font-style:italic; color:#555555;}}
+</style>
+"""
+
+
+def _fmt_pmaf_lbs(value: object) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return "-" if pd.isna(num) else f"{num:,.1f}"
+
+
+def _fmt_pmaf_diff(value: object) -> str:
+    """Accounting style: negatives in parentheses, 1 dp; NaN → '-'."""
+    try:
+        num = round(float(value), 1)
+    except (TypeError, ValueError):
+        return "-"
+    if pd.isna(num):
+        return "-"
+    return f"({abs(num):.1f})" if num < 0 else f"{num:.1f}"
+
+
+def _fmt_pmaf_pct(value: object) -> str:
+    """Fraction → whole-percent (e.g. 0.03 → '3%', -0.13 → '-13%'); NaN → '-'."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    return "-" if pd.isna(num) else f"{round(num * 100):.0f}%"
+
+
+def _render_pmaf_html(table: pd.DataFrame, *, prior_cycle: str, prior_month: date) -> None:
+    """Render Prior Month Actual vs Fcst as the screenshot-styled HTML table.
+
+    Two-row banded header (Total {forecast, Ordered, Shipped} · Difference
+    {Ordered, Shipped} · % {Ordered, Shipped}), dark-blue header, light-blue
+    Total B2C, light-orange Portfolio-Major section rows, bold subtotals and
+    italic memo rows.  Read-only (edits/exports happen via the CSV download).
+    """
+    fcst_label = f"{prior_cycle} Forecast"
+    # (column id, header label, value formatter) grouped under the band names.
+    groups: tuple[tuple[str, tuple[tuple[str, str, object], ...]], ...] = (
+        ("Total", (
+            (PMAF_COL_PRIOR_PLAN, fcst_label, _fmt_pmaf_lbs),
+            (PMAF_COL_ORDERED, "Ordered", _fmt_pmaf_lbs),
+            (PMAF_COL_SHIPPED, "Shipped", _fmt_pmaf_lbs),
+        )),
+        ("Difference", (
+            (PMAF_COL_ORDERED_DIFF, "Ordered", _fmt_pmaf_diff),
+            (PMAF_COL_SHIPPED_DIFF, "Shipped", _fmt_pmaf_diff),
+        )),
+        ("%", (
+            (PMAF_COL_ORDERED_PCT, "Ordered", _fmt_pmaf_pct),
+            (PMAF_COL_SHIPPED_PCT, "Shipped", _fmt_pmaf_pct),
+        )),
+    )
+    cols = [(cid, fmt) for _g, gcols in groups for (cid, _lbl, fmt) in gcols]
+    group_start = {gcols[0][0] for _g, gcols in groups}  # first col of each band
+
+    # ── Header: band row + sub-column row ─────────────────────────
+    band = [f'<th class="lbl">{_esc_html(prior_month.strftime("%B %Y"))}</th>']
+    for gname, gcols in groups:
+        band.append(f'<th class="grp" colspan="{len(gcols)}">{_esc_html(gname)}</th>')
+    sub = ['<th class="lbl">Millions of lbs.</th>']
+    for _g, gcols in groups:
+        for cid, lbl, _fmt in gcols:
+            cls = ' class="grp"' if cid in group_start else ""
+            sub.append(f'<th{cls}>{_esc_html(lbl)}</th>')
+
+    # ── Body rows ─────────────────────────────────────────────────
+    body: list[str] = []
+    for _idx, row in table.iterrows():
+        row_id = str(row.get("_row_id", ""))
+        indent = int(row.get("_indent", 0) or 0)
+        is_sub = bool(row.get("_is_subtotal", False))
+        is_memo = bool(row.get("_is_memo", False))
+        if row_id == "total_b2c":
+            cls = "total"
+        elif is_sub and indent == 1:
+            cls = "section"
+        elif is_sub:
+            cls = "sub"
+        elif is_memo:
+            cls = "memo"
+        else:
+            cls = ""
+        tr = f'<tr class="{cls}">' if cls else "<tr>"
+        cells = [f'<td class="lbl">{_esc_html(row.get(DPC_COL_LABEL, ""))}</td>']
+        for cid, fmt in cols:
+            grp = ' class="grp"' if cid in group_start else ""
+            cells.append(f'<td{grp}>{fmt(row.get(cid))}</td>')
+        body.append(tr + "".join(cells) + "</tr>")
+
+    html = (
+        f'{_PMAF_CSS}<div class="pmaf"><table>'
+        f'<thead><tr>{"".join(band)}</tr><tr>{"".join(sub)}</tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_prior_month_actual_vs_fcst_table(
+    table: pd.DataFrame, *, prior_cycle: str, prior_month: date,
+) -> None:
     """Render the *Prior Month Actual vs Fcst* summary table.
 
     This sits below Demand Plan Comparison Summary and above the driver
     tables.  It reuses the exact same row hierarchy/indent metadata as
-    the comparison table (including dynamic Butter detail rows).
+    the comparison table (including dynamic Butter detail rows), and is
+    presented as a screenshot-styled HTML table (dark-blue banded header,
+    light-blue Total B2C, light-orange section rows).
     """
     st.markdown("#### 📌 Prior Month Actual vs Fcst")
     st.caption(
-        "Prior Plan = Prior Month Forecast (prior-cycle plan for the prior month), "
+        f"**{prior_cycle} Forecast** = the prior-cycle plan for the prior month, "
         "Ordered = IBP Orders (Ordered Qty lbs), "
         "Shipped = **Prior Month Actual = prior-month IBP Shipments (not orders)**.  "
         "All values are in millions of lbs."
@@ -5748,11 +5880,13 @@ def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
         st.info("No rows available for Prior Month Actual vs Fcst.")
         return
 
+    # Download mirrors the on-screen table; the forecast column header carries
+    # the specific cycle name (e.g. "C3 Forecast") like the display.
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")
     out_df = table.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
                  if c in table.columns]
-    ).reset_index(drop=True)
+    ).rename(columns={PMAF_COL_PRIOR_PLAN: f"{prior_cycle} Forecast"}).reset_index(drop=True)
     st.download_button(
         label="⬇️ Download Prior Month Actual vs Fcst (CSV)",
         data=out_df.to_csv(index=False).encode("utf-8"),
@@ -5762,57 +5896,7 @@ def _render_prior_month_actual_vs_fcst_table(table: pd.DataFrame) -> None:
         width="stretch",
     )
 
-    subtotal_flags = table["_is_subtotal"].tolist() if "_is_subtotal" in table.columns else []
-    memo_flags = table["_is_memo"].tolist() if "_is_memo" in table.columns else []
-    row_ids = (
-        table["_row_id"].tolist() if "_row_id" in table.columns else None
-    )
-    label_flags = (
-        table[DPC_COL_LABEL].tolist() if DPC_COL_LABEL in table.columns else None
-    )
-    for pct_col in (PMAF_COL_ORDERED_PCT, PMAF_COL_SHIPPED_PCT):
-        if pct_col in out_df.columns:
-            out_df[pct_col] = out_df[pct_col] * 100.0
-
-    def _style_row(row: pd.Series) -> list[str]:
-        return _style_comparison_hierarchy_row(
-            row,
-            subtotal_flags=subtotal_flags,
-            memo_flags=memo_flags,
-            row_ids=row_ids,
-            labels=label_flags,
-        )
-
-    styled = out_df.style.apply(_style_row, axis=1)
-    column_order = [
-        DPC_COL_LABEL,
-        PMAF_COL_PRIOR_PLAN,
-        PMAF_COL_ORDERED,
-        PMAF_COL_SHIPPED,
-        PMAF_COL_ORDERED_DIFF,
-        PMAF_COL_SHIPPED_DIFF,
-        PMAF_COL_ORDERED_PCT,
-        PMAF_COL_SHIPPED_PCT,
-    ]
-    column_config = {
-        DPC_COL_LABEL: st.column_config.TextColumn(DPC_COL_LABEL, width="large", pinned=True),
-        PMAF_COL_PRIOR_PLAN: st.column_config.NumberColumn(PMAF_COL_PRIOR_PLAN, format="%.2f"),
-        PMAF_COL_ORDERED: st.column_config.NumberColumn(PMAF_COL_ORDERED, format="%.2f"),
-        PMAF_COL_SHIPPED: st.column_config.NumberColumn(PMAF_COL_SHIPPED, format="%.2f"),
-        PMAF_COL_ORDERED_DIFF: st.column_config.NumberColumn(PMAF_COL_ORDERED_DIFF, format="%.2f"),
-        PMAF_COL_SHIPPED_DIFF: st.column_config.NumberColumn(PMAF_COL_SHIPPED_DIFF, format="%.2f"),
-        PMAF_COL_ORDERED_PCT: st.column_config.NumberColumn(PMAF_COL_ORDERED_PCT, format="%.1f%%"),
-        PMAF_COL_SHIPPED_PCT: st.column_config.NumberColumn(PMAF_COL_SHIPPED_PCT, format="%.1f%%"),
-    }
-    table_height = min(35 * (len(out_df) + 1) + 38, 860)
-    st.dataframe(
-        styled,
-        width="stretch",
-        hide_index=True,
-        height=table_height,
-        column_order=[c for c in column_order if c in out_df.columns],
-        column_config=column_config,
-    )
+    _render_pmaf_html(table, prior_cycle=prior_cycle, prior_month=prior_month)
 
 
 def _render_prior_month_shipment_diagnostic(

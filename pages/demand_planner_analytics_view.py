@@ -5271,6 +5271,17 @@ def _render_demand_comparison_filters(
             pmaj_filter = frozenset(pmaj_sel)
         if sfmt_sel and set(sfmt_sel) != set(sfmt_options):
             sfmt_filter = frozenset(sfmt_sel)
+    else:
+        # No options → the tracker file doesn't carry the categorisation
+        # columns yet.  Say so explicitly instead of silently omitting the
+        # filters (they appear automatically once the columns are present).
+        st.caption(
+            "ℹ️ **Portfolio Major / Supply Format filters will appear here** "
+            "once the tracker carries those columns.  Click **▶ Generate "
+            "Demand Plan Comparison Summary** below — it backfills them "
+            "(PDH → RO_Item_Master) — or upload a new Base Plan in Demand "
+            "Plan Generation."
+        )
 
     # Plain-language echo of the current selection — makes the active
     # window obvious at a glance regardless of dropdown contrast.

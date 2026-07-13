@@ -663,11 +663,13 @@ class ComparisonFilters:
     prior_month
         The single month treated as "Prior Month" for the PM Actual /
         Prior Month Forecast columns.
-    pmaj_filter / sfmt_filter
-        Optional whitelists of Portfolio Major / Supply Format values to
-        include.  Empty = include everything (the default).  When set, the
-        tracker + actuals are narrowed to those dims before roll-up, so the
-        whole summary (incl. Total B2C) reflects only the selected slice.
+    pmaj_filter / sfmt_filter / brand_filter
+        Optional whitelists of Portfolio Major / Supply Format / Brand
+        (``Branded`` / ``Private``) values to include.  Empty = include
+        everything (the default).  When set, the tracker + actuals are
+        narrowed to those dims before roll-up, so the whole summary (incl.
+        Total B2C) reflects only the selected slice — deselecting ``Private``
+        excludes private-label rows (incl. private-label butter), etc.
     """
     current_cycle: str
     prior_cycle: str
@@ -678,6 +680,7 @@ class ComparisonFilters:
     prior_month: date
     pmaj_filter: frozenset = frozenset()
     sfmt_filter: frozenset = frozenset()
+    brand_filter: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -937,15 +940,20 @@ def _apply_dim_filter(df: pd.DataFrame, filters: "ComparisonFilters") -> pd.Data
     """Narrow an enriched frame to the selected Portfolio Major / Supply Format.
 
     Empty whitelists = keep everything (default).  Operates on the enriched
-    ``pmaj`` / ``sfmt`` columns, so it works identically for tracker + actuals.
+    ``pmaj`` / ``sfmt`` / ``brand`` columns, so it works identically for
+    tracker + actuals.
     """
-    if df is None or df.empty or not (filters.pmaj_filter or filters.sfmt_filter):
+    if df is None or df.empty or not (
+        filters.pmaj_filter or filters.sfmt_filter or filters.brand_filter
+    ):
         return df
     mask = pd.Series(True, index=df.index)
     if filters.pmaj_filter and "pmaj" in df.columns:
         mask &= df["pmaj"].isin(filters.pmaj_filter)
     if filters.sfmt_filter and "sfmt" in df.columns:
         mask &= df["sfmt"].isin(filters.sfmt_filter)
+    if filters.brand_filter and "brand" in df.columns:
+        mask &= df["brand"].astype(str).str.strip().isin(filters.brand_filter)
     return df.loc[mask]
 
 

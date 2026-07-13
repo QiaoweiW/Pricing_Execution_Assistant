@@ -226,6 +226,7 @@ from data_sources.ship_to_sites import (
     fetch_dimshiptosites_df,
 )
 from data_sources.holistic_demand_plan_aps import (
+    APS_OUTPUT_NAME,
     HolisticDemandPlanError,
     MATCH_COL_CORP,
     MATCH_COL_CUSTOMER,
@@ -235,8 +236,11 @@ from data_sources.holistic_demand_plan_aps import (
     MATCH_OVERRIDE,
     MATCH_UNMAPPED,
     apply_customer_corp_overrides,
+    aps_output_path,
     filter_needs_review,
     generate_holistic_demand_plan_aps,
+    load_persisted_aps_plan,
+    save_aps_plan,
 )
 from data_sources.product_line_review import (
     cy_full_year_months as _plr_cy_full_year_months,
@@ -3241,30 +3245,72 @@ _HDP_APS_OVERRIDES_KEY: str = "holistic_demand_plan_aps_overrides"
 # clears overrides, so the keyed mapping editor re-initialises cleanly instead
 # of replaying stale cell edits onto a different row set.
 _HDP_APS_EDITOR_NONCE_KEY: str = "holistic_demand_plan_aps_editor_nonce"
+# Bumped after a successful mapping-patch upload so the file_uploader widget
+# resets (a re-run doesn't re-ingest the same file).
+_HDP_APS_UPLOAD_NONCE_KEY: str = "holistic_demand_plan_aps_upload_nonce"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_persisted_aps_plan() -> Optional[pd.DataFrame]:
+    """Cached read of the persisted APS plan from Fabric (``None`` if absent).
+
+    Cached so the existence-check + preview/download don't re-read the (large)
+    CSV on every rerun; cleared explicitly after a Generate or Apply-patch save
+    so the fresh file is picked up.
+    """
+    df, _etag = load_persisted_aps_plan()
+    return df
+
+
+def _parse_uploaded_mapping(uploaded) -> dict[str, str]:
+    """Parse an uploaded mapping-log CSV → ``{Customer -> Corporate Group}``.
+
+    Accepts the downloaded log shape (``Customer``, ``Corporate Group``, …);
+    rows with a blank / ``(Unmapped)`` Corporate Group are skipped so a
+    half-filled sheet only patches the rows the planner actually completed.
+    """
+    raw = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
+    cols = {c.strip().lower(): c for c in raw.columns}
+    cust_col = cols.get(MATCH_COL_CUSTOMER.lower())
+    corp_col = cols.get(MATCH_COL_CORP.lower())
+    if not cust_col or not corp_col:
+        raise ValueError(
+            f"The uploaded CSV must have '{MATCH_COL_CUSTOMER}' and "
+            f"'{MATCH_COL_CORP}' columns (found: {list(raw.columns)})."
+        )
+    out: dict[str, str] = {}
+    for cust, corp in zip(raw[cust_col], raw[corp_col]):
+        k, v = str(cust).strip(), str(corp).strip()
+        if k and v and v != CORP_GROUP_UNMAPPED:
+            out[k] = v
+    return out
 
 
 def _render_demand_summary_aps() -> None:
     """Render the Demand Summary (APS) section — the Holistic Demand Plan build.
 
-    A foldable, self-contained section: one **Generate Holistic Demand
-    Plan** button pulls ``dp_factscurrentaps`` (APS Base Plan) + expands
-    ``RO_Seed.csv`` into the R&O portion, merges them into
-    ``qry_mgmt_plan_full_aps.csv`` (Month · Item · Corporate Group ·
-    Demand Plan Pounds · Forecast Type), and offers it as a **download**
-    (never written back to Fabric).  The built result is cached in
-    ``st.session_state`` so download / preview clicks don't rebuild.
+    A foldable, self-contained section: **Generate / Rebuild** pulls
+    ``dp_factscurrentaps`` (APS Base Plan) + expands ``RO_Seed.csv`` into the
+    R&O portion, merges + enriches them into ``qry_mgmt_plan_full_aps.csv``
+    (Start of Month · Item · Item Description · Party Site Number · Demand
+    Plan Pounds · Forecast Type · Business Unit · Portfolio Major/Minor ·
+    Supply Format · Corporate Group), and **saves it to Fabric**
+    (``Files/RO Tracking/APS/``).  Once the file exists it loads from there
+    (preview + download) **without regenerating**, so hand-applied Corporate
+    Group fixes survive.
     """
     with st.expander("📈 Demand Summary (APS)", expanded=False):
         st.caption(
             "**Holistic Demand Plan** — merges the **APS Base Plan** "
-            "(`dbo.dp_factscurrentaps`, consensus plan tagged *APS Base "
-            "Plan*) with the **R&O** portion expanded from `RO_Seed.csv` "
-            "into one file **`qry_mgmt_plan_full_aps.csv`** "
-            "(Month · Item · Corporate Group · Demand Plan Pounds · "
-            "Forecast Type).  R&O rows are attributed to a Corporate Group "
-            "by fuzzy-matching RO_Seed's Customer name to "
-            "`dp_dimcustomernames`.  Download-only — nothing is written "
-            "back to Fabric."
+            "(`dbo.dp_factscurrentaps`, tagged *APS Base Plan*) with the "
+            "**R&O** portion expanded from `RO_Seed.csv` into "
+            "**`qry_mgmt_plan_full_aps.csv`**, matching the "
+            "`qry_mgmt_plan_full.csv` structure (+ **Corporate Group** last). "
+            "Item Description / Portfolio / Supply are resolved PDH → "
+            "RO_Item_Master; R&O rows are attributed to a Corporate Group by "
+            "fuzzy-matching RO_Seed's Customer to `dp_dimcustomernames`.  The "
+            f"file is **saved to `{aps_output_path()}`** and reused on later "
+            "visits (no regeneration) so mapping fixes stick."
         )
 
         # Auth gate — match every other Fabric-backed section here.
@@ -3276,27 +3322,35 @@ def _render_demand_summary_aps() -> None:
             return
 
         generate_clicked = st.button(
-            "▶️ Generate Holistic Demand Plan",
+            "▶️ Generate / Rebuild Holistic Demand Plan",
             key="hdp_aps_generate",
             type="primary",
             use_container_width=True,
             help=(
                 "Pulls dp_factscurrentaps + RO_Seed + supporting dims from "
-                "Fabric and builds qry_mgmt_plan_full_aps.csv.  Heavy (full "
-                "APS scan + 36-month RO expansion) — runs only on click."
+                "Fabric, builds qry_mgmt_plan_full_aps.csv and SAVES it to "
+                f"{aps_output_path()}.  Heavy (full APS scan + 36-month RO "
+                "expansion) — runs only on click.  Rebuilding overwrites the "
+                "saved file with a fresh fuzzy match (re-apply overrides "
+                "afterward to restore manual fixes)."
             ),
         )
 
         result = st.session_state.get(_HDP_APS_RESULT_KEY)
         if generate_clicked:
             try:
-                with st.spinner("Building Holistic Demand Plan (APS) from Microsoft Fabric…"):
+                with st.spinner(
+                    "Building Holistic Demand Plan (APS) and saving to Fabric…"
+                ):
                     result = generate_holistic_demand_plan_aps()
+                    save_aps_plan(result.frame)
+                _cached_persisted_aps_plan.clear()
                 st.session_state[_HDP_APS_RESULT_KEY] = result
                 # Fresh data → reset the mapping editor's widget state.
                 st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
                     st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
                 )
+                st.success(f"✅ Built and saved to `{aps_output_path()}`.")
             except (
                 HolisticDemandPlanError, PlanLiftError, CustomerDimsError,
                 LakehouseIOError, ValueError,
@@ -3305,56 +3359,73 @@ def _render_demand_summary_aps() -> None:
                 st.error(f"❌ Could not build the Holistic Demand Plan.\n\n{exc}")
                 return
 
-        if result is None:
+        # ── Interactive path: a freshly built / rebuilt result is in session.
+        #    Full mapping editor + patch upload + download reflect edits live.
+        if result is not None:
+            overrides = _render_hdp_match_editor(result)
+            effective = apply_customer_corp_overrides(result, overrides)
+            frame = effective.frame
+            if frame.empty:
+                st.info(
+                    "The build produced no rows — check that "
+                    "`dp_factscurrentaps` and `RO_Seed.csv` are populated."
+                )
+            else:
+                st.success(
+                    f"✅ Built **{len(frame):,}** rows — "
+                    f"{effective.aps_rows:,} APS Base Plan + "
+                    f"{effective.ro_rows:,} R&O.  Corporate Group edits below "
+                    "apply to the download now; click **Apply patch & save** "
+                    "to write them to the Fabric file."
+                )
+                _render_aps_download_preview(frame, key_prefix="hdp_aps_live")
+            return
+
+        # ── Load path: no session result → serve the persisted Fabric file.
+        try:
+            persisted = _cached_persisted_aps_plan()
+        except (LakehouseIOError, ValueError) as exc:
+            persisted = None
+            st.warning(f"Could not read the saved APS file: {exc}")
+        if persisted is not None and not persisted.empty:
+            st.success(
+                f"✅ Loaded existing **{APS_OUTPUT_NAME}** from Fabric "
+                f"({len(persisted):,} rows).  It is **not regenerated** on "
+                "load — click **Generate / Rebuild** above to refresh from "
+                "source, or fix Corporate Group mappings there."
+            )
+            _render_aps_download_preview(persisted, key_prefix="hdp_aps_saved")
             st.caption(
-                "_Click **Generate Holistic Demand Plan** to build the merged "
-                "APS + R&O file.  It reads the current Fabric data (cached ~15 "
-                "min); nothing is written back._"
+                "_To correct Corporate Group mappings, click **Generate / "
+                "Rebuild** — that loads the R&O detail needed to re-map, then "
+                "use the mapping-patch upload._"
             )
             return
 
-        # Editable Customer → Corporate Group mapping FIRST (top of the
-        # results) so the planner can fix mis-matches before trusting /
-        # downloading the file.  Returns the merged overrides after applying
-        # any inline edits; the download below reflects them immediately.
-        overrides = _render_hdp_match_editor(result)
-        effective = apply_customer_corp_overrides(result, overrides)
+        # ── Empty state: nothing built and nothing saved yet.
+        st.caption(
+            "_Click **Generate / Rebuild Holistic Demand Plan** to build the "
+            f"merged APS + R&O file and save it to `{aps_output_path()}`.  "
+            "Once saved it loads from there on later visits without "
+            "rebuilding._"
+        )
 
-        frame = effective.frame
-        if frame.empty:
-            st.info(
-                "The build produced no rows — check that `dp_factscurrentaps` "
-                "and `RO_Seed.csv` are populated in Fabric."
-            )
-        else:
-            st.success(
-                f"✅ Built **{len(frame):,}** rows — "
-                f"{effective.aps_rows:,} APS Base Plan + {effective.ro_rows:,} R&O."
-            )
-            today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-            st.download_button(
-                label="⬇️ Download `qry_mgmt_plan_full_aps.csv`",
-                data=frame.to_csv(index=False).encode("utf-8"),
-                file_name=f"qry_mgmt_plan_full_aps_{today}.csv",
-                mime="text/csv",
-                key="hdp_aps_download",
-                type="primary",
-                use_container_width=True,
-                help=(
-                    "Reflects your Corporate Group edits above — each override "
-                    "is applied to every R&O row of that Customer."
-                ),
-            )
-            with st.expander("👁️ Preview (first 100 rows)", expanded=False):
-                st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
 
-        # Rebuild = drop the cached result + Fabric caches, then re-fetch
-        # fresh.  Manual overrides are KEPT (re-applied to the new data) —
-        # use the "Clear overrides" button in the editor to discard them.
-        if st.button("🔄 Rebuild (refresh from Fabric)", key="hdp_aps_rebuild"):
-            st.session_state.pop(_HDP_APS_RESULT_KEY, None)
-            st.cache_data.clear()
-            st.rerun()
+def _render_aps_download_preview(frame: pd.DataFrame, *, key_prefix: str) -> None:
+    """Download button (fixed filename) + a first-100-rows preview expander."""
+    st.download_button(
+        label=f"⬇️ Download `{APS_OUTPUT_NAME}`",
+        data=frame.to_csv(index=False).encode("utf-8"),
+        file_name=APS_OUTPUT_NAME,
+        mime="text/csv",
+        key=f"{key_prefix}_download",
+        type="primary",
+        use_container_width=True,
+        help="Exactly the file saved in Fabric (reflects any applied "
+             "Corporate Group patch).",
+    )
+    with st.expander("👁️ Preview (first 100 rows)", expanded=False):
+        st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
 
 
 def _render_hdp_match_editor(result) -> dict[str, str]:
@@ -3497,6 +3568,73 @@ def _render_hdp_match_editor(result) -> dict[str, str]:
             mime="text/csv",
             key="hdp_aps_match_log_download",
         )
+
+        # ── Bulk patch round-trip: download log → fill → upload → apply ──────
+        # The patch is written to the Fabric file ONLY when the planner clicks
+        # "Apply patch & save" (inline edits + uploaded rows are merged).
+        st.markdown("---")
+        st.markdown(
+            "**Patch mappings from a file.**  Download the log above, fill the "
+            "**Corporate Group** column for the unmapped rows, upload it here, "
+            "then **Apply patch & save** to write the corrections into "
+            f"`{APS_OUTPUT_NAME}` in Fabric (the file is not otherwise "
+            "regenerated)."
+        )
+        upload_nonce = st.session_state.get(_HDP_APS_UPLOAD_NONCE_KEY, 0)
+        uploaded = st.file_uploader(
+            "Upload filled mapping log (CSV)",
+            type=["csv"],
+            key=f"hdp_aps_mapping_upload_{upload_nonce}",
+            help="Must carry Customer + Corporate Group columns (the "
+                 "downloaded log's shape).  Blank / (Unmapped) rows are ignored.",
+        )
+        if st.button(
+            "✅ Apply patch & save to Fabric",
+            key="hdp_aps_apply_patch",
+            type="primary",
+            use_container_width=True,
+            help="Applies uploaded + inline Corporate Group edits to every R&O "
+                 "row of each Customer, then overwrites the saved Fabric file.",
+        ):
+            merged = dict(overrides)
+            try:
+                if uploaded is not None:
+                    merged.update(_parse_uploaded_mapping(uploaded))
+            except (ValueError, pd.errors.ParserError) as exc:
+                st.error(f"❌ Could not read the uploaded mapping.\n\n{exc}")
+            else:
+                if not merged:
+                    st.warning(
+                        "Nothing to apply — edit a Corporate Group cell above "
+                        "or upload a filled log first."
+                    )
+                else:
+                    patched = apply_customer_corp_overrides(result, merged)
+                    try:
+                        with st.spinner("Applying patch and saving to Fabric…"):
+                            save_aps_plan(patched.frame)
+                    except (LakehouseIOError, HolisticDemandPlanError) as exc:
+                        st.error(f"❌ Save failed.\n\n{exc}")
+                    else:
+                        st.session_state[_HDP_APS_OVERRIDES_KEY] = merged
+                        _cached_persisted_aps_plan.clear()
+                        st.session_state[_HDP_APS_UPLOAD_NONCE_KEY] = upload_nonce + 1
+                        st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
+                            st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
+                        )
+                        remaining = len(filter_needs_review(patched.customer_match_log))
+                        if remaining:
+                            st.warning(
+                                f"Patch saved to `{APS_OUTPUT_NAME}`, but "
+                                f"**{remaining}** customer(s) still need a "
+                                "Corporate Group."
+                            )
+                        else:
+                            st.success(
+                                f"✅ Patch applied and saved to "
+                                f"`{APS_OUTPUT_NAME}` — the mapping log is clean."
+                            )
+                        st.rerun()
     return overrides
 
 
@@ -5273,41 +5411,66 @@ def _render_demand_comparison_filters(
         help="The single month used for the Prior-Month columns.",
     )
 
-    # ── Portfolio Major / Supply Format filter ──────────────────────────
+    # ── Portfolio Major / Supply Format / Brand filter ──────────────────
     # Multiselects default to EVERYTHING selected; deselecting narrows the
     # whole summary (incl. Total B2C) to the chosen slice.  A full (or empty)
-    # selection means "no filter" so the default view is unchanged.
+    # selection means "no filter" so the default view is unchanged.  Brand
+    # (Branded / Private) is always available — it's derived from the Item
+    # Description — so deselecting Private drops private-label rows (incl.
+    # private-label butter) even when the tracker lacks the PDH dim columns.
     pmaj_options = pmaj_options or []
     sfmt_options = sfmt_options or []
+    brand_options = [BRAND_BRANDED, BRAND_PRIVATE]
     pmaj_filter: frozenset = frozenset()
     sfmt_filter: frozenset = frozenset()
-    if pmaj_options or sfmt_options:
-        st.markdown("**Filter by Portfolio Major / Supply Format** "
-                    "_(all selected = no filter; deselect to remove)_")
-        frow = st.columns(2)
-        with frow[0]:
+    brand_filter: frozenset = frozenset()
+
+    st.markdown(
+        "**Filter by Portfolio Major / Supply Format / Brand** "
+        "_(all selected = no filter; deselect to remove — e.g. deselect "
+        "**Private** to drop private-label rows incl. private-label butter)_"
+    )
+    frow = st.columns(3)
+    with frow[0]:
+        if pmaj_options:
             pmaj_sel = st.multiselect(
                 "Portfolio Major", options=pmaj_options, default=pmaj_options,
                 key="dpc_pmaj_filter",
                 help="Rows outside the selected Portfolio Majors are removed "
                      "and the subtotals recompute.",
             )
-        with frow[1]:
+            if pmaj_sel and set(pmaj_sel) != set(pmaj_options):
+                pmaj_filter = frozenset(pmaj_sel)
+        else:
+            st.caption("_Portfolio Major filter appears once the tracker "
+                       "carries the column._")
+    with frow[1]:
+        if sfmt_options:
             sfmt_sel = st.multiselect(
                 "Supply Format", options=sfmt_options, default=sfmt_options,
                 key="dpc_sfmt_filter",
                 help="Rows outside the selected Supply Formats are removed "
                      "and the subtotals recompute.",
             )
+            if sfmt_sel and set(sfmt_sel) != set(sfmt_options):
+                sfmt_filter = frozenset(sfmt_sel)
+        else:
+            st.caption("_Supply Format filter appears once the tracker "
+                       "carries the column._")
+    with frow[2]:
+        brand_sel = st.multiselect(
+            "Brand", options=brand_options, default=brand_options,
+            key="dpc_brand_filter",
+            help="Deselect **Private** to exclude private-label rows (incl. "
+                 "private-label butter); deselect **Branded** for the inverse. "
+                 "Subtotals (incl. Total B2C) recompute on the selected slice.",
+        )
         # Only narrow on a strict, non-empty subset.
-        if pmaj_sel and set(pmaj_sel) != set(pmaj_options):
-            pmaj_filter = frozenset(pmaj_sel)
-        if sfmt_sel and set(sfmt_sel) != set(sfmt_options):
-            sfmt_filter = frozenset(sfmt_sel)
-    else:
-        # No options → the tracker file doesn't carry the categorisation
-        # columns yet.  Say so explicitly instead of silently omitting the
-        # filters (they appear automatically once the columns are present).
+        if brand_sel and set(brand_sel) != set(brand_options):
+            brand_filter = frozenset(brand_sel)
+    if not (pmaj_options or sfmt_options):
+        # The tracker file doesn't carry the categorisation columns yet — the
+        # PDH-backed dims appear automatically once present (Brand always works).
         st.caption(
             "ℹ️ **Portfolio Major / Supply Format filters will appear here** "
             "once the tracker carries those columns.  Click **▶ Generate "
@@ -5348,6 +5511,7 @@ def _render_demand_comparison_filters(
         prior_month=prior_month,
         pmaj_filter=pmaj_filter,
         sfmt_filter=sfmt_filter,
+        brand_filter=brand_filter,
     )
 
 
@@ -5650,6 +5814,105 @@ def _render_comparison_kpis(
     )
 
 
+# ── Demand Plan Comparison — screenshot-styled HTML table ────────────────────
+# Mirrors the sibling RO Summary / Prior-Month tables (navy header + white
+# font, light-blue Total B2C, orange #f8cbad Portfolio-Major section rows) so
+# the comparison reads as one system with the rest of this UI.  st.dataframe
+# can't style the header band, hence the hand-built table.
+_DPC_CMP_CSS: str = """
+<style>
+.dpc-cmp {overflow-x:auto; margin:0.35rem 0 0.75rem;}
+.dpc-cmp table {border-collapse:collapse; width:100%;
+  font-size:0.82rem; background:#ffffff; color:#1a1a1a;}
+.dpc-cmp th, .dpc-cmp td {padding:4px 10px; white-space:nowrap;}
+.dpc-cmp thead th {background:#1f3864; color:#ffffff; font-weight:700;
+  text-align:center; border:1px solid #2f4a7a; position:sticky; top:0; z-index:1;}
+.dpc-cmp tbody td {border-bottom:1px solid #e8e8e8; text-align:right;}
+.dpc-cmp td.lbl, .dpc-cmp th.lbl {text-align:left;}
+.dpc-cmp tr.total td {background:#dce6f1; font-weight:700;}
+.dpc-cmp tr.section td {background:#f8cbad; font-weight:700;}
+.dpc-cmp tr.subtotal td {font-weight:700;}
+.dpc-cmp tr.memo td {font-style:italic; color:#555555;}
+</style>
+"""
+
+
+def _dpc_cmp_row_class(
+    *, row_id: object, is_subtotal: bool, is_memo: bool, indent: int,
+) -> str:
+    """CSS class for one comparison row: total / section / subtotal / memo / leaf."""
+    if str(row_id) == "total_b2c":
+        return "total"
+    if is_memo:
+        return "memo"
+    if is_subtotal and indent == 1:
+        return "section"  # Portfolio Major: ESL / Aseptic / Cultured / Fresh Milk / Butter
+    return "subtotal" if is_subtotal else ""
+
+
+def _dpc_fmt_cell(value: object, *, is_percent: bool) -> str:
+    """Format one metric cell: '1,129.00' / '6.0%' / '—' for blank/NaN.
+
+    Percent values arrive pre-scaled to whole percents; millions keep two
+    decimals with thousands separators (matches the prior NumberColumn view).
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if pd.isna(num):
+        return "—"
+    return f"{num:.1f}%" if is_percent else f"{num:,.2f}"
+
+
+def _render_comparison_html(
+    display_df: pd.DataFrame,
+    *,
+    label_col: str,
+    metric_cols: list[str],
+    percent_labels: list[str],
+    row_ids: list[str] | None,
+    subtotal_flags: list[bool],
+    memo_flags: list[bool],
+    indent_flags: list[int],
+) -> None:
+    """Render the comparison table as the screenshot-styled, read-only HTML table.
+
+    The indented row hierarchy (NBSP-padded labels) is preserved verbatim; row
+    classes drive the Total B2C / Portfolio-Major / subtotal / memo styling.
+    """
+    percent_set = set(percent_labels)
+    head = [f'<th class="lbl">{_esc_html(label_col)}</th>']
+    head += [f'<th>{_esc_html(c)}</th>' for c in metric_cols]
+
+    body: list[str] = []
+    for i in range(len(display_df)):
+        cls = _dpc_cmp_row_class(
+            row_id=row_ids[i] if row_ids is not None and i < len(row_ids) else "",
+            is_subtotal=bool(subtotal_flags[i]) if i < len(subtotal_flags) else False,
+            is_memo=bool(memo_flags[i]) if i < len(memo_flags) else False,
+            indent=int(indent_flags[i]) if i < len(indent_flags) else 0,
+        )
+        tr = f'<tr class="{cls}">' if cls else "<tr>"
+        row = display_df.iloc[i]
+        cells = [f'<td class="lbl">{_esc_html(row[label_col])}</td>']
+        cells += [
+            f'<td>{_esc_html(_dpc_fmt_cell(row[c], is_percent=c in percent_set))}</td>'
+            for c in metric_cols
+        ]
+        body.append(tr + "".join(cells) + "</tr>")
+
+    st.markdown(
+        _DPC_CMP_CSS
+        + '<div class="dpc-cmp"><table><thead><tr>'
+        + "".join(head)
+        + "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_demand_comparison_table(result) -> None:
     """Render the comparison table (styled) + a CSV download button.
 
@@ -5719,9 +5982,6 @@ def _render_demand_comparison_table(result) -> None:
     row_ids = (
         table["_row_id"].tolist() if "_row_id" in table.columns else None
     )
-    label_flags = (
-        table[DPC_COL_LABEL].tolist() if DPC_COL_LABEL in table.columns else None
-    )
 
     display_df = table.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
@@ -5749,27 +6009,22 @@ def _render_demand_comparison_table(result) -> None:
         DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER
         if show_detail_cols or DPC_DISPLAY_LABELS[c] not in hidden_detail_labels
     ]
-    column_order = [DPC_COL_LABEL, *visible_metric_cols]
 
-    def _style_row(row: pd.Series) -> list[str]:
-        return _style_comparison_hierarchy_row(
-            row,
-            subtotal_flags=subtotal_flags,
-            memo_flags=memo_flags,
-            row_ids=row_ids,
-            labels=label_flags,
-        )
-
-    styled = display_df.style.apply(_style_row, axis=1)
-
-    table_height = min(35 * (len(display_df) + 1) + 38, 900)
-    st.dataframe(
-        styled,
-        width="stretch",
-        hide_index=True,
-        height=table_height,
-        column_order=column_order,
-        column_config=_demand_comparison_column_config(percent_labels),
+    # Screenshot-styled HTML table — navy header + white font, light-blue
+    # Total B2C, orange (#f8cbad) Portfolio-Major rows — matching the sibling
+    # tables so the whole page reads as one system.
+    indent_flags = (
+        table["_indent"].tolist() if "_indent" in table.columns else []
+    )
+    _render_comparison_html(
+        display_df,
+        label_col=DPC_COL_LABEL,
+        metric_cols=visible_metric_cols,
+        percent_labels=percent_labels,
+        row_ids=row_ids,
+        subtotal_flags=subtotal_flags,
+        memo_flags=memo_flags,
+        indent_flags=indent_flags,
     )
 
     if not result.ro_summary_available:

@@ -1,18 +1,24 @@
 """Holistic Demand Plan (APS) builder.
 
-Produces the downloadable ``qry_mgmt_plan_full_aps.csv`` — an APS-based
-analogue of ``qry_mgmt_plan_full.csv`` — by merging two legs into ONE
-unified 5-column frame::
+Produces ``qry_mgmt_plan_full_aps.csv`` — an APS-based analogue of
+``qry_mgmt_plan_full.csv`` — by merging two legs, then enriching to the SAME
+column structure as the IBP file with **Corporate Group appended last**::
 
-    Month | Item | Corporate Group | Demand Plan Pounds | Forecast Type
+    Start of Month | Item | Item Description | Party Site Number |
+    Demand Plan Pounds | Forecast Type | Business Unit |
+    Portfolio Major | Portfolio Minor | Supply Format | Corporate Group
+
+Item Description + the Portfolio/Supply dims are resolved PDH-primary →
+RO_Item_Master-fallback (the same coalesce the IBP pipeline uses); Party Site
+Number is intentionally blank and Business Unit is ``"B2C"`` for every row.
 
 Legs
 ----
 * **APS Base Plan** — ``dbo.dp_factscurrentaps`` (via
   :func:`data_sources.plan_lift.fetch_factscurrentaps_holistic_df`):
-  ``month → Month``, ``item_code → Item``, native ``corporate_group_code →
-  Corporate Group``, ``consensus_plan_lbs → Demand Plan Pounds``,
-  ``Forecast Type = "APS Base Plan"``.
+  ``month → Start of Month``, ``item_code → Item``, native
+  ``corporate_group_code → Corporate Group``, ``consensus_plan_lbs → Demand
+  Plan Pounds``, ``Forecast Type = "APS Base Plan"``.
 * **R&O** — ``RO_Seed.csv`` expanded through the *existing* pipeline
   automation (:func:`demand_plan_pipeline._build_tbl_ro_input` — the
   Format×Month 36-month expansion), then melted to long **keeping the
@@ -23,8 +29,11 @@ Legs
 
 This module is **pure-logic** for the builder (frames in → frame out, unit
 testable) with a thin :func:`generate_holistic_demand_plan_aps` orchestrator
-that reads the sources from Fabric.  It never writes to Fabric — the page
-offers the result as a download only.
+that reads the sources from Fabric.  The finished plan is **persisted** to
+``Files/RO Tracking/APS/qry_mgmt_plan_full_aps.csv`` (see
+:func:`save_aps_plan`); once it exists the page loads it via
+:func:`load_persisted_aps_plan` instead of regenerating, so hand-applied
+Corporate Group fixes survive.
 """
 from __future__ import annotations
 
@@ -46,6 +55,7 @@ from data_sources.demand_plan_pipeline import (
     _RO_SEED_BLOB,
     _SECRETS_SECTION,
     _TBL_MONTHS_BLOB,
+    _attach_item_attrs,
     _build_tbl_ro_input,
     _norm_item,
     _parse_dates,
@@ -56,7 +66,7 @@ from data_sources.customer_dims import (
     CUSTOMER_NAME_CANDIDATES,
     fetch_dp_dimcustomernames_df,
 )
-from data_sources.fabric_lakehouse_io import read_csv
+from data_sources.fabric_lakehouse_io import read_csv, write_csv
 from data_sources.plan_lift import (
     COL_CORP_GROUP,
     COL_ITEM_CODE,
@@ -70,14 +80,36 @@ logger = logging.getLogger(__name__)
 
 
 # ── Output contract ──────────────────────────────────────────────────────────
-HDP_COL_MONTH: str    = "Month"
-HDP_COL_ITEM: str     = "Item"
-HDP_COL_CORP: str     = "Corporate Group"
-HDP_COL_POUNDS: str   = "Demand Plan Pounds"
-HDP_COL_FORECAST: str = "Forecast Type"
+# Mirrors the IBP qry_mgmt_plan_full.csv structure with Corporate Group LAST.
+HDP_COL_MONTH: str      = "Start of Month"
+HDP_COL_ITEM: str       = "Item"
+HDP_COL_ITEM_DESC: str  = "Item Description"
+HDP_COL_PARTY: str      = "Party Site Number"
+HDP_COL_POUNDS: str     = "Demand Plan Pounds"
+HDP_COL_FORECAST: str   = "Forecast Type"
+HDP_COL_BU: str         = "Business Unit"
+HDP_COL_PMAJ: str       = "Portfolio Major"
+HDP_COL_PMIN: str       = "Portfolio Minor"
+HDP_COL_SFMT: str       = "Supply Format"
+HDP_COL_CORP: str       = "Corporate Group"
 HDP_COLUMNS: tuple[str, ...] = (
+    HDP_COL_MONTH, HDP_COL_ITEM, HDP_COL_ITEM_DESC, HDP_COL_PARTY,
+    HDP_COL_POUNDS, HDP_COL_FORECAST, HDP_COL_BU,
+    HDP_COL_PMAJ, HDP_COL_PMIN, HDP_COL_SFMT, HDP_COL_CORP,
+)
+# Working schema for the two legs BEFORE item-attribute enrichment: the
+# grouping keys + Corporate Group + pounds.  Item Description / Portfolio dims
+# / Party Site / Business Unit are attached AFTER grouping since each is a pure
+# function of Item (or a constant), so they can't change group cardinality.
+_CORE_COLUMNS: tuple[str, ...] = (
     HDP_COL_MONTH, HDP_COL_ITEM, HDP_COL_CORP, HDP_COL_POUNDS, HDP_COL_FORECAST,
 )
+HDP_BUSINESS_UNIT: str = "B2C"
+
+# Persisted output location (OneLake Files/…) — fixed name so the existence
+# check can find it and skip regeneration once it's written.
+_APS_OUTPUT_BLOB: str = "RO Tracking/APS/qry_mgmt_plan_full_aps.csv"
+APS_OUTPUT_NAME: str  = "qry_mgmt_plan_full_aps.csv"
 
 FORECAST_APS_BASE_PLAN: str = "APS Base Plan"
 FORECAST_R_AND_O: str       = "R&O"
@@ -133,6 +165,11 @@ class HolisticPlanResult:
         The B2C-filtered R&O rows *before* Corporate Group attribution and
         grouping (``Month | Item | Customer | Demand Plan Pounds``).  The
         override re-map keys off ``Customer`` here.
+    item_attrs
+        Distinct-Item lookup (``Item | Item Description | Portfolio Major |
+        Portfolio Minor | Supply Format``) used to enrich the core legs into
+        the full output shape.  Stored so an override re-map can re-assemble
+        the frame in-memory without re-reading PDH / RO_Item_Master.
     """
     frame: pd.DataFrame
     customer_match_log: pd.DataFrame
@@ -140,6 +177,7 @@ class HolisticPlanResult:
     ro_rows: int
     aps_leg: pd.DataFrame
     ro_detail: pd.DataFrame
+    item_attrs: pd.DataFrame
 
     @property
     def unmapped_customers(self) -> tuple[str, ...]:
@@ -169,21 +207,33 @@ def _pick(df: Optional[pd.DataFrame], candidates: tuple[str, ...]) -> Optional[s
     return next((c for c in candidates if c in df.columns), None)
 
 
-def _empty_frame() -> pd.DataFrame:
+def _empty_core() -> pd.DataFrame:
+    return pd.DataFrame(columns=list(_CORE_COLUMNS))
+
+
+def _empty_output() -> pd.DataFrame:
     return pd.DataFrame(columns=list(HDP_COLUMNS))
 
 
+def _concat_core(aps_leg: pd.DataFrame, ro_leg: pd.DataFrame) -> pd.DataFrame:
+    """Concatenate the two core legs, skipping empties (no all-NA concat warn)."""
+    legs = [leg for leg in (aps_leg, ro_leg) if leg is not None and not leg.empty]
+    if not legs:
+        return _empty_core()
+    return pd.concat(legs, ignore_index=True)[list(_CORE_COLUMNS)]
+
+
 def _group(df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate a shaped leg to one row per (Month, Item, Corp, Forecast)."""
+    """Aggregate a shaped leg to one core row per (Month, Item, Corp, Forecast)."""
     if df.empty:
-        return _empty_frame()
+        return _empty_core()
     out = (
         df.groupby(
             [HDP_COL_MONTH, HDP_COL_ITEM, HDP_COL_CORP, HDP_COL_FORECAST],
             as_index=False, dropna=False,
         )[HDP_COL_POUNDS].sum()
     )
-    return out[list(HDP_COLUMNS)]
+    return out[list(_CORE_COLUMNS)]
 
 
 # ── Fuzzy Customer → Corporate Group ─────────────────────────────────────────
@@ -279,9 +329,9 @@ def _resolve_customer_corp(
 # ── Leg builders ─────────────────────────────────────────────────────────────
 
 def _build_aps_leg(aps_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Shape dp_factscurrentaps into the unified schema ("APS Base Plan")."""
+    """Shape dp_factscurrentaps into the core schema ("APS Base Plan")."""
     if aps_df is None or aps_df.empty:
-        return _empty_frame()
+        return _empty_core()
     corp = aps_df[COL_CORP_GROUP].astype("string").str.strip()
     shaped = pd.DataFrame({
         HDP_COL_MONTH:    pd.to_datetime(aps_df[COL_MONTH], errors="coerce"),
@@ -395,7 +445,7 @@ def _ro_frame(
     planner overrides.
     """
     if ro_detail is None or ro_detail.empty:
-        return _empty_frame()
+        return _empty_core()
     corp = (
         ro_detail["Customer"].astype(str).str.strip()
         .map(lambda c: corp_by_customer.get(c) or CORP_GROUP_UNMAPPED)
@@ -405,6 +455,95 @@ def _ro_frame(
         HDP_COL_FORECAST: FORECAST_R_AND_O,
     })
     return _group(shaped)
+
+
+# ── Item-attribute enrichment (Item Description + Portfolio/Supply dims) ──────
+#
+# The core legs carry only the grouping keys + pounds.  Everything the IBP
+# qry_mgmt_plan_full.csv adds on top (Item Description, Portfolio Major/Minor,
+# Supply Format) is a pure function of Item, resolved PDH-primary →
+# RO_Item_Master-fallback exactly like the IBP pipeline — so it is attached
+# AFTER grouping and never affects group cardinality.
+
+def _build_desc_map(
+    pdh_df: Optional[pd.DataFrame], ro_master_df: Optional[pd.DataFrame],
+) -> dict[str, str]:
+    """``{normalised Item -> Item Description}``, PDH-primary → RO fallback.
+
+    RO_Item_Master's ``Item Desc`` is loaded first (fallback), then PDH's
+    ``Item Description`` overwrites it (primary wins) — mirroring the per-field
+    coalesce used for the Portfolio/Supply dims.
+    """
+    out: dict[str, str] = {}
+    for df, item_col, desc_col in (
+        (ro_master_df, "Item #", "Item Desc"),
+        (pdh_df, "Item No", "Item Description"),
+    ):
+        if df is None or df.empty or not {item_col, desc_col}.issubset(df.columns):
+            continue
+        keys = _norm_item(df[item_col])
+        vals = df[desc_col].astype("string").str.strip()
+        for k, v in zip(keys, vals):
+            if pd.notna(k) and str(k) and pd.notna(v) and str(v):
+                out[str(k)] = str(v)
+    return out
+
+
+_ATTRS_COLS: tuple[str, ...] = (
+    HDP_COL_ITEM, HDP_COL_ITEM_DESC, HDP_COL_PMAJ, HDP_COL_PMIN, HDP_COL_SFMT,
+)
+
+
+def _build_item_attrs(
+    items: pd.Series,
+    pdh_df: Optional[pd.DataFrame],
+    ro_master_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """One row per distinct Item: Item Description + Portfolio Major/Minor/Supply.
+
+    Portfolio dims come from the shared :func:`_attach_item_attrs` coalesce
+    (PDH → RO_Item_Master); Item Description from :func:`_build_desc_map`.
+    Missing values degrade to ``""`` so the output never carries NaN.
+    """
+    distinct = pd.Series(
+        pd.unique(_norm_item(items)), name=HDP_COL_ITEM,
+    ).dropna()
+    if distinct.empty:
+        return pd.DataFrame(columns=list(_ATTRS_COLS))
+    base = pd.DataFrame({HDP_COL_ITEM: distinct.astype(str)})
+    enriched = _attach_item_attrs(
+        base,
+        pdh_df if pdh_df is not None else pd.DataFrame(),
+        ro_master_df if ro_master_df is not None else pd.DataFrame(),
+    )
+    desc = _build_desc_map(pdh_df, ro_master_df)
+    enriched[HDP_COL_ITEM_DESC] = (
+        enriched[HDP_COL_ITEM].astype(str).map(desc)
+    )
+    for c in (HDP_COL_ITEM_DESC, HDP_COL_PMAJ, HDP_COL_PMIN, HDP_COL_SFMT):
+        if c not in enriched.columns:
+            enriched[c] = ""
+        enriched[c] = enriched[c].astype("string").fillna("").astype(str)
+    return enriched[list(_ATTRS_COLS)]
+
+
+def _assemble(core: pd.DataFrame, item_attrs: pd.DataFrame) -> pd.DataFrame:
+    """Attach item attributes + the constant columns → the full HDP frame.
+
+    ``Party Site Number`` is left blank and ``Business Unit`` is ``"B2C"`` for
+    every row, per the file spec; the result is column-ordered to
+    :data:`HDP_COLUMNS` (Corporate Group last).
+    """
+    if core is None or core.empty:
+        return _empty_output()
+    out = core.copy()
+    out[HDP_COL_ITEM] = _norm_item(out[HDP_COL_ITEM]).astype(str)
+    out = out.merge(item_attrs, on=HDP_COL_ITEM, how="left")
+    for c in (HDP_COL_ITEM_DESC, HDP_COL_PMAJ, HDP_COL_PMIN, HDP_COL_SFMT):
+        out[c] = out[c].fillna("") if c in out.columns else ""
+    out[HDP_COL_PARTY] = ""                 # kept blank per spec
+    out[HDP_COL_BU] = HDP_BUSINESS_UNIT     # every row is B2C
+    return out[list(HDP_COLUMNS)].reset_index(drop=True)
 
 
 # ── Public builder + orchestrator ────────────────────────────────────────────
@@ -419,7 +558,7 @@ def build_holistic_demand_plan_aps(
     *,
     anchor_month: date = _DEFAULT_ANCHOR_MONTH,
 ) -> HolisticPlanResult:
-    """Merge the APS Base Plan + R&O legs into the unified plan (pure)."""
+    """Merge the APS Base Plan + R&O legs, enrich to the full plan (pure)."""
     name_to_corp = _build_name_to_corp(customer_names_df)
     aps_leg = _build_aps_leg(aps_df)
     ro_detail, match_log = _build_ro_leg(
@@ -428,7 +567,9 @@ def build_holistic_demand_plan_aps(
     # Default Corporate Group per Customer = how the match log resolved it.
     base_corp = _corp_by_customer(match_log)
     ro_leg = _ro_frame(ro_detail, base_corp)
-    frame = pd.concat([aps_leg, ro_leg], ignore_index=True)[list(HDP_COLUMNS)]
+    core = _concat_core(aps_leg, ro_leg)
+    item_attrs = _build_item_attrs(core[HDP_COL_ITEM], pdh_df, ro_master_df)
+    frame = _assemble(core, item_attrs)
     return HolisticPlanResult(
         frame=frame,
         customer_match_log=match_log,
@@ -436,6 +577,7 @@ def build_holistic_demand_plan_aps(
         ro_rows=len(ro_leg),
         aps_leg=aps_leg,
         ro_detail=ro_detail,
+        item_attrs=item_attrs,
     )
 
 
@@ -482,7 +624,8 @@ def apply_customer_corp_overrides(
 
     effective = {**_corp_by_customer(result.customer_match_log), **clean}
     ro_leg = _ro_frame(result.ro_detail, effective)
-    frame = pd.concat([result.aps_leg, ro_leg], ignore_index=True)[list(HDP_COLUMNS)]
+    core = _concat_core(result.aps_leg, ro_leg)
+    frame = _assemble(core, result.item_attrs)
 
     log = result.customer_match_log.copy()
     if not log.empty:
@@ -504,6 +647,7 @@ def apply_customer_corp_overrides(
         ro_rows=len(ro_leg),
         aps_leg=result.aps_leg,
         ro_detail=result.ro_detail,
+        item_attrs=result.item_attrs,
     )
 
 
@@ -553,13 +697,46 @@ def generate_holistic_demand_plan_aps(
     )
 
 
+# ── Fabric persistence (existence-check load + save) ──────────────────────────
+#
+# The finished plan is written to Files/RO Tracking/APS/qry_mgmt_plan_full_aps.csv
+# under the fixed name so the page can (a) skip regeneration when it already
+# exists and (b) keep hand-applied Corporate Group fixes across sessions.
+
+def load_persisted_aps_plan() -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(frame, etag)`` for the persisted APS plan, or ``(None, None)``.
+
+    ``keep_default_na=False`` so blank Party Site Number / Corporate Group stay
+    empty strings (not NaN) and round-trip identically on the next save.
+    """
+    return read_csv(
+        _SECRETS_SECTION, _APS_OUTPUT_BLOB,
+        read_csv_kwargs={"keep_default_na": False},
+    )
+
+
+def save_aps_plan(frame: pd.DataFrame) -> str:
+    """Persist *frame* to ``Files/RO Tracking/APS/…`` and return the new ETag."""
+    if frame is None:
+        raise HolisticDemandPlanError("Refusing to save a null Holistic Demand Plan.")
+    return write_csv(_SECRETS_SECTION, _APS_OUTPUT_BLOB, frame)
+
+
+def aps_output_path() -> str:
+    """The OneLake-relative output path, e.g. for user-facing messages."""
+    return f"Files/{_APS_OUTPUT_BLOB}"
+
+
 __all__ = [
-    "HDP_COLUMNS", "HDP_COL_MONTH", "HDP_COL_ITEM", "HDP_COL_CORP",
-    "HDP_COL_POUNDS", "HDP_COL_FORECAST",
+    "HDP_COLUMNS", "HDP_COL_MONTH", "HDP_COL_ITEM", "HDP_COL_ITEM_DESC",
+    "HDP_COL_PARTY", "HDP_COL_POUNDS", "HDP_COL_FORECAST", "HDP_COL_BU",
+    "HDP_COL_PMAJ", "HDP_COL_PMIN", "HDP_COL_SFMT", "HDP_COL_CORP",
+    "HDP_BUSINESS_UNIT", "APS_OUTPUT_NAME",
     "FORECAST_APS_BASE_PLAN", "FORECAST_R_AND_O",
     "MATCH_COLUMNS", "MATCH_COL_CUSTOMER", "MATCH_COL_CORP", "MATCH_COL_STATUS",
     "MATCH_EXACT", "MATCH_FUZZY", "MATCH_UNMAPPED", "MATCH_OVERRIDE",
     "HolisticDemandPlanError", "HolisticPlanResult",
     "build_holistic_demand_plan_aps", "generate_holistic_demand_plan_aps",
     "apply_customer_corp_overrides", "filter_needs_review",
+    "load_persisted_aps_plan", "save_aps_plan", "aps_output_path",
 ]

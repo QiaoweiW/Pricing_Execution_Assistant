@@ -614,13 +614,20 @@ PERCENT_COLS: frozenset = frozenset({
 })
 
 # Metric columns hidden by default in the Streamlit table — planners can
-# expand them via a checkbox on the page.  Current Plan (Base)/(R&O), PY
-# Actual and O% are shown by default (per planner direction); only the raw
-# prior-month + current-actual detail columns start hidden.
+# expand them via a checkbox on the page.  The default-visible set matches the
+# executive layout (Prior Plan · Current-vs-Prior Delta breakdown · Current
+# Plan · Total Delta % · v. Budget · % · Budget); everything else — the raw
+# prior-month + current-actual legs, the Current Plan Base/R&O split, PY Actual,
+# O% and Base Plan Var % — starts hidden.
 COLS_HIDDEN_BY_DEFAULT: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL,
     COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL,
+    COL_CURRENT_PLAN_BASE,
+    COL_CURRENT_PLAN_RO,
+    COL_PY_ACTUAL,
+    COL_O_PCT,
+    COL_BASE_PLAN_VAR_PCT,
 )
 
 _LBS_PER_MILLION: float = 1_000_000.0
@@ -2481,6 +2488,9 @@ class ComparisonKpis:
     t6m_yoy: Optional[float]
     full_year_yoy: Optional[float]
     ro_pct: Optional[float]
+    # ``budget_pct`` — Total B2C ``%`` cell (Current Plan vs Budget %), shown
+    # as the last tile on the YoY/share row.
+    budget_pct: Optional[float] = None
     # Walk-row values (M lbs) — read directly off the Total B2C row of the
     # assembled table so tile ↔ table reconciliation is trivial.
     last_plan_total: Optional[float] = None
@@ -2567,6 +2577,7 @@ def build_comparison_kpis(
     # the RO Summary Report by construction.
     full_year_yoy: Optional[float] = None
     ro_pct: Optional[float] = None
+    budget_pct: Optional[float] = None
     last_plan_total: Optional[float] = None
     current_plan_total: Optional[float] = None
     pm_actual_var: Optional[float] = None
@@ -2583,6 +2594,7 @@ def build_comparison_kpis(
                 _safe_ratio(cur_plan - py_actual, py_actual) if py_actual else None
             ) if cur_plan is not None and py_actual is not None else None
             ro_pct = _cell(row, COL_O_PCT)
+            budget_pct = _cell(row, COL_PCT)
             current_plan_total = cur_plan
             last_plan_total = _cell(row, COL_LAST_PLAN)
             pm_actual_var = _cell(row, COL_PM_ACTUAL)
@@ -2592,6 +2604,7 @@ def build_comparison_kpis(
     return ComparisonKpis(
         t3m_yoy=t3m_yoy, t6m_yoy=t6m_yoy,
         full_year_yoy=full_year_yoy, ro_pct=ro_pct,
+        budget_pct=budget_pct,
         last_plan_total=last_plan_total,
         current_plan_total=current_plan_total,
         pm_actual_var=pm_actual_var,

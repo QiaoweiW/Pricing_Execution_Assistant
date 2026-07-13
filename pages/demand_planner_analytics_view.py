@@ -91,6 +91,13 @@ from data_sources.demand_plan_comparison import (
     fetch_fy27_budget_by_row_id,
     fy27_budget_blob_path,
     COL_LABEL as DPC_COL_LABEL,
+    COL_CURRENT_PLAN as DPC_COL_CURRENT_PLAN,
+    COL_CURRENT_PLAN_RO as DPC_COL_CURRENT_PLAN_RO,
+    COL_PY_ACTUAL as DPC_COL_PY_ACTUAL,
+    COL_O_PCT as DPC_COL_O_PCT,
+    COL_BUDGET as DPC_COL_BUDGET,
+    COL_PCT as DPC_COL_PCT,
+    COL_ROW_ID as DPC_COL_ROW_ID,
     DRV_COL_PMAJ,
     DRV_COL_SFMT,
     DRV_COL_BRAND,
@@ -5163,15 +5170,21 @@ def _render_demand_plan_comparison_fragment() -> None:
         ),
     )
 
-    # 6c. Executive KPI strip (headline metrics) — sits directly above the
-    #     table so the reader gets the top-line story before the detail.
-    _render_comparison_kpis(
-        build_comparison_kpis(
-            result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
-        ),
-        filters,
+    # 6c. Executive story, top → bottom:
+    #     (1) YoY / share metrics row (incl. Total B2C Plan vs Budget %),
+    #     (2) the condensed current-plan summary table (screenshot 2),
+    #     (3) a divider clearly splitting the two sections,
+    #     (4) the cycle-walk ("Prior Plan") metrics row, then
+    #     (5) the full restyled comparison table.
+    kpis = build_comparison_kpis(
+        result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
     )
+    _render_comparison_kpis_yoy(kpis)
+    _render_comparison_summary_table(result)
 
+    st.markdown("---")
+
+    _render_comparison_kpis_walk(kpis, filters)
     # 7. Render the comparison table + download / save.
     _render_demand_comparison_table(result)
 
@@ -5732,27 +5745,50 @@ def _fmt_millions(value: Optional[float], *, signed: bool) -> tuple[str, str]:
     return f"{value:.2f}", ""
 
 
-def _render_comparison_kpis(
+def _render_comparison_kpis_yoy(kpis: ComparisonKpis) -> None:
+    """Render the YoY / share KPI row (top of the section).
+
+    T3M YoY · T6M YoY · Full-Year YoY · R&O % of Current Plan · **Total B2C
+    Plan vs Budget %** (the last tile — the Total B2C ``%`` cell).  Values are
+    read straight off the assembled table's Total B2C row so tiles reconcile
+    with the table by construction.
+    """
+    t3m = _fmt_yoy(kpis.t3m_yoy)
+    t6m = _fmt_yoy(kpis.t6m_yoy)
+    fy = _fmt_yoy(kpis.full_year_yoy)
+    ro = _fmt_share(kpis.ro_pct)
+    budget = _fmt_yoy(kpis.budget_pct)
+    yoy = (
+        ("T3M YoY", t3m, "Current reality"),
+        ("T6M YoY", t6m, "Recent trend"),
+        ("Full-Year YoY", fy, "Plan assumption"),
+        ("R&O % of Current Plan", ro, "Aspiration"),
+        ("Total B2C Plan vs Budget %", budget, "Plan vs budget"),
+    )
+    yoy_cards = "".join(
+        f'<div class="dpc-kpi"><div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value {cls}">{_esc_html(text)}</div>'
+        f'<div class="k-desc">{_esc_html(desc)}</div></div>'
+        for label, (text, cls), desc in yoy
+    )
+    st.markdown(
+        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{yoy_cards}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_comparison_kpis_walk(
     kpis: ComparisonKpis, filters: ComparisonFilters,
 ) -> None:
-    """Render the KPI strip above the comparison table.
+    """Render the cycle-over-cycle walk KPI row (the "Prior Plan" metrics).
 
-    Two stacked rows, sharing the ``.dpc-kpis`` grid:
-
-    * **Row 1 — cycle-over-cycle walk** (top, drives the section's story):
-      Last Plan (prior cycle) → PM Actual Var. → Base Plan Var. → R&O Var. →
-      Current Plan (current cycle).  Cycle labels are dynamic — pulled from
-      the current selection in ``filters`` — so the narrative always names
-      the exact cycles being compared.  Values are read straight off the
-      Total B2C row of the assembled table (see :func:`build_comparison_kpis`)
-      so tile ↔ table numbers reconcile by construction.
-    * **Row 2 — YoY / share narrative** (below): unchanged.
+    Last Plan (prior cycle) → PM Actual Var. → Base Plan Var. → R&O Var. →
+    Current Plan (current cycle).  Cycle labels are dynamic (pulled from
+    ``filters``); values are read straight off the Total B2C row of the
+    assembled table so tile ↔ table numbers reconcile by construction.
     """
     prior_cy = filters.prior_cycle
     current_cy = filters.current_cycle
-
-    # ── Row 1: cycle-over-cycle walk ─────────────────────────────────
-    # (label, formatted value, plain-English sub-label with dynamic cycles).
     walk = (
         (
             "Last Plan",
@@ -5787,29 +5823,8 @@ def _render_comparison_kpis(
         f'<span class="k-sub">{_esc_html(sub)}</span></div>'
         for label, (text, cls), sub in walk
     )
-
-    # ── Row 2: YoY / share narrative (unchanged) ─────────────────────
-    t3m = _fmt_yoy(kpis.t3m_yoy)
-    t6m = _fmt_yoy(kpis.t6m_yoy)
-    fy = _fmt_yoy(kpis.full_year_yoy)
-    ro = _fmt_share(kpis.ro_pct)
-    yoy = (
-        ("T3M YoY", t3m, "Current reality"),
-        ("T6M YoY", t6m, "Recent trend"),
-        ("Full-Year YoY", fy, "Plan assumption"),
-        ("R&O % of Current Plan", ro, "Aspiration"),
-    )
-    yoy_cards = "".join(
-        f'<div class="dpc-kpi"><div class="k-label">{_esc_html(label)}</div>'
-        f'<div class="k-value {cls}">{_esc_html(text)}</div>'
-        f'<div class="k-desc">{_esc_html(desc)}</div></div>'
-        for label, (text, cls), desc in yoy
-    )
-
     st.markdown(
-        f'{_DPC_KPI_CSS}'
-        f'<div class="dpc-kpis">{walk_cards}</div>'
-        f'<div class="dpc-kpis">{yoy_cards}</div>',
+        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{walk_cards}</div>',
         unsafe_allow_html=True,
     )
 
@@ -5833,6 +5848,8 @@ _DPC_CMP_CSS: str = """
 .dpc-cmp tr.section td {background:#f8cbad; font-weight:700;}
 .dpc-cmp tr.subtotal td {font-weight:700;}
 .dpc-cmp tr.memo td {font-style:italic; color:#555555;}
+.dpc-cmp td.pos {color:#1b7f3a;}   /* positive variance % — green */
+.dpc-cmp td.neg {color:#c0392b;}   /* negative variance % — red   */
 </style>
 """
 
@@ -5909,6 +5926,109 @@ def _render_comparison_html(
         + "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+# Curated executive current-plan summary (screenshot 2): each entry is
+# (row_id, css-class).  Only ESL is split into its carton subtotals and only
+# Cultured shows the Cottage Cheese / Sour Cream memo lines; every other major
+# stays a single line, then Total B2C anchors the bottom.
+_DPC_SUMMARY_ROWS: tuple[tuple[str, str], ...] = (
+    ("esl", "section"),
+    ("esl_lc", "subtotal"),
+    ("esl_sc", "subtotal"),
+    ("aseptic", "section"),
+    ("cultured", "section"),
+    ("cult_cottage_cheese", "memo"),
+    ("cult_sour_cream", "memo"),
+    ("fresh_milk", "section"),
+    ("butter", "section"),
+    ("total_b2c", "total"),
+)
+
+
+def _dpc_num(row: pd.Series, col_id: str) -> Optional[float]:
+    """Numeric cell from a comparison-table row by column id (None if missing)."""
+    val = row.get(DPC_DISPLAY_LABELS.get(col_id, col_id))
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    return None if pd.isna(num) else num
+
+
+def _dpc_fmt_m(value: Optional[float]) -> str:
+    """Millions, one decimal + thousands separators (screenshot 2 style)."""
+    return "—" if value is None else f"{value:,.1f}"
+
+
+def _dpc_fmt_pct(frac: Optional[float], *, signed: bool) -> tuple[str, str]:
+    """Fraction → (whole-percent-ish text, css-class) — green/red when signed."""
+    if frac is None:
+        return "—", ""
+    pct = frac * 100.0
+    if signed:
+        cls = "pos" if pct > 0.05 else "neg" if pct < -0.05 else ""
+        return f"{pct:+.1f}%", cls
+    return f"{pct:.1f}%", ""
+
+
+def _render_comparison_summary_table(result) -> None:
+    """Render the executive current-plan summary table (screenshot 2).
+
+    A condensed, current-plan-anchored projection of the SAME comparison data
+    (no new math beyond Base plan = Current Plan − R&O and Base vs PY %):
+    Base plan · PY · Base vs PY % · R&O vol · Total plan · RO% · Budget ·
+    % vs Budget.  Styled like the detailed table (navy header, light-blue
+    Total B2C, orange majors) with green/red variance percents.
+    """
+    table = getattr(result, "table", None)
+    if table is None or table.empty or DPC_COL_ROW_ID not in table.columns:
+        return
+    by_id = {str(r[DPC_COL_ROW_ID]): r for _, r in table.iterrows()}
+
+    headers = ["Category", "Base plan", "PY", "Base vs PY %", "R&O vol",
+               "Total plan", "RO%", "Budget", "% vs Budget"]
+    head_html = "".join(
+        f'<th class="lbl">{_esc_html(h)}</th>' if i == 0
+        else f'<th>{_esc_html(h)}</th>'
+        for i, h in enumerate(headers)
+    )
+
+    body_rows: list[str] = []
+    for row_id, cls in _DPC_SUMMARY_ROWS:
+        r = by_id.get(row_id)
+        if r is None:
+            continue
+        current_plan = _dpc_num(r, DPC_COL_CURRENT_PLAN)
+        ro_vol = _dpc_num(r, DPC_COL_CURRENT_PLAN_RO)
+        py = _dpc_num(r, DPC_COL_PY_ACTUAL)
+        base_plan = None if current_plan is None else current_plan - (ro_vol or 0.0)
+        base_vs_py = (
+            (base_plan - py) / py
+            if base_plan is not None and py not in (None, 0.0) else None
+        )
+        base_py_txt, base_py_cls = _dpc_fmt_pct(base_vs_py, signed=True)
+        ro_pct_txt, _ = _dpc_fmt_pct(_dpc_num(r, DPC_COL_O_PCT), signed=False)
+        vsb_txt, vsb_cls = _dpc_fmt_pct(_dpc_num(r, DPC_COL_PCT), signed=True)
+        cells = [
+            f'<td class="lbl">{_esc_html(r.get(DPC_COL_LABEL, row_id))}</td>',
+            f'<td>{_esc_html(_dpc_fmt_m(base_plan))}</td>',
+            f'<td>{_esc_html(_dpc_fmt_m(py))}</td>',
+            f'<td class="{base_py_cls}">{_esc_html(base_py_txt)}</td>',
+            f'<td>{_esc_html(_dpc_fmt_m(ro_vol))}</td>',
+            f'<td>{_esc_html(_dpc_fmt_m(current_plan))}</td>',
+            f'<td>{_esc_html(ro_pct_txt)}</td>',
+            f'<td>{_esc_html(_dpc_fmt_m(_dpc_num(r, DPC_COL_BUDGET)))}</td>',
+            f'<td class="{vsb_cls}">{_esc_html(vsb_txt)}</td>',
+        ]
+        body_rows.append(f'<tr class="{cls}">' + "".join(cells) + "</tr>")
+
+    st.markdown(
+        _DPC_CMP_CSS
+        + '<div class="dpc-cmp"><table><thead><tr>' + head_html
+        + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
         unsafe_allow_html=True,
     )
 

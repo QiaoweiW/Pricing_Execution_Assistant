@@ -5593,27 +5593,27 @@ def _render_comparison_kpis(
         (
             "Last Plan",
             _fmt_millions(kpis.last_plan_total, signed=False),
-            f"prior cycle ({prior_cy}) total forecast, incl. R&O",
+            f"{prior_cy} total forecast incl. R&O",
         ),
         (
             "PM Actual Var.",
             _fmt_millions(kpis.pm_actual_var, signed=True),
-            f"prior month actual vs prior cycle ({prior_cy}) forecast",
+            f"prior month actual vs {prior_cy} forecast",
         ),
         (
             "Base Plan Var.",
             _fmt_millions(kpis.base_plan_var, signed=True),
-            f"current cycle ({current_cy}) vs prior cycle ({prior_cy}) baseline forecast",
+            f"{current_cy} vs {prior_cy} baseline forecast",
         ),
         (
             "R&O Var.",
             _fmt_millions(kpis.ro_var, signed=True),
-            f"current cycle ({current_cy}) vs prior cycle ({prior_cy}) R&O forecast",
+            f"{current_cy} vs {prior_cy} R&O forecast",
         ),
         (
             "Current Plan",
             _fmt_millions(kpis.current_plan_total, signed=False),
-            f"current cycle ({current_cy}) total forecast, incl. R&O",
+            f"{current_cy} total forecast incl. R&O",
         ),
     )
     walk_cards = "".join(

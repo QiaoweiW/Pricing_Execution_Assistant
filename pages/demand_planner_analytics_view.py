@@ -7889,6 +7889,21 @@ def _plan_lift_describe_filters(filters) -> str:
     )
 
 
+def _render_promotion_lift_analysis() -> None:
+    """Foldable 'Promotion Lift Analysis' section.
+
+    A collapsed ``st.expander`` matching the other page sections, separated
+    from its neighbours by the same ``st.markdown("---")`` divider line.
+    """
+    with st.expander("🎯 Promotion Lift Analysis", expanded=False):
+        st.caption(
+            "Incremental volume lift attributable to promotions — how much "
+            "extra was shipped during promoted periods versus the non-promoted "
+            "baseline."
+        )
+        st.info("ℹ️ Promotion Lift Analysis is coming soon.")
+
+
 # ── 3. Entry point ────────────────────────────────────────────────────────────
 
 
@@ -7900,11 +7915,12 @@ def render() -> None:
     1. Page header + Instructions
     2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
     3. Plan Lift Analysis           (📈, collapsible, collapsed; above RO)
-    4. RO Comparison                (collapsible, expanded by default)
-    5. Demand Summary               (collapsible, collapsed by default)
-    6. Product Line Review          (collapsible, collapsed by default)
-    7. Sales Distribution Tracker   (🚚, collapsible, collapsed)
-    8. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
+    4. Promotion Lift Analysis      (🎯, collapsible, collapsed)
+    5. RO Comparison                (collapsible, expanded by default)
+    6. Demand Summary               (collapsible, collapsed by default)
+    7. Product Line Review          (collapsible, collapsed by default)
+    8. Sales Distribution Tracker   (🚚, collapsible, collapsed)
+    9. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -7921,6 +7937,9 @@ def render() -> None:
     # Plan Lift Analysis sits ABOVE RO Comparison and reads its own Fabric
     # sources, so it stays fully independent of the RO calculations below.
     _render_plan_lift_analysis()
+    st.markdown("---")
+
+    _render_promotion_lift_analysis()
     st.markdown("---")
 
     _render_ro_comparison()

@@ -18,7 +18,7 @@ can be re-exposed behind a selector once their schema + read functions exist
 """
 import streamlit as st
 
-from pricebook import ords_client, pricing_flow_diagram
+from pricebook import ords_client
 from pricebook.editor import render_editor, render_price_book_updater
 from pricebook.schemas import TABLES
 
@@ -31,10 +31,6 @@ def render():
         '<h1 class="main-header">Pricebook Editor</h1>', unsafe_allow_html=True)
     st.caption("Read & write via ORDS REST — server-side validations and "
                "triggers run exactly as in the Excel add-in.")
-
-    # Reference figure: how a submitted price flows through Oracle Pricing
-    # and the methods used to verify it (foldable so the editor stays primary).
-    pricing_flow_diagram.render()
 
     render_editor(
         TABLES[_TABLE_KEY],

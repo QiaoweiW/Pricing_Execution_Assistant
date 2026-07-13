@@ -532,6 +532,11 @@ COL_V_BUDGET: str               = "v_budget"
 # values after roll-up.
 COL_TOTAL_DELTA_PCT: str        = "total_delta_pct"
 COL_PCT: str                    = "pct"
+# Base Plan Var % — Base Plan Var. as a share of the PRIOR-cycle baseline
+# forecast the current-cycle Base leg walked away from.  Denominator is
+# ``current_plan_base − base_plan_var`` (i.e. what Base was before the walk).
+# Blank when the denominator is zero (undefined baseline).
+COL_BASE_PLAN_VAR_PCT: str      = "base_plan_var_pct"
 # O% of Current Plan = Current Plan (R&O) ÷ Current Plan (the whole current
 # plan: actuals + Base + R&O).  The R&O ("opportunity") share of the plan.
 COL_O_PCT: str                  = "o_pct"
@@ -573,14 +578,20 @@ DISPLAY_LABELS: dict[str, str] = {
     COL_CURRENT_PLAN_BASE:     "Current Plan (Base)",
     COL_CURRENT_PLAN_RO:       "Current Plan (R&O)",
     COL_PY_ACTUAL:             "PY Actual",
-    COL_LAST_PLAN:             "Last Plan",
-    COL_CURRENT_PLAN:          "Current Plan",
+    # Total-plan columns explicitly flag that they include the R&O leg
+    # (matches the KPI-strip walk tiles' "incl. R&O" wording).
+    COL_LAST_PLAN:             "Last Plan (incl. RO)",
+    COL_CURRENT_PLAN:          "Current Plan (incl. RO)",
     COL_O_PCT:                 "O% of Current Plan",
-    COL_PM_ACTUAL:             "PM Actual",
+    # "…Var." suffix disambiguates variance vs level (a planner can now
+    # tell PM Actual — the shipped pounds — from PM Actual Var. — the
+    # variance vs the prior-cycle plan for that month).
+    COL_PM_ACTUAL:             "PM Actual Var.",
     COL_TOTAL_DELTA:           "Total Delta",
     COL_TOTAL_DELTA_PCT:       "Total Delta %",
-    COL_BASE_PLAN:             "Base Plan",
-    COL_R_AND_O:               "R&O",
+    COL_BASE_PLAN:             "Base Plan Var.",
+    COL_BASE_PLAN_VAR_PCT:     "Base Plan Var %",
+    COL_R_AND_O:               "R&O Var.",
     COL_V_BUDGET:              "v. Budget",
     COL_PCT:                   "%",
     COL_BUDGET:                "Budget",
@@ -594,10 +605,13 @@ DISPLAY_ORDER: tuple[str, ...] = (
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_BASE, COL_CURRENT_PLAN_RO,
     COL_PY_ACTUAL, COL_LAST_PLAN, COL_CURRENT_PLAN, COL_O_PCT,
     COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
-    COL_BASE_PLAN, COL_R_AND_O, COL_V_BUDGET, COL_PCT, COL_BUDGET,
+    COL_BASE_PLAN, COL_BASE_PLAN_VAR_PCT, COL_R_AND_O,
+    COL_V_BUDGET, COL_PCT, COL_BUDGET,
 )
 # Columns rendered as percentages (the rest are millions of lbs).
-PERCENT_COLS: frozenset = frozenset({COL_TOTAL_DELTA_PCT, COL_PCT, COL_O_PCT})
+PERCENT_COLS: frozenset = frozenset({
+    COL_TOTAL_DELTA_PCT, COL_PCT, COL_O_PCT, COL_BASE_PLAN_VAR_PCT,
+})
 
 # Metric columns hidden by default in the Streamlit table — planners can
 # expand them via a checkbox on the page.  Current Plan (Base)/(R&O), PY
@@ -2159,9 +2173,14 @@ def _assemble_table(
         #   Total Delta %       = Total Delta as a share of Last Plan (MoM move).
         #   %                   = v. Budget as a share of Current Plan.
         #   O% of Current Plan  = Current Plan (R&O) as a share of Current Plan.
+        #   Base Plan Var %     = Base Plan Var. ÷ prior-cycle baseline
+        #                         (= current_plan_base − base_plan_var).  Reads
+        #                         as "how much the baseline moved, relative to
+        #                         what it was before the walk".
         total_delta_pct = _safe_ratio(total_delta, last_plan)
         pct = _safe_ratio(v_budget, current_plan)
         o_pct = _safe_ratio(current_plan_ro, current_plan)
+        base_plan_var_pct = _safe_ratio(base_plan, current_plan_base - base_plan)
 
         row = {
             COL_ROW_ID: tpl.row_id,
@@ -2182,6 +2201,7 @@ def _assemble_table(
             COL_TOTAL_DELTA: total_delta,
             COL_TOTAL_DELTA_PCT: total_delta_pct,
             COL_BASE_PLAN: base_plan,
+            COL_BASE_PLAN_VAR_PCT: base_plan_var_pct,
             COL_R_AND_O: r_and_o,
             COL_V_BUDGET: v_budget,
             COL_PCT: pct,
@@ -2269,14 +2289,59 @@ def _comparison_captured_mask(trk: pd.DataFrame) -> pd.Series:
     return captured
 
 
+def _coalesce_from_dim_frame(
+    grouped: pd.DataFrame, dim_frame: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Back-fill blank ``item_desc / pmaj / sfmt`` from the PDH → RO cascade.
+
+    An item lands in the not-captured log precisely because its dims did NOT
+    match any template leaf — often because the tracker/IBP row carried empty
+    Portfolio Major / Supply Format / Description strings (unclassified item,
+    or the pipeline hadn't back-filled them yet).  Screenshot 2 shows exactly
+    this: every row has an Item but the description / PMaj / SFmt columns are
+    blank.
+
+    The PDH → RO_Item_Master cascade frame (built once by the caller via
+    :func:`build_item_dim_frame_cascade`) knows the same dimensions the
+    template uses to classify, so we prefer values already on the enriched
+    row, and fall back to the cascade for anything still blank.  Downstream
+    ``_norm_dim`` still renders stubborn blanks as ``(blank)``.
+
+    Called INSIDE :func:`_aggregate_not_captured` so both forecast legs and
+    the actual-shipments leg use the same enrichment (no duplication).
+    """
+    if dim_frame is None or dim_frame.empty or grouped.empty:
+        return grouped
+
+    lookup = dim_frame.loc[:, ["__item_key", "desc", "pmaj", "sfmt"]].rename(
+        columns={"__item_key": "item_key", "desc": "_fb_desc",
+                 "pmaj": "_fb_pmaj", "sfmt": "_fb_sfmt"},
+    )
+    merged = grouped.merge(lookup, on="item_key", how="left")
+    # Prefer the existing (tracker/IBP) value when non-blank; fall back to
+    # cascade otherwise.  Treat NaN as blank for the same reason _norm_dim
+    # does — the cascade may not carry the item.
+    for src, fb in (("item_desc", "_fb_desc"),
+                    ("pmaj", "_fb_pmaj"),
+                    ("sfmt", "_fb_sfmt")):
+        primary = merged[src].astype("string").fillna("").str.strip()
+        fallback = merged[fb].astype("string").fillna("").str.strip()
+        merged[src] = primary.where(primary != "", fallback)
+    return merged.drop(columns=["_fb_desc", "_fb_pmaj", "_fb_sfmt"])
+
+
 def _aggregate_not_captured(
     df: pd.DataFrame, mask: pd.Series, *, measure_label: str,
+    dim_frame: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Aggregate the *mask*-selected rows of *df* into a not-captured table.
 
-    Groups by item, sums pounds → millions under *measure_label*, and sorts
-    heaviest-first (that's what moves the totals most).  Shared by every leg
-    (forecast + actuals) so the shaping lives in one place.
+    Groups by item, sums pounds → millions under *measure_label*, back-fills
+    Item Description / Portfolio Major / Supply Format from the PDH →
+    RO_Item_Master cascade (``dim_frame``) when the enriched row is blank,
+    and sorts heaviest-first (that's what moves the totals most).  Shared by
+    every leg (forecast + actuals) so the shaping — and the fallback — lives
+    in one place.
     """
     cols = _not_captured_columns(measure_label)
     empty = pd.DataFrame(columns=list(cols))
@@ -2289,6 +2354,7 @@ def _aggregate_not_captured(
         sfmt=("sfmt", "first"),
         pounds=("pounds", "sum"),
     )
+    grouped = _coalesce_from_dim_frame(grouped, dim_frame)
     grouped[NC_COL_PMAJ] = grouped["pmaj"].map(_norm_dim)
     grouped[NC_COL_SFMT] = grouped["sfmt"].map(_norm_dim)
     grouped[measure_label] = (grouped["pounds"] / _LBS_PER_MILLION).round(3)
@@ -2302,13 +2368,19 @@ def build_comparison_not_captured(
     filters: ComparisonFilters,
     *,
     ibp_enriched: Optional[pd.DataFrame] = None,
+    dim_frame: Optional[pd.DataFrame] = None,
 ) -> ComparisonNotCaptured:
     """Return the not-captured reconciliation logs (prior, current, actuals).
 
     An item is *not captured* when its dims (Portfolio Major / Supply Format /
     Portfolio Minor / Brand — carried on the tracker, filled from PDH →
     RO_Item_Master) match no template leaf, so its pounds never reach a
-    comparison row.  Windows:
+    comparison row.  ``dim_frame`` (a PDH → RO_Item_Master cascade, e.g. from
+    :func:`build_item_dim_frame_cascade`) is used to back-fill blank Item
+    Description / Portfolio Major / Supply Format in the surfaced rows so
+    planners see the item's classification even when the tracker/IBP row
+    carried empty strings.  ``None`` degrades gracefully to the pre-fallback
+    behaviour.  Windows:
 
       * **current cycle** forecast → ``[forecast_start … forecast_end]``
       * **prior cycle**   forecast → ``[forecast_start − 1 month … forecast_end]``
@@ -2327,7 +2399,10 @@ def build_comparison_not_captured(
             & trk_enriched["month"].isin(window)
             & (~captured_trk)
         )
-        return _aggregate_not_captured(trk_enriched, mask, measure_label=CNC_COL_FORECAST_M)
+        return _aggregate_not_captured(
+            trk_enriched, mask,
+            measure_label=CNC_COL_FORECAST_M, dim_frame=dim_frame,
+        )
 
     current_window = _months_in_range(filters.forecast_start, filters.forecast_end)
     prior_window = _months_in_range(
@@ -2339,7 +2414,10 @@ def build_comparison_not_captured(
     if ibp_enriched is not None and not ibp_enriched.empty and actual_window:
         captured_ibp = _comparison_captured_mask(ibp_enriched)
         amask = ibp_enriched["month"].isin(actual_window) & (~captured_ibp)
-        actuals = _aggregate_not_captured(ibp_enriched, amask, measure_label=CNC_COL_SHIPPED_M)
+        actuals = _aggregate_not_captured(
+            ibp_enriched, amask,
+            measure_label=CNC_COL_SHIPPED_M, dim_frame=dim_frame,
+        )
 
     return ComparisonNotCaptured(
         prior_cycle=_trk_leg(filters.prior_cycle, prior_window),
@@ -2371,19 +2449,37 @@ def tracker_has_dim_columns(tracker_df: Optional[pd.DataFrame]) -> bool:
 class ComparisonKpis:
     """Headline metrics for the KPI strip above the Demand Plan Comparison.
 
-    Every value is a FRACTION (e.g. 0.03 = +3%) or ``None`` when it can't be
-    computed (missing/zero denominator).  All are at the **Total B2C** level
-    and honour the section's Portfolio Major / Supply Format filter.
+    Two logical groupings, both scoped to the **Total B2C** row and honouring
+    the section's Portfolio Major / Supply Format filter:
 
-    * ``t3m_yoy`` / ``t6m_yoy`` — trailing 3- / 6-month actual shipments vs the
-      same months a year ago (anchored on the Actual-window end month).
-    * ``full_year_yoy`` — (Current Plan − PY Actual) / PY Actual.
-    * ``ro_pct`` — Current Plan (R&O) / Current Plan (the R&O share of plan).
+    * **YoY / share ratios** — FRACTIONs (0.03 = +3%) or ``None`` when the
+      denominator is missing/zero:
+      ``t3m_yoy`` / ``t6m_yoy`` — trailing 3- / 6-month actual shipments vs
+      the same months a year ago (anchored on the Actual-window end month);
+      ``full_year_yoy`` — (Current Plan − PY Actual) / PY Actual;
+      ``ro_pct`` — Current Plan (R&O) / Current Plan (R&O share of plan).
+
+    * **Cycle-over-cycle walk (millions of lbs)** — mirrors the assembled
+      table's Total B2C row so the tile and the table cell tie by construction
+      (no independent math).  ``None`` when the source cell is missing:
+      ``last_plan_total`` / ``current_plan_total`` — total plan (incl. R&O)
+      for the prior / current cycle;
+      ``pm_actual_var`` — Prior-Month actual − prior-cycle forecast;
+      ``base_plan_var`` — Base Plan Var. (residual);
+      ``ro_var`` — R&O Var. (the same ``FY27 Probabilized | Total Δ`` cell
+      from ``RO_Summary_Report.csv`` the table's ``R&O Var.`` column reads).
     """
     t3m_yoy: Optional[float]
     t6m_yoy: Optional[float]
     full_year_yoy: Optional[float]
     ro_pct: Optional[float]
+    # Walk-row values (M lbs) — read directly off the Total B2C row of the
+    # assembled table so tile ↔ table reconciliation is trivial.
+    last_plan_total: Optional[float] = None
+    current_plan_total: Optional[float] = None
+    pm_actual_var: Optional[float] = None
+    base_plan_var: Optional[float] = None
+    ro_var: Optional[float] = None
 
 
 def _b2c_shipments_millions(
@@ -2402,6 +2498,29 @@ def _b2c_shipments_millions(
         return 0.0
     mask = _comparison_captured_mask(df) & df["month"].isin(months)
     return _sum_millions(df, mask)
+
+
+def _cell(row: pd.Series, col_id: str) -> Optional[float]:
+    """Return the Total-B2C row's numeric cell for a comparison column id.
+
+    Resolves the display label from :data:`DISPLAY_LABELS` and coerces the
+    value to ``float``.  Returns ``None`` for missing / NaN cells so
+    downstream tiles render "—" instead of a bogus 0.  Used by the KPI
+    builder to lift walk values straight off the assembled table.
+    """
+    label = DISPLAY_LABELS.get(col_id, col_id)
+    val = row.get(label)
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
 
 
 def build_comparison_kpis(
@@ -2433,22 +2552,43 @@ def build_comparison_kpis(
     t3m_yoy = _safe_ratio(t3m_cur - t3m_py, t3m_py) if t3m_py else None
     t6m_yoy = _safe_ratio(t6m_cur - t6m_py, t6m_py) if t6m_py else None
 
-    # ── Plan-level KPIs (from the Total B2C row of the table) ────────
+    # ── Plan-level KPIs + cycle-walk values (from Total B2C row) ─────
+    # Every walk value is the SAME cell rendered in the table's Total B2C
+    # row.  Reading them here (rather than recomputing) guarantees the tile
+    # and the table always agree — including R&O Var., which stays tied to
+    # the RO Summary Report by construction.
     full_year_yoy: Optional[float] = None
     ro_pct: Optional[float] = None
+    last_plan_total: Optional[float] = None
+    current_plan_total: Optional[float] = None
+    pm_actual_var: Optional[float] = None
+    base_plan_var: Optional[float] = None
+    ro_var: Optional[float] = None
+
     if table is not None and not table.empty and COL_ROW_ID in table.columns:
         tot = table.loc[table[COL_ROW_ID] == "total_b2c"]
         if not tot.empty:
             row = tot.iloc[0]
-            cur_plan = float(row.get(DISPLAY_LABELS[COL_CURRENT_PLAN], 0.0) or 0.0)
-            py_actual = float(row.get(DISPLAY_LABELS[COL_PY_ACTUAL], 0.0) or 0.0)
-            full_year_yoy = _safe_ratio(cur_plan - py_actual, py_actual) if py_actual else None
-            ro_val = row.get(DISPLAY_LABELS[COL_O_PCT])
-            ro_pct = None if ro_val is None or pd.isna(ro_val) else float(ro_val)
+            cur_plan = _cell(row, COL_CURRENT_PLAN)
+            py_actual = _cell(row, COL_PY_ACTUAL)
+            full_year_yoy = (
+                _safe_ratio(cur_plan - py_actual, py_actual) if py_actual else None
+            ) if cur_plan is not None and py_actual is not None else None
+            ro_pct = _cell(row, COL_O_PCT)
+            current_plan_total = cur_plan
+            last_plan_total = _cell(row, COL_LAST_PLAN)
+            pm_actual_var = _cell(row, COL_PM_ACTUAL)
+            base_plan_var = _cell(row, COL_BASE_PLAN)
+            ro_var = _cell(row, COL_R_AND_O)
 
     return ComparisonKpis(
         t3m_yoy=t3m_yoy, t6m_yoy=t6m_yoy,
         full_year_yoy=full_year_yoy, ro_pct=ro_pct,
+        last_plan_total=last_plan_total,
+        current_plan_total=current_plan_total,
+        pm_actual_var=pm_actual_var,
+        base_plan_var=base_plan_var,
+        ro_var=ro_var,
     )
 
 
@@ -3905,6 +4045,7 @@ __all__ = [
     "build_enriched_sources",
     "EnrichedSources",
     "build_item_dim_frame",
+    "build_item_dim_frame_cascade",
     "build_demand_plan_comparison",
     "build_comparison_kpis",
     "ComparisonKpis",

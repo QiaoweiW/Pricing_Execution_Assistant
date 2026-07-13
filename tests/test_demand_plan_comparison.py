@@ -261,19 +261,26 @@ def test_current_last_total_delta_and_total_actuals_removed():
     assert "Total Actuals" not in table.columns          # column removed
     assert "Reconciliation" not in table.columns         # column removed
     row = table.loc[table["_row_id"] == "esl_lc_branded"].iloc[0]
-    # Current Plan = actuals(7) + current forecast(10) = 17.
-    assert float(row["Current Plan"]) == 17.0
-    # Last Plan = last-actuals(3) + prior forecast(8+9=17) = 20.
-    assert float(row["Last Plan"]) == 20.0
+    # Current Plan (incl. RO) = actuals(7) + current forecast(10) = 17.
+    assert float(row["Current Plan (incl. RO)"]) == 17.0
+    # Last Plan (incl. RO) = last-actuals(3) + prior forecast(8+9=17) = 20.
+    assert float(row["Last Plan (incl. RO)"]) == 20.0
     # Total Delta = Current − Last = 17 − 20 = −3.
     assert float(row["Total Delta"]) == -3.0
-    # Base Plan is now the residual = Total Delta − PM Actual − R&O.
-    #   PM Actual = 4 (Jun ship) − 8 (C3 Jun fcst) = −4;  R&O = 0.
-    #   Base Plan = −3 − (−4) − 0 = 1.
-    assert float(row["PM Actual"]) == -4.0
-    assert float(row["Base Plan"]) == 1.0
-    # Identity holds by construction: Base + PM Actual + R&O == Total Delta.
-    assert float(row["Base Plan"]) + float(row["PM Actual"]) + float(row["R&O"]) == -3.0
+    # Base Plan Var. is the residual = Total Delta − PM Actual Var. − R&O Var.
+    #   PM Actual Var. = 4 (Jun ship) − 8 (C3 Jun fcst) = −4;  R&O Var. = 0.
+    #   Base Plan Var. = −3 − (−4) − 0 = 1.
+    assert float(row["PM Actual Var."]) == -4.0
+    assert float(row["Base Plan Var."]) == 1.0
+    # Identity holds by construction: three variances sum to Total Delta.
+    assert (
+        float(row["Base Plan Var."])
+        + float(row["PM Actual Var."])
+        + float(row["R&O Var."])
+    ) == -3.0
+    # Base Plan Var % = Base Plan Var. ÷ (Current Plan (Base) − Base Plan Var.).
+    #   Current Plan (Base) = 10 (C4 Base 10M lbs); denom = 10 − 1 = 9.
+    assert round(float(row["Base Plan Var %"]), 4) == round(1.0 / 9.0, 4)
 
 
 def test_current_plan_split_o_pct_and_py_actual():
@@ -306,8 +313,8 @@ def test_current_plan_split_o_pct_and_py_actual():
     row = result.table.loc[result.table["_row_id"] == "esl_lc_branded"].iloc[0]
     assert float(row["Current Plan (Base)"]) == 10.0
     assert float(row["Current Plan (R&O)"]) == 2.0
-    # Current Plan = actuals(7) + Base(10) + R&O(2) = 19.
-    assert float(row["Current Plan"]) == 19.0
+    # Current Plan (incl. RO) = actuals(7) + Base(10) + R&O(2) = 19.
+    assert float(row["Current Plan (incl. RO)"]) == 19.0
     # O% of Current Plan = R&O(2) / 19.
     assert round(float(row["O% of Current Plan"]), 4) == round(2.0 / 19.0, 4)
     assert float(row["PY Actual"]) == 6.0
@@ -350,6 +357,19 @@ def test_build_comparison_kpis():
     # Current Plan = actuals(7)+Base(10)+R&O(2)=19; PY Actual=6.
     assert round(kpis.full_year_yoy, 4) == round((19 - 6) / 6, 4)
     assert round(kpis.ro_pct, 4) == round(2 / 19, 4)
+    # Walk-tile values must tie to the assembled Total B2C cells so the
+    # KPI strip and the table always reconcile.
+    cp = "Current Plan (incl. RO)"
+    lp = "Last Plan (incl. RO)"
+    tot = result.table.loc[result.table["_row_id"] == "total_b2c"].iloc[0]
+    assert kpis.current_plan_total == float(tot[cp])
+    assert kpis.last_plan_total == float(tot[lp])
+    assert kpis.pm_actual_var == float(tot["PM Actual Var."])
+    assert kpis.base_plan_var == float(tot["Base Plan Var."])
+    # R&O Var. tile must equal the R&O Var. table cell (which is the
+    # RO Summary Report's FY27 Probabilized | Total Δ) — guards the
+    # RO_Summary_Report ↔ table ↔ tile chain from silent drift.
+    assert kpis.ro_var == float(tot["R&O Var."])
 
 
 def test_kpis_none_when_denominator_zero():
@@ -387,9 +407,10 @@ def test_pmaj_filter_narrows_rollup():
         enriched=_enriched_sources(trk, _enriched_ibp([])), ro_total_delta_by_path={},
     )
     t = result.table
-    esl = float(t.loc[t["_row_id"] == "esl_lc_branded", "Current Plan"].iloc[0])
-    cult = float(t.loc[t["_row_id"] == "cult_large_tub", "Current Plan"].iloc[0])
-    b2c = float(t.loc[t["_row_id"] == "total_b2c", "Current Plan"].iloc[0])
+    cp = "Current Plan (incl. RO)"
+    esl = float(t.loc[t["_row_id"] == "esl_lc_branded", cp].iloc[0])
+    cult = float(t.loc[t["_row_id"] == "cult_large_tub", cp].iloc[0])
+    b2c = float(t.loc[t["_row_id"] == "total_b2c", cp].iloc[0])
     assert esl == 10.0
     assert cult == 0.0            # Cultured filtered out
     assert b2c == 10.0            # Total B2C reflects only the ESL slice

@@ -118,6 +118,7 @@ from data_sources.demand_plan_comparison import (
     build_comparison_not_captured,
     build_demand_plan_comparison,
     build_enriched_sources,
+    build_item_dim_frame_cascade,
     ComparisonNotCaptured,
     DIAG_COL_LBS,
     DIAG_COL_MLBS,
@@ -4496,37 +4497,65 @@ def _render_demand_plan_comparison_section() -> None:
         "treated as *Prior Month*, and optionally filter by Portfolio Major "
         "/ Supply Format.  All values are in **millions of pounds**."
     )
-    # Spell out exactly how each column is built — planners kept asking what
-    # "Current Plan" vs "Last Plan" (a.k.a. Prior Plan) mean.  Foldable so the
-    # reference text doesn't crowd the metrics + table (collapsed by default).
-    with st.expander("ℹ️ How the columns are built", expanded=False):
+    # Spell out — in plain English — what each KPI tile and each table column
+    # means, in the same left→right order the planner reads them on screen.
+    # Foldable so the reference text doesn't crowd the metrics + table
+    # (collapsed by default).  "prior cycle" / "current cycle" mirror the two
+    # cycles selected in the filter — the KPI tiles print the exact codes.
+    with st.expander("ℹ️ How the metrics and columns are built", expanded=False):
         st.markdown(
             "_(Actual window = `[Actual Start … Actual End]`, "
-        "Forecast window = `[Forecast Start … Forecast End]`)_\n"
-        "- **Current Plan (Base)** / **Current Plan (R&O)** = the "
-        "**current-cycle** forecast over the Forecast window, split by "
-        "Forecast Type (Base Plan vs R&O).\n"
-        "- **Current Plan** = **actual shipments** over the Actual window "
-        "**＋** Current Plan (Base) **＋** Current Plan (R&O).\n"
-        "- **O% of Current Plan** = Current Plan (R&O) ÷ Current Plan _(the "
-        "R&O / opportunity share of the plan)_.\n"
-        "- **PY Actual** = **prior-year shipments** over the plan's full "
-        "horizon shifted back **12 months** — window "
-        "`[Actual Start − 1yr … Forecast End − 1yr]`.  E.g. Actual begins "
-        "Apr 2026 and Forecast ends Mar 2027 → PY = **Apr 2025 … Mar 2026**.\n"
-        "- **Last Plan** _(the prior / one-month-ago estimate)_ = **actual "
-        "shipments** over the Actual window shifted back one month "
-        "`[Actual Start … Actual End − 1]` **＋** the **prior-cycle** "
-        "forecast over the Forecast window shifted back one month "
-        "`[Forecast Start − 1 … Forecast End]` — i.e. the month that just "
-        "closed is still a prior-cycle forecast here.\n"
-        "- **Total Delta** = Current Plan − Last Plan.\n"
-        "- **Base Plan** = Total Delta − PM Actual − R&O _(residual, so "
-        "Base Plan + PM Actual + R&O = Total Delta)_.\n"
-        "- **PM Actual** = Prior-Month actual shipments − prior-cycle "
-        "forecast for the selected Prior Month.\n"
-        "- **R&O** = *FY27 Total Delta* from the saved RO Summary Report."
-    )
+            "Forecast window = `[Forecast Start … Forecast End]`.  "
+            "\"prior cycle\" and \"current cycle\" follow the filter above.)_\n"
+            "\n"
+            "**KPI strip — Row 1 (cycle-over-cycle walk):**\n"
+            "- **Last Plan** — the prior cycle's total forecast (baseline + "
+            "R&O), i.e. what we thought the plan was last cycle.\n"
+            "- **PM Actual Var.** — how prior-month shipments came in vs the "
+            "prior cycle's forecast for that same month.\n"
+            "- **Base Plan Var.** — how the baseline plan moved from the "
+            "prior cycle to the current cycle.\n"
+            "- **R&O Var.** — how the R&O plan moved from the prior cycle "
+            "to the current cycle.  Same cell as the table's **R&O Var.** "
+            "column: sourced from *FY27 Probabilized | Total Δ* on the saved "
+            "**RO Summary Report**, so it ties by construction.\n"
+            "- **Current Plan** — the current cycle's total forecast "
+            "(baseline + R&O), i.e. this cycle's view of the plan.\n"
+            "- Identity: **Base Plan Var. + PM Actual Var. + R&O Var. = "
+            "Total Delta = Current Plan − Last Plan.**\n"
+            "\n"
+            "**KPI strip — Row 2 (YoY / share context):**\n"
+            "- **T3M / T6M YoY** — trailing 3- / 6-month shipments vs the "
+            "same months a year ago.\n"
+            "- **Full-Year YoY** — Current Plan vs Prior-Year Actual over "
+            "the full plan horizon.\n"
+            "- **R&O % of Current Plan** — R&O share of the current plan.\n"
+            "\n"
+            "**Table columns:**\n"
+            "- **Current Plan (Base)** / **Current Plan (R&O)** — the "
+            "current-cycle forecast over the Forecast window, split by "
+            "Forecast Type (Base Plan vs R&O).\n"
+            "- **Current Plan (incl. RO)** — actual shipments over the "
+            "Actual window ＋ Current Plan (Base) ＋ Current Plan (R&O).\n"
+            "- **Last Plan (incl. RO)** — one-month-ago estimate: actuals "
+            "over `[Actual Start … Actual End − 1]` ＋ the prior-cycle "
+            "forecast over `[Forecast Start − 1 … Forecast End]`.\n"
+            "- **O% of Current Plan** — Current Plan (R&O) ÷ Current Plan "
+            "(incl. RO).\n"
+            "- **PY Actual** — prior-year shipments over the plan's full "
+            "horizon shifted back 12 months.\n"
+            "- **Total Delta** = Current Plan (incl. RO) − Last Plan (incl. RO).\n"
+            "- **PM Actual Var.** — Prior-Month actual shipments − "
+            "prior-cycle forecast for the selected Prior Month.\n"
+            "- **Base Plan Var.** — the residual Total Delta − PM Actual "
+            "Var. − R&O Var., so the three variances always add to Total "
+            "Delta.\n"
+            "- **Base Plan Var %** — Base Plan Var. as a share of the "
+            "prior cycle's baseline forecast (i.e. Base Plan Var. ÷ "
+            "(Current Plan (Base) − Base Plan Var.)).\n"
+            "- **R&O Var.** — *FY27 Probabilized | Total Δ* from the saved "
+            "RO Summary Report (same cell surfaced in the R&O Var. tile)."
+        )
     _render_demand_plan_comparison_fragment()
 
 
@@ -4984,10 +5013,16 @@ def _render_demand_plan_comparison_fragment() -> None:
     # 6b. "SKUs not captured" reconciliation logs (prior cycle · current
     #     cycle · actual shipments), surfaced above the table so the planner
     #     reconciles before trusting the totals.  Categorised off the dims
-    #     carried on the tracker (filled from PDH → RO_Item_Master).
+    #     carried on the tracker (filled from PDH → RO_Item_Master); the
+    #     same PDH → RO_Item_Master cascade is passed through so blank
+    #     Item Description / Portfolio Major / Supply Format on unclassified
+    #     items get filled from those sources rather than rendering empty.
+    _not_captured_dim = build_item_dim_frame_cascade(pdh_df, item_master_df)
     _render_comparison_not_captured_logs(
         build_comparison_not_captured(
-            enriched.tracker, filters, ibp_enriched=enriched.ibp),
+            enriched.tracker, filters,
+            ibp_enriched=enriched.ibp, dim_frame=_not_captured_dim,
+        ),
     )
 
     # 6c. Executive KPI strip (headline metrics) — sits directly above the
@@ -4995,7 +5030,8 @@ def _render_demand_plan_comparison_fragment() -> None:
     _render_comparison_kpis(
         build_comparison_kpis(
             result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
-        )
+        ),
+        filters,
     )
 
     # 7. Render the comparison table + download / save.
@@ -5478,9 +5514,13 @@ def _demand_comparison_column_config(percent_labels: list[str]) -> dict:
 _DPC_KPI_CSS = """
 <style>
 .dpc-kpis {display:flex; gap:14px; flex-wrap:wrap; margin:.15rem 0 1rem;}
+.dpc-kpis + .dpc-kpis {margin-top:-.35rem;}  /* tighten walk → YoY gap */
 .dpc-kpi {flex:1 1 180px; min-width:165px; background:#ffffff;
   border:1px solid #e4e0d8; border-top:3px solid #1f4e79; border-radius:10px;
   padding:12px 16px 11px; box-shadow:0 1px 3px rgba(40,50,70,.07);}
+/* Walk-row tiles wear a slightly heavier accent so the plan-vs-plan story
+   reads first; totals use the deep accent, variances share it. */
+.dpc-kpi--walk {border-top-color:#0f3d63;}
 .dpc-kpi .k-label {font-size:.72rem; font-weight:700; letter-spacing:.04em;
   text-transform:uppercase; color:#5a6472;}
 .dpc-kpi .k-value {font-size:1.85rem; font-weight:800; line-height:1.15;
@@ -5489,6 +5529,10 @@ _DPC_KPI_CSS = """
 .dpc-kpi .k-value.down {color:#c0392b;}
 .dpc-kpi .k-value.flat {color:#5a6472;}
 .dpc-kpi .k-desc {font-size:.7rem; font-style:italic; color:#8a8f98;}
+/* Sub-label sits under the value on the walk tiles — cycle labels + a
+   plain-English descriptor.  Small enough not to compete with the value. */
+.dpc-kpi .k-sub {display:block; font-size:.68rem; font-style:italic;
+  color:#8a8f98; margin-top:.1rem; line-height:1.25;}
 </style>
 """
 
@@ -5508,27 +5552,100 @@ def _fmt_share(value: Optional[float]) -> tuple[str, str]:
     return f"{value * 100:.1f}%", ""
 
 
-def _render_comparison_kpis(kpis: ComparisonKpis) -> None:
-    """Render the four headline KPI tiles above the comparison table."""
+def _fmt_millions(value: Optional[float], *, signed: bool) -> tuple[str, str]:
+    """Format a millions-of-lbs value → (text, css-class).
+
+    ``signed=True`` renders a leading ``+``/``−`` and colours the tile
+    up/down/flat like the YoY formatter (used for the three ``Var.`` tiles).
+    ``signed=False`` is unsigned + neutral colour (used for the two total
+    tiles that anchor the walk).  Missing / NaN → ``"—"``.
+    """
+    if value is None or pd.isna(value):
+        return "—", "flat"
+    if signed:
+        cls = "up" if value > 0 else "down" if value < 0 else "flat"
+        return f"{value:+.2f}", cls
+    return f"{value:.2f}", ""
+
+
+def _render_comparison_kpis(
+    kpis: ComparisonKpis, filters: ComparisonFilters,
+) -> None:
+    """Render the KPI strip above the comparison table.
+
+    Two stacked rows, sharing the ``.dpc-kpis`` grid:
+
+    * **Row 1 — cycle-over-cycle walk** (top, drives the section's story):
+      Last Plan (prior cycle) → PM Actual Var. → Base Plan Var. → R&O Var. →
+      Current Plan (current cycle).  Cycle labels are dynamic — pulled from
+      the current selection in ``filters`` — so the narrative always names
+      the exact cycles being compared.  Values are read straight off the
+      Total B2C row of the assembled table (see :func:`build_comparison_kpis`)
+      so tile ↔ table numbers reconcile by construction.
+    * **Row 2 — YoY / share narrative** (below): unchanged.
+    """
+    prior_cy = filters.prior_cycle
+    current_cy = filters.current_cycle
+
+    # ── Row 1: cycle-over-cycle walk ─────────────────────────────────
+    # (label, formatted value, plain-English sub-label with dynamic cycles).
+    walk = (
+        (
+            "Last Plan",
+            _fmt_millions(kpis.last_plan_total, signed=False),
+            f"prior cycle ({prior_cy}) total forecast, incl. R&O",
+        ),
+        (
+            "PM Actual Var.",
+            _fmt_millions(kpis.pm_actual_var, signed=True),
+            f"prior month actual vs prior cycle ({prior_cy}) forecast",
+        ),
+        (
+            "Base Plan Var.",
+            _fmt_millions(kpis.base_plan_var, signed=True),
+            f"current cycle ({current_cy}) vs prior cycle ({prior_cy}) baseline forecast",
+        ),
+        (
+            "R&O Var.",
+            _fmt_millions(kpis.ro_var, signed=True),
+            f"current cycle ({current_cy}) vs prior cycle ({prior_cy}) R&O forecast",
+        ),
+        (
+            "Current Plan",
+            _fmt_millions(kpis.current_plan_total, signed=False),
+            f"current cycle ({current_cy}) total forecast, incl. R&O",
+        ),
+    )
+    walk_cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk">'
+        f'<div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value {cls}">{_esc_html(text)}</div>'
+        f'<span class="k-sub">{_esc_html(sub)}</span></div>'
+        for label, (text, cls), sub in walk
+    )
+
+    # ── Row 2: YoY / share narrative (unchanged) ─────────────────────
     t3m = _fmt_yoy(kpis.t3m_yoy)
     t6m = _fmt_yoy(kpis.t6m_yoy)
     fy = _fmt_yoy(kpis.full_year_yoy)
     ro = _fmt_share(kpis.ro_pct)
-    # (label, (value_text, css_class), descriptor) — narrative left→right.
-    tiles = (
+    yoy = (
         ("T3M YoY", t3m, "Current reality"),
         ("T6M YoY", t6m, "Recent trend"),
         ("Full-Year YoY", fy, "Plan assumption"),
         ("R&O % of Current Plan", ro, "Aspiration"),
     )
-    cards = "".join(
+    yoy_cards = "".join(
         f'<div class="dpc-kpi"><div class="k-label">{_esc_html(label)}</div>'
         f'<div class="k-value {cls}">{_esc_html(text)}</div>'
         f'<div class="k-desc">{_esc_html(desc)}</div></div>'
-        for label, (text, cls), desc in tiles
+        for label, (text, cls), desc in yoy
     )
+
     st.markdown(
-        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
+        f'{_DPC_KPI_CSS}'
+        f'<div class="dpc-kpis">{walk_cards}</div>'
+        f'<div class="dpc-kpis">{yoy_cards}</div>',
         unsafe_allow_html=True,
     )
 

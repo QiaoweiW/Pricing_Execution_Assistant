@@ -5802,8 +5802,9 @@ _DPC_LITE_CSS: str = """
 .dpc-lite tbody td {border-bottom:1px solid #f1f2f4;}
 .dpc-lite tr.section td {font-weight:700;}
 .dpc-lite tr.memo td {font-style:italic; color:#6b7280;}
+/* Total row reads as an emphasised band whether it sits on top or bottom. */
 .dpc-lite tr.total td {font-weight:700; border-top:2px solid #d1d5db;
-  border-bottom:none;}
+  border-bottom:2px solid #d1d5db;}
 .dpc-lite td.pos {color:#1b7f3a;}   /* positive variance — green */
 .dpc-lite td.neg {color:#c0392b;}   /* negative variance — red   */
 
@@ -5816,9 +5817,6 @@ _DPC_LITE_CSS: str = """
   font-size:0.76rem; color:#4b5563;}
 .dpc-mixlegend span {display:inline-flex; align-items:center; gap:6px;}
 .dpc-mixlegend i {width:11px; height:11px; border-radius:2px; display:inline-block;}
-.dpc-narrative {background:#f7f8fa; border-left:3px solid #9aa4b2;
-  border-radius:4px; padding:9px 13px; margin:0 0 0.7rem; font-size:0.82rem;
-  color:#3f4652; line-height:1.45;}
 </style>
 """
 
@@ -5899,21 +5897,21 @@ def _render_comparison_html(
     )
 
 
-# Curated executive current-plan summary (screenshot 2): each entry is
-# (row_id, css-class).  Only ESL is split into its carton subtotals and only
-# Cultured shows the Cottage Cheese / Sour Cream memo lines; every other major
-# stays a single line, then Total B2C anchors the bottom.
+# Curated executive current-plan summary: each entry is (row_id, css-class).
+# Total B2C anchors the TOP; only ESL is split into its carton subtotals and
+# only Cultured shows Cottage Cheese / Sour Cream.  Those two render with the
+# same weight as the carton sub-rows (plain "subtotal", not italic "memo").
 _DPC_SUMMARY_ROWS: tuple[tuple[str, str], ...] = (
+    ("total_b2c", "total"),
     ("esl", "section"),
     ("esl_lc", "subtotal"),
     ("esl_sc", "subtotal"),
     ("aseptic", "section"),
     ("cultured", "section"),
-    ("cult_cottage_cheese", "memo"),
-    ("cult_sour_cream", "memo"),
+    ("cult_cottage_cheese", "subtotal"),
+    ("cult_sour_cream", "subtotal"),
     ("fresh_milk", "section"),
     ("butter", "section"),
-    ("total_b2c", "total"),
 )
 
 
@@ -6085,47 +6083,14 @@ def _dpc_clean_label(label: object) -> str:
     return str(label).replace(" ", "").strip()
 
 
-def _md_inline_to_html(text: str) -> str:
-    """Escape HTML, then render ``**bold**`` spans as ``<strong>`` (no regex/deps)."""
-    parts = _esc_html(text).split("**")
-    return "".join(
-        f"<strong>{p}</strong>" if i % 2 else p for i, p in enumerate(parts)
-    )
-
-
-def _mix_narrative(majors: list[dict]) -> str:
-    """One-line, data-driven read of the mix (biggest · fastest · decliner)."""
-    with_yoy = [m for m in majors if m["yoy"] is not None and m["mix"] is not None]
-    if not with_yoy:
-        return ""
-    biggest = max(with_yoy, key=lambda m: m["mix"])
-    fastest = max(with_yoy, key=lambda m: m["yoy"])
-    parts = [
-        f"**{biggest['label']}** is {biggest['mix'] * 100:.0f}% of volume, "
-        f"growing {biggest['yoy'] * 100:+.0f}%."
-    ]
-    if fastest["row_id"] != biggest["row_id"]:
-        parts.append(
-            f"**{fastest['label']}** is growing fastest at "
-            f"{fastest['yoy'] * 100:+.0f}%."
-        )
-    decliner = min(with_yoy, key=lambda m: m["yoy"])
-    if decliner["yoy"] < 0:
-        parts.append(
-            f"**{decliner['label']}** is declining "
-            f"({decliner['yoy'] * 100:+.0f}%)."
-        )
-    return " ".join(parts)
-
-
 def _render_comparison_mix_table(result) -> None:
     """Render the current-plan volume-mix + mix-shift view (screenshot 2).
 
-    Three lightweight pieces: a stacked **volume-mix bar** (+ legend), a short
-    data-driven **narrative**, then a table of Plan vol · Mix % · PY mix % ·
-    Mix shift (pp) · YOY growth per Portfolio Major, anchored by Total B2C.
-    All values are re-projected from the SAME comparison data (current plan vs
-    prior-year), so it reconciles with the summary table above.
+    Two lightweight pieces: a stacked **volume-mix bar** (+ legend), then a
+    table of Plan vol · Mix % · PY mix % · Mix shift (pp) · YOY growth per
+    Portfolio Major, anchored by Total B2C.  All values are re-projected from
+    the SAME comparison data (current plan vs prior-year), so it reconciles
+    with the summary table above.
     """
     majors, total_row = _build_mix_rows(result)
     if not majors or total_row is None:
@@ -6149,14 +6114,7 @@ def _render_comparison_mix_table(result) -> None:
             f'{_esc_html(m["label"])} {pct:.0f}%</span>'
         )
 
-    # 2) Narrative callout (skipped silently if the data can't support one).
-    narrative = _mix_narrative(majors)
-    narrative_html = (
-        f'<div class="dpc-narrative">{_md_inline_to_html(narrative)}</div>'
-        if narrative else ""
-    )
-
-    # 3) Mix table.
+    # 2) Mix table.
     headers = ["Category", "Plan vol", "Mix %", "PY mix %", "Mix shift", "YOY growth"]
     head_html = "".join(
         f'<th class="lbl">{_esc_html(h)}</th>' if i == 0
@@ -6186,116 +6144,86 @@ def _render_comparison_mix_table(result) -> None:
         _DPC_LITE_CSS
         + f'<div class="dpc-mixbar">{"".join(segments)}</div>'
         + f'<div class="dpc-mixlegend">{"".join(legend)}</div>'
-        + narrative_html
         + '<div class="dpc-lite"><table><thead><tr>' + head_html
         + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
         unsafe_allow_html=True,
     )
 
 
-def _render_demand_comparison_table(result) -> None:
-    """Render the comparison table (styled) + a CSV download button.
+# Foldable detail levels for the detailed comparison table: label → the
+# deepest ``_indent`` kept (lower levels fold up into their parent subtotal,
+# which already sums them).  "Full detail" shows every brand-level leaf.
+_DPC_DEPTH_LEVELS: dict[str, int] = {
+    "Portfolio Major": 1,
+    "+ Supply Format": 2,
+    "Full detail": 3,
+}
+_DPC_DEFAULT_LEVEL: str = "Full detail"
+_DPC_DETAIL_LEVEL_KEY: str = "demand_plan_comparison_detail_level"
 
-    Subtotal rows are shaded + bold; memo rows (Cottage Cheese / Sour
-    Cream) are italicised.  Percentage columns are scaled to whole
-    percents for display.  The download serves the on-screen frame
-    (internal metadata columns stripped).
+
+def _render_demand_comparison_table(result) -> None:
+    """Render the detailed comparison table with its view controls + exports.
+
+    Layout: the table first, then (below it) the fold-level + detail-column
+    controls, then the Download / Save-to-Fabric buttons.  The controls live
+    below the table but their state is read up-front (via session_state) so the
+    table always reflects the current selection.
     """
     table = result.table
     if table is None or table.empty:
         st.info("No comparison rows to display.")
         return
 
-    # Clean frame (no internal metadata cols) — shared by the download
-    # and the Fabric save so both emit exactly what's on screen.
+    # Full frame (all rows + cols, metadata stripped) for Download / Fabric
+    # save — always the complete data, independent of the on-screen fold level
+    # or column toggle.
     save_df = table.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
                  if c in table.columns]
     ).reset_index(drop=True)
 
-    # ── Download + Save to Fabric (above the table — easy to find) ────
-    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    dl_col, save_col = st.columns([1, 1])
-    with dl_col:
-        st.download_button(
-            label="⬇️ Download Demand Plan Comparison Summary (CSV)",
-            data=comparison_to_csv_bytes(result),
-            file_name=f"demand_plan_comparison_summary_{today}.csv",
-            mime="text/csv",
-            key="demand_plan_comparison_download",
-            type="primary",
-            width="stretch",
-            help=(
-                "Downloads the comparison as shown — preserves the indented "
-                "row hierarchy and every metric column."
-            ),
-        )
-    with save_col:
-        if st.button(
-            "💾 Save to Fabric (overwrite)",
-            key="demand_plan_comparison_save",
-            type="primary",
-            width="stretch",
-            help=(
-                "Overwrites `Files/RO Tracking/Demand Plan/"
-                "qry_demand_plan_comparison_summary.csv` with the table as "
-                "shown, so the comparison can be consumed without recomputing."
-            ),
-        ):
-            try:
-                with st.spinner("Saving Demand Plan Comparison Summary to Microsoft Fabric…"):
-                    blob_path = save_demand_plan_comparison(save_df)
-            except DemandSummaryError as exc:
-                st.error(f"❌ Save failed.\n\n{exc}")
-            else:
-                st.success(f"✅ Saved to `Files/{blob_path}` ({len(save_df)} rows).")
+    # View-control state is read here (widgets are rendered BELOW the table);
+    # session_state carries the selection across the rerun a widget triggers.
+    st.session_state.setdefault(_DPC_DETAIL_LEVEL_KEY, _DPC_DEFAULT_LEVEL)
+    st.session_state.setdefault(_DPC_SHOW_DETAIL_COLS_KEY, False)
+    max_indent = _DPC_DEPTH_LEVELS.get(
+        st.session_state[_DPC_DETAIL_LEVEL_KEY], _DPC_DEPTH_LEVELS[_DPC_DEFAULT_LEVEL])
+    show_detail_cols = bool(st.session_state[_DPC_SHOW_DETAIL_COLS_KEY])
 
-    # ── Build the display frame ───────────────────────────────────────
-    # Percent ids → display labels; the stored values are fractions, so
-    # multiply by 100 for a whole-percent display.
+    # Fold lower levels into their parent: keep only rows at/above the chosen
+    # depth.  The dropped rows' pounds still live in their parent subtotal.
+    view = table
+    if "_indent" in view.columns:
+        view = view[view["_indent"] <= max_indent].reset_index(drop=True)
+
+    # Percent ids → display labels; stored values are fractions, ×100 to show.
     percent_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_PERCENT_COLS]
 
-    # Row-type flags (positional) for styling, captured before we drop
-    # the internal metadata columns.
-    subtotal_flags = table["_is_subtotal"].tolist()
-    memo_flags = table["_is_memo"].tolist()
-    row_ids = (
-        table["_row_id"].tolist() if "_row_id" in table.columns else None
-    )
+    # Row-type flags (positional) captured before dropping the metadata cols.
+    subtotal_flags = view["_is_subtotal"].tolist()
+    memo_flags = view["_is_memo"].tolist()
+    row_ids = view["_row_id"].tolist() if "_row_id" in view.columns else None
+    indent_flags = view["_indent"].tolist() if "_indent" in view.columns else []
 
-    display_df = table.drop(
+    display_df = view.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
-                 if c in table.columns]
+                 if c in view.columns]
     ).reset_index(drop=True)
     for label in percent_labels:
         if label in display_df.columns:
             display_df[label] = display_df[label] * 100.0
 
-    # Optional detail columns (hidden by default per planner spec).
-    hidden_detail_labels = {
-        DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT
-    }
-    show_detail_cols = st.checkbox(
-        "Show prior-month & current-actual detail columns "
-        "(Prior Month Actual / Forecast, Current Plan (Actual))",
-        value=False,
-        key=_DPC_SHOW_DETAIL_COLS_KEY,
-        help=(
-            "When unchecked, the table shows Last Plan through Budget only. "
-            "Download and Save to Fabric still include every column."
-        ),
-    )
+    # Column visibility: the hidden-by-default set collapses unless the planner
+    # ticks the detail-columns box below.
+    hidden_detail_labels = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT}
     visible_metric_cols = [
         DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER
         if show_detail_cols or DPC_DISPLAY_LABELS[c] not in hidden_detail_labels
     ]
 
     # Screenshot-styled HTML table — navy header + white font, light-blue
-    # Total B2C, orange (#f8cbad) Portfolio-Major rows — matching the sibling
-    # tables so the whole page reads as one system.
-    indent_flags = (
-        table["_indent"].tolist() if "_indent" in table.columns else []
-    )
+    # Total B2C, orange (#f8cbad) Portfolio-Major rows.
     _render_comparison_html(
         display_df,
         label_col=DPC_COL_LABEL,
@@ -6312,6 +6240,80 @@ def _render_demand_comparison_table(result) -> None:
             "_R&O is zero because the RO Summary Report could not be read. "
             "Save the RO Summary Report above to populate it._"
         )
+
+    # Controls + exports, below the table (per planner layout).
+    _render_comparison_table_controls()
+    _render_comparison_table_exports(result, save_df)
+
+
+def _render_comparison_table_controls() -> None:
+    """Fold-level + detail-column toggles, rendered below the detailed table.
+
+    Both widgets bind to session_state by key only (no ``value``/``index`` arg)
+    so :func:`_render_demand_comparison_table` can read the same state up-front
+    without Streamlit's "value set via both" warning.
+    """
+    c1, c2 = st.columns([1.3, 1])
+    with c1:
+        st.radio(
+            "Detail level (fold lower layers into the level above)",
+            options=list(_DPC_DEPTH_LEVELS),
+            key=_DPC_DETAIL_LEVEL_KEY,
+            horizontal=True,
+            help="Portfolio Major only · + Supply Format · Full brand-level "
+                 "detail.  Folded rows stay counted in their parent subtotal.",
+        )
+    with c2:
+        st.checkbox(
+            "Show extra detail columns",
+            key=_DPC_SHOW_DETAIL_COLS_KEY,
+            help="Adds the hidden metric columns (Prior-Month Actual/Forecast, "
+                 "Current Plan Actual/Base/R&O, PY Actual, O%, Base Plan Var %). "
+                 "Download and Save to Fabric always include every column.",
+        )
+
+
+def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:
+    """Download + Save-to-Fabric buttons, rendered at the very bottom.
+
+    Both act on the FULL frame (``save_df`` / ``result``), never the folded /
+    column-trimmed on-screen view.
+    """
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    dl_col, save_col = st.columns(2)
+    with dl_col:
+        st.download_button(
+            label="⬇️ Download Demand Plan Comparison Summary (CSV)",
+            data=comparison_to_csv_bytes(result),
+            file_name=f"demand_plan_comparison_summary_{today}.csv",
+            mime="text/csv",
+            key="demand_plan_comparison_download",
+            type="primary",
+            width="stretch",
+            help=(
+                "Downloads the full comparison — every row and metric column, "
+                "regardless of the on-screen fold level."
+            ),
+        )
+    with save_col:
+        if st.button(
+            "💾 Save to Fabric (overwrite)",
+            key="demand_plan_comparison_save",
+            type="primary",
+            width="stretch",
+            help=(
+                "Overwrites `Files/RO Tracking/Demand Plan/"
+                "qry_demand_plan_comparison_summary.csv` with the full table so "
+                "the comparison can be consumed without recomputing."
+            ),
+        ):
+            try:
+                with st.spinner("Saving Demand Plan Comparison Summary to Microsoft Fabric…"):
+                    blob_path = save_demand_plan_comparison(save_df)
+            except DemandSummaryError as exc:
+                st.error(f"❌ Save failed.\n\n{exc}")
+            else:
+                st.success(f"✅ Saved to `Files/{blob_path}` ({len(save_df)} rows).")
 
 
 def _render_one_driver_table(

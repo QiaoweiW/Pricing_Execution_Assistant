@@ -604,8 +604,10 @@ DISPLAY_ORDER: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_BASE, COL_CURRENT_PLAN_RO,
     COL_PY_ACTUAL, COL_LAST_PLAN, COL_CURRENT_PLAN, COL_O_PCT,
-    COL_PM_ACTUAL, COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
-    COL_BASE_PLAN, COL_BASE_PLAN_VAR_PCT, COL_R_AND_O,
+    # Delta-breakdown legs (PM Actual · Base Plan · R&O) come BEFORE the
+    # Total Delta they sum into, so the walk reads left→right into the total.
+    COL_PM_ACTUAL, COL_BASE_PLAN, COL_BASE_PLAN_VAR_PCT, COL_R_AND_O,
+    COL_TOTAL_DELTA, COL_TOTAL_DELTA_PCT,
     COL_V_BUDGET, COL_PCT, COL_BUDGET,
 )
 # Columns rendered as percentages (the rest are millions of lbs).

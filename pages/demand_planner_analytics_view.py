@@ -5181,6 +5181,7 @@ def _render_demand_plan_comparison_fragment() -> None:
     )
     _render_comparison_kpis_yoy(kpis)
     _render_comparison_summary_table(result)
+    _render_comparison_mix_table(result)
 
     st.markdown("---")
 
@@ -5610,79 +5611,12 @@ def _load_demand_comparison_dim() -> tuple[Optional[pd.DataFrame], Optional[str]
         )
 
 
-# Hierarchy table row highlights (planner-facing).
+# Row-highlight styles for the Product Line Review Styler tables (the Demand
+# Plan Comparison tables render as HTML \u2014 see _DPC_CMP_CSS / _DPC_LITE_CSS \u2014
+# and no longer use these pandas-Styler strings).
 _ROW_STYLE_HIGHLIGHT_ORANGE_BOLD = "background-color: #ffcc80; font-weight: 700"
-_ROW_STYLE_SUBTOTAL = "background-color: #fde9d9; font-weight: 600"
-_ROW_STYLE_MEMO = "font-style: italic; color: #555555"
 _ROW_STYLE_PLR_CUSTOMER = "background-color: #e3f2fd"
-
-_DPC_HIGHLIGHT_ROW_IDS: frozenset[str] = frozenset({"butter"})
 _PLR_HIGHLIGHT_LABELS: frozenset[str] = frozenset({"Branded", "Private", "Grand Total"})
-
-
-def _normalize_table_label(label: object) -> str:
-    """Strip hierarchy indent (NBSP) and surrounding whitespace."""
-    return str(label).replace("\u00a0", " ").strip()
-
-
-def _is_butter_highlight_row(
-    idx: int,
-    *,
-    row_ids: list[str] | None,
-    labels: list[str] | None,
-    highlight_row_ids: frozenset[str],
-) -> bool:
-    if row_ids is not None and idx < len(row_ids) and row_ids[idx] in highlight_row_ids:
-        return True
-    if labels is not None and idx < len(labels):
-        return _normalize_table_label(labels[idx]) == "Butter"
-    return False
-
-
-def _style_comparison_hierarchy_row(
-    row: pd.Series,
-    *,
-    subtotal_flags: list[bool],
-    memo_flags: list[bool],
-    row_ids: list[str] | None,
-    labels: list[str] | None,
-) -> list[str]:
-    """Orange+bold Butter row; peach subtotals; italic memo rows."""
-    idx = int(row.name)
-    n = len(row)
-    if _is_butter_highlight_row(
-        idx,
-        row_ids=row_ids,
-        labels=labels,
-        highlight_row_ids=_DPC_HIGHLIGHT_ROW_IDS,
-    ):
-        return [_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD] * n
-    if idx < len(subtotal_flags) and subtotal_flags[idx]:
-        return [_ROW_STYLE_SUBTOTAL] * n
-    if idx < len(memo_flags) and memo_flags[idx]:
-        return [_ROW_STYLE_MEMO] * n
-    return [""] * n
-
-
-def _demand_comparison_column_config(percent_labels: list[str]) -> dict:
-    """Return the ``column_config`` for the comparison table.
-
-    The row-label column is pinned and widened so the indented hierarchy
-    stays readable; metric columns format as one-decimal millions, and
-    the two ratio columns format as one-decimal percentages.
-    """
-    config: dict = {
-        DPC_COL_LABEL: st.column_config.TextColumn(
-            DPC_COL_LABEL, width="large", pinned=True,
-        ),
-    }
-    for col_id in DPC_DISPLAY_ORDER:
-        label = DPC_DISPLAY_LABELS[col_id]
-        if label in percent_labels:
-            config[label] = st.column_config.NumberColumn(label, format="%.1f%%")
-        else:
-            config[label] = st.column_config.NumberColumn(label, format="%.2f")
-    return config
 
 
 # Executive KPI strip shown above the Demand Plan Comparison table.  Four
@@ -5848,8 +5782,43 @@ _DPC_CMP_CSS: str = """
 .dpc-cmp tr.section td {background:#f8cbad; font-weight:700;}
 .dpc-cmp tr.subtotal td {font-weight:700;}
 .dpc-cmp tr.memo td {font-style:italic; color:#555555;}
-.dpc-cmp td.pos {color:#1b7f3a;}   /* positive variance % — green */
-.dpc-cmp td.neg {color:#c0392b;}   /* negative variance % — red   */
+</style>
+"""
+
+
+# ── Lightweight table + mix-visual styling (executive summary section) ───────
+# A clean, low-chrome look (white background, hairline separators, bold section
+# rows, no fills) for the two top summary tables + the volume-mix bar — kept
+# separate from the detailed table's heavier navy/orange treatment.
+_DPC_LITE_CSS: str = """
+<style>
+.dpc-lite {overflow-x:auto; margin:0.3rem 0 0.8rem;}
+.dpc-lite table {border-collapse:collapse; width:100%; background:transparent;
+  color:#1f2430; font-size:0.86rem;}
+.dpc-lite th, .dpc-lite td {padding:7px 14px; white-space:nowrap; text-align:right;}
+.dpc-lite thead th {color:#6b7280; font-weight:600; font-size:0.8rem;
+  border-bottom:2px solid #e5e7eb;}
+.dpc-lite th.lbl, .dpc-lite td.lbl {text-align:left;}
+.dpc-lite tbody td {border-bottom:1px solid #f1f2f4;}
+.dpc-lite tr.section td {font-weight:700;}
+.dpc-lite tr.memo td {font-style:italic; color:#6b7280;}
+.dpc-lite tr.total td {font-weight:700; border-top:2px solid #d1d5db;
+  border-bottom:none;}
+.dpc-lite td.pos {color:#1b7f3a;}   /* positive variance — green */
+.dpc-lite td.neg {color:#c0392b;}   /* negative variance — red   */
+
+/* Current-plan volume-mix stacked bar + legend. */
+.dpc-mixbar {display:flex; width:100%; height:26px; border-radius:5px;
+  overflow:hidden; margin:0.15rem 0 0.5rem;}
+.dpc-mixbar .seg {display:flex; align-items:center; justify-content:center;
+  color:#ffffff; font-size:0.72rem; font-weight:700; min-width:0;}
+.dpc-mixlegend {display:flex; flex-wrap:wrap; gap:14px; margin:0 0 0.6rem;
+  font-size:0.76rem; color:#4b5563;}
+.dpc-mixlegend span {display:inline-flex; align-items:center; gap:6px;}
+.dpc-mixlegend i {width:11px; height:11px; border-radius:2px; display:inline-block;}
+.dpc-narrative {background:#f7f8fa; border-left:3px solid #9aa4b2;
+  border-radius:4px; padding:9px 13px; margin:0 0 0.7rem; font-size:0.82rem;
+  color:#3f4652; line-height:1.45;}
 </style>
 """
 
@@ -5959,29 +5928,47 @@ def _dpc_num(row: pd.Series, col_id: str) -> Optional[float]:
 
 
 def _dpc_fmt_m(value: Optional[float]) -> str:
-    """Millions, one decimal + thousands separators (screenshot 2 style)."""
+    """Millions, one decimal + thousands separators (screenshot style)."""
     return "—" if value is None else f"{value:,.1f}"
 
 
-def _dpc_fmt_pct(frac: Optional[float], *, signed: bool) -> tuple[str, str]:
-    """Fraction → (whole-percent-ish text, css-class) — green/red when signed."""
+def _dpc_fmt_pct(
+    frac: Optional[float], *, signed: bool, decimals: int = 1,
+) -> tuple[str, str]:
+    """Fraction → (percent text, css-class) — green/red when *signed*.
+
+    Rounds to *decimals* places; a value that rounds to zero renders as a
+    neutral ``"0%"`` (never ``"-0%"``) with no colour class.
+    """
     if frac is None:
         return "—", ""
     pct = frac * 100.0
-    if signed:
-        cls = "pos" if pct > 0.05 else "neg" if pct < -0.05 else ""
-        return f"{pct:+.1f}%", cls
-    return f"{pct:.1f}%", ""
+    if abs(round(pct, decimals)) == 0.0:           # avoid "-0%" / spurious colour
+        return f"{0:.{decimals}f}%", ""
+    cls = ("pos" if pct > 0 else "neg") if signed else ""
+    txt = f"{pct:+.{decimals}f}%" if signed else f"{pct:.{decimals}f}%"
+    return txt, cls
+
+
+def _dpc_fmt_pp(delta_frac: Optional[float], *, decimals: int = 1) -> tuple[str, str]:
+    """Fraction difference → (``"+1.8pp"`` text, css-class), green/red signed."""
+    if delta_frac is None:
+        return "—", ""
+    pp = delta_frac * 100.0
+    if abs(round(pp, decimals)) == 0.0:
+        return f"{0:.{decimals}f}pp", ""
+    cls = "pos" if pp > 0 else "neg"
+    return f"{pp:+.{decimals}f}pp", cls
 
 
 def _render_comparison_summary_table(result) -> None:
-    """Render the executive current-plan summary table (screenshot 2).
+    """Render the executive current-plan summary table (screenshot 1).
 
     A condensed, current-plan-anchored projection of the SAME comparison data
     (no new math beyond Base plan = Current Plan − R&O and Base vs PY %):
     Base plan · PY · Base vs PY % · R&O vol · Total plan · RO% · Budget ·
-    % vs Budget.  Styled like the detailed table (navy header, light-blue
-    Total B2C, orange majors) with green/red variance percents.
+    % vs Budget.  Rendered in the lightweight style (white, hairline row
+    separators, bold section rows, green/red variance percents).
     """
     table = getattr(result, "table", None)
     if table is None or table.empty or DPC_COL_ROW_ID not in table.columns:
@@ -6009,9 +5996,10 @@ def _render_comparison_summary_table(result) -> None:
             (base_plan - py) / py
             if base_plan is not None and py not in (None, 0.0) else None
         )
-        base_py_txt, base_py_cls = _dpc_fmt_pct(base_vs_py, signed=True)
-        ro_pct_txt, _ = _dpc_fmt_pct(_dpc_num(r, DPC_COL_O_PCT), signed=False)
-        vsb_txt, vsb_cls = _dpc_fmt_pct(_dpc_num(r, DPC_COL_PCT), signed=True)
+        # Whole-percent display (screenshot 1) — green/red on the two variances.
+        base_py_txt, base_py_cls = _dpc_fmt_pct(base_vs_py, signed=True, decimals=0)
+        ro_pct_txt, _ = _dpc_fmt_pct(_dpc_num(r, DPC_COL_O_PCT), signed=False, decimals=0)
+        vsb_txt, vsb_cls = _dpc_fmt_pct(_dpc_num(r, DPC_COL_PCT), signed=True, decimals=0)
         cells = [
             f'<td class="lbl">{_esc_html(r.get(DPC_COL_LABEL, row_id))}</td>',
             f'<td>{_esc_html(_dpc_fmt_m(base_plan))}</td>',
@@ -6026,8 +6014,180 @@ def _render_comparison_summary_table(result) -> None:
         body_rows.append(f'<tr class="{cls}">' + "".join(cells) + "</tr>")
 
     st.markdown(
-        _DPC_CMP_CSS
-        + '<div class="dpc-cmp"><table><thead><tr>' + head_html
+        _DPC_LITE_CSS
+        + '<div class="dpc-lite"><table><thead><tr>' + head_html
+        + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ── Current-plan volume-mix / mix-shift view (screenshot 2) ──────────────────
+# Portfolio-Major rows only (direct children of Total B2C), ordered by current
+# plan volume so the biggest mover reads first.  Each major gets a stable
+# colour for the stacked bar + legend.
+_MIX_MAJOR_IDS: tuple[str, ...] = ("esl", "aseptic", "cultured", "fresh_milk", "butter")
+_MIX_COLORS: dict[str, str] = {
+    "fresh_milk": "#3b82f6",   # blue
+    "esl":        "#10b981",   # green
+    "cultured":   "#f59e0b",   # amber
+    "aseptic":    "#8b5cf6",   # purple
+    "butter":     "#ef4444",   # red
+}
+_MIX_FALLBACK_COLOR: str = "#9ca3af"
+
+
+def _build_mix_rows(result) -> tuple[list[dict], Optional[dict]]:
+    """Return ``(major_rows_sorted_desc, total_row)`` for the mix view.
+
+    Each dict carries: ``row_id``, ``label``, ``plan`` (current plan vol),
+    ``py``, ``mix`` / ``py_mix`` (fractions of the Total B2C plan / PY),
+    ``shift`` (mix − py_mix), ``yoy`` ((plan − py) / py).  ``total_row`` is the
+    Total B2C anchor (100 % mix).  Returns ``([], None)`` when unavailable.
+    """
+    table = getattr(result, "table", None)
+    if table is None or table.empty or DPC_COL_ROW_ID not in table.columns:
+        return [], None
+    by_id = {str(r[DPC_COL_ROW_ID]): r for _, r in table.iterrows()}
+    total = by_id.get("total_b2c")
+    if total is None:
+        return [], None
+    total_plan = _dpc_num(total, DPC_COL_CURRENT_PLAN) or 0.0
+    total_py = _dpc_num(total, DPC_COL_PY_ACTUAL) or 0.0
+    if total_plan <= 0:
+        return [], None
+
+    def _mk(r, row_id) -> dict:
+        plan = _dpc_num(r, DPC_COL_CURRENT_PLAN) or 0.0
+        py = _dpc_num(r, DPC_COL_PY_ACTUAL) or 0.0
+        mix = plan / total_plan if total_plan else None
+        py_mix = py / total_py if total_py else None
+        return {
+            "row_id": row_id,
+            "label": _dpc_clean_label(r.get(DPC_COL_LABEL, row_id)),
+            "plan": plan, "py": py, "mix": mix, "py_mix": py_mix,
+            "shift": (mix - py_mix) if (mix is not None and py_mix is not None) else None,
+            "yoy": ((plan - py) / py) if py else None,
+        }
+
+    majors = [_mk(by_id[i], i) for i in _MIX_MAJOR_IDS if i in by_id]
+    majors.sort(key=lambda d: d["plan"], reverse=True)
+    total_row = {
+        "label": _dpc_clean_label(total.get(DPC_COL_LABEL, "Total B2C")),
+        "plan": total_plan, "mix": 1.0, "py_mix": 1.0 if total_py else None,
+        "shift": None,
+        "yoy": ((total_plan - total_py) / total_py) if total_py else None,
+    }
+    return majors, total_row
+
+
+def _dpc_clean_label(label: object) -> str:
+    """Strip the NBSP hierarchy indent so a top-level label reads flush-left."""
+    return str(label).replace(" ", "").strip()
+
+
+def _md_inline_to_html(text: str) -> str:
+    """Escape HTML, then render ``**bold**`` spans as ``<strong>`` (no regex/deps)."""
+    parts = _esc_html(text).split("**")
+    return "".join(
+        f"<strong>{p}</strong>" if i % 2 else p for i, p in enumerate(parts)
+    )
+
+
+def _mix_narrative(majors: list[dict]) -> str:
+    """One-line, data-driven read of the mix (biggest · fastest · decliner)."""
+    with_yoy = [m for m in majors if m["yoy"] is not None and m["mix"] is not None]
+    if not with_yoy:
+        return ""
+    biggest = max(with_yoy, key=lambda m: m["mix"])
+    fastest = max(with_yoy, key=lambda m: m["yoy"])
+    parts = [
+        f"**{biggest['label']}** is {biggest['mix'] * 100:.0f}% of volume, "
+        f"growing {biggest['yoy'] * 100:+.0f}%."
+    ]
+    if fastest["row_id"] != biggest["row_id"]:
+        parts.append(
+            f"**{fastest['label']}** is growing fastest at "
+            f"{fastest['yoy'] * 100:+.0f}%."
+        )
+    decliner = min(with_yoy, key=lambda m: m["yoy"])
+    if decliner["yoy"] < 0:
+        parts.append(
+            f"**{decliner['label']}** is declining "
+            f"({decliner['yoy'] * 100:+.0f}%)."
+        )
+    return " ".join(parts)
+
+
+def _render_comparison_mix_table(result) -> None:
+    """Render the current-plan volume-mix + mix-shift view (screenshot 2).
+
+    Three lightweight pieces: a stacked **volume-mix bar** (+ legend), a short
+    data-driven **narrative**, then a table of Plan vol · Mix % · PY mix % ·
+    Mix shift (pp) · YOY growth per Portfolio Major, anchored by Total B2C.
+    All values are re-projected from the SAME comparison data (current plan vs
+    prior-year), so it reconciles with the summary table above.
+    """
+    majors, total_row = _build_mix_rows(result)
+    if not majors or total_row is None:
+        return
+
+    # 1) Stacked mix bar — one segment per major (mix % width), label shown
+    #    only when the segment is wide enough to fit it.
+    segments, legend = [], []
+    for m in majors:
+        if not m["mix"]:
+            continue
+        color = _MIX_COLORS.get(m["row_id"], _MIX_FALLBACK_COLOR)
+        pct = m["mix"] * 100.0
+        label = f"{pct:.0f}%" if pct >= 6 else ""
+        segments.append(
+            f'<div class="seg" style="width:{pct:.4f}%;background:{color};" '
+            f'title="{_esc_html(m["label"])} {pct:.1f}%">{label}</div>'
+        )
+        legend.append(
+            f'<span><i style="background:{color}"></i>'
+            f'{_esc_html(m["label"])} {pct:.0f}%</span>'
+        )
+
+    # 2) Narrative callout (skipped silently if the data can't support one).
+    narrative = _mix_narrative(majors)
+    narrative_html = (
+        f'<div class="dpc-narrative">{_md_inline_to_html(narrative)}</div>'
+        if narrative else ""
+    )
+
+    # 3) Mix table.
+    headers = ["Category", "Plan vol", "Mix %", "PY mix %", "Mix shift", "YOY growth"]
+    head_html = "".join(
+        f'<th class="lbl">{_esc_html(h)}</th>' if i == 0
+        else f'<th>{_esc_html(h)}</th>'
+        for i, h in enumerate(headers)
+    )
+
+    def _mix_row(m: dict, *, cls: str) -> str:
+        mix_txt, _ = _dpc_fmt_pct(m["mix"], signed=False, decimals=1)
+        pymix_txt, _ = _dpc_fmt_pct(m["py_mix"], signed=False, decimals=1)
+        shift_txt, shift_cls = _dpc_fmt_pp(m["shift"])
+        yoy_txt, yoy_cls = _dpc_fmt_pct(m["yoy"], signed=True, decimals=0)
+        cells = [
+            f'<td class="lbl">{_esc_html(m["label"])}</td>',
+            f'<td>{_esc_html(_dpc_fmt_m(m["plan"]))}</td>',
+            f'<td>{_esc_html(mix_txt)}</td>',
+            f'<td>{_esc_html(pymix_txt)}</td>',
+            f'<td class="{shift_cls}">{_esc_html(shift_txt)}</td>',
+            f'<td class="{yoy_cls}">{_esc_html(yoy_txt)}</td>',
+        ]
+        return f'<tr class="{cls}">' + "".join(cells) + "</tr>"
+
+    body_rows = [_mix_row(m, cls="section") for m in majors]
+    body_rows.append(_mix_row(total_row, cls="total"))
+
+    st.markdown(
+        _DPC_LITE_CSS
+        + f'<div class="dpc-mixbar">{"".join(segments)}</div>'
+        + f'<div class="dpc-mixlegend">{"".join(legend)}</div>'
+        + narrative_html
+        + '<div class="dpc-lite"><table><thead><tr>' + head_html
         + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
         unsafe_allow_html=True,
     )

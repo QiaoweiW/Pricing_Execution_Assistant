@@ -4734,8 +4734,10 @@ def _render_demand_plan_comparison_section() -> None:
 # across reruns so the planner doesn't have to re-click on every
 # interaction once they've expanded the section.
 _DPC_ENABLED_KEY: str = "demand_plan_comparison_enabled"
-# When False, hide Total Actuals … Current Plan (Forecast) in the table.
-_DPC_SHOW_DETAIL_COLS_KEY: str = "demand_plan_comparison_show_detail_cols"
+# Planner's chosen visible metric columns for the detailed table (the ⚙️
+# Columns picker below the table).  Defaults to everything except the
+# extra-detail set; every column is individually hidable.
+_DPC_DETAIL_COLS_KEY: str = "demand_plan_comparison_detail_cols"
 # One-shot flag: force the tracker re-read on the next fragment run (set by
 # the Generate / Regenerate action so it always pulls the LATEST file).
 _DPC_FORCE_TRACKER_REFRESH_KEY: str = "demand_plan_comparison_force_tracker"
@@ -6263,10 +6265,15 @@ def _render_demand_comparison_table(result) -> None:
                  if c in table.columns]
     ).reset_index(drop=True)
 
-    # Column-toggle state is read here (the checkbox is rendered BELOW the
+    # Column-visibility state is read here (the picker is rendered BELOW the
     # table); session_state carries it across the rerun the widget triggers.
-    st.session_state.setdefault(_DPC_SHOW_DETAIL_COLS_KEY, False)
-    show_detail_cols = bool(st.session_state[_DPC_SHOW_DETAIL_COLS_KEY])
+    # Every metric column is individually hidable; the default-visible set is
+    # everything except COLS_HIDDEN_BY_DEFAULT (the screenshot-3 column set).
+    all_detail_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER]
+    _hidden_default = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT}
+    default_visible = [lbl for lbl in all_detail_labels if lbl not in _hidden_default]
+    st.session_state.setdefault(_DPC_DETAIL_COLS_KEY, default_visible)
+    visible_labels = set(st.session_state.get(_DPC_DETAIL_COLS_KEY) or default_visible)
 
     # Percent ids → display labels; stored values are fractions, ×100 to show.
     percent_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_PERCENT_COLS]
@@ -6286,13 +6293,9 @@ def _render_demand_comparison_table(result) -> None:
         if label in display_df.columns:
             display_df[label] = display_df[label] * 100.0
 
-    # Column visibility: the hidden-by-default set collapses unless the planner
-    # ticks the detail-columns box below.
-    hidden_detail_labels = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT}
-    visible_metric_cols = [
-        DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER
-        if show_detail_cols or DPC_DISPLAY_LABELS[c] not in hidden_detail_labels
-    ]
+    # Visible metric columns = the planner's picks (from the Columns popover
+    # below), kept in the canonical DISPLAY_ORDER.
+    visible_metric_cols = [lbl for lbl in all_detail_labels if lbl in visible_labels]
 
     # Foldable tree — navy header + white font, light-blue Total B2C, orange
     # (#f8cbad) Portfolio-Major rows (incl. Butter); click a parent row to fold.
@@ -6313,26 +6316,27 @@ def _render_demand_comparison_table(result) -> None:
             "Save the RO Summary Report above to populate it._"
         )
 
-    # Column toggle + exports, below the table (per planner layout).
-    _render_comparison_table_controls()
+    # Column picker + exports, below the table (per planner layout).
+    _render_comparison_table_controls(all_detail_labels)
     _render_comparison_table_exports(result, save_df)
 
 
-def _render_comparison_table_controls() -> None:
-    """Detail-column toggle, rendered below the detailed table.
+def _render_comparison_table_controls(all_labels: list[str]) -> None:
+    """⚙️ Columns picker for the detailed table, rendered below it.
 
-    Binds to session_state by key only (no ``value`` arg) so
-    :func:`_render_demand_comparison_table` can read the same state up-front
-    without Streamlit's "value set via both" warning.  (Row folding is native
-    per-row — no global control.)
+    Lists EVERY metric column so the planner can show/hide any of them (incl.
+    the extra-detail columns that start hidden).  Binds to session_state by key
+    only (no ``default`` arg) so :func:`_render_demand_comparison_table` can
+    read the same selection up-front without Streamlit's "value set via both"
+    warning.  Category always shows; Download / Save always include every
+    column.  (Row folding is native per-row — no global control.)
     """
-    st.checkbox(
-        "Show extra detail columns",
-        key=_DPC_SHOW_DETAIL_COLS_KEY,
-        help="Adds the hidden metric columns (Prior-Month Actual/Forecast, "
-             "Current Plan Actual/Base/R&O, PY Actual, O%, Base Plan Var %). "
-             "Download and Save to Fabric always include every column.",
-    )
+    with st.popover("⚙️ Columns", use_container_width=False):
+        st.multiselect(
+            "Show columns", options=all_labels, key=_DPC_DETAIL_COLS_KEY,
+            help="Tick / untick any metric column.  The Category column always "
+                 "shows; Download and Save to Fabric always include every column.",
+        )
 
 
 def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:

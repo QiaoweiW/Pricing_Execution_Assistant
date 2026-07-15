@@ -6399,7 +6399,8 @@ def _render_bias_instructions(prior_cycle: str) -> None:
     with st.expander("ℹ️ How the bias metrics work", expanded=False):
         st.markdown(
             f"**Forecast = Lag 1 (the selected prior cycle, {prior_cycle}) plan "
-            "= Base + R&O** for each month; **Actual = IBP shipments**.  The six "
+            "= Base + R&O** for each month; **Actual = IBP Orders (ordered "
+            "lbs)** — bias measures the plan vs what customers ordered.  The six "
             "columns are the months **ending at (and including) the Prior "
             "Month**.  A month shows only when the prior cycle actually "
             "forecast it (its horizon overlaps that month); earlier months are "
@@ -6498,10 +6499,11 @@ def _render_forecast_bias_section(
         f"#### 🎯 Forecast Bias — Lag 1 (prior cycle {filters.prior_cycle}) "
         "by Segment × Month")
 
-    # Actuals for the 6 bias months + the seasonal-naive (same months −12mo).
+    # "Actual" = IBP ORDERS for the 6 bias months + the seasonal-naive
+    # benchmark (the same months a year earlier).
     bias_cur = _last_n_months_local(filters.prior_month, 6)
-    ibp_actuals_df, _ = _load_demand_comparison_ibp(months=tuple(sorted(bias_cur)))
-    ibp_naive_df, _ = _load_demand_comparison_ibp(
+    ibp_actuals_df, _ = _load_demand_comparison_ibp_orders(months=tuple(sorted(bias_cur)))
+    ibp_naive_df, _ = _load_demand_comparison_ibp_orders(
         months=tuple(sorted(_shift_year_back(m) for m in bias_cur)))
 
     sig = (

@@ -2995,8 +2995,8 @@ def _assemble_prior_month_actual_vs_fcst_table(
 # Forecast Bias (Lag 1) by Segment × Month
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Compares each segment's ACTUAL shipments against the SELECTED prior cycle's
-# ("Lag 1") forecast (Base + R&O) — ``filters.prior_cycle``, whatever the
+# Compares each segment's ACTUAL orders (IBP Orders) against the SELECTED
+# prior cycle's ("Lag 1") forecast (Base + R&O) — ``filters.prior_cycle``, whatever the
 # planner picks, not a hard-coded cycle — for the six months ending at (and
 # including) the Prior Month.  Only months the prior cycle actually forecast
 # (its horizon overlaps them) are scored; earlier months are blank.  Surfaces
@@ -3141,10 +3141,13 @@ def build_forecast_bias_table(
 ) -> ForecastBiasResult:
     """Build the Forecast Bias (Lag 1) by Segment × Month table.
 
-    *ibp_actuals_df* must cover the six months ending at ``filters.prior_month``;
-    *ibp_naive_df* the same months a year earlier (seasonal-naive benchmark).
-    Segments reuse the comparison hierarchy (incl. dynamic Butter detail) and
-    honour the section's Portfolio Major · Supply Format · Brand filter.
+    "Actual" is **IBP Orders** (ordered lbs) — bias/WMAPE compare the prior
+    cycle's forecast to what customers actually ordered.  *ibp_actuals_df* must
+    be the ORDERS covering the six months ending at ``filters.prior_month``;
+    *ibp_naive_df* the ORDERS for the same months a year earlier (seasonal-naive
+    benchmark).  Segments reuse the comparison hierarchy (incl. dynamic Butter
+    detail) and honour the section's Portfolio Major · Supply Format · Brand
+    filter.
     """
     prior_month = filters.prior_month.replace(day=1)
     prior_cycle = filters.prior_cycle
@@ -3157,14 +3160,16 @@ def build_forecast_bias_table(
         _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched(),
         filters,
     )
+    # "Actual" here is ORDERS (IBP Orders), so enrich with the ordered-qty
+    # column — bias/WMAPE measure forecast vs what customers ordered.
     actuals = _apply_dim_filter(
-        _enrich_ibp(ibp_actuals_df, dim_frame) if ibp_actuals_df is not None
-        else _empty_enriched(actuals=True),
+        _enrich_ibp(ibp_actuals_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
+        if ibp_actuals_df is not None else _empty_enriched(actuals=True),
         filters,
     )
     naive = _apply_dim_filter(
-        _enrich_ibp(ibp_naive_df, dim_frame) if ibp_naive_df is not None
-        else _empty_enriched(actuals=True),
+        _enrich_ibp(ibp_naive_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
+        if ibp_naive_df is not None else _empty_enriched(actuals=True),
         filters,
     )
 

@@ -4674,9 +4674,16 @@ def _render_demand_plan_comparison_section() -> None:
             "**KPI strip — Row 2 (YoY / share context):**\n"
             "- **T3M / T6M YoY** — trailing 3- / 6-month shipments vs the "
             "same months a year ago.\n"
-            "- **Full-Year YoY** — Current Plan vs Prior-Year Actual over "
-            "the full plan horizon.\n"
+            "- **Full-Year Base vs PY%** — Base plan (Current Plan − R&O) vs "
+            "Prior-Year Actual over the full plan horizon.\n"
             "- **R&O % of Current Plan** — R&O share of the current plan.\n"
+            "- **Total B2C Plan vs Budget %** — Current Plan vs Budget.\n"
+            "\n"
+            "**Summary table (Base vs PY %) + the metric tiles read the "
+            "SAME filtered data as the detailed table** — the Portfolio "
+            "Major · Supply Format · Brand filter above narrows the whole "
+            "section, so removing e.g. Butter · … · Private updates the "
+            "summary's Butter row and the tiles to match the detailed table.\n"
             "\n"
             "**Table columns:**\n"
             "- **Current Plan (Base)** / **Current Plan (R&O)** — the "
@@ -5176,11 +5183,16 @@ def _render_demand_plan_comparison_fragment() -> None:
     )
 
     # 6c. Executive story, top → bottom:
+    #     (0) the summary table's Columns picker (sits ABOVE the metrics),
     #     (1) YoY / share metrics row (incl. Total B2C Plan vs Budget %),
     #     (2) the condensed current-plan summary table (screenshot 2),
     #     (3) a divider clearly splitting the two sections,
     #     (4) the cycle-walk ("Prior Plan") metrics row, then
     #     (5) the full restyled comparison table.
+    # Everything here reads the FILTERED ``result`` / ``kpis`` — the Portfolio
+    # Major · Supply Format · Brand filter narrows the summary table AND the
+    # metric tiles, not just the detailed table below.
+    _render_comparison_summary_col_picker()
     kpis = build_comparison_kpis(
         result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
     )
@@ -6038,13 +6050,31 @@ def _summary_clean_label(r: pd.Series) -> str:
     return str(r.get(DPC_COL_LABEL, "")).replace("• ", "")
 
 
+def _render_comparison_summary_col_picker() -> None:
+    """⚙️ Columns popover for the summary table — rendered ABOVE the metrics row.
+
+    Kept separate from :func:`_render_comparison_summary_table` so it can sit at
+    the very top of the section; the table reads its selection from
+    session_state (Category is always shown, every metric column is hidable).
+    """
+    all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
+    st.session_state.setdefault(_DPC_SUMMARY_COLS_KEY, all_headers)
+    with st.popover("⚙️ Columns", use_container_width=False):
+        st.multiselect(
+            "Show columns", options=all_headers, key=_DPC_SUMMARY_COLS_KEY,
+            help="Untick a column to hide it in the summary table below.  "
+                 "The Category column always shows.",
+        )
+
+
 def _render_comparison_summary_table(result) -> None:
     """Render the executive current-plan summary table (screenshot 1).
 
-    A condensed, current-plan-anchored projection of the SAME comparison data
-    (Base plan = Current Plan − R&O; Base vs PY %; per-row T3M/T6M YoY read off
-    the table).  Column order + which columns are hidable come from
-    :data:`_DPC_SUMMARY_COLS`; a popover lets the planner hide any of them.
+    A condensed, current-plan-anchored projection of the SAME (filtered)
+    comparison data (Base plan = Current Plan − R&O; Base vs PY %; per-row
+    T3M/T6M YoY read off the table), so the Portfolio Major · Supply Format ·
+    Brand filter flows through here too.  Visible columns come from the
+    :func:`_render_comparison_summary_col_picker` popover (session_state).
     Lightweight style (white, hairline separators, bold section rows).
     """
     table = getattr(result, "table", None)
@@ -6052,14 +6082,9 @@ def _render_comparison_summary_table(result) -> None:
         return
     by_id = {str(r[DPC_COL_ROW_ID]): r for _, r in table.iterrows()}
 
-    # Column-hiding popover (Category is always shown; every metric is hidable).
+    # Visible columns (Category always shown) — selection lives in the picker
+    # rendered above the metrics; default to all when unset.
     all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
-    st.session_state.setdefault(_DPC_SUMMARY_COLS_KEY, all_headers)
-    with st.popover("⚙️ Columns", use_container_width=False):
-        st.multiselect(
-            "Show columns", options=all_headers, key=_DPC_SUMMARY_COLS_KEY,
-            help="Untick a column to hide it.  The Category column always shows.",
-        )
     visible = set(st.session_state.get(_DPC_SUMMARY_COLS_KEY) or all_headers)
     cols = [c for c in _DPC_SUMMARY_COLS if c[1] in visible]
 

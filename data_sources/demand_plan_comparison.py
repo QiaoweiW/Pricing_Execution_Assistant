@@ -1732,6 +1732,18 @@ def build_enriched_sources(
                 "files (they now carry these columns) or check the PDH / "
                 "RO_Item_Master exports."
             )
+    else:
+        # Augment the (plan-derived) dim map with the item CATALOG for items
+        # that ship/order but were never planned — e.g. Butter Chips / Elgin
+        # Solid / Private.  Tracker dims stay authoritative (they win); catalog
+        # dims (PDH → RO_Item_Master) only fill items absent from the tracker,
+        # so their actuals classify into the right leaf instead of vanishing
+        # into the "not captured" log.  No effect when the catalog is missing.
+        catalog = build_item_dim_frame_cascade(pdh_df, item_master_df)
+        if not catalog.empty:
+            missing = catalog[~catalog["__item_key"].isin(dim_frame["__item_key"])]
+            if not missing.empty:
+                dim_frame = pd.concat([dim_frame, missing], ignore_index=True)
     trk = _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched()
     ibp = _enrich_ibp(ibp_df, dim_frame) if ibp_df is not None else _empty_enriched(actuals=True)
     ibp_orders = (

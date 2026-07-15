@@ -142,8 +142,7 @@ from data_sources.demand_plan_comparison import (
     list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
-    list_tracker_dim_values,
-    list_catalog_dim_values,
+    list_comparison_combos,
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
@@ -5003,20 +5002,17 @@ def _render_demand_plan_comparison_fragment() -> None:
     if not actual_months:
         actual_months = months
 
-    # Portfolio Major / Supply Format options: the tracker's planned combos
-    # UNION the item catalog (PDH), so the filter can also target combos that
-    # exist as items but aren't planned yet (e.g. Chips, Elgin Solid, Private
-    # butter) — matching the Butter breakdown, which now seeds from the catalog.
-    # PDH is a small, cached read; on failure it degrades to tracker-only.
-    _trk_pmaj, _trk_sfmt = list_tracker_dim_values(tracker_df)
-    _cat_pmaj, _cat_sfmt = list_catalog_dim_values(_load_demand_comparison_pdh())
-    pmaj_options = sorted(set(_trk_pmaj) | set(_cat_pmaj))
-    sfmt_options = sorted(set(_trk_sfmt) | set(_cat_sfmt))
+    # Concatenated Portfolio Major · Supply Format · Brand combos for the
+    # filter: the tracker's planned B2C combos (ESL / Fresh Milk / Cultured /
+    # Butter — no Powders / Cheese / Bulk Fluid) UNION the Butter item catalog
+    # (so Private / Chips / Elgin Solid are selectable).  PDH is a small, cached
+    # read; on failure it degrades to tracker-only combos.
+    combo_options = list_comparison_combos(tracker_df, _load_demand_comparison_pdh())
     # Foldable filters — wrapping the call renders every picker inside the
     # expander.  Expanded by default so the active window is visible.
     with st.expander("🔍 Filters", expanded=True):
         filters = _render_demand_comparison_filters(
-            cycles, months, actual_months, pmaj_options, sfmt_options)
+            cycles, months, actual_months, combo_options)
     errors = validate_filters(filters)
     if errors:
         for msg in errors:
@@ -5321,10 +5317,14 @@ def _render_one_comparison_not_captured(
             )
 
 
+# Friendly Portfolio-Major labels for the combination filter (the tracker
+# tags Fresh Milk as "HTST"); combos still filter on the raw value.
+_DPC_PMAJ_DISPLAY: dict[str, str] = {"HTST": "Fresh Milk"}
+
+
 def _render_demand_comparison_filters(
     cycles: list[str], months: list[date], actual_months: list[date],
-    pmaj_options: list[str] | None = None,
-    sfmt_options: list[str] | None = None,
+    combo_options: list[tuple[str, str, str]] | None = None,
 ) -> ComparisonFilters:
     """Render the cycle + month-range pickers; return a filter selection.
 
@@ -5434,72 +5434,41 @@ def _render_demand_comparison_filters(
         help="The single month used for the Prior-Month columns.",
     )
 
-    # ── Portfolio Major / Supply Format / Brand filter ──────────────────
-    # Multiselects default to EVERYTHING selected; deselecting narrows the
-    # whole summary (incl. Total B2C) to the chosen slice.  A full (or empty)
-    # selection means "no filter" so the default view is unchanged.  Brand
-    # (Branded / Private) is always available — it's derived from the Item
-    # Description — so deselecting Private drops private-label rows (incl.
-    # private-label butter) even when the tracker lacks the PDH dim columns.
-    pmaj_options = pmaj_options or []
-    sfmt_options = sfmt_options or []
-    brand_options = [BRAND_BRANDED, BRAND_PRIVATE]
-    pmaj_filter: frozenset = frozenset()
-    sfmt_filter: frozenset = frozenset()
-    brand_filter: frozenset = frozenset()
-
-    st.markdown(
-        "**Filter by Portfolio Major / Supply Format / Brand** "
-        "_(all selected = no filter; deselect to remove — e.g. deselect "
-        "**Private** to drop private-label rows incl. private-label butter)_"
-    )
-    frow = st.columns(3)
-    with frow[0]:
-        if pmaj_options:
-            pmaj_sel = st.multiselect(
-                "Portfolio Major", options=pmaj_options, default=pmaj_options,
-                key="dpc_pmaj_filter",
-                help="Rows outside the selected Portfolio Majors are removed "
-                     "and the subtotals recompute.",
-            )
-            if pmaj_sel and set(pmaj_sel) != set(pmaj_options):
-                pmaj_filter = frozenset(pmaj_sel)
-        else:
-            st.caption("_Portfolio Major filter appears once the tracker "
-                       "carries the column._")
-    with frow[1]:
-        if sfmt_options:
-            sfmt_sel = st.multiselect(
-                "Supply Format", options=sfmt_options, default=sfmt_options,
-                key="dpc_sfmt_filter",
-                help="Rows outside the selected Supply Formats are removed "
-                     "and the subtotals recompute.",
-            )
-            if sfmt_sel and set(sfmt_sel) != set(sfmt_options):
-                sfmt_filter = frozenset(sfmt_sel)
-        else:
-            st.caption("_Supply Format filter appears once the tracker "
-                       "carries the column._")
-    with frow[2]:
-        brand_sel = st.multiselect(
-            "Brand", options=brand_options, default=brand_options,
-            key="dpc_brand_filter",
-            help="Deselect **Private** to exclude private-label rows (incl. "
-                 "private-label butter); deselect **Branded** for the inverse. "
-                 "Subtotals (incl. Total B2C) recompute on the selected slice.",
+    # ── Concatenated Portfolio Major · Supply Format · Brand filter ─────
+    # ONE multiselect of exact combinations (default = everything), so a
+    # single combo can be dropped — e.g. keep "Butter · … · Branded" while
+    # removing "Butter · … · Private", which independent per-dimension
+    # whitelists can't express.  Deselecting narrows the whole summary
+    # (incl. Total B2C); a full selection means "no filter".
+    combo_filter: frozenset = frozenset()
+    combos = list(combo_options or [])
+    # HTST is the Fresh Milk portfolio major — show the friendly name.
+    labels_to_combo = {
+        f"{_DPC_PMAJ_DISPLAY.get(p, p)} · {s} · {b}": (p, s, b)
+        for p, s, b in combos
+    }
+    all_labels = sorted(labels_to_combo)
+    if all_labels:
+        st.markdown(
+            "**Filter by Portfolio Major · Supply Format · Brand** "
+            "_(all selected = no filter; deselect a combination to drop it — "
+            "e.g. remove the **Butter · … · Private** rows while keeping "
+            "Butter · … · Branded)_"
         )
-        # Only narrow on a strict, non-empty subset.
-        if brand_sel and set(brand_sel) != set(brand_options):
-            brand_filter = frozenset(brand_sel)
-    if not (pmaj_options or sfmt_options):
-        # The tracker file doesn't carry the categorisation columns yet — the
-        # PDH-backed dims appear automatically once present (Brand always works).
+        sel = st.multiselect(
+            "Combinations", options=all_labels, default=all_labels,
+            key="dpc_combo_filter", label_visibility="collapsed",
+            help="Powders / Cheese / Bulk Fluid are excluded from this list "
+                 "(non-B2C).  Butter includes catalog combinations (Private / "
+                 "Chips / Elgin Solid) even with no plan.",
+        )
+        # Only narrow on a strict, non-empty subset (full selection = no filter).
+        if sel and set(sel) != set(all_labels):
+            combo_filter = frozenset(labels_to_combo[s] for s in sel)
+    else:
         st.caption(
-            "ℹ️ **Portfolio Major / Supply Format filters will appear here** "
-            "once the tracker carries those columns.  Click **▶ Generate "
-            "Demand Plan Comparison Summary** below — it backfills them "
-            "(PDH → RO_Item_Master) — or upload a new Base Plan in Demand "
-            "Plan Generation."
+            "ℹ️ **The Portfolio Major · Supply Format · Brand filter will "
+            "appear here** once the tracker carries the categorisation columns."
         )
 
     # Plain-language echo of the current selection — makes the active
@@ -5532,9 +5501,7 @@ def _render_demand_comparison_filters(
         forecast_start=forecast_start,
         forecast_end=forecast_end,
         prior_month=prior_month,
-        pmaj_filter=pmaj_filter,
-        sfmt_filter=sfmt_filter,
-        brand_filter=brand_filter,
+        combo_filter=combo_filter,
     )
 
 

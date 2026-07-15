@@ -693,11 +693,15 @@ class ComparisonFilters:
         Prior Month Forecast columns.
     pmaj_filter / sfmt_filter / brand_filter
         Optional whitelists of Portfolio Major / Supply Format / Brand
-        (``Branded`` / ``Private``) values to include.  Empty = include
-        everything (the default).  When set, the tracker + actuals are
-        narrowed to those dims before roll-up, so the whole summary (incl.
-        Total B2C) reflects only the selected slice — deselecting ``Private``
-        excludes private-label rows (incl. private-label butter), etc.
+        (``Branded`` / ``Private``) values to include (each AND-ed).  Empty =
+        include everything.  Kept for programmatic callers / tests; the page
+        UI now drives ``combo_filter`` instead.
+    combo_filter
+        Optional whitelist of exact ``(portfolio_major, supply_format, brand)``
+        tuples to include — a *concatenated* filter, so you can keep
+        ``Butter · … · Branded`` while dropping ``Butter · … · Private``
+        (which the independent whitelists above cannot express).  Matched on
+        the enriched ``pmaj`` / ``sfmt`` / ``brand`` columns; empty = no filter.
     """
     current_cycle: str
     prior_cycle: str
@@ -709,6 +713,7 @@ class ComparisonFilters:
     pmaj_filter: frozenset = frozenset()
     sfmt_filter: frozenset = frozenset()
     brand_filter: frozenset = frozenset()
+    combo_filter: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -969,10 +974,12 @@ def _apply_dim_filter(df: pd.DataFrame, filters: "ComparisonFilters") -> pd.Data
 
     Empty whitelists = keep everything (default).  Operates on the enriched
     ``pmaj`` / ``sfmt`` / ``brand`` columns, so it works identically for
-    tracker + actuals.
+    tracker + actuals.  ``combo_filter`` (exact PMaj·SFmt·Brand tuples) is
+    AND-ed with the independent whitelists.
     """
     if df is None or df.empty or not (
         filters.pmaj_filter or filters.sfmt_filter or filters.brand_filter
+        or filters.combo_filter
     ):
         return df
     mask = pd.Series(True, index=df.index)
@@ -982,6 +989,14 @@ def _apply_dim_filter(df: pd.DataFrame, filters: "ComparisonFilters") -> pd.Data
         mask &= df["sfmt"].isin(filters.sfmt_filter)
     if filters.brand_filter and "brand" in df.columns:
         mask &= df["brand"].astype(str).str.strip().isin(filters.brand_filter)
+    if filters.combo_filter and {"pmaj", "sfmt", "brand"}.issubset(df.columns):
+        combo = (
+            df["pmaj"].astype(str).str.strip() + "␟"
+            + df["sfmt"].astype(str).str.strip() + "␟"
+            + df["brand"].astype(str).str.strip()
+        )
+        wanted = {f"{p}␟{s}␟{b}" for p, s, b in filters.combo_filter}
+        mask &= combo.isin(wanted)
     return df.loc[mask]
 
 
@@ -1041,25 +1056,44 @@ def butter_catalog_combos(
     return tuple(sorted(combos))
 
 
-def list_catalog_dim_values(
-    pdh_df: Optional[pd.DataFrame],
-    item_master_df: Optional[pd.DataFrame] = None,
-) -> tuple[list[str], list[str]]:
-    """Return ``(portfolio_majors, supply_formats)`` present in the catalog.
+# Portfolio Majors that belong in the B2C comparison filter — everything the
+# template rolls up (ESL / Fresh Milk(=HTST) / Cultured / Butter).  Powders,
+# Cheese, Bulk Fluid & other non-B2C catalog majors are deliberately excluded.
+_FILTER_ALLOWED_PMAJ: frozenset[str] = frozenset({"esl", "htst", "cultured", "butter"})
 
-    Lets the section's filters offer Portfolio Major / Supply Format values
-    (e.g. Chips, Elgin Solid) that exist as items but aren't in the plan yet.
+
+def _combo_key(pmaj: str, sfmt: str, brand: str) -> tuple[str, str, str]:
+    """Loose dedup key so e.g. 'Elgin Quarter' folds into 'Elgin Quarters'."""
+    return (pmaj.casefold(), sfmt.strip().casefold().rstrip("s"), brand)
+
+
+def list_comparison_combos(
+    tracker_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame] = None,
+    item_master_df: Optional[pd.DataFrame] = None,
+) -> list[tuple[str, str, str]]:
+    """Return the ``(portfolio_major, supply_format, brand)`` combos for the filter.
+
+    Union of the tracker's planned combos (restricted to the B2C majors —
+    ESL / HTST / Cultured / Butter, so Powders / Cheese / Bulk Fluid never
+    appear) and the Butter item catalog (so Private / Chips / Elgin Solid are
+    selectable even with no plan).  Deduped loosely, tracker names winning.
     """
-    pmajs: set[str] = set()
-    sfmts: set[str] = set()
-    for df in (pdh_df, item_master_df):
-        if df is None or df.empty:
-            continue
-        if "Portfolio Major" in df.columns:
-            pmajs |= {v for v in df["Portfolio Major"].astype(str).str.strip() if v}
-        if "Supply Format" in df.columns:
-            sfmts |= {v for v in df["Supply Format"].astype(str).str.strip() if v}
-    return sorted(pmajs), sorted(sfmts)
+    out: dict[tuple[str, str, str], tuple[str, str, str]] = {}
+    if (tracker_df is not None and not tracker_df.empty
+            and {"Portfolio Major", "Supply Format", "Item Description"}.issubset(tracker_df.columns)):
+        t = tracker_df[["Portfolio Major", "Supply Format", "Item Description"]].copy()
+        t["pmaj"] = t["Portfolio Major"].astype(str).str.strip()
+        t["sfmt"] = t["Supply Format"].astype(str).str.strip()
+        t = t[t["pmaj"].str.casefold().isin(_FILTER_ALLOWED_PMAJ)
+              & (t["sfmt"] != "")].drop_duplicates(["pmaj", "sfmt", "Item Description"])
+        t["brand"] = _vectorised_brand(t["Item Description"])
+        for pmaj, sfmt, brand in zip(t["pmaj"], t["sfmt"], t["brand"]):
+            out.setdefault(_combo_key(pmaj, sfmt, str(brand)), (pmaj, sfmt, str(brand)))
+    # Butter catalog (adds Private / Chips / Elgin Solid …); tracker wins on clash.
+    for brand, sfmt in butter_catalog_combos(pdh_df, item_master_df):
+        out.setdefault(_combo_key("Butter", sfmt, brand), ("Butter", sfmt, brand))
+    return sorted(out.values())
 
 
 # ── Vectorised primitives (used by the enrichment helpers) ──────────────────
@@ -3143,11 +3177,19 @@ def _filter_butter_combos(
         return []
     sfmt_wl = {s.casefold() for s in filters.sfmt_filter} if filters.sfmt_filter else None
     brand_wl = set(filters.brand_filter) if filters.brand_filter else None
+    # Concatenated combo filter: which Butter (sfmt, brand) tuples are allowed.
+    combo_wl = (
+        {(s.casefold(), b) for p, s, b in filters.combo_filter
+         if p.casefold() in {x.casefold() for x in _BUTTER}}
+        if filters.combo_filter else None
+    )
     out: list[tuple[str, str]] = []
     for brand, sfmt in combos:
         if brand_wl and brand not in brand_wl:
             continue
         if sfmt_wl and sfmt.casefold() not in sfmt_wl:
+            continue
+        if combo_wl is not None and (sfmt.casefold(), brand) not in combo_wl:
             continue
         out.append((brand, sfmt))
     return out

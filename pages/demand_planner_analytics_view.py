@@ -143,6 +143,7 @@ from data_sources.demand_plan_comparison import (
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
     list_tracker_dim_values,
+    list_catalog_dim_values,
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
@@ -5002,9 +5003,15 @@ def _render_demand_plan_comparison_fragment() -> None:
     if not actual_months:
         actual_months = months
 
-    # Portfolio Major / Supply Format options come straight off the tracker
-    # file (it now carries them) so the filter widgets render pre-enrichment.
-    pmaj_options, sfmt_options = list_tracker_dim_values(tracker_df)
+    # Portfolio Major / Supply Format options: the tracker's planned combos
+    # UNION the item catalog (PDH), so the filter can also target combos that
+    # exist as items but aren't planned yet (e.g. Chips, Elgin Solid, Private
+    # butter) — matching the Butter breakdown, which now seeds from the catalog.
+    # PDH is a small, cached read; on failure it degrades to tracker-only.
+    _trk_pmaj, _trk_sfmt = list_tracker_dim_values(tracker_df)
+    _cat_pmaj, _cat_sfmt = list_catalog_dim_values(_load_demand_comparison_pdh())
+    pmaj_options = sorted(set(_trk_pmaj) | set(_cat_pmaj))
+    sfmt_options = sorted(set(_trk_sfmt) | set(_cat_sfmt))
     # Foldable filters — wrapping the call renders every picker inside the
     # expander.  Expanded by default so the active window is visible.
     with st.expander("🔍 Filters", expanded=True):

@@ -1003,6 +1003,65 @@ def list_tracker_dim_values(
     return _distinct(TRK_PMAJ), _distinct(TRK_SFMT)
 
 
+# ── Catalog (PDH / RO_Item_Master) dim helpers ──────────────────────────────
+# The plan/tracker only carries the Supply Format × Brand combinations that
+# have demand planned against them.  These helpers read the fuller ITEM CATALOG
+# so the Butter breakdown + the filters can also surface combinations that
+# exist as items but have no plan yet (e.g. Private butter, Chips, Elgin Solid).
+
+def butter_catalog_combos(
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame] = None,
+) -> tuple[tuple[str, str], ...]:
+    """Distinct ``(brand, supply_format)`` for **Packaged Butter** in the catalog.
+
+    Union of PDH (``qry_pdh.csv``) + RO_Item_Master; brand is derived from the
+    Item Description (``DG`` prefix → Branded).  Used to seed the Butter detail
+    with every catalogued format, even those with zero plan.
+    """
+    butter_names = {s.casefold() for s in _BUTTER}
+    pminor = _BUTTER_PMINOR.casefold()
+    combos: set[tuple[str, str]] = set()
+    for df, desc_c in ((pdh_df, "Item Description"), (item_master_df, "Item Desc")):
+        if df is None or df.empty:
+            continue
+        if not {desc_c, "Portfolio Major", "Portfolio Minor", "Supply Format"}.issubset(df.columns):
+            continue
+        mask = (
+            df["Portfolio Major"].astype(str).str.strip().str.casefold().isin(butter_names)
+            & (df["Portfolio Minor"].astype(str).str.strip().str.casefold() == pminor)
+        )
+        sub = df.loc[mask]
+        if sub.empty:
+            continue
+        for brand, sfmt in zip(_vectorised_brand(sub[desc_c]),
+                               sub["Supply Format"].astype(str).str.strip()):
+            if sfmt:
+                combos.add((str(brand), sfmt))
+    return tuple(sorted(combos))
+
+
+def list_catalog_dim_values(
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame] = None,
+) -> tuple[list[str], list[str]]:
+    """Return ``(portfolio_majors, supply_formats)`` present in the catalog.
+
+    Lets the section's filters offer Portfolio Major / Supply Format values
+    (e.g. Chips, Elgin Solid) that exist as items but aren't in the plan yet.
+    """
+    pmajs: set[str] = set()
+    sfmts: set[str] = set()
+    for df in (pdh_df, item_master_df):
+        if df is None or df.empty:
+            continue
+        if "Portfolio Major" in df.columns:
+            pmajs |= {v for v in df["Portfolio Major"].astype(str).str.strip() if v}
+        if "Supply Format" in df.columns:
+            sfmts |= {v for v in df["Supply Format"].astype(str).str.strip() if v}
+    return sorted(pmajs), sorted(sfmts)
+
+
 # ── Vectorised primitives (used by the enrichment helpers) ──────────────────
 #
 # These are pure functions over ``pd.Series`` — no per-row Python calls,
@@ -1592,6 +1651,10 @@ class EnrichedSources:
     # KPI tiles; empty when the caller doesn't request them.
     ibp_recent: pd.DataFrame = field(default_factory=lambda: _empty_enriched(actuals=True))
     ibp_recent_py: pd.DataFrame = field(default_factory=lambda: _empty_enriched(actuals=True))
+    # Packaged-Butter (brand, supply_format) combos from the item catalog
+    # (PDH + RO_Item_Master) — seeds the Butter detail with every catalogued
+    # format, incl. ones with no plan (Private / Chips / Elgin Solid …).
+    butter_catalog: tuple[tuple[str, str], ...] = ()
 
 
 def build_enriched_sources(
@@ -1652,6 +1715,7 @@ def build_enriched_sources(
         ibp_py=_enrich_opt(ibp_py_df),
         ibp_recent=_enrich_opt(ibp_recent_df),
         ibp_recent_py=_enrich_opt(ibp_recent_py_df),
+        butter_catalog=butter_catalog_combos(pdh_df, item_master_df),
     )
 
 
@@ -2009,6 +2073,7 @@ def _build_runtime_artifacts(
         actual_months=actual_months,
         forecast_months=forecast_months,
         prior_month=prior_month,
+        butter_catalog=enriched.butter_catalog,
     )
     runtime_template_by_id = {row.row_id: row for row in runtime_template}
 
@@ -2932,6 +2997,7 @@ def _build_runtime_template_for_filters(
     actual_months: set[date],
     forecast_months: set[date],
     prior_month: date,
+    butter_catalog: tuple[tuple[str, str], ...] = (),
 ) -> tuple[TemplateRow, ...]:
     """Return the table template with dynamic Butter detail rows.
 
@@ -2955,6 +3021,7 @@ def _build_runtime_template_for_filters(
         actual_months=actual_months,
         forecast_months=forecast_months,
         prior_month=prior_month,
+        butter_catalog=butter_catalog,
     )
     if not dynamic_rows:
         return COMPARISON_TEMPLATE
@@ -2975,11 +3042,18 @@ def _build_dynamic_butter_rows(
     actual_months: set[date],
     forecast_months: set[date],
     prior_month: date,
+    butter_catalog: tuple[tuple[str, str], ...] = (),
 ) -> tuple[TemplateRow, ...]:
-    """Build dynamic Butter detail rows for the current filter selection."""
-    if trk.empty and ibp.empty:
-        return ()
+    """Build the Butter detail rows (Branded / Private → Supply Format leaves).
 
+    Combos come from BOTH the plan data (real names + numbers, already
+    dim-filtered by the caller) AND the item *catalog* (``butter_catalog``), so
+    every catalogued Packaged-Butter format shows — including ones with no plan
+    (Private / Chips / Elgin Solid …), which render as zeros.  Catalog combos
+    are deduped against the data combos by a loose key (so PDH's "Elgin Quarter"
+    doesn't double the plan's "Elgin Quarters"), and the whole set honours the
+    active Portfolio Major / Supply Format / Brand filter.
+    """
     def _collect_from_tracker() -> pd.DataFrame:
         if trk.empty:
             return pd.DataFrame(columns=["brand", "sfmt"])
@@ -3013,20 +3087,31 @@ def _build_dynamic_butter_rows(
         return ibp.loc[contributes & mask, ["brand", "sfmt"]].copy()
 
     candidates = pd.concat([_collect_from_tracker(), _collect_from_ibp()], ignore_index=True)
-    if candidates.empty:
-        return ()
-
     candidates["brand"] = candidates["brand"].astype(str).str.strip()
     candidates["sfmt"] = candidates["sfmt"].astype(str).str.strip()
     candidates = candidates.loc[(candidates["brand"] != "") & (candidates["sfmt"] != "")]
-    if candidates.empty:
+
+    # Merge the plan combos with the catalog combos.  Data names win on a loose
+    # key clash (casefold + trailing-'s') so "Elgin Quarter"/"Elgin Quarters"
+    # collapse to one row keyed on the plan's display name.
+    def _key(brand: str, sfmt: str) -> tuple[str, str]:
+        return (brand.casefold(), sfmt.strip().casefold().rstrip("s"))
+
+    combos: dict[tuple[str, str], tuple[str, str]] = {}
+    for brand, sfmt in zip(candidates["brand"], candidates["sfmt"]):
+        combos[_key(brand, sfmt)] = (brand, sfmt)
+    for brand, sfmt in butter_catalog:
+        brand, sfmt = str(brand).strip(), str(sfmt).strip()
+        if brand and sfmt:
+            combos.setdefault(_key(brand, sfmt), (brand, sfmt))
+
+    merged = _filter_butter_combos(list(combos.values()), filters)
+    if not merged:
         return ()
 
     rows: list[TemplateRow] = []
     for brand in (BRAND_BRANDED, BRAND_PRIVATE):
-        brand_formats = sorted({
-            sf for sf in candidates.loc[candidates["brand"] == brand, "sfmt"].tolist() if sf
-        })
+        brand_formats = sorted({s for b, s in merged if b == brand})
         if not brand_formats:
             continue
         brand_id = f"butter_{brand.casefold()}"
@@ -3041,6 +3126,31 @@ def _build_dynamic_butter_rows(
                 sfmt_match=sfmt,
             ))
     return tuple(rows)
+
+
+def _filter_butter_combos(
+    combos: list[tuple[str, str]], filters: ComparisonFilters,
+) -> list[tuple[str, str]]:
+    """Narrow Butter ``(brand, sfmt)`` combos to the active PMaj/SFmt/Brand filter.
+
+    Butter's Portfolio Major is always "Butter", so a Portfolio-Major whitelist
+    that excludes it drops every combo; the Supply-Format / Brand whitelists
+    filter the leaves (matched case-insensitively for SFmt).
+    """
+    if filters.pmaj_filter and not (
+        {p.casefold() for p in _BUTTER} & {p.casefold() for p in filters.pmaj_filter}
+    ):
+        return []
+    sfmt_wl = {s.casefold() for s in filters.sfmt_filter} if filters.sfmt_filter else None
+    brand_wl = set(filters.brand_filter) if filters.brand_filter else None
+    out: list[tuple[str, str]] = []
+    for brand, sfmt in combos:
+        if brand_wl and brand not in brand_wl:
+            continue
+        if sfmt_wl and sfmt.casefold() not in sfmt_wl:
+            continue
+        out.append((brand, sfmt))
+    return out
 
 
 def _slugify_for_row_id(text: str) -> str:

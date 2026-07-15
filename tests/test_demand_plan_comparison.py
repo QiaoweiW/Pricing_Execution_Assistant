@@ -354,8 +354,9 @@ def test_build_comparison_kpis():
     kpis = build_comparison_kpis(result.table, recent, recent_py, filters)
     assert round(kpis.t3m_yoy, 4) == round((12 - 9) / 9, 4)     # +33.3%
     assert round(kpis.t6m_yoy, 4) == round((18 - 12) / 12, 4)   # +50%
-    # Current Plan = actuals(7)+Base(10)+R&O(2)=19; PY Actual=6.
-    assert round(kpis.full_year_yoy, 4) == round((19 - 6) / 6, 4)
+    # Current Plan = actuals(7)+Base(10)+R&O(2)=19; Base plan = 19−R&O(2)=17;
+    # Full-Year Base vs PY% = (Base − PY) / PY = (17 − 6) / 6.
+    assert round(kpis.full_year_base_vs_py, 4) == round((17 - 6) / 6, 4)
     assert round(kpis.ro_pct, 4) == round(2 / 19, 4)
     # Walk-tile values must tie to the assembled Total B2C cells so the
     # KPI strip and the table always reconcile.
@@ -381,7 +382,7 @@ def test_kpis_none_when_denominator_zero():
     )
     kpis = build_comparison_kpis(result.table, empty, empty, filters)
     assert kpis.t3m_yoy is None and kpis.t6m_yoy is None
-    assert kpis.full_year_yoy is None       # PY Actual = 0 → undefined
+    assert kpis.full_year_base_vs_py is None   # PY Actual = 0 → undefined
 
 
 def test_pmaj_filter_narrows_rollup():

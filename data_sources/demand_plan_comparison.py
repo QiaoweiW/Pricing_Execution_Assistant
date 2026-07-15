@@ -541,16 +541,30 @@ COL_BASE_PLAN_VAR_PCT: str      = "base_plan_var_pct"
 # plan: actuals + Base + R&O).  The R&O ("opportunity") share of the plan.
 COL_O_PCT: str                  = "o_pct"
 
+# Trailing-window shipment sums (millions of lbs) — additive leaf measures
+# that roll up like the rest.  ``*_cur`` = the trailing 3-/6-month actuals
+# ending at the Actual window's end month; ``*_py`` = the same months a year
+# earlier.  Only the derived YoY ratios below are shown.
+COL_T3M_CUR: str                = "t3m_cur"
+COL_T3M_PY: str                 = "t3m_py"
+COL_T6M_CUR: str                = "t6m_cur"
+COL_T6M_PY: str                 = "t6m_py"
+# Per-row trailing YoY ratios (derived from the sums above, ratio-of-sums).
+COL_T3M_YOY: str                = "t3m_yoy"
+COL_T6M_YOY: str                = "t6m_yoy"
+
 # The set of measures summed during subtotal roll-up.  Base Plan is
 # intentionally absent — it's a derived residual (see _assemble_table),
 # linear in these additive measures, so it rolls up correctly without
-# being summed independently.
+# being summed independently.  The trailing-window sums roll up so a
+# subtotal's T3M/T6M YoY is a correct ratio-of-sums over its leaves.
 _ADDITIVE_COLS: tuple[str, ...] = (
     COL_TOTAL_ACTUALS, COL_PY_ACTUAL,
     COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_BASE, COL_CURRENT_PLAN_RO,
     COL_LAST_PLAN_ACTUALS, COL_LAST_PLAN_FORECAST,
     COL_R_AND_O, COL_BUDGET,
+    COL_T3M_CUR, COL_T3M_PY, COL_T6M_CUR, COL_T6M_PY,
 )
 
 # Internal structural columns kept alongside the metrics for the page.
@@ -595,6 +609,10 @@ DISPLAY_LABELS: dict[str, str] = {
     COL_V_BUDGET:              "v. Budget",
     COL_PCT:                   "%",
     COL_BUDGET:                "Budget",
+    # Trailing YoY ratios — surfaced only in the lightweight summary table
+    # (deliberately NOT in DISPLAY_ORDER, so the detailed table is unchanged).
+    COL_T3M_YOY:               "T3M YoY",
+    COL_T6M_YOY:               "T6M YoY",
 }
 # Left → right order of the metric columns in the rendered table.  The two
 # Current Plan legs (Base / R&O) sit where the single forecast column used to;
@@ -613,6 +631,7 @@ DISPLAY_ORDER: tuple[str, ...] = (
 # Columns rendered as percentages (the rest are millions of lbs).
 PERCENT_COLS: frozenset = frozenset({
     COL_TOTAL_DELTA_PCT, COL_PCT, COL_O_PCT, COL_BASE_PLAN_VAR_PCT,
+    COL_T3M_YOY, COL_T6M_YOY,
 })
 
 # Metric columns hidden by default in the Streamlit table — planners can
@@ -1926,6 +1945,11 @@ def _build_runtime_artifacts(
     trk = _apply_dim_filter(enriched.tracker, filters)
     ibp = _apply_dim_filter(enriched.ibp, filters)
     ibp_py = _apply_dim_filter(enriched.ibp_py, filters)
+    # Trailing-window shipment frames for the per-row T3M/T6M YoY columns.
+    # Empty (degrades to blank YoY) when the caller built ``enriched`` without
+    # the recent frames, e.g. a standalone/test build.
+    ibp_recent = _apply_dim_filter(enriched.ibp_recent, filters)
+    ibp_recent_py = _apply_dim_filter(enriched.ibp_recent_py, filters)
 
     if ro_total_delta_by_path is None:
         ro_total_delta_by_path = fetch_ro_summary_total_delta_by_path()
@@ -1940,6 +1964,15 @@ def _build_runtime_artifacts(
     actual_months = _months_in_range(filters.actual_start, filters.actual_end)
     forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
     prior_month = filters.prior_month.replace(day=1)
+
+    # Trailing 3-/6-month YoY windows, anchored on the Actual window's end
+    # month (same convention as build_comparison_kpis).  Computed once and
+    # reused for every leaf's T3M/T6M shipment sums below.
+    _t_end = filters.actual_end.replace(day=1)
+    m3_cur = _last_n_months(_t_end, 3)
+    m6_cur = _last_n_months(_t_end, 6)
+    m3_py = {_shift_year_back(m) for m in m3_cur}
+    m6_py = {_shift_year_back(m) for m in m6_cur}
 
     # Last Plan = the "one-month-ago" snapshot, shifted back one calendar
     # month on both legs (see COL_LAST_PLAN_ACTUALS / COL_LAST_PLAN_FORECAST):
@@ -1992,6 +2025,8 @@ def _build_runtime_artifacts(
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
             ibp_py=ibp_py,
+            ibp_recent=ibp_recent, ibp_recent_py=ibp_recent_py,
+            m3_cur=m3_cur, m6_cur=m6_cur, m3_py=m3_py, m6_py=m6_py,
         )
         if budget_by_row_id and tpl.row_id in budget_by_row_id:
             measures[tpl.row_id][COL_BUDGET] = float(
@@ -2025,6 +2060,12 @@ def _compute_leaf_measures(
     prior_month: date,
     ro_total_delta_by_path: dict[tuple[str, ...], float],
     ibp_py: Optional[pd.DataFrame] = None,
+    ibp_recent: Optional[pd.DataFrame] = None,
+    ibp_recent_py: Optional[pd.DataFrame] = None,
+    m3_cur: Optional[set[date]] = None,
+    m6_cur: Optional[set[date]] = None,
+    m3_py: Optional[set[date]] = None,
+    m6_py: Optional[set[date]] = None,
 ) -> dict[str, float]:
     """Compute the additive measures for a single leaf row.
 
@@ -2036,6 +2077,10 @@ def _compute_leaf_measures(
     prior-cycle forecast starting one month earlier).  ``ibp_py`` is the
     prior-year shipments frame (already scoped to the PY window by the
     caller's fetch), summed whole for the PY Actual column.
+
+    ``ibp_recent`` / ``ibp_recent_py`` + the ``m3_*`` / ``m6_*`` month sets
+    drive the trailing 3-/6-month shipment sums (this year vs a year ago),
+    from which the per-row T3M/T6M YoY ratios are derived after roll-up.
     """
     # Dimension masks (computed once, reused across month/cycle slices).
     trk_mask = _leaf_mask(trk, tpl)
@@ -2110,6 +2155,13 @@ def _compute_leaf_measures(
     if tpl.ro_summary_path is not None:
         r_and_o = float(ro_total_delta_by_path.get(tpl.ro_summary_path, 0.0))
 
+    # ── Trailing 3-/6-month shipments (this leaf, this year vs a year ago).
+    # Sums (not ratios) so they roll up additively; the YoY ratio is derived
+    # per row after roll-up.  Degrades to 0 when the recent frames weren't
+    # supplied (e.g. a standalone build).
+    t3m_cur, t3m_py, t6m_cur, t6m_py = _leaf_trailing_shipments(
+        tpl, ibp_recent, ibp_recent_py, m3_cur, m6_cur, m3_py, m6_py)
+
     # NOTE: Base Plan is NOT computed here.  Per the planner's spec it is a
     # DERIVED residual — Total Delta − PM Actual − R&O — assembled in
     # _assemble_table so the columns always sum to Total Delta.
@@ -2125,7 +2177,34 @@ def _compute_leaf_measures(
         COL_LAST_PLAN_FORECAST: last_plan_forecast,
         COL_R_AND_O: r_and_o,
         COL_BUDGET: tpl.budget_m,
+        COL_T3M_CUR: t3m_cur, COL_T3M_PY: t3m_py,
+        COL_T6M_CUR: t6m_cur, COL_T6M_PY: t6m_py,
     }
+
+
+def _leaf_trailing_shipments(
+    tpl: TemplateRow,
+    ibp_recent: Optional[pd.DataFrame],
+    ibp_recent_py: Optional[pd.DataFrame],
+    m3_cur: Optional[set[date]],
+    m6_cur: Optional[set[date]],
+    m3_py: Optional[set[date]],
+    m6_py: Optional[set[date]],
+) -> tuple[float, float, float, float]:
+    """Return ``(t3m_cur, t3m_py, t6m_cur, t6m_py)`` shipment sums for a leaf.
+
+    Each sum applies the leaf's dimension mask to the relevant trailing-window
+    frame; missing frames / windows yield 0.0 so the caller degrades cleanly.
+    """
+    def _sum(df: Optional[pd.DataFrame], months: Optional[set[date]]) -> float:
+        if df is None or df.empty or not months:
+            return 0.0
+        return _sum_millions(df, _leaf_mask(df, tpl) & df["month"].isin(months))
+
+    return (
+        _sum(ibp_recent, m3_cur), _sum(ibp_recent_py, m3_py),
+        _sum(ibp_recent, m6_cur), _sum(ibp_recent_py, m6_py),
+    )
 
 
 def _rollup_subtotal(
@@ -2199,6 +2278,14 @@ def _assemble_table(
         o_pct = _safe_ratio(current_plan_ro, current_plan)
         base_plan_var_pct = _safe_ratio(base_plan, current_plan_base - base_plan)
 
+        # Trailing YoY (ratio-of-sums over the rolled-up trailing windows).
+        # NaN — rendered as "—" — when there's no prior-year base to divide by.
+        t3m_py, t6m_py = m.get(COL_T3M_PY, 0.0), m.get(COL_T6M_PY, 0.0)
+        t3m_yoy = (_safe_ratio(m.get(COL_T3M_CUR, 0.0) - t3m_py, t3m_py)
+                   if abs(t3m_py) > 1e-9 else float("nan"))
+        t6m_yoy = (_safe_ratio(m.get(COL_T6M_CUR, 0.0) - t6m_py, t6m_py)
+                   if abs(t6m_py) > 1e-9 else float("nan"))
+
         row = {
             COL_ROW_ID: tpl.row_id,
             COL_INDENT: tpl.indent,
@@ -2223,6 +2310,9 @@ def _assemble_table(
             COL_V_BUDGET: v_budget,
             COL_PCT: pct,
             COL_BUDGET: m[COL_BUDGET],
+            # Trailing YoY (summary-table only; kept out of DISPLAY_ORDER).
+            COL_T3M_YOY: t3m_yoy,
+            COL_T6M_YOY: t6m_yoy,
         }
         records.append(row)
 
@@ -2235,10 +2325,13 @@ def _assemble_table(
             df[col] = df[col].round(4)
         else:
             df[col] = df[col].round(_MILLIONS_DISPLAY_DECIMALS)
+    # The trailing-YoY ratios ride alongside (not in DISPLAY_ORDER).
+    for col in (COL_T3M_YOY, COL_T6M_YOY):
+        df[col] = df[col].round(4)
 
-    # Final column order: metadata + label + metrics (display order),
-    # renamed to the screenshot labels.
-    ordered = [*_META_COLS, COL_LABEL, *DISPLAY_ORDER]
+    # Final column order: metadata + label + metrics (display order) + the
+    # trailing-YoY extras, renamed to the screenshot labels.
+    ordered = [*_META_COLS, COL_LABEL, *DISPLAY_ORDER, COL_T3M_YOY, COL_T6M_YOY]
     df = df.loc[:, ordered]
     return df.rename(columns=DISPLAY_LABELS)
 
@@ -2473,7 +2566,8 @@ class ComparisonKpis:
       denominator is missing/zero:
       ``t3m_yoy`` / ``t6m_yoy`` — trailing 3- / 6-month actual shipments vs
       the same months a year ago (anchored on the Actual-window end month);
-      ``full_year_yoy`` — (Current Plan − PY Actual) / PY Actual;
+      ``full_year_base_vs_py`` — (Base plan − PY Actual) / PY Actual, where
+      Base plan = Current Plan − R&O (i.e. the plan excluding R&O, vs PY);
       ``ro_pct`` — Current Plan (R&O) / Current Plan (R&O share of plan).
 
     * **Cycle-over-cycle walk (millions of lbs)** — mirrors the assembled
@@ -2488,7 +2582,7 @@ class ComparisonKpis:
     """
     t3m_yoy: Optional[float]
     t6m_yoy: Optional[float]
-    full_year_yoy: Optional[float]
+    full_year_base_vs_py: Optional[float]
     ro_pct: Optional[float]
     # ``budget_pct`` — Total B2C ``%`` cell (Current Plan vs Budget %), shown
     # as the last tile on the YoY/share row.
@@ -2577,7 +2671,7 @@ def build_comparison_kpis(
     # row.  Reading them here (rather than recomputing) guarantees the tile
     # and the table always agree — including R&O Var., which stays tied to
     # the RO Summary Report by construction.
-    full_year_yoy: Optional[float] = None
+    full_year_base_vs_py: Optional[float] = None
     ro_pct: Optional[float] = None
     budget_pct: Optional[float] = None
     last_plan_total: Optional[float] = None
@@ -2592,9 +2686,15 @@ def build_comparison_kpis(
             row = tot.iloc[0]
             cur_plan = _cell(row, COL_CURRENT_PLAN)
             py_actual = _cell(row, COL_PY_ACTUAL)
-            full_year_yoy = (
-                _safe_ratio(cur_plan - py_actual, py_actual) if py_actual else None
-            ) if cur_plan is not None and py_actual is not None else None
+            ro_vol = _cell(row, COL_CURRENT_PLAN_RO)
+            # Full-Year "Base vs PY %": Base plan (= Current Plan − R&O) vs PY.
+            base_plan = (
+                cur_plan - ro_vol
+                if cur_plan is not None and ro_vol is not None else None
+            )
+            full_year_base_vs_py = (
+                _safe_ratio(base_plan - py_actual, py_actual) if py_actual else None
+            ) if base_plan is not None and py_actual is not None else None
             ro_pct = _cell(row, COL_O_PCT)
             budget_pct = _cell(row, COL_PCT)
             current_plan_total = cur_plan
@@ -2605,7 +2705,7 @@ def build_comparison_kpis(
 
     return ComparisonKpis(
         t3m_yoy=t3m_yoy, t6m_yoy=t6m_yoy,
-        full_year_yoy=full_year_yoy, ro_pct=ro_pct,
+        full_year_base_vs_py=full_year_base_vs_py, ro_pct=ro_pct,
         budget_pct=budget_pct,
         last_plan_total=last_plan_total,
         current_plan_total=current_plan_total,

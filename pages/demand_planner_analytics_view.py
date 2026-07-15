@@ -98,6 +98,8 @@ from data_sources.demand_plan_comparison import (
     COL_BUDGET as DPC_COL_BUDGET,
     COL_PCT as DPC_COL_PCT,
     COL_ROW_ID as DPC_COL_ROW_ID,
+    COL_T3M_YOY as DPC_COL_T3M_YOY,
+    COL_T6M_YOY as DPC_COL_T6M_YOY,
     DRV_COL_PMAJ,
     DRV_COL_SFMT,
     DRV_COL_BRAND,
@@ -5689,13 +5691,13 @@ def _render_comparison_kpis_yoy(kpis: ComparisonKpis) -> None:
     """
     t3m = _fmt_yoy(kpis.t3m_yoy)
     t6m = _fmt_yoy(kpis.t6m_yoy)
-    fy = _fmt_yoy(kpis.full_year_yoy)
+    fy = _fmt_yoy(kpis.full_year_base_vs_py)
     ro = _fmt_share(kpis.ro_pct)
     budget = _fmt_yoy(kpis.budget_pct)
     yoy = (
         ("T3M YoY", t3m, "Current reality"),
         ("T6M YoY", t6m, "Recent trend"),
-        ("Full-Year YoY", fy, "Plan assumption"),
+        ("Full-Year Base vs PY%", fy, "Plan assumption"),
         ("R&O % of Current Plan", ro, "Aspiration"),
         ("Total B2C Plan vs Budget %", budget, "Plan vs budget"),
     )
@@ -5914,6 +5916,24 @@ _DPC_SUMMARY_ROWS: tuple[tuple[str, str], ...] = (
     ("butter", "section"),
 )
 
+# Summary-table columns, in display order.  Each entry is (key, header, kind)
+# where ``kind`` ∈ {"m" millions, "pct_signed" green/red %, "pct_plain" %}.
+# RO% sits between R&O vol and Total plan; T3M/T6M YoY follow Base vs PY %.
+# Every column here is individually hidable via the popover; Category is fixed.
+_DPC_SUMMARY_COLS: tuple[tuple[str, str, str], ...] = (
+    ("base_plan",  "Base plan",    "m"),
+    ("py",         "PY",           "m"),
+    ("base_vs_py", "Base vs PY %", "pct_signed"),
+    ("t3m_yoy",    "T3M YoY",      "pct_signed"),
+    ("t6m_yoy",    "T6M YoY",      "pct_signed"),
+    ("ro_vol",     "R&O vol",      "m"),
+    ("ro_pct",     "RO%",          "pct_plain"),
+    ("total_plan", "Total plan",   "m"),
+    ("budget",     "Budget",       "m"),
+    ("vs_budget",  "% vs Budget",  "pct_signed"),
+)
+_DPC_SUMMARY_COLS_KEY: str = "demand_plan_comparison_summary_cols"
+
 
 def _dpc_num(row: pd.Series, col_id: str) -> Optional[float]:
     """Numeric cell from a comparison-table row by column id (None if missing)."""
@@ -5959,26 +5979,77 @@ def _dpc_fmt_pp(delta_frac: Optional[float], *, decimals: int = 1) -> tuple[str,
     return f"{pp:+.{decimals}f}pp", cls
 
 
+def _summary_row_values(r: pd.Series) -> dict[str, Optional[float]]:
+    """Project one comparison-table row into the summary table's value keys.
+
+    All keys map to :data:`_DPC_SUMMARY_COLS`.  The only derived values are
+    ``base_plan`` (Current Plan − R&O) and ``base_vs_py`` ((Base − PY) / PY);
+    T3M/T6M YoY are read straight off the pre-computed table columns.
+    """
+    current_plan = _dpc_num(r, DPC_COL_CURRENT_PLAN)
+    ro_vol = _dpc_num(r, DPC_COL_CURRENT_PLAN_RO)
+    py = _dpc_num(r, DPC_COL_PY_ACTUAL)
+    base_plan = None if current_plan is None else current_plan - (ro_vol or 0.0)
+    base_vs_py = (
+        (base_plan - py) / py
+        if base_plan is not None and py not in (None, 0.0) else None
+    )
+    return {
+        "base_plan": base_plan,
+        "py": py,
+        "base_vs_py": base_vs_py,
+        "t3m_yoy": _dpc_num(r, DPC_COL_T3M_YOY),
+        "t6m_yoy": _dpc_num(r, DPC_COL_T6M_YOY),
+        "ro_vol": ro_vol,
+        "ro_pct": _dpc_num(r, DPC_COL_O_PCT),
+        "total_plan": current_plan,
+        "budget": _dpc_num(r, DPC_COL_BUDGET),
+        "vs_budget": _dpc_num(r, DPC_COL_PCT),
+    }
+
+
+def _summary_cell_html(kind: str, value: Optional[float]) -> str:
+    """Format one summary cell (whole-percent, green/red for signed) as ``<td>``."""
+    if kind == "m":
+        return f"<td>{_esc_html(_dpc_fmt_m(value))}</td>"
+    signed = kind == "pct_signed"
+    txt, cls = _dpc_fmt_pct(value, signed=signed, decimals=0)
+    return f'<td class="{cls}">{_esc_html(txt)}</td>' if cls else f"<td>{_esc_html(txt)}</td>"
+
+
+def _summary_clean_label(r: pd.Series) -> str:
+    """Row label with the memo bullet dropped so Cottage Cheese / Sour Cream
+    render exactly like the Large/Small Carton sub-rows (indent preserved)."""
+    return str(r.get(DPC_COL_LABEL, "")).replace("• ", "")
+
+
 def _render_comparison_summary_table(result) -> None:
     """Render the executive current-plan summary table (screenshot 1).
 
     A condensed, current-plan-anchored projection of the SAME comparison data
-    (no new math beyond Base plan = Current Plan − R&O and Base vs PY %):
-    Base plan · PY · Base vs PY % · R&O vol · Total plan · RO% · Budget ·
-    % vs Budget.  Rendered in the lightweight style (white, hairline row
-    separators, bold section rows, green/red variance percents).
+    (Base plan = Current Plan − R&O; Base vs PY %; per-row T3M/T6M YoY read off
+    the table).  Column order + which columns are hidable come from
+    :data:`_DPC_SUMMARY_COLS`; a popover lets the planner hide any of them.
+    Lightweight style (white, hairline separators, bold section rows).
     """
     table = getattr(result, "table", None)
     if table is None or table.empty or DPC_COL_ROW_ID not in table.columns:
         return
     by_id = {str(r[DPC_COL_ROW_ID]): r for _, r in table.iterrows()}
 
-    headers = ["Category", "Base plan", "PY", "Base vs PY %", "R&O vol",
-               "Total plan", "RO%", "Budget", "% vs Budget"]
-    head_html = "".join(
-        f'<th class="lbl">{_esc_html(h)}</th>' if i == 0
-        else f'<th>{_esc_html(h)}</th>'
-        for i, h in enumerate(headers)
+    # Column-hiding popover (Category is always shown; every metric is hidable).
+    all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
+    st.session_state.setdefault(_DPC_SUMMARY_COLS_KEY, all_headers)
+    with st.popover("⚙️ Columns", use_container_width=False):
+        st.multiselect(
+            "Show columns", options=all_headers, key=_DPC_SUMMARY_COLS_KEY,
+            help="Untick a column to hide it.  The Category column always shows.",
+        )
+    visible = set(st.session_state.get(_DPC_SUMMARY_COLS_KEY) or all_headers)
+    cols = [c for c in _DPC_SUMMARY_COLS if c[1] in visible]
+
+    head_html = '<th class="lbl">Category</th>' + "".join(
+        f"<th>{_esc_html(header)}</th>" for _key, header, _kind in cols
     )
 
     body_rows: list[str] = []
@@ -5986,30 +6057,11 @@ def _render_comparison_summary_table(result) -> None:
         r = by_id.get(row_id)
         if r is None:
             continue
-        current_plan = _dpc_num(r, DPC_COL_CURRENT_PLAN)
-        ro_vol = _dpc_num(r, DPC_COL_CURRENT_PLAN_RO)
-        py = _dpc_num(r, DPC_COL_PY_ACTUAL)
-        base_plan = None if current_plan is None else current_plan - (ro_vol or 0.0)
-        base_vs_py = (
-            (base_plan - py) / py
-            if base_plan is not None and py not in (None, 0.0) else None
+        vals = _summary_row_values(r)
+        cells = f'<td class="lbl">{_esc_html(_summary_clean_label(r))}</td>' + "".join(
+            _summary_cell_html(kind, vals[key]) for key, _header, kind in cols
         )
-        # Whole-percent display (screenshot 1) — green/red on the two variances.
-        base_py_txt, base_py_cls = _dpc_fmt_pct(base_vs_py, signed=True, decimals=0)
-        ro_pct_txt, _ = _dpc_fmt_pct(_dpc_num(r, DPC_COL_O_PCT), signed=False, decimals=0)
-        vsb_txt, vsb_cls = _dpc_fmt_pct(_dpc_num(r, DPC_COL_PCT), signed=True, decimals=0)
-        cells = [
-            f'<td class="lbl">{_esc_html(r.get(DPC_COL_LABEL, row_id))}</td>',
-            f'<td>{_esc_html(_dpc_fmt_m(base_plan))}</td>',
-            f'<td>{_esc_html(_dpc_fmt_m(py))}</td>',
-            f'<td class="{base_py_cls}">{_esc_html(base_py_txt)}</td>',
-            f'<td>{_esc_html(_dpc_fmt_m(ro_vol))}</td>',
-            f'<td>{_esc_html(_dpc_fmt_m(current_plan))}</td>',
-            f'<td>{_esc_html(ro_pct_txt)}</td>',
-            f'<td>{_esc_html(_dpc_fmt_m(_dpc_num(r, DPC_COL_BUDGET)))}</td>',
-            f'<td class="{vsb_cls}">{_esc_html(vsb_txt)}</td>',
-        ]
-        body_rows.append(f'<tr class="{cls}">' + "".join(cells) + "</tr>")
+        body_rows.append(f'<tr class="{cls}">{cells}</tr>')
 
     st.markdown(
         _DPC_LITE_CSS
@@ -8441,6 +8493,21 @@ def _render_promotion_lift_analysis() -> None:
         st.info("ℹ️ Promotion Lift Analysis is coming soon.")
 
 
+def _render_pricing_elasticity_analysis() -> None:
+    """Foldable 'Pricing Elasticity Analysis' section.
+
+    A collapsed ``st.expander`` matching the other page sections, separated
+    from its neighbours by the same ``st.markdown("---")`` divider line.
+    """
+    with st.expander("📉 Pricing Elasticity Analysis", expanded=False):
+        st.caption(
+            "How volume responds to price — the estimated demand elasticity "
+            "by product, so a proposed price move can be translated into an "
+            "expected volume impact."
+        )
+        st.info("ℹ️ Pricing Elasticity Analysis is coming soon.")
+
+
 # ── 3. Entry point ────────────────────────────────────────────────────────────
 
 
@@ -8453,11 +8520,12 @@ def render() -> None:
     2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
     3. Plan Lift Analysis           (📈, collapsible, collapsed; above RO)
     4. Promotion Lift Analysis      (🎯, collapsible, collapsed)
-    5. RO Comparison                (collapsible, expanded by default)
-    6. Demand Summary               (collapsible, collapsed by default)
-    7. Product Line Review          (collapsible, collapsed by default)
-    8. Sales Distribution Tracker   (🚚, collapsible, collapsed)
-    9. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
+    5. Pricing Elasticity Analysis  (📉, collapsible, collapsed)
+    6. RO Comparison                (collapsible, expanded by default)
+    7. Demand Summary               (collapsible, collapsed by default)
+    8. Product Line Review          (collapsible, collapsed by default)
+    9. Sales Distribution Tracker   (🚚, collapsible, collapsed)
+    10. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -8477,6 +8545,9 @@ def render() -> None:
     st.markdown("---")
 
     _render_promotion_lift_analysis()
+    st.markdown("---")
+
+    _render_pricing_elasticity_analysis()
     st.markdown("---")
 
     _render_ro_comparison()

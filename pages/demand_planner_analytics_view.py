@@ -5614,7 +5614,7 @@ def _load_demand_comparison_dim() -> tuple[Optional[pd.DataFrame], Optional[str]
 
 
 # Row-highlight styles for the Product Line Review Styler tables (the Demand
-# Plan Comparison tables render as HTML \u2014 see _DPC_CMP_CSS / _DPC_LITE_CSS \u2014
+# Plan Comparison tables render as HTML \u2014 see _DPC_TREE_CSS / _DPC_LITE_CSS \u2014
 # and no longer use these pandas-Styler strings).
 _ROW_STYLE_HIGHLIGHT_ORANGE_BOLD = "background-color: #ffcc80; font-weight: 700"
 _ROW_STYLE_PLR_CUSTOMER = "background-color: #e3f2fd"
@@ -5770,20 +5770,31 @@ def _render_comparison_kpis_walk(
 # font, light-blue Total B2C, orange #f8cbad Portfolio-Major section rows) so
 # the comparison reads as one system with the rest of this UI.  st.dataframe
 # can't style the header band, hence the hand-built table.
-_DPC_CMP_CSS: str = """
+_DPC_TREE_CSS: str = """
 <style>
-.dpc-cmp {overflow-x:auto; margin:0.35rem 0 0.75rem;}
-.dpc-cmp table {border-collapse:collapse; width:100%;
-  font-size:0.82rem; background:#ffffff; color:#1a1a1a;}
-.dpc-cmp th, .dpc-cmp td {padding:4px 10px; white-space:nowrap;}
-.dpc-cmp thead th {background:#1f3864; color:#ffffff; font-weight:700;
-  text-align:center; border:1px solid #2f4a7a; position:sticky; top:0; z-index:1;}
-.dpc-cmp tbody td {border-bottom:1px solid #e8e8e8; text-align:right;}
-.dpc-cmp td.lbl, .dpc-cmp th.lbl {text-align:left;}
-.dpc-cmp tr.total td {background:#dce6f1; font-weight:700;}
-.dpc-cmp tr.section td {background:#f8cbad; font-weight:700;}
-.dpc-cmp tr.subtotal td {font-weight:700;}
-.dpc-cmp tr.memo td {font-style:italic; color:#555555;}
+.dpc-tree {overflow-x:auto; margin:0.35rem 0 0.75rem;}
+.dpc-tree-in {min-width:920px; background:#ffffff; color:#1a1a1a; font-size:0.82rem;}
+.dpc-tree details {margin:0;}
+.dpc-tree .rw {display:flex; align-items:center; border-bottom:1px solid #e8e8e8;}
+.dpc-tree .rw > span {flex:1 1 70px; padding:4px 10px; white-space:nowrap;
+  text-align:right; overflow:hidden; text-overflow:ellipsis;}
+.dpc-tree .rw > span.lbl {flex:0 0 230px; text-align:left;
+  display:flex; align-items:center; gap:2px;}
+.dpc-tree .hdr {background:#1f3864; color:#ffffff; font-weight:700;
+  position:sticky; top:0; z-index:1;}
+.dpc-tree .hdr > span {text-align:center;}
+.dpc-tree .hdr > span.lbl {text-align:left;}
+/* Native disclosure: the summary IS the row; hide the default marker and use
+   our own triangle that rotates when the node is open. */
+.dpc-tree summary.rw {cursor:pointer; list-style:none;}
+.dpc-tree summary.rw::-webkit-details-marker {display:none;}
+.dpc-tree .rw.total {background:#dce6f1; font-weight:700;}
+.dpc-tree .rw.section {background:#f8cbad; font-weight:700;}
+.dpc-tree .rw.subtotal {font-weight:700;}
+.dpc-tree .rw.memo {font-style:italic; color:#555555;}
+.dpc-tree .tri {flex:0 0 auto; display:inline-block; width:0.85em;
+  color:#5a6472; transition:transform .12s ease;}
+.dpc-tree details[open] > summary.rw .tri {transform:rotate(90deg);}
 </style>
 """
 
@@ -5826,13 +5837,18 @@ _DPC_LITE_CSS: str = """
 def _dpc_cmp_row_class(
     *, row_id: object, is_subtotal: bool, is_memo: bool, indent: int,
 ) -> str:
-    """CSS class for one comparison row: total / section / subtotal / memo / leaf."""
+    """CSS class for one comparison row: total / section / subtotal / memo / leaf.
+
+    Every indent-1 row is a Portfolio Major (ESL / Aseptic / Cultured / Fresh
+    Milk / **Butter**) and gets the orange ``section`` fill — including Butter,
+    which is a leaf in the static template but still a top-level major.
+    """
     if str(row_id) == "total_b2c":
         return "total"
     if is_memo:
         return "memo"
-    if is_subtotal and indent == 1:
-        return "section"  # Portfolio Major: ESL / Aseptic / Cultured / Fresh Milk / Butter
+    if indent == 1:
+        return "section"
     return "subtotal" if is_subtotal else ""
 
 
@@ -5851,7 +5867,7 @@ def _dpc_fmt_cell(value: object, *, is_percent: bool) -> str:
     return f"{num:.1f}%" if is_percent else f"{num:,.2f}"
 
 
-def _render_comparison_html(
+def _render_comparison_tree(
     display_df: pd.DataFrame,
     *,
     label_col: str,
@@ -5862,39 +5878,64 @@ def _render_comparison_html(
     memo_flags: list[bool],
     indent_flags: list[int],
 ) -> None:
-    """Render the comparison table as the screenshot-styled, read-only HTML table.
+    """Render the comparison rows as a natively-foldable ``<details>`` tree.
 
-    The indented row hierarchy (NBSP-padded labels) is preserved verbatim; row
-    classes drive the Total B2C / Portfolio-Major / subtotal / memo styling.
+    Parent/child nesting is inferred from ``_indent``: a row is a foldable
+    parent (``<details><summary>``) when the next row is deeper; otherwise it's
+    a leaf ``<div>``.  All nodes start expanded; clicking a parent row collapses
+    its subtree with no server round-trip.  The NBSP hierarchy indent in each
+    label is preserved and a rotating triangle marks foldable rows.
     """
     percent_set = set(percent_labels)
-    head = [f'<th class="lbl">{_esc_html(label_col)}</th>']
-    head += [f'<th>{_esc_html(c)}</th>' for c in metric_cols]
+    n = len(display_df)
 
-    body: list[str] = []
-    for i in range(len(display_df)):
+    def _ind(i: int) -> int:
+        return int(indent_flags[i]) if i < len(indent_flags) else 0
+
+    def _row_html(i: int, *, foldable: bool) -> tuple[str, str]:
         cls = _dpc_cmp_row_class(
             row_id=row_ids[i] if row_ids is not None and i < len(row_ids) else "",
             is_subtotal=bool(subtotal_flags[i]) if i < len(subtotal_flags) else False,
             is_memo=bool(memo_flags[i]) if i < len(memo_flags) else False,
-            indent=int(indent_flags[i]) if i < len(indent_flags) else 0,
+            indent=_ind(i),
         )
-        tr = f'<tr class="{cls}">' if cls else "<tr>"
         row = display_df.iloc[i]
-        cells = [f'<td class="lbl">{_esc_html(row[label_col])}</td>']
-        cells += [
-            f'<td>{_esc_html(_dpc_fmt_cell(row[c], is_percent=c in percent_set))}</td>'
+        tri = '<span class="tri">▸</span>' if foldable else '<span class="tri"></span>'
+        cells = f'<span class="lbl">{tri}{_esc_html(row[label_col])}</span>' + "".join(
+            f'<span>{_esc_html(_dpc_fmt_cell(row[c], is_percent=c in percent_set))}</span>'
             for c in metric_cols
-        ]
-        body.append(tr + "".join(cells) + "</tr>")
+        )
+        return cls, cells
+
+    header = (
+        '<div class="rw hdr"><span class="lbl">' + _esc_html(label_col) + "</span>"
+        + "".join(f"<span>{_esc_html(c)}</span>" for c in metric_cols)
+        + "</div>"
+    )
+
+    parts: list[str] = [header]
+    open_stack: list[int] = []      # indents of currently-open <details>
+    for i in range(n):
+        ind = _ind(i)
+        # Close every open node that isn't an ancestor of this row.
+        while open_stack and open_stack[-1] >= ind:
+            parts.append("</details>")
+            open_stack.pop()
+        foldable = (i + 1 < n) and _ind(i + 1) > ind
+        cls, cells = _row_html(i, foldable=foldable)
+        if foldable:
+            parts.append(
+                f'<details open class="node"><summary class="rw {cls}">{cells}</summary>')
+            open_stack.append(ind)
+        else:
+            parts.append(f'<div class="rw {cls}">{cells}</div>')
+    parts.extend("</details>" for _ in open_stack)
 
     st.markdown(
-        _DPC_CMP_CSS
-        + '<div class="dpc-cmp"><table><thead><tr>'
-        + "".join(head)
-        + "</tr></thead><tbody>"
-        + "".join(body)
-        + "</tbody></table></div>",
+        _DPC_TREE_CSS
+        + '<div class="dpc-tree"><div class="dpc-tree-in">'
+        + "".join(parts)
+        + "</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -6202,25 +6243,13 @@ def _render_comparison_mix_table(result) -> None:
     )
 
 
-# Foldable detail levels for the detailed comparison table: label → the
-# deepest ``_indent`` kept (lower levels fold up into their parent subtotal,
-# which already sums them).  "Full detail" shows every brand-level leaf.
-_DPC_DEPTH_LEVELS: dict[str, int] = {
-    "Portfolio Major": 1,
-    "+ Supply Format": 2,
-    "Full detail": 3,
-}
-_DPC_DEFAULT_LEVEL: str = "Full detail"
-_DPC_DETAIL_LEVEL_KEY: str = "demand_plan_comparison_detail_level"
-
-
 def _render_demand_comparison_table(result) -> None:
-    """Render the detailed comparison table with its view controls + exports.
+    """Render the detailed comparison table (foldable tree) + controls + exports.
 
-    Layout: the table first, then (below it) the fold-level + detail-column
-    controls, then the Download / Save-to-Fabric buttons.  The controls live
-    below the table but their state is read up-front (via session_state) so the
-    table always reflects the current selection.
+    Layout: the tree first, then (below it) the detail-column toggle, then the
+    Download / Save-to-Fabric buttons.  Folding is per-row and native (click a
+    parent row) — there is no global fold control.  The column toggle lives
+    below the table but its state is read up-front via session_state.
     """
     table = result.table
     if table is None or table.empty:
@@ -6228,39 +6257,31 @@ def _render_demand_comparison_table(result) -> None:
         return
 
     # Full frame (all rows + cols, metadata stripped) for Download / Fabric
-    # save — always the complete data, independent of the on-screen fold level
-    # or column toggle.
+    # save — always the complete data, independent of the on-screen column
+    # toggle (row folding is client-side only, so every row is already here).
     save_df = table.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
                  if c in table.columns]
     ).reset_index(drop=True)
 
-    # View-control state is read here (widgets are rendered BELOW the table);
-    # session_state carries the selection across the rerun a widget triggers.
-    st.session_state.setdefault(_DPC_DETAIL_LEVEL_KEY, _DPC_DEFAULT_LEVEL)
+    # Column-toggle state is read here (the checkbox is rendered BELOW the
+    # table); session_state carries it across the rerun the widget triggers.
     st.session_state.setdefault(_DPC_SHOW_DETAIL_COLS_KEY, False)
-    max_indent = _DPC_DEPTH_LEVELS.get(
-        st.session_state[_DPC_DETAIL_LEVEL_KEY], _DPC_DEPTH_LEVELS[_DPC_DEFAULT_LEVEL])
     show_detail_cols = bool(st.session_state[_DPC_SHOW_DETAIL_COLS_KEY])
-
-    # Fold lower levels into their parent: keep only rows at/above the chosen
-    # depth.  The dropped rows' pounds still live in their parent subtotal.
-    view = table
-    if "_indent" in view.columns:
-        view = view[view["_indent"] <= max_indent].reset_index(drop=True)
 
     # Percent ids → display labels; stored values are fractions, ×100 to show.
     percent_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_PERCENT_COLS]
 
     # Row-type flags (positional) captured before dropping the metadata cols.
-    subtotal_flags = view["_is_subtotal"].tolist()
-    memo_flags = view["_is_memo"].tolist()
-    row_ids = view["_row_id"].tolist() if "_row_id" in view.columns else None
-    indent_flags = view["_indent"].tolist() if "_indent" in view.columns else []
+    # The full row set is rendered — the tree folds levels client-side.
+    subtotal_flags = table["_is_subtotal"].tolist()
+    memo_flags = table["_is_memo"].tolist()
+    row_ids = table["_row_id"].tolist() if "_row_id" in table.columns else None
+    indent_flags = table["_indent"].tolist() if "_indent" in table.columns else []
 
-    display_df = view.drop(
+    display_df = table.drop(
         columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
-                 if c in view.columns]
+                 if c in table.columns]
     ).reset_index(drop=True)
     for label in percent_labels:
         if label in display_df.columns:
@@ -6274,9 +6295,9 @@ def _render_demand_comparison_table(result) -> None:
         if show_detail_cols or DPC_DISPLAY_LABELS[c] not in hidden_detail_labels
     ]
 
-    # Screenshot-styled HTML table — navy header + white font, light-blue
-    # Total B2C, orange (#f8cbad) Portfolio-Major rows.
-    _render_comparison_html(
+    # Foldable tree — navy header + white font, light-blue Total B2C, orange
+    # (#f8cbad) Portfolio-Major rows (incl. Butter); click a parent row to fold.
+    _render_comparison_tree(
         display_df,
         label_col=DPC_COL_LABEL,
         metric_cols=visible_metric_cols,
@@ -6293,36 +6314,26 @@ def _render_demand_comparison_table(result) -> None:
             "Save the RO Summary Report above to populate it._"
         )
 
-    # Controls + exports, below the table (per planner layout).
+    # Column toggle + exports, below the table (per planner layout).
     _render_comparison_table_controls()
     _render_comparison_table_exports(result, save_df)
 
 
 def _render_comparison_table_controls() -> None:
-    """Fold-level + detail-column toggles, rendered below the detailed table.
+    """Detail-column toggle, rendered below the detailed table.
 
-    Both widgets bind to session_state by key only (no ``value``/``index`` arg)
-    so :func:`_render_demand_comparison_table` can read the same state up-front
-    without Streamlit's "value set via both" warning.
+    Binds to session_state by key only (no ``value`` arg) so
+    :func:`_render_demand_comparison_table` can read the same state up-front
+    without Streamlit's "value set via both" warning.  (Row folding is native
+    per-row — no global control.)
     """
-    c1, c2 = st.columns([1.3, 1])
-    with c1:
-        st.radio(
-            "Detail level (fold lower layers into the level above)",
-            options=list(_DPC_DEPTH_LEVELS),
-            key=_DPC_DETAIL_LEVEL_KEY,
-            horizontal=True,
-            help="Portfolio Major only · + Supply Format · Full brand-level "
-                 "detail.  Folded rows stay counted in their parent subtotal.",
-        )
-    with c2:
-        st.checkbox(
-            "Show extra detail columns",
-            key=_DPC_SHOW_DETAIL_COLS_KEY,
-            help="Adds the hidden metric columns (Prior-Month Actual/Forecast, "
-                 "Current Plan Actual/Base/R&O, PY Actual, O%, Base Plan Var %). "
-                 "Download and Save to Fabric always include every column.",
-        )
+    st.checkbox(
+        "Show extra detail columns",
+        key=_DPC_SHOW_DETAIL_COLS_KEY,
+        help="Adds the hidden metric columns (Prior-Month Actual/Forecast, "
+             "Current Plan Actual/Base/R&O, PY Actual, O%, Base Plan Var %). "
+             "Download and Save to Fabric always include every column.",
+    )
 
 
 def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:

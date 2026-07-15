@@ -2698,7 +2698,7 @@ _RO_SR_CSS: str = """
 <style>
 .ro-sr {overflow-x:auto; margin:0.25rem 0 0.75rem;}
 .ro-sr table {border-collapse:collapse; width:100%;
-  font-size:0.82rem; background:#ffffff; color:#1a1a1a;}
+  font-size:0.95rem; background:#ffffff; color:#1a1a1a;}
 .ro-sr th, .ro-sr td {padding:4px 10px; white-space:nowrap;}
 .ro-sr thead th {background:#1f3864; color:#ffffff; font-weight:700;
   text-align:center; border:1px solid #2f4a7a;}
@@ -5773,7 +5773,7 @@ def _render_comparison_kpis_walk(
 _DPC_TREE_CSS: str = """
 <style>
 .dpc-tree {overflow-x:auto; margin:0.35rem 0 0.75rem;}
-.dpc-tree-in {min-width:920px; background:#ffffff; color:#1a1a1a; font-size:0.82rem;}
+.dpc-tree-in {min-width:920px; background:#ffffff; color:#1a1a1a; font-size:0.95rem;}
 .dpc-tree details {margin:0;}
 .dpc-tree .rw {display:flex; align-items:center; border-bottom:1px solid #e8e8e8;}
 .dpc-tree .rw > span {flex:1 1 70px; padding:4px 10px; white-space:nowrap;
@@ -5807,9 +5807,9 @@ _DPC_LITE_CSS: str = """
 <style>
 .dpc-lite {overflow-x:auto; margin:0.3rem 0 0.8rem;}
 .dpc-lite table {border-collapse:collapse; width:100%; background:transparent;
-  color:#1f2430; font-size:0.86rem;}
+  color:#1f2430; font-size:0.98rem;}
 .dpc-lite th, .dpc-lite td {padding:7px 14px; white-space:nowrap; text-align:right;}
-.dpc-lite thead th {color:#6b7280; font-weight:600; font-size:0.8rem;
+.dpc-lite thead th {color:#6b7280; font-weight:600; font-size:0.9rem;
   border-bottom:2px solid #e5e7eb;}
 .dpc-lite th.lbl, .dpc-lite td.lbl {text-align:left;}
 .dpc-lite tbody td {border-bottom:1px solid #f1f2f4;}
@@ -6645,7 +6645,7 @@ _PMAF_NAVY = "#1f4e79"
 _PMAF_CSS = f"""
 <style>
 .pmaf {{overflow-x:auto; margin:.25rem 0 .75rem;}}
-.pmaf table {{border-collapse:collapse; width:100%; font-size:.8rem;
+.pmaf table {{border-collapse:collapse; width:100%; font-size:.92rem;
   background:#ffffff; color:#1a1a1a;}}
 .pmaf th, .pmaf td {{padding:4px 10px; white-space:nowrap;}}
 .pmaf thead th {{background:{_PMAF_NAVY}; color:#ffffff; font-weight:700;

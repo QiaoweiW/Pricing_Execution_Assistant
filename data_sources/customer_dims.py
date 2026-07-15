@@ -56,7 +56,9 @@ from data_sources.fabric_auth import (
     bind_storage_token,
     duckdb_lock,
     get_duckdb_connection,
+    prepare_duckdb_tls,
 )
+from data_sources.fabric_tls import tls_error_hint as _tls_hint
 
 
 logger = logging.getLogger(__name__)
@@ -119,10 +121,13 @@ def _read_full_table(table: str) -> pd.DataFrame:
         token = acquire_storage_token()
     except FabricAuthError as exc:
         raise CustomerDimsError(str(exc)) from exc
+    # Honor [fabric_htst] ca_cert_file / ssl_verify for the OneLake TLS
+    # handshake (corporate MITM proxy → else DuckDB libcurl "SSL connect error").
+    ssl_verify = prepare_duckdb_tls()
     try:
         con = get_duckdb_connection()
         with duckdb_lock():
-            bind_storage_token(con, token)
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
             df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
     except FabricAuthError as exc:
         raise CustomerDimsError(str(exc)) from exc
@@ -130,7 +135,7 @@ def _read_full_table(table: str) -> pd.DataFrame:
         raise CustomerDimsError(
             f"Could not read Delta table via DuckDB at {table_uri}.  "
             f"Verify the lakehouse identifiers and your Read access.  "
-            f"Underlying error: {exc}"
+            f"Underlying error: {exc}{_tls_hint(exc)}"
         ) from exc
     logger.info("Loaded %s (%s rows) from %s", table, len(df), table_uri)
     return df

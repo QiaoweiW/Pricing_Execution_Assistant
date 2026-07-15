@@ -844,6 +844,40 @@ def bind_storage_token(con, token: str, *, ssl_verify: bool = True) -> None:
     )
 
 
+def prepare_duckdb_tls(section: str = "fabric_htst") -> bool:
+    """Resolve the ``[section]`` TLS config, apply the CA-bundle env, return ``ssl_verify``.
+
+    Call this BEFORE :func:`bind_storage_token` on any OneLake Delta scan, then
+    pass the result through as ``bind_storage_token(con, token,
+    ssl_verify=...)``.  It is the one-liner that makes every Delta reader honor
+    the ``[fabric_htst].ca_cert_file`` / ``ssl_verify`` overrides identically —
+    without it, DuckDB's bundled libcurl can't verify the OneLake TLS chain on
+    a workstation behind a corporate MITM proxy and the scan fails with
+    ``Fail to get a new connection … SSL connect error`` (see
+    :mod:`data_sources.fabric_tls`).
+
+    A missing / malformed secrets section degrades silently to the
+    ``certifi.where()`` default (verification stays ON).
+    """
+    from data_sources.fabric_tls import (
+        apply_ca_cert_env, resolve_ca_cert_file, ssl_verify_enabled,
+    )
+    try:
+        cfg = dict(read_section(section))
+    except FabricAuthError:
+        cfg = {}
+    apply_ca_cert_env(resolve_ca_cert_file(cfg))
+    verify = ssl_verify_enabled(cfg)
+    if not verify:
+        logger.warning(
+            "TLS certificate verification is DISABLED for OneLake Delta scans "
+            "([%s].ssl_verify = false).  Corporate-MITM workaround — restore it "
+            "by removing the flag and setting [%s].ca_cert_file to a trusted "
+            "CA bundle.", section, section,
+        )
+    return verify
+
+
 # ── App-startup warm-up ──────────────────────────────────────────────────────
 
 def warmup(*, cache_name: str = DEFAULT_CACHE_NAME) -> None:

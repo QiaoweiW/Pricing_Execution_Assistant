@@ -49,7 +49,9 @@ from data_sources.fabric_auth import (
     bind_storage_token,
     duckdb_lock,
     get_duckdb_connection,
+    prepare_duckdb_tls,
 )
+from data_sources.fabric_tls import tls_error_hint as _tls_hint
 
 
 logger = logging.getLogger(__name__)
@@ -185,10 +187,13 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
         )
 
     # ── Authoritative read via the shared DuckDB connection ────────────────
+    # Honor [fabric_htst] ca_cert_file / ssl_verify so the OneLake TLS
+    # handshake works behind a corporate MITM proxy.
+    ssl_verify = prepare_duckdb_tls()
     try:
         con = get_duckdb_connection()
         with duckdb_lock():
-            bind_storage_token(con, token)
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
             df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
     except FabricAuthError as exc:
         raise IBPOfficialSourceError(str(exc)) from exc
@@ -198,7 +203,7 @@ def _read_delta_table(table_uri: str, token: str) -> tuple[pd.DataFrame, int, Op
             f"Verify (1) the workspace + lakehouse + table identifiers, "
             f"(2) your account has Read access to the lakehouse, and "
             f"(3) the dataflow refresh has actually populated the table.  "
-            f"Underlying error: {exc}"
+            f"Underlying error: {exc}{_tls_hint(exc)}"
         ) from exc
 
     return df, version, last_modified
@@ -354,17 +359,18 @@ def _cached_fetch_slim_table(
     table_uri = _build_table_uri(table_name)
     token = _acquire_storage_token()
     sql = _build_slim_table_sql(table_uri, columns_key, months_key)
+    ssl_verify = prepare_duckdb_tls()
     try:
         con = get_duckdb_connection()
         with duckdb_lock():
-            bind_storage_token(con, token)
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
             df = con.execute(sql).df()
     except FabricAuthError as exc:
         raise IBPOfficialSourceError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise IBPOfficialSourceError(
             f"Could not read slim Delta projection for '{table_name}' at {table_uri}.  "
-            f"Underlying error: {exc}"
+            f"Underlying error: {exc}{_tls_hint(exc)}"
         ) from exc
     logger.info(
         "Loaded slim IBP table=%s (%s rows, cols=%s, months=%s).",
@@ -452,17 +458,18 @@ def _cached_fetch_shipments_months(_cache_token: str) -> tuple[date, ...]:
     table_uri = _build_table_uri(_TABLE_SHIPMENTS)
     token = _acquire_storage_token()
     sql = f'SELECT DISTINCT "Month" FROM delta_scan(\'{table_uri}\')'
+    ssl_verify = prepare_duckdb_tls()
     try:
         con = get_duckdb_connection()
         with duckdb_lock():
-            bind_storage_token(con, token)
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
             df = con.execute(sql).df()
     except FabricAuthError as exc:
         raise IBPOfficialSourceError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise IBPOfficialSourceError(
             f"Could not read distinct Months from '{_TABLE_SHIPMENTS}' at "
-            f"{table_uri}.  Underlying error: {exc}"
+            f"{table_uri}.  Underlying error: {exc}{_tls_hint(exc)}"
         ) from exc
     # Coerce to first-of-month dates; drop anything unparseable.
     parsed = pd.to_datetime(df["Month"], errors="coerce").dropna()

@@ -115,8 +115,32 @@ def apply_ca_cert_env(ca_cert_file: Optional[str]) -> None:
         os.environ.setdefault(env_name, ca_cert_file)
 
 
+def tls_error_hint(exc: BaseException, *, section: str = "fabric_htst") -> str:
+    """Return a remediation hint when *exc* looks like a libcurl TLS/CA failure.
+
+    Empty string when the error is unrelated to TLS, so callers can append it
+    unconditionally.  Keeps the "how do I fix the SSL connect error" guidance
+    identical across every OneLake Delta reader.
+    """
+    msg = str(exc).lower()
+    if not any(tok in msg for tok in ("ssl", "certificate", "ca cert", "curl")):
+        return ""
+    return (
+        "\n\nThis looks like a TLS / CA-certificate failure inside DuckDB's "
+        "bundled libcurl — NOT a problem with your token, workspace identifiers "
+        "or permissions (a corporate proxy is likely re-signing "
+        "*.fabric.microsoft.com).  Fix it in .streamlit/secrets.toml under "
+        f"[{section}]:\n"
+        "  (a) [PREFERRED] point at a CA bundle your machine trusts:\n"
+        '        ca_cert_file = "C:/path/to/corporate_ca.pem"\n'
+        "  (b) [LAST RESORT, trusted networks only] skip verification:\n"
+        "        ssl_verify = false"
+    )
+
+
 __all__ = [
     "apply_ca_cert_env",
     "resolve_ca_cert_file",
     "ssl_verify_enabled",
+    "tls_error_hint",
 ]

@@ -74,7 +74,9 @@ from data_sources.fabric_auth import (
     bind_storage_token,
     duckdb_lock,
     get_duckdb_connection,
+    prepare_duckdb_tls,
 )
+from data_sources.fabric_tls import tls_error_hint as _tls_hint
 from data_sources.fabric_lakehouse_io import (
     LakehouseIOError,
     list_files,
@@ -208,18 +210,23 @@ def _scan(sql: str, table_uri: str) -> pd.DataFrame:
         token = acquire_storage_token()
     except FabricAuthError as exc:
         raise PlanLiftError(str(exc)) from exc
+    # Honor the [fabric_htst] ca_cert_file / ssl_verify overrides so the
+    # OneLake TLS handshake works behind a corporate MITM proxy (else DuckDB's
+    # bundled libcurl fails with "SSL connect error").
+    ssl_verify = prepare_duckdb_tls()
     try:
         con = get_duckdb_connection()
         with duckdb_lock():
-            bind_storage_token(con, token)
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
             return con.execute(sql).df()
     except FabricAuthError as exc:
         raise PlanLiftError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
+        hint = _tls_hint(exc)
         raise PlanLiftError(
             f"Could not read Delta table via DuckDB at {table_uri}.  Verify "
             f"the lakehouse identifiers, your Read access, and that the "
-            f"dataflow has populated the table.  Underlying error: {exc}"
+            f"dataflow has populated the table.  Underlying error: {exc}{hint}"
         ) from exc
 
 

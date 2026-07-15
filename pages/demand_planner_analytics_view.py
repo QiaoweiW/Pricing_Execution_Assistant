@@ -143,6 +143,14 @@ from data_sources.demand_plan_comparison import (
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
     list_comparison_combos,
+    build_forecast_bias_table,
+    BIAS_COL_AVG,
+    BIAS_COL_WMAPE,
+    BIAS_COL_FVA,
+    BIAS_COL_FLAG_DIR,
+    BIAS_COL_FLAG_SEV,
+    BIAS_FLAG_PRIORITY,
+    BIAS_FLAG_MONITOR,
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
@@ -5204,6 +5212,12 @@ def _render_demand_plan_comparison_fragment() -> None:
 
     st.markdown("---")
 
+    # 6d. Forecast Bias (Lag 1 = C3) by Segment × Month — its own section,
+    #     divider-bracketed between the volume-mix table and the detailed table.
+    _render_forecast_bias_section(tracker_df, pdh_df, item_master_df, filters)
+
+    st.markdown("---")
+
     _render_comparison_kpis_walk(kpis, filters)
     # 7. Render the comparison table + download / save.
     _render_demand_comparison_table(result)
@@ -5855,6 +5869,45 @@ def _dpc_fmt_cell(value: object, *, is_percent: bool) -> str:
     return f"{num:.1f}%" if is_percent else f"{num:,.2f}"
 
 
+def _foldable_tree_body(
+    n: int, indent_flags: list[int],
+    make_row: "Callable[[int, bool], tuple[str, str]]",
+) -> list[str]:
+    """Return the ``<details>`` / ``<div>`` row parts for a foldable tree.
+
+    Parent/child nesting is inferred from ``indent_flags``: a row is a foldable
+    ``<details><summary>`` when the next row is deeper, else a leaf ``<div>``.
+    ``make_row(i, foldable)`` returns ``(css_class, inner_cells_html)``.  Shared
+    by the comparison / Prior-Month / bias trees so the fold mechanics live in
+    one place.
+    """
+    def _ind(i: int) -> int:
+        return int(indent_flags[i]) if i < len(indent_flags) else 0
+
+    parts: list[str] = []
+    open_stack: list[int] = []      # indents of currently-open <details>
+    for i in range(n):
+        ind = _ind(i)
+        while open_stack and open_stack[-1] >= ind:   # close non-ancestors
+            parts.append("</details>")
+            open_stack.pop()
+        foldable = (i + 1 < n) and _ind(i + 1) > ind
+        cls, cells = make_row(i, foldable)
+        if foldable:
+            parts.append(
+                f'<details open class="node"><summary class="rw {cls}">{cells}</summary>')
+            open_stack.append(ind)
+        else:
+            parts.append(f'<div class="rw {cls}">{cells}</div>')
+    parts.extend("</details>" for _ in open_stack)
+    return parts
+
+
+def _tri_span(foldable: bool) -> str:
+    """Rotating disclosure triangle for foldable rows (spacer when a leaf)."""
+    return '<span class="tri">▸</span>' if foldable else '<span class="tri"></span>'
+
+
 def _render_comparison_tree(
     display_df: pd.DataFrame,
     *,
@@ -5868,28 +5921,21 @@ def _render_comparison_tree(
 ) -> None:
     """Render the comparison rows as a natively-foldable ``<details>`` tree.
 
-    Parent/child nesting is inferred from ``_indent``: a row is a foldable
-    parent (``<details><summary>``) when the next row is deeper; otherwise it's
-    a leaf ``<div>``.  All nodes start expanded; clicking a parent row collapses
-    its subtree with no server round-trip.  The NBSP hierarchy indent in each
-    label is preserved and a rotating triangle marks foldable rows.
+    All nodes start expanded; clicking a parent row collapses its subtree with
+    no server round-trip.  The NBSP hierarchy indent in each label is preserved
+    and a rotating triangle marks foldable rows.
     """
     percent_set = set(percent_labels)
-    n = len(display_df)
 
-    def _ind(i: int) -> int:
-        return int(indent_flags[i]) if i < len(indent_flags) else 0
-
-    def _row_html(i: int, *, foldable: bool) -> tuple[str, str]:
+    def _make_row(i: int, foldable: bool) -> tuple[str, str]:
         cls = _dpc_cmp_row_class(
             row_id=row_ids[i] if row_ids is not None and i < len(row_ids) else "",
             is_subtotal=bool(subtotal_flags[i]) if i < len(subtotal_flags) else False,
             is_memo=bool(memo_flags[i]) if i < len(memo_flags) else False,
-            indent=_ind(i),
+            indent=int(indent_flags[i]) if i < len(indent_flags) else 0,
         )
         row = display_df.iloc[i]
-        tri = '<span class="tri">▸</span>' if foldable else '<span class="tri"></span>'
-        cells = f'<span class="lbl">{tri}{_esc_html(row[label_col])}</span>' + "".join(
+        cells = f'<span class="lbl">{_tri_span(foldable)}{_esc_html(row[label_col])}</span>' + "".join(
             f'<span>{_esc_html(_dpc_fmt_cell(row[c], is_percent=c in percent_set))}</span>'
             for c in metric_cols
         )
@@ -5900,24 +5946,7 @@ def _render_comparison_tree(
         + "".join(f"<span>{_esc_html(c)}</span>" for c in metric_cols)
         + "</div>"
     )
-
-    parts: list[str] = [header]
-    open_stack: list[int] = []      # indents of currently-open <details>
-    for i in range(n):
-        ind = _ind(i)
-        # Close every open node that isn't an ancestor of this row.
-        while open_stack and open_stack[-1] >= ind:
-            parts.append("</details>")
-            open_stack.pop()
-        foldable = (i + 1 < n) and _ind(i + 1) > ind
-        cls, cells = _row_html(i, foldable=foldable)
-        if foldable:
-            parts.append(
-                f'<details open class="node"><summary class="rw {cls}">{cells}</summary>')
-            open_stack.append(ind)
-        else:
-            parts.append(f'<div class="rw {cls}">{cells}</div>')
-    parts.extend("</details>" for _ in open_stack)
+    parts = [header] + _foldable_tree_body(len(display_df), indent_flags, _make_row)
 
     st.markdown(
         _DPC_TREE_CSS
@@ -6242,6 +6271,261 @@ def _render_comparison_mix_table(result) -> None:
         + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
         unsafe_allow_html=True,
     )
+
+
+# ── Forecast Bias (Lag 1) section ────────────────────────────────────────────
+# Lightweight foldable tree: monthly Bias% (green over / red under), a trend
+# sparkline, 6-month average, WMAPE, FVA and an over/under + priority Flag.
+_BIAS_CSS: str = """
+<style>
+.bias {overflow-x:auto; margin:.3rem 0 .6rem;}
+.bias-in {min-width:960px; background:#ffffff; color:#1f2430; font-size:0.9rem;}
+.bias details {margin:0;}
+.bias .rw {display:flex; align-items:center; border-bottom:1px solid #f1f2f4;}
+.bias .rw > span {flex:1 1 60px; padding:6px 10px; white-space:nowrap;
+  text-align:right; overflow:hidden; text-overflow:ellipsis;}
+.bias .rw > span.lbl {flex:0 0 240px; text-align:left; display:flex;
+  align-items:center; gap:2px;}
+.bias .rw > span.wide {flex:1.4 1 74px;}
+.bias .hdr {background:#fafafa; color:#6b7280; font-weight:600; font-size:0.72rem;
+  text-transform:uppercase; letter-spacing:.02em; border-bottom:2px solid #e5e7eb;}
+.bias .hdr > span {text-align:right;}
+.bias .hdr > span.lbl {text-align:left;}
+.bias summary.rw {cursor:pointer; list-style:none;}
+.bias summary.rw::-webkit-details-marker {display:none;}
+.bias .rw.total {background:#eef3fb; font-weight:700;}
+.bias .rw.section {background:#fbeee6; font-weight:700;}
+.bias .rw.subtotal {font-weight:600;}
+.bias .rw.memo {font-style:italic; color:#6b7280;}
+.bias .tri {flex:0 0 auto; display:inline-block; width:.85em; color:#5a6472;
+  transition:transform .12s ease;}
+.bias details[open] > summary.rw .tri {transform:rotate(90deg);}
+.bias .pos {color:#1b7f3a;}
+.bias .neg {color:#c0392b;}
+.bias .spark {display:inline-flex; align-items:flex-end; gap:1px; height:16px;
+  justify-content:flex-end;}
+.bias .spark i {width:4px; display:inline-block; border-radius:1px;}
+.bias .chip {display:inline-block; padding:1px 7px; border-radius:9px;
+  font-size:.7rem; font-weight:700;}
+.bias .chip.pri {background:#fde2e1; color:#c0392b;}
+.bias .chip.mon {background:#fdf0d5; color:#9a6a00;}
+.bias .chip.dir {background:#eef1f4; color:#55606e; font-weight:600; margin-left:4px;}
+</style>
+"""
+
+
+def _bias_fmt_pct(frac: object) -> tuple[str, str]:
+    """Signed Bias% → (text, css-class): negative in parens + red, positive green."""
+    if frac is None or pd.isna(frac):
+        return "—", ""
+    pct = float(frac) * 100.0
+    if abs(round(pct)) == 0:
+        return "0%", ""
+    return (f"({abs(pct):.0f}%)", "neg") if pct < 0 else (f"{pct:.0f}%", "pos")
+
+
+def _bias_wmape_txt(frac: object) -> str:
+    """Unsigned WMAPE as a whole percent."""
+    return "—" if frac is None or pd.isna(frac) else f"{float(frac) * 100:.0f}%"
+
+
+def _bias_pp(frac: object) -> tuple[str, str]:
+    """Percentage-point value (FVA) → (``+2.1pp``, css-class)."""
+    if frac is None or pd.isna(frac):
+        return "—", ""
+    pp = float(frac) * 100.0
+    cls = "pos" if pp > 0 else "neg" if pp < 0 else ""
+    return f"{pp:+.1f}pp", cls
+
+
+def _bias_spark(values: list) -> str:
+    """Tiny bar sparkline of the monthly Bias% (green over / red under)."""
+    nums = [float(v) for v in values if v is not None and not pd.isna(v)]
+    if not nums:
+        return ""
+    scale = max(0.05, max(abs(v) for v in nums))
+    bars = []
+    for v in values:
+        if v is None or pd.isna(v):
+            bars.append('<i style="height:2px;background:#d1d5db"></i>')
+            continue
+        h = max(2, min(16, round(abs(float(v)) / scale * 16)))
+        color = "#1b7f3a" if v > 0 else "#c0392b" if v < 0 else "#9ca3af"
+        bars.append(f'<i style="height:{h}px;background:{color}"></i>')
+    return f'<span class="spark">{"".join(bars)}</span>'
+
+
+def _bias_flag_html(direction: object, severity: object) -> str:
+    """Flag cell: a severity chip (Priority/Monitor) + an Over/Under chip."""
+    chips: list[str] = []
+    if severity == BIAS_FLAG_PRIORITY:
+        chips.append('<span class="chip pri">Priority</span>')
+    elif severity == BIAS_FLAG_MONITOR:
+        chips.append('<span class="chip mon">Monitor</span>')
+    if direction and str(direction) not in ("", "Balanced"):
+        chips.append(f'<span class="chip dir">{_esc_html(direction)}</span>')
+    return "".join(chips) if chips else "—"
+
+
+def _render_bias_tiles(total: pd.Series | None) -> None:
+    """Section KPI tiles: Total B2C WMAPE (6-mo), Bias 6-mo avg, FVA vs naive."""
+    wmape = None if total is None else _dpc_num(total, BIAS_COL_WMAPE)
+    avg = None if total is None else _dpc_num(total, BIAS_COL_AVG)
+    fva = None if total is None else _dpc_num(total, BIAS_COL_FVA)
+    avg_txt, avg_cls = _fmt_yoy(avg)          # signed %, up/down colour
+    fva_txt, fva_cls = _bias_pp(fva)
+    tiles = (
+        ("Total B2C WMAPE — 6-Mo", _bias_wmape_txt(wmape), "",
+         "Volume-weighted error: Σ|Actual−Forecast| ÷ Σ|Actual| over the last "
+         "6 months. Lower = more accurate."),
+        ("Bias — 6-Mo Avg", avg_txt, avg_cls,
+         "Average monthly (Forecast−Actual)/Actual. Negative = chronic "
+         "under-forecast; positive = over-forecast."),
+        ("FVA vs Seasonal-Naive", fva_txt, fva_cls,
+         "WMAPE points better than a same-month-last-year guess. "
+         "Positive = the plan adds value over the naive benchmark."),
+    )
+    cards = "".join(
+        f'<div class="dpc-kpi"><div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value {cls}">{_esc_html(val)}</div>'
+        f'<div class="k-desc">{_esc_html(desc)}</div></div>'
+        for label, val, cls, desc in tiles
+    )
+    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
+
+
+def _render_bias_instructions(prior_cycle: str) -> None:
+    """Foldable definitions for the bias section (formulas + flag rules)."""
+    with st.expander("ℹ️ How the bias metrics work", expanded=False):
+        st.markdown(
+            f"**Forecast = Lag 1 (the selected prior cycle, {prior_cycle}) plan "
+            "= Base + R&O** for each month; **Actual = IBP shipments**.  The six "
+            "columns are the months **ending at (and including) the Prior "
+            "Month**.  A month shows only when the prior cycle actually "
+            "forecast it (its horizon overlaps that month); earlier months are "
+            "blank (—), and WMAPE / averages use only the covered months.\n\n"
+            "- **Bias %** = (Forecast − Actual) ÷ Actual.  Negative = "
+            "**under-forecast** (plan below actual); positive = over-forecast.\n"
+            "- **6-Mo Avg** = simple average of the six monthly Bias %.\n"
+            "- **WMAPE** (volume-weighted MAPE) = Σ|Actual − Forecast| ÷ "
+            "Σ|Actual| across the six months.  0% = perfect; it weights big "
+            "SKUs more than a plain average of percentages, so one tiny line "
+            "can't dominate.\n"
+            "- **FVA vs Seasonal-Naive** = WMAPE(same-month-last-year) − "
+            "WMAPE(forecast), in percentage points.  Positive = the plan beats "
+            "just repeating last year (adds value).\n"
+            "- **Flag** — severity from WMAPE: **Priority** ≥ 15%, **Monitor** "
+            "10–15%, else blank; direction from the 6-Mo Avg bias: **Over** if "
+            "> +2pp, **Under** if < −2pp, else Balanced.\n\n"
+            "_Headline WMAPE uses the trailing 6-month window (stable); a single "
+            "month is too noisy to represent accuracy.  The filter above "
+            "(Portfolio Major · Supply Format · Brand) narrows this section too._"
+        )
+
+
+def _render_bias_tree(table: pd.DataFrame, months: tuple[str, ...]) -> None:
+    """Render the foldable Bias-by-segment×month tree."""
+    rows = table.reset_index(drop=True)
+    indent_flags = rows["_indent"].tolist() if "_indent" in rows.columns else []
+
+    def _cls(row: pd.Series) -> str:
+        if str(row.get("_row_id", "")) == "total_b2c":
+            return "total"
+        if int(row.get("_indent", 0) or 0) == 1:
+            return "section"
+        if bool(row.get("_is_subtotal", False)):
+            return "subtotal"
+        if bool(row.get("_is_memo", False)):
+            return "memo"
+        return ""
+
+    def _make_row(i: int, foldable: bool) -> tuple[str, str]:
+        row = rows.iloc[i]
+        parts = [f'<span class="lbl">{_tri_span(foldable)}{_esc_html(row.get(DPC_COL_LABEL, ""))}</span>']
+        for mk in months:
+            txt, c = _bias_fmt_pct(row.get(mk))
+            parts.append(f'<span class="{c}">{_esc_html(txt)}</span>')
+        parts.append(f'<span class="wide">{_bias_spark([row.get(mk) for mk in months])}</span>')
+        avg_txt, avg_c = _bias_fmt_pct(row.get(BIAS_COL_AVG))
+        parts.append(f'<span class="{avg_c}">{_esc_html(avg_txt)}</span>')
+        parts.append(f'<span>{_esc_html(_bias_wmape_txt(row.get(BIAS_COL_WMAPE)))}</span>')
+        fva_txt, fva_c = _bias_pp(row.get(BIAS_COL_FVA))
+        parts.append(f'<span class="{fva_c}">{_esc_html(fva_txt)}</span>')
+        parts.append(
+            f'<span class="wide">'
+            f'{_bias_flag_html(row.get(BIAS_COL_FLAG_DIR), row.get(BIAS_COL_FLAG_SEV))}</span>')
+        return _cls(row), "".join(parts)
+
+    head = ['<span class="lbl">Segment</span>']
+    head += [f"<span>{_esc_html(mk)}</span>" for mk in months]
+    head += ['<span class="wide">Trend</span>', "<span>6-Mo Avg</span>",
+             "<span>WMAPE</span>", "<span>FVA</span>", '<span class="wide">Flag</span>']
+    header = '<div class="rw hdr">' + "".join(head) + "</div>"
+    body = _foldable_tree_body(len(rows), indent_flags, _make_row)
+    st.markdown(
+        _BIAS_CSS + '<div class="bias"><div class="bias-in">'
+        + header + "".join(body) + "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_forecast_bias(
+    sig_key: tuple,
+    filters: ComparisonFilters,
+    _tracker_df: pd.DataFrame,
+    _ibp_actuals_df: Optional[pd.DataFrame],
+    _ibp_naive_df: Optional[pd.DataFrame],
+    _pdh_df: Optional[pd.DataFrame],
+    _item_master_df: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
+    """Cache the forecast-bias build (native tuple to dodge the dataclass-pickle hazard)."""
+    res = build_forecast_bias_table(
+        _tracker_df, _ibp_actuals_df, _ibp_naive_df, _pdh_df, filters,
+        item_master_df=_item_master_df,
+    )
+    return res.table, res.months, res.available
+
+
+def _render_forecast_bias_section(
+    tracker_df: pd.DataFrame,
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+) -> None:
+    """Render the Forecast Bias (Lag 1) section — tiles + foldable segment tree."""
+    st.markdown(
+        f"#### 🎯 Forecast Bias — Lag 1 (prior cycle {filters.prior_cycle}) "
+        "by Segment × Month")
+
+    # Actuals for the 6 bias months + the seasonal-naive (same months −12mo).
+    bias_cur = _last_n_months_local(filters.prior_month, 6)
+    ibp_actuals_df, _ = _load_demand_comparison_ibp(months=tuple(sorted(bias_cur)))
+    ibp_naive_df, _ = _load_demand_comparison_ibp(
+        months=tuple(sorted(_shift_year_back(m) for m in bias_cur)))
+
+    sig = (
+        _signature_for(tracker_df), _signature_for(ibp_actuals_df),
+        _signature_for(ibp_naive_df), _signature_for(pdh_df),
+        _signature_for(item_master_df), filters.prior_cycle,
+        filters.prior_month.isoformat(),
+        tuple(sorted(filters.combo_filter)),
+    )
+    table, months, available = _cached_forecast_bias(
+        sig, filters, tracker_df, ibp_actuals_df, ibp_naive_df, pdh_df, item_master_df)
+
+    if table is None or table.empty or not available:
+        st.info(
+            "ℹ️ No data to compute forecast bias for the selected Prior Month "
+            "and cycle — check that IBP Shipments and the prior-cycle plan are "
+            "populated."
+        )
+        return
+
+    by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
+    _render_bias_tiles(by_id.get("total_b2c"))
+    _render_bias_instructions(filters.prior_cycle)
+    _render_bias_tree(table, months)
 
 
 def _render_demand_comparison_table(result) -> None:
@@ -6644,28 +6928,6 @@ def _render_demand_driver_drill_down(
 #   * "same dark blue on UI" = #1f4e79 (the stitched MoM chart's dark blue,
 #     used just below this table), light-blue Total B2C, light-orange section
 #     rows — a banded Total / Difference / % header, like the source workbook.
-_PMAF_NAVY = "#1f4e79"
-_PMAF_CSS = f"""
-<style>
-.pmaf {{overflow-x:auto; margin:.25rem 0 .75rem;}}
-.pmaf table {{border-collapse:collapse; width:100%; font-size:.92rem;
-  background:#ffffff; color:#1a1a1a;}}
-.pmaf th, .pmaf td {{padding:4px 10px; white-space:nowrap;}}
-.pmaf thead th {{background:{_PMAF_NAVY}; color:#ffffff; font-weight:700;
-  text-align:right; border:1px solid #2f5f8f;}}
-.pmaf thead th.lbl {{text-align:left;}}
-.pmaf tbody td {{border-bottom:1px solid #e8e8e8; text-align:right;
-  background:#ffffff;}}
-.pmaf td.lbl {{text-align:left;}}
-.pmaf .grp {{border-left:2px solid {_PMAF_NAVY};}}
-.pmaf tr.total td {{background:#dce6f1; font-weight:700;}}
-.pmaf tr.section td {{background:#f8cbad; font-weight:700;}}
-.pmaf tr.sub td {{font-weight:600;}}
-.pmaf tr.memo td {{font-style:italic; color:#555555;}}
-</style>
-"""
-
-
 def _fmt_pmaf_lbs(value: object) -> str:
     try:
         num = float(value)
@@ -6695,75 +6957,58 @@ def _fmt_pmaf_pct(value: object) -> str:
 
 
 def _render_pmaf_html(table: pd.DataFrame, *, prior_cycle: str, prior_month: date) -> None:
-    """Render Prior Month Actual vs Fcst as the screenshot-styled HTML table.
+    """Render Prior Month Actual vs Fcst as a natively-foldable ``<details>`` tree.
 
-    Two-row banded header (Total {forecast, Ordered, Shipped} · Difference
-    {Ordered, Shipped} · % {Ordered, Shipped}), dark-blue header, light-blue
-    Total B2C, light-orange Portfolio-Major section rows, bold subtotals and
-    italic memo rows.  Read-only (edits/exports happen via the CSV download).
+    Same row hierarchy + folding as the detailed comparison table (click a
+    Portfolio-Major row to collapse its children).  Columns: the prior-cycle
+    forecast, Ordered / Shipped, their differences, and %.  Read-only (edits /
+    exports happen via the CSV download).
     """
     fcst_label = f"{prior_cycle} Forecast"
-    # (column id, header label, value formatter) grouped under the band names.
-    groups: tuple[tuple[str, tuple[tuple[str, str, object], ...]], ...] = (
-        ("Total", (
-            (PMAF_COL_PRIOR_PLAN, fcst_label, _fmt_pmaf_lbs),
-            (PMAF_COL_ORDERED, "Ordered", _fmt_pmaf_lbs),
-            (PMAF_COL_SHIPPED, "Shipped", _fmt_pmaf_lbs),
-        )),
-        ("Difference", (
-            (PMAF_COL_ORDERED_DIFF, "Ordered", _fmt_pmaf_diff),
-            (PMAF_COL_SHIPPED_DIFF, "Shipped", _fmt_pmaf_diff),
-        )),
-        ("%", (
-            (PMAF_COL_ORDERED_PCT, "Ordered", _fmt_pmaf_pct),
-            (PMAF_COL_SHIPPED_PCT, "Shipped", _fmt_pmaf_pct),
-        )),
+    # (column id, header label, value formatter) — one flat header row (the
+    # labels are self-describing, matching the detailed table's single header).
+    cols: tuple[tuple[str, str, object], ...] = (
+        (PMAF_COL_PRIOR_PLAN, fcst_label, _fmt_pmaf_lbs),
+        (PMAF_COL_ORDERED, "Ordered", _fmt_pmaf_lbs),
+        (PMAF_COL_SHIPPED, "Shipped", _fmt_pmaf_lbs),
+        (PMAF_COL_ORDERED_DIFF, "Ordered Diff.", _fmt_pmaf_diff),
+        (PMAF_COL_SHIPPED_DIFF, "Shipped Diff.", _fmt_pmaf_diff),
+        (PMAF_COL_ORDERED_PCT, "Ordered %", _fmt_pmaf_pct),
+        (PMAF_COL_SHIPPED_PCT, "Shipped %", _fmt_pmaf_pct),
     )
-    cols = [(cid, fmt) for _g, gcols in groups for (cid, _lbl, fmt) in gcols]
-    group_start = {gcols[0][0] for _g, gcols in groups}  # first col of each band
+    rows = table.reset_index(drop=True)
+    indent_flags = rows["_indent"].tolist() if "_indent" in rows.columns else []
 
-    # ── Header: band row + sub-column row ─────────────────────────
-    band = [f'<th class="lbl">{_esc_html(prior_month.strftime("%B %Y"))}</th>']
-    for gname, gcols in groups:
-        band.append(f'<th class="grp" colspan="{len(gcols)}">{_esc_html(gname)}</th>')
-    sub = ['<th class="lbl">Millions of lbs.</th>']
-    for _g, gcols in groups:
-        for cid, lbl, _fmt in gcols:
-            cls = ' class="grp"' if cid in group_start else ""
-            sub.append(f'<th{cls}>{_esc_html(lbl)}</th>')
+    def _cls(row: pd.Series) -> str:
+        if str(row.get("_row_id", "")) == "total_b2c":
+            return "total"
+        if int(row.get("_indent", 0) or 0) == 1:      # Portfolio Major (incl. Butter)
+            return "section"
+        if bool(row.get("_is_subtotal", False)):
+            return "subtotal"
+        if bool(row.get("_is_memo", False)):
+            return "memo"
+        return ""
 
-    # ── Body rows ─────────────────────────────────────────────────
-    body: list[str] = []
-    for _idx, row in table.iterrows():
-        row_id = str(row.get("_row_id", ""))
-        indent = int(row.get("_indent", 0) or 0)
-        is_sub = bool(row.get("_is_subtotal", False))
-        is_memo = bool(row.get("_is_memo", False))
-        if row_id == "total_b2c":
-            cls = "total"
-        elif indent == 1:
-            # Every indent-1 row is a Portfolio Major section (orange + bold),
-            # whether it's a subtotal (ESL, Cultured, …) or a leaf (Butter).
-            cls = "section"
-        elif is_sub:
-            cls = "sub"
-        elif is_memo:
-            cls = "memo"
-        else:
-            cls = ""
-        tr = f'<tr class="{cls}">' if cls else "<tr>"
-        cells = [f'<td class="lbl">{_esc_html(row.get(DPC_COL_LABEL, ""))}</td>']
-        for cid, fmt in cols:
-            grp = ' class="grp"' if cid in group_start else ""
-            cells.append(f'<td{grp}>{fmt(row.get(cid))}</td>')
-        body.append(tr + "".join(cells) + "</tr>")
+    def _make_row(i: int, foldable: bool) -> tuple[str, str]:
+        row = rows.iloc[i]
+        cells = f'<span class="lbl">{_tri_span(foldable)}{_esc_html(row.get(DPC_COL_LABEL, ""))}</span>' + "".join(
+            # formatters may emit safe HTML (coloured spans) → not escaped.
+            f"<span>{fmt(row.get(cid))}</span>" for cid, _lbl, fmt in cols
+        )
+        return _cls(row), cells
 
-    html = (
-        f'{_PMAF_CSS}<div class="pmaf"><table>'
-        f'<thead><tr>{"".join(band)}</tr><tr>{"".join(sub)}</tr></thead>'
-        f'<tbody>{"".join(body)}</tbody></table></div>'
+    header = (
+        f'<div class="rw hdr"><span class="lbl">{_esc_html(prior_month.strftime("%B %Y"))}</span>'
+        + "".join(f"<span>{_esc_html(lbl)}</span>" for _cid, lbl, _fmt in cols)
+        + "</div>"
     )
-    st.markdown(html, unsafe_allow_html=True)
+    parts = [header] + _foldable_tree_body(len(rows), indent_flags, _make_row)
+    st.markdown(
+        _DPC_TREE_CSS + '<div class="dpc-tree"><div class="dpc-tree-in">'
+        + "".join(parts) + "</div></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _render_prior_month_actual_vs_fcst_table(

@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -1691,6 +1692,42 @@ class EnrichedSources:
     butter_catalog: tuple[tuple[str, str], ...] = ()
 
 
+def _build_augmented_dim_frame(
+    tracker_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, Optional[str]]:
+    """Return ``(item→dim frame, pdh_warning)`` used to classify every source.
+
+    Dims come straight off the tracker (planned items).  For a legacy tracker
+    without the dim columns we fall back entirely to the PDH → RO_Item_Master
+    cascade.  Otherwise we AUGMENT the tracker map with catalog dims for items
+    absent from the tracker — so UNPLANNED SKUs that ship/order (e.g. Butter
+    Chips / Elgin Solid / Private) classify into the right leaf instead of
+    vanishing into the "not captured" log.  Tracker dims always win on a clash.
+    """
+    dim_frame = build_item_dim_frame_from_tracker(tracker_df)
+    pdh_warning: Optional[str] = None
+    if dim_frame.empty:
+        dim_frame = build_item_dim_frame_cascade(pdh_df, item_master_df)
+        if dim_frame.empty:
+            pdh_warning = (
+                "The tracker carries no Portfolio Major / Supply Format / "
+                "Portfolio Minor columns and neither PDH (qry_pdh.csv) nor "
+                "RO_Item_Master.csv could resolve any item — categorisation "
+                "is blank, so every row is zero.  Regenerate the Demand Plan "
+                "files (they now carry these columns) or check the PDH / "
+                "RO_Item_Master exports."
+            )
+        return dim_frame, pdh_warning
+    catalog = build_item_dim_frame_cascade(pdh_df, item_master_df)
+    if not catalog.empty:
+        missing = catalog[~catalog["__item_key"].isin(dim_frame["__item_key"])]
+        if not missing.empty:
+            dim_frame = pd.concat([dim_frame, missing], ignore_index=True)
+    return dim_frame, pdh_warning
+
+
 def build_enriched_sources(
     tracker_df: pd.DataFrame,
     ibp_df: Optional[pd.DataFrame],
@@ -1718,32 +1755,8 @@ def build_enriched_sources(
     files are regenerated.  ``pdh_df`` / ``item_master_df`` are therefore only
     consulted on that fallback path.
     """
-    dim_frame = build_item_dim_frame_from_tracker(tracker_df)
-    pdh_warning: Optional[str] = None
-    if dim_frame.empty:
-        # Legacy tracker (no dim columns yet) → re-join PDH/RO_Item_Master.
-        dim_frame = build_item_dim_frame_cascade(pdh_df, item_master_df)
-        if dim_frame.empty:
-            pdh_warning = (
-                "The tracker carries no Portfolio Major / Supply Format / "
-                "Portfolio Minor columns and neither PDH (qry_pdh.csv) nor "
-                "RO_Item_Master.csv could resolve any item — categorisation "
-                "is blank, so every row is zero.  Regenerate the Demand Plan "
-                "files (they now carry these columns) or check the PDH / "
-                "RO_Item_Master exports."
-            )
-    else:
-        # Augment the (plan-derived) dim map with the item CATALOG for items
-        # that ship/order but were never planned — e.g. Butter Chips / Elgin
-        # Solid / Private.  Tracker dims stay authoritative (they win); catalog
-        # dims (PDH → RO_Item_Master) only fill items absent from the tracker,
-        # so their actuals classify into the right leaf instead of vanishing
-        # into the "not captured" log.  No effect when the catalog is missing.
-        catalog = build_item_dim_frame_cascade(pdh_df, item_master_df)
-        if not catalog.empty:
-            missing = catalog[~catalog["__item_key"].isin(dim_frame["__item_key"])]
-            if not missing.empty:
-                dim_frame = pd.concat([dim_frame, missing], ignore_index=True)
+    dim_frame, pdh_warning = _build_augmented_dim_frame(
+        tracker_df, pdh_df, item_master_df)
     trk = _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched()
     ibp = _enrich_ibp(ibp_df, dim_frame) if ibp_df is not None else _empty_enriched(actuals=True)
     ibp_orders = (
@@ -2976,6 +2989,253 @@ def _assemble_prior_month_actual_vs_fcst_table(
         PMAF_COL_SHIPPED_PCT,
     ]
     return out.loc[:, ordered_cols].rename(columns={COL_LABEL: "Millions of lbs."})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forecast Bias (Lag 1) by Segment × Month
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Compares each segment's ACTUAL shipments against the SELECTED prior cycle's
+# ("Lag 1") forecast (Base + R&O) — ``filters.prior_cycle``, whatever the
+# planner picks, not a hard-coded cycle — for the six months ending at (and
+# including) the Prior Month.  Only months the prior cycle actually forecast
+# (its horizon overlaps them) are scored; earlier months are blank.  Surfaces
+# monthly Bias%, a 6-month average, WMAPE, and Forecast Value Added vs a
+# seasonal-naive (same-month-last-year) benchmark.
+#
+#   Bias%(m)   = (Forecast(m) − Actual(m)) / Actual(m)   (− = under-forecast)
+#   6-Mo Avg   = simple mean of the monthly Bias%
+#   WMAPE      = Σ|Actual − Forecast| / Σ|Actual|         (volume-weighted; 0 best)
+#   FVA vs SN  = WMAPE(seasonal-naive) − WMAPE(forecast)  (pp; + = beats naive)
+
+BIAS_COL_AVG: str        = "_avg_bias"
+BIAS_COL_WMAPE: str      = "_wmape"
+BIAS_COL_FVA: str        = "_fva"
+BIAS_COL_FLAG_DIR: str   = "_flag_dir"
+BIAS_COL_FLAG_SEV: str   = "_flag_sev"
+
+# Flag thresholds (planner-confirmed): severity from WMAPE, direction from the
+# 6-month average bias.
+_BIAS_WMAPE_PRIORITY: float = 0.15
+_BIAS_WMAPE_MONITOR: float  = 0.10
+_BIAS_DIR_BAND: float       = 0.02   # ±2 pp around zero reads as "Balanced"
+
+BIAS_FLAG_PRIORITY: str = "Priority"
+BIAS_FLAG_MONITOR: str  = "Monitor"
+BIAS_DIR_OVER: str      = "Over"
+BIAS_DIR_UNDER: str     = "Under"
+BIAS_DIR_BALANCED: str  = "Balanced"
+
+
+@dataclass(frozen=True)
+class ForecastBiasResult:
+    """Output of :func:`build_forecast_bias_table`.
+
+    ``table`` carries the metadata columns (``_row_id`` / ``_indent`` /
+    ``_is_subtotal`` / ``_is_memo`` / ``Segment``), one Bias% column per month
+    (keyed ``YYYY-MM``), and the derived ``_avg_bias`` / ``_wmape`` / ``_fva`` /
+    flag columns.  ``months`` lists the six month keys oldest→newest.
+    """
+    table: pd.DataFrame
+    months: tuple[str, ...]
+    available: bool = False
+
+
+def _add_months(d: date, k: int) -> date:
+    """First-of-month *d* shifted by *k* calendar months (k may be negative)."""
+    idx = (d.year * 12 + (d.month - 1)) + k
+    return date(idx // 12, idx % 12 + 1, 1)
+
+
+def _months_back(anchor: date, n: int) -> list[date]:
+    """``n`` first-of-month dates ending at (and including) *anchor*, oldest→newest."""
+    a = anchor.replace(day=1)
+    return [_add_months(a, -(n - 1 - i)) for i in range(n)]
+
+
+def _bias_flag(avg_bias: float, wmape: float) -> tuple[str, str]:
+    """Return ``(direction, severity)`` for the segment's Flag cell."""
+    if avg_bias is None or (isinstance(avg_bias, float) and math.isnan(avg_bias)):
+        direction = ""
+    elif avg_bias > _BIAS_DIR_BAND:
+        direction = BIAS_DIR_OVER
+    elif avg_bias < -_BIAS_DIR_BAND:
+        direction = BIAS_DIR_UNDER
+    else:
+        direction = BIAS_DIR_BALANCED
+    if wmape is None or (isinstance(wmape, float) and math.isnan(wmape)):
+        severity = ""
+    elif wmape >= _BIAS_WMAPE_PRIORITY:
+        severity = BIAS_FLAG_PRIORITY
+    elif wmape >= _BIAS_WMAPE_MONITOR:
+        severity = BIAS_FLAG_MONITOR
+    else:
+        severity = ""
+    return direction, severity
+
+
+def _bias_leaf_series(
+    tpl: TemplateRow,
+    trk: pd.DataFrame,
+    actuals: pd.DataFrame,
+    naive: pd.DataFrame,
+    prior_cycle: str,
+    bias_months: list[date],
+    naive_months: list[date],
+) -> tuple[list[float], list[float], list[float]]:
+    """Return ``(forecast[], actual[], naive[])`` M-lb series for one leaf.
+
+    Forecast = prior-cycle (Lag-1) Base + R&O; actual / naive are shipments in
+    the bias window and the same-month-a-year-ago window respectively.
+    """
+    if not trk.empty:
+        fmask = (
+            _leaf_mask(trk, tpl)
+            & (trk["cycle"] == prior_cycle)
+            & trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+        )
+        f = [_sum_millions(trk, fmask & (trk["month"] == m)) for m in bias_months]
+    else:
+        f = [0.0] * len(bias_months)
+    if actuals is not None and not actuals.empty:
+        amask = _leaf_mask(actuals, tpl)
+        a = [_sum_millions(actuals, amask & (actuals["month"] == m)) for m in bias_months]
+    else:
+        a = [0.0] * len(bias_months)
+    if naive is not None and not naive.empty:
+        nmask = _leaf_mask(naive, tpl)
+        nvals = [_sum_millions(naive, nmask & (naive["month"] == m)) for m in naive_months]
+    else:
+        nvals = [0.0] * len(naive_months)
+    return f, a, nvals
+
+
+def _sum_leaf_series(
+    tpl: TemplateRow,
+    series_by_row: dict[str, list[float]],
+    template_by_id: dict[str, TemplateRow],
+    n: int,
+) -> list[float]:
+    """Element-wise sum of a subtotal's children series (recursive)."""
+    total = [0.0] * n
+    for child_id in tpl.children:
+        child = template_by_id[child_id]
+        vals = (
+            _sum_leaf_series(child, series_by_row, template_by_id, n)
+            if child.is_subtotal else series_by_row[child_id]
+        )
+        for i in range(n):
+            total[i] += vals[i]
+    return total
+
+
+def build_forecast_bias_table(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_actuals_df: Optional[pd.DataFrame],
+    ibp_naive_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    item_master_df: Optional[pd.DataFrame] = None,
+    n_months: int = 6,
+) -> ForecastBiasResult:
+    """Build the Forecast Bias (Lag 1) by Segment × Month table.
+
+    *ibp_actuals_df* must cover the six months ending at ``filters.prior_month``;
+    *ibp_naive_df* the same months a year earlier (seasonal-naive benchmark).
+    Segments reuse the comparison hierarchy (incl. dynamic Butter detail) and
+    honour the section's Portfolio Major · Supply Format · Brand filter.
+    """
+    prior_month = filters.prior_month.replace(day=1)
+    prior_cycle = filters.prior_cycle
+    bias_months = _months_back(prior_month, n_months)
+    naive_months = [_add_months(m, -12) for m in bias_months]
+    month_keys = tuple(m.strftime("%Y-%m") for m in bias_months)
+
+    dim_frame, _warn = _build_augmented_dim_frame(tracker_df, pdh_df, item_master_df)
+    trk = _apply_dim_filter(
+        _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched(),
+        filters,
+    )
+    actuals = _apply_dim_filter(
+        _enrich_ibp(ibp_actuals_df, dim_frame) if ibp_actuals_df is not None
+        else _empty_enriched(actuals=True),
+        filters,
+    )
+    naive = _apply_dim_filter(
+        _enrich_ibp(ibp_naive_df, dim_frame) if ibp_naive_df is not None
+        else _empty_enriched(actuals=True),
+        filters,
+    )
+
+    template = _build_runtime_template_for_filters(
+        trk, actuals, filters,
+        actual_months=set(bias_months), forecast_months=set(), prior_month=prior_month,
+        butter_catalog=butter_catalog_combos(pdh_df, item_master_df),
+    )
+    template_by_id = {t.row_id: t for t in template}
+
+    # Per-leaf forecast / actual / naive series, then roll subtotals up.
+    fser: dict[str, list[float]] = {}
+    aser: dict[str, list[float]] = {}
+    nser: dict[str, list[float]] = {}
+    for tpl in template:
+        if tpl.is_subtotal:
+            continue
+        fser[tpl.row_id], aser[tpl.row_id], nser[tpl.row_id] = _bias_leaf_series(
+            tpl, trk, actuals, naive, prior_cycle, bias_months, naive_months)
+    for tpl in template:
+        if tpl.is_subtotal:
+            fser[tpl.row_id] = _sum_leaf_series(tpl, fser, template_by_id, n_months)
+            aser[tpl.row_id] = _sum_leaf_series(tpl, aser, template_by_id, n_months)
+            nser[tpl.row_id] = _sum_leaf_series(tpl, nser, template_by_id, n_months)
+
+    # A month is only "covered" when the prior cycle ACTUALLY forecast it
+    # (its horizon overlaps that month).  Months outside the prior cycle's
+    # horizon have no lag-1 forecast at all — treat them as blank (NaN), NOT a
+    # zero forecast (which would read as a bogus −100% bias).  Coverage is
+    # judged on the Total B2C forecast so a segment that genuinely planned zero
+    # in a covered month still shows its real (−100%) bias.
+    total_f = fser.get("total_b2c", [0.0] * n_months)
+    covered = [i for i in range(n_months) if abs(total_f[i]) > 1e-9]
+
+    records: list[dict] = []
+    for tpl in template:
+        f, a, nv = fser[tpl.row_id], aser[tpl.row_id], nser[tpl.row_id]
+        bias = [
+            ((f[i] - a[i]) / a[i]) if (i in covered and abs(a[i]) > 1e-9)
+            else float("nan")
+            for i in range(n_months)
+        ]
+        valid = [bias[i] for i in covered if not math.isnan(bias[i])]
+        avg_bias = (sum(valid) / len(valid)) if valid else float("nan")
+        denom = sum(abs(a[i]) for i in covered)
+        wmape = (sum(abs(a[i] - f[i]) for i in covered) / denom
+                 if denom > 1e-9 else float("nan"))
+        wmape_naive = (sum(abs(a[i] - nv[i]) for i in covered) / denom
+                       if denom > 1e-9 else float("nan"))
+        fva = (wmape_naive - wmape
+               if not (math.isnan(wmape) or math.isnan(wmape_naive)) else float("nan"))
+        direction, severity = _bias_flag(avg_bias, wmape)
+        rec = {
+            COL_ROW_ID: tpl.row_id,
+            COL_INDENT: tpl.indent,
+            COL_IS_SUBTOTAL: tpl.is_subtotal,
+            COL_IS_MEMO: tpl.is_memo,
+            COL_LABEL: _make_indented_label(tpl.label, tpl.indent, tpl.is_memo),
+            BIAS_COL_AVG: round(avg_bias, 4) if not math.isnan(avg_bias) else avg_bias,
+            BIAS_COL_WMAPE: round(wmape, 4) if not math.isnan(wmape) else wmape,
+            BIAS_COL_FVA: round(fva, 4) if not math.isnan(fva) else fva,
+            BIAS_COL_FLAG_DIR: direction,
+            BIAS_COL_FLAG_SEV: severity,
+        }
+        for key, b in zip(month_keys, bias):
+            rec[key] = round(b, 4) if not math.isnan(b) else b
+        records.append(rec)
+
+    table = pd.DataFrame.from_records(records)
+    available = bool(len(table)) and (trk is not None and not trk.empty)
+    return ForecastBiasResult(table=table, months=month_keys, available=available)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

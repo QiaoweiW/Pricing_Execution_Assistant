@@ -699,10 +699,14 @@ class ComparisonFilters:
         UI now drives ``combo_filter`` instead.
     combo_filter
         Optional whitelist of exact ``(portfolio_major, supply_format, brand)``
-        tuples to include — a *concatenated* filter, so you can keep
-        ``Butter · … · Branded`` while dropping ``Butter · … · Private``
-        (which the independent whitelists above cannot express).  Matched on
-        the enriched ``pmaj`` / ``sfmt`` / ``brand`` columns; empty = no filter.
+        tuples to INCLUDE.  Kept for programmatic callers; the UI now drives
+        ``combo_exclude`` instead.
+    combo_exclude
+        Optional set of exact ``(portfolio_major, supply_format, brand)`` tuples
+        to DROP (everything else shown).  This is the search-to-hide filter —
+        e.g. add ``Butter · … · Private`` combos to remove them while keeping
+        ``Butter · … · Branded``.  Matched on the enriched ``pmaj`` / ``sfmt`` /
+        ``brand`` columns; empty = no filter.
     """
     current_cycle: str
     prior_cycle: str
@@ -715,6 +719,7 @@ class ComparisonFilters:
     sfmt_filter: frozenset = frozenset()
     brand_filter: frozenset = frozenset()
     combo_filter: frozenset = frozenset()
+    combo_exclude: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -980,7 +985,7 @@ def _apply_dim_filter(df: pd.DataFrame, filters: "ComparisonFilters") -> pd.Data
     """
     if df is None or df.empty or not (
         filters.pmaj_filter or filters.sfmt_filter or filters.brand_filter
-        or filters.combo_filter
+        or filters.combo_filter or filters.combo_exclude
     ):
         return df
     mask = pd.Series(True, index=df.index)
@@ -990,14 +995,19 @@ def _apply_dim_filter(df: pd.DataFrame, filters: "ComparisonFilters") -> pd.Data
         mask &= df["sfmt"].isin(filters.sfmt_filter)
     if filters.brand_filter and "brand" in df.columns:
         mask &= df["brand"].astype(str).str.strip().isin(filters.brand_filter)
-    if filters.combo_filter and {"pmaj", "sfmt", "brand"}.issubset(df.columns):
+    if (filters.combo_filter or filters.combo_exclude) and \
+            {"pmaj", "sfmt", "brand"}.issubset(df.columns):
         combo = (
             df["pmaj"].astype(str).str.strip() + "␟"
             + df["sfmt"].astype(str).str.strip() + "␟"
             + df["brand"].astype(str).str.strip()
         )
-        wanted = {f"{p}␟{s}␟{b}" for p, s, b in filters.combo_filter}
-        mask &= combo.isin(wanted)
+        if filters.combo_filter:      # include whitelist (programmatic)
+            wanted = {f"{p}␟{s}␟{b}" for p, s, b in filters.combo_filter}
+            mask &= combo.isin(wanted)
+        if filters.combo_exclude:     # search-to-hide exclude list (UI)
+            drop = {f"{p}␟{s}␟{b}" for p, s, b in filters.combo_exclude}
+            mask &= ~combo.isin(drop)
     return df.loc[mask]
 
 
@@ -3039,6 +3049,10 @@ class ForecastBiasResult:
     table: pd.DataFrame
     months: tuple[str, ...]
     available: bool = False
+    # Per-month lag-1 provenance: ``(month_key, cycle, lag, is_fallback)`` —
+    # which cycle supplied each month's forecast, its lag, and whether it was a
+    # backfill (no cycle forecast that month 1-ahead).
+    month_meta: tuple[tuple[str, str, int, bool], ...] = ()
 
 
 def _add_months(d: date, k: int) -> date:
@@ -3047,10 +3061,58 @@ def _add_months(d: date, k: int) -> date:
     return date(idx // 12, idx % 12 + 1, 1)
 
 
+def _month_diff(a: date, b: date) -> int:
+    """Whole calendar months from *a* to *b* (b − a)."""
+    return (b.year * 12 + b.month) - (a.year * 12 + a.month)
+
+
 def _months_back(anchor: date, n: int) -> list[date]:
     """``n`` first-of-month dates ending at (and including) *anchor*, oldest→newest."""
     a = anchor.replace(day=1)
     return [_add_months(a, -(n - 1 - i)) for i in range(n)]
+
+
+def _cycle_horizon_starts(trk: pd.DataFrame) -> dict[str, tuple[date, date]]:
+    """Return ``{cycle: (first_month, last_month)}`` over its Base/R&O rows.
+
+    A cycle's ``first_month`` is its horizon start — the month it forecasts
+    "1-month-ahead" — used to place it on the rolling lag-1 timeline.
+    """
+    if trk is None or trk.empty or "cycle" not in trk.columns:
+        return {}
+    m = trk[trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))]
+    m = m[m["month"].notna()]
+    if m.empty:
+        return {}
+    agg = m.groupby(m["cycle"].astype(str).str.strip())["month"].agg(["min", "max"])
+    return {c: (r["min"], r["max"]) for c, r in agg.iterrows() if c}
+
+
+def _map_lag1_cycles(
+    bias_months: list[date], cyc_range: dict[str, tuple[date, date]],
+) -> list[tuple[Optional[str], Optional[int], bool]]:
+    """Map each actual month to its lag-1 cycle: ``(cycle, lag, is_fallback)``.
+
+    Rolling lag-1: the forecast for month M comes from the cycle whose horizon
+    STARTS at M (the freshest 1-month-ahead view).  Ties on the start month are
+    broken by the lexically-smallest cycle label.  When no cycle starts at M
+    (a gap month), backfill with the nearest EARLIER cycle that still covers M
+    — a longer-lag fallback, flagged so the UI can mark it.  ``(None, None,
+    False)`` when even a backfill is impossible (M predates every cycle).
+    """
+    out: list[tuple[Optional[str], Optional[int], bool]] = []
+    for month in bias_months:
+        exact = sorted(c for c, (start, _mx) in cyc_range.items() if start == month)
+        if exact:
+            out.append((exact[0], 1, False))
+            continue
+        earlier = [(c, s) for c, (s, mx) in cyc_range.items() if s < month <= mx]
+        if earlier:
+            cyc, start = max(earlier, key=lambda cs: (cs[1], cs[0]))
+            out.append((cyc, _month_diff(start, month) + 1, True))
+        else:
+            out.append((None, None, False))
+    return out
 
 
 def _bias_flag(avg_bias: float, wmape: float) -> tuple[str, str]:
@@ -3079,22 +3141,27 @@ def _bias_leaf_series(
     trk: pd.DataFrame,
     actuals: pd.DataFrame,
     naive: pd.DataFrame,
-    prior_cycle: str,
+    month_cycles: list[Optional[str]],
     bias_months: list[date],
     naive_months: list[date],
 ) -> tuple[list[float], list[float], list[float]]:
     """Return ``(forecast[], actual[], naive[])`` M-lb series for one leaf.
 
-    Forecast = prior-cycle (Lag-1) Base + R&O; actual / naive are shipments in
-    the bias window and the same-month-a-year-ago window respectively.
+    Forecast for each month = the ROLLING lag-1 cycle for that month
+    (``month_cycles[i]``) Base + R&O; actual / naive are orders in the bias
+    window and the same-month-a-year-ago window respectively.
     """
     if not trk.empty:
-        fmask = (
+        base = (
             _leaf_mask(trk, tpl)
-            & (trk["cycle"] == prior_cycle)
             & trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
         )
-        f = [_sum_millions(trk, fmask & (trk["month"] == m)) for m in bias_months]
+        trk_cyc = trk["cycle"].astype(str).str.strip()
+        f = [
+            _sum_millions(trk, base & (trk_cyc == cyc) & (trk["month"] == m))
+            if cyc is not None else 0.0
+            for cyc, m in zip(month_cycles, bias_months)
+        ]
     else:
         f = [0.0] * len(bias_months)
     if actuals is not None and not actuals.empty:
@@ -3139,18 +3206,20 @@ def build_forecast_bias_table(
     item_master_df: Optional[pd.DataFrame] = None,
     n_months: int = 6,
 ) -> ForecastBiasResult:
-    """Build the Forecast Bias (Lag 1) by Segment × Month table.
+    """Build the Forecast Bias (rolling Lag 1) by Segment × Month table.
 
-    "Actual" is **IBP Orders** (ordered lbs) — bias/WMAPE compare the prior
-    cycle's forecast to what customers actually ordered.  *ibp_actuals_df* must
-    be the ORDERS covering the six months ending at ``filters.prior_month``;
+    **Rolling lag-1**: each month's forecast comes from the cycle whose horizon
+    starts that month (the freshest 1-month-ahead view) — NOT a single fixed
+    cycle.  Gap months backfill to the nearest earlier cycle (longer lag,
+    flagged).  "Actual" is **IBP Orders** (ordered lbs); bias/WMAPE compare the
+    lag-1 forecast to what customers ordered.  *ibp_actuals_df* must be the
+    ORDERS covering the six months ending at ``filters.prior_month``;
     *ibp_naive_df* the ORDERS for the same months a year earlier (seasonal-naive
     benchmark).  Segments reuse the comparison hierarchy (incl. dynamic Butter
     detail) and honour the section's Portfolio Major · Supply Format · Brand
     filter.
     """
     prior_month = filters.prior_month.replace(day=1)
-    prior_cycle = filters.prior_cycle
     bias_months = _months_back(prior_month, n_months)
     naive_months = [_add_months(m, -12) for m in bias_months]
     month_keys = tuple(m.strftime("%Y-%m") for m in bias_months)
@@ -3159,6 +3228,13 @@ def build_forecast_bias_table(
     trk = _apply_dim_filter(
         _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched(),
         filters,
+    )
+    # Rolling lag-1 cycle per month (freshest 1-month-ahead view; gaps backfill).
+    lag1_map = _map_lag1_cycles(bias_months, _cycle_horizon_starts(trk))
+    month_cycles = [cyc for cyc, _lag, _fb in lag1_map]
+    month_meta = tuple(
+        (key, cyc or "", lag or 0, fb)
+        for key, (cyc, lag, fb) in zip(month_keys, lag1_map)
     )
     # "Actual" here is ORDERS (IBP Orders), so enrich with the ordered-qty
     # column — bias/WMAPE measure forecast vs what customers ordered.
@@ -3188,21 +3264,23 @@ def build_forecast_bias_table(
         if tpl.is_subtotal:
             continue
         fser[tpl.row_id], aser[tpl.row_id], nser[tpl.row_id] = _bias_leaf_series(
-            tpl, trk, actuals, naive, prior_cycle, bias_months, naive_months)
+            tpl, trk, actuals, naive, month_cycles, bias_months, naive_months)
     for tpl in template:
         if tpl.is_subtotal:
             fser[tpl.row_id] = _sum_leaf_series(tpl, fser, template_by_id, n_months)
             aser[tpl.row_id] = _sum_leaf_series(tpl, aser, template_by_id, n_months)
             nser[tpl.row_id] = _sum_leaf_series(tpl, nser, template_by_id, n_months)
 
-    # A month is only "covered" when the prior cycle ACTUALLY forecast it
-    # (its horizon overlaps that month).  Months outside the prior cycle's
-    # horizon have no lag-1 forecast at all — treat them as blank (NaN), NOT a
-    # zero forecast (which would read as a bogus −100% bias).  Coverage is
+    # A month is only "covered" when a lag-1 (or backfill) cycle supplied a
+    # forecast for it.  Uncovered months (no cycle at all) render blank (NaN),
+    # NOT a zero forecast — which would read as a bogus −100% bias.  Coverage is
     # judged on the Total B2C forecast so a segment that genuinely planned zero
     # in a covered month still shows its real (−100%) bias.
     total_f = fser.get("total_b2c", [0.0] * n_months)
-    covered = [i for i in range(n_months) if abs(total_f[i]) > 1e-9]
+    covered = [
+        i for i in range(n_months)
+        if month_cycles[i] is not None and abs(total_f[i]) > 1e-9
+    ]
 
     records: list[dict] = []
     for tpl in template:
@@ -3240,7 +3318,8 @@ def build_forecast_bias_table(
 
     table = pd.DataFrame.from_records(records)
     available = bool(len(table)) and (trk is not None and not trk.empty)
-    return ForecastBiasResult(table=table, months=month_keys, available=available)
+    return ForecastBiasResult(
+        table=table, months=month_keys, available=available, month_meta=month_meta)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3454,12 +3533,18 @@ def _filter_butter_combos(
         return []
     sfmt_wl = {s.casefold() for s in filters.sfmt_filter} if filters.sfmt_filter else None
     brand_wl = set(filters.brand_filter) if filters.brand_filter else None
-    # Concatenated combo filter: which Butter (sfmt, brand) tuples are allowed.
+    # Concatenated combo filters (Butter combos only): include whitelist and/or
+    # search-to-hide exclude set, keyed on (sfmt casefold, brand).
+    butter_names = {x.casefold() for x in _BUTTER}
     combo_wl = (
         {(s.casefold(), b) for p, s, b in filters.combo_filter
-         if p.casefold() in {x.casefold() for x in _BUTTER}}
+         if p.casefold() in butter_names}
         if filters.combo_filter else None
     )
+    combo_drop = {
+        (s.casefold(), b) for p, s, b in filters.combo_exclude
+        if p.casefold() in butter_names
+    }
     out: list[tuple[str, str]] = []
     for brand, sfmt in combos:
         if brand_wl and brand not in brand_wl:
@@ -3467,6 +3552,8 @@ def _filter_butter_combos(
         if sfmt_wl and sfmt.casefold() not in sfmt_wl:
             continue
         if combo_wl is not None and (sfmt.casefold(), brand) not in combo_wl:
+            continue
+        if (sfmt.casefold(), brand) in combo_drop:
             continue
         out.append((brand, sfmt))
     return out

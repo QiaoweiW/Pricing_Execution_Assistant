@@ -5202,6 +5202,7 @@ def _render_demand_plan_comparison_fragment() -> None:
     # Everything here reads the FILTERED ``result`` / ``kpis`` — the Portfolio
     # Major · Supply Format · Brand filter narrows the summary table AND the
     # metric tiles, not just the detailed table below.
+    st.markdown("#### 📈 YoY Comparison")
     _render_comparison_summary_col_picker()
     kpis = build_comparison_kpis(
         result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
@@ -5212,12 +5213,13 @@ def _render_demand_plan_comparison_fragment() -> None:
 
     st.markdown("---")
 
-    # 6d. Forecast Bias (Lag 1 = C3) by Segment × Month — its own section,
-    #     divider-bracketed between the volume-mix table and the detailed table.
+    # 6d. Forecast Bias (rolling lag-1) by Segment × Month — its own section,
+    #     divider-bracketed between the YoY block and the cycle-over-cycle table.
     _render_forecast_bias_section(tracker_df, pdh_df, item_master_df, filters)
 
     st.markdown("---")
 
+    st.markdown("#### 🔄 Cycle over Cycle Comparison")
     _render_comparison_kpis_walk(kpis, filters)
     # 7. Render the comparison table + download / save.
     _render_demand_comparison_table(result)
@@ -5462,13 +5464,12 @@ def _render_demand_comparison_filters(
         help="The single month used for the Prior-Month columns.",
     )
 
-    # ── Concatenated Portfolio Major · Supply Format · Brand filter ─────
-    # ONE multiselect of exact combinations (default = everything), so a
-    # single combo can be dropped — e.g. keep "Butter · … · Branded" while
-    # removing "Butter · … · Private", which independent per-dimension
-    # whitelists can't express.  Deselecting narrows the whole summary
-    # (incl. Total B2C); a full selection means "no filter".
-    combo_filter: frozenset = frozenset()
+    # ── Search-to-HIDE Portfolio Major · Supply Format · Brand filter ───
+    # ONE multiselect that starts EMPTY (everything shown); type to search a
+    # combination and pick it to REMOVE it — e.g. type "butter private" and
+    # drop those rows while keeping Butter · … · Branded.  Much easier than
+    # deselecting from ~60 chips.  Empty = no filter.
+    combo_exclude: frozenset = frozenset()
     combos = list(combo_options or [])
     # HTST is the Fresh Milk portfolio major — show the friendly name.
     labels_to_combo = {
@@ -5478,21 +5479,21 @@ def _render_demand_comparison_filters(
     all_labels = sorted(labels_to_combo)
     if all_labels:
         st.markdown(
-            "**Filter by Portfolio Major · Supply Format · Brand** "
-            "_(all selected = no filter; deselect a combination to drop it — "
-            "e.g. remove the **Butter · … · Private** rows while keeping "
-            "Butter · … · Branded)_"
+            "**Hide combinations — Portfolio Major · Supply Format · Brand** "
+            "_(empty = show all; search a name and pick it to remove — e.g. "
+            "type **butter private** to drop those rows)_"
         )
-        sel = st.multiselect(
-            "Combinations", options=all_labels, default=all_labels,
-            key="dpc_combo_filter", label_visibility="collapsed",
-            help="Powders / Cheese / Bulk Fluid are excluded from this list "
-                 "(non-B2C).  Butter includes catalog combinations (Private / "
+        hidden = st.multiselect(
+            "Hide combinations", options=all_labels,
+            key="dpc_combo_exclude", label_visibility="collapsed",
+            placeholder="Search to hide, e.g. “butter private”…",
+            help="Type to search; each pick is REMOVED from every table in "
+                 "this section.  Powders / Cheese / Bulk Fluid aren't listed "
+                 "(non-B2C); Butter includes catalog combinations (Private / "
                  "Chips / Elgin Solid) even with no plan.",
         )
-        # Only narrow on a strict, non-empty subset (full selection = no filter).
-        if sel and set(sel) != set(all_labels):
-            combo_filter = frozenset(labels_to_combo[s] for s in sel)
+        combo_exclude = frozenset(
+            labels_to_combo[h] for h in hidden if h in labels_to_combo)
     else:
         st.caption(
             "ℹ️ **The Portfolio Major · Supply Format · Brand filter will "
@@ -5529,7 +5530,7 @@ def _render_demand_comparison_filters(
         forecast_start=forecast_start,
         forecast_end=forecast_end,
         prior_month=prior_month,
-        combo_filter=combo_filter,
+        combo_exclude=combo_exclude,
     )
 
 
@@ -6394,40 +6395,56 @@ def _render_bias_tiles(total: pd.Series | None) -> None:
     st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
 
 
-def _render_bias_instructions(prior_cycle: str) -> None:
-    """Foldable definitions for the bias section (formulas + flag rules)."""
-    with st.expander("ℹ️ How the bias metrics work", expanded=False):
+def _render_bias_instructions(month_meta: tuple) -> None:
+    """Definitions + formulas for the bias section (rolling lag-1)."""
+    mapping = ", ".join(
+        f"{k}←{cyc}" + (f" (lag {lag})*" if fb else "")
+        for k, cyc, lag, fb in month_meta if cyc
+    )
+    with st.expander("ℹ️ How the metrics and columns are built", expanded=False):
         st.markdown(
-            f"**Forecast = Lag 1 (the selected prior cycle, {prior_cycle}) plan "
-            "= Base + R&O** for each month; **Actual = IBP Orders (ordered "
-            "lbs)** — bias measures the plan vs what customers ordered.  The six "
-            "columns are the months **ending at (and including) the Prior "
-            "Month**.  A month shows only when the prior cycle actually "
-            "forecast it (its horizon overlaps that month); earlier months are "
-            "blank (—), and WMAPE / averages use only the covered months.\n\n"
+            "**Rolling lag-1 forecast.**  For each actual month, the forecast is "
+            "taken from the planning cycle whose horizon **starts that month** — "
+            "the freshest *one-month-ahead* view — rather than a single fixed "
+            "cycle.  This is the industry-standard lag-1 accuracy series: every "
+            "column is the same 1-step-ahead horizon, so months are comparable.\n"
+            + (f"\n_This run's source per month: {mapping}._\n" if mapping else "")
+            + "\n"
+            "- **Forecast** = that month's lag-1 cycle plan = **Base + R&O**.\n"
+            "- **Actual** = **IBP Orders (ordered lbs)** — bias measures the "
+            "plan vs what customers actually ordered.\n"
+            "- The six columns are the months **ending at (and including) the "
+            "Prior Month**.  A month with no cycle at exactly lag-1 is "
+            "**backfilled** from the nearest earlier cycle (a longer lag), "
+            "marked with an asterisk (*).\n\n"
+            "**Formulas**\n"
             "- **Bias %** = (Forecast − Actual) ÷ Actual.  Negative = "
-            "**under-forecast** (plan below actual); positive = over-forecast.\n"
-            "- **6-Mo Avg** = simple average of the six monthly Bias %.\n"
+            "**under-forecast** (ordered more than planned); positive = "
+            "over-forecast.\n"
+            "- **6-Mo Avg** = simple average of the monthly Bias %.\n"
             "- **WMAPE** (volume-weighted MAPE) = Σ|Actual − Forecast| ÷ "
-            "Σ|Actual| across the six months.  0% = perfect; it weights big "
+            "Σ|Actual| across the shown months.  0% = perfect; it weights big "
             "SKUs more than a plain average of percentages, so one tiny line "
-            "can't dominate.\n"
-            "- **FVA vs Seasonal-Naive** = WMAPE(same-month-last-year) − "
+            "can't dominate — the most representative single accuracy number.\n"
+            "- **FVA vs Seasonal-Naive** = WMAPE(same-month-last-year orders) − "
             "WMAPE(forecast), in percentage points.  Positive = the plan beats "
-            "just repeating last year (adds value).\n"
+            "just repeating last year (adds value); ≤ 0 = it doesn't.\n"
             "- **Flag** — severity from WMAPE: **Priority** ≥ 15%, **Monitor** "
             "10–15%, else blank; direction from the 6-Mo Avg bias: **Over** if "
             "> +2pp, **Under** if < −2pp, else Balanced.\n\n"
-            "_Headline WMAPE uses the trailing 6-month window (stable); a single "
-            "month is too noisy to represent accuracy.  The filter above "
-            "(Portfolio Major · Supply Format · Brand) narrows this section too._"
+            "_The search-to-hide filter (Portfolio Major · Supply Format · "
+            "Brand) at the top narrows this section too._"
         )
 
 
-def _render_bias_tree(table: pd.DataFrame, months: tuple[str, ...]) -> None:
-    """Render the foldable Bias-by-segment×month tree."""
+def _render_bias_tree(
+    table: pd.DataFrame, months: tuple[str, ...], month_meta: tuple,
+) -> None:
+    """Render the foldable Bias-by-segment×month tree (fallback months marked *)."""
     rows = table.reset_index(drop=True)
     indent_flags = rows["_indent"].tolist() if "_indent" in rows.columns else []
+    # month_key -> (cycle, lag, is_fallback)
+    meta_by_key = {k: (cyc, lag, fb) for k, cyc, lag, fb in month_meta}
 
     def _cls(row: pd.Series) -> str:
         if str(row.get("_row_id", "")) == "total_b2c":
@@ -6458,7 +6475,10 @@ def _render_bias_tree(table: pd.DataFrame, months: tuple[str, ...]) -> None:
         return _cls(row), "".join(parts)
 
     head = ['<span class="lbl">Segment</span>']
-    head += [f"<span>{_esc_html(mk)}</span>" for mk in months]
+    head += [
+        f'<span>{_esc_html(mk)}{"*" if meta_by_key.get(mk, ("", 0, False))[2] else ""}</span>'
+        for mk in months
+    ]
     head += ['<span class="wide">Trend</span>', "<span>6-Mo Avg</span>",
              "<span>WMAPE</span>", "<span>FVA</span>", '<span class="wide">Flag</span>']
     header = '<div class="rw hdr">' + "".join(head) + "</div>"
@@ -6468,6 +6488,17 @@ def _render_bias_tree(table: pd.DataFrame, months: tuple[str, ...]) -> None:
         + header + "".join(body) + "</div></div>",
         unsafe_allow_html=True,
     )
+    # Footnote: which cycle fed each month's lag-1 forecast (+ backfill marks).
+    srcs = ", ".join(
+        f"{k}←{cyc}" + (f" (lag {lag})*" if fb else "")
+        for k, cyc, lag, fb in month_meta if cyc
+    )
+    if srcs:
+        st.caption(
+            f"Lag-1 source per month: {srcs}.  \\* = no cycle forecast that "
+            "month one-month-ahead, so the nearest earlier cycle is used "
+            "(longer lag)."
+        )
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
@@ -6479,13 +6510,13 @@ def _cached_forecast_bias(
     _ibp_naive_df: Optional[pd.DataFrame],
     _pdh_df: Optional[pd.DataFrame],
     _item_master_df: Optional[pd.DataFrame],
-) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
+) -> tuple[pd.DataFrame, tuple[str, ...], bool, tuple]:
     """Cache the forecast-bias build (native tuple to dodge the dataclass-pickle hazard)."""
     res = build_forecast_bias_table(
         _tracker_df, _ibp_actuals_df, _ibp_naive_df, _pdh_df, filters,
         item_master_df=_item_master_df,
     )
-    return res.table, res.months, res.available
+    return res.table, res.months, res.available, res.month_meta
 
 
 def _render_forecast_bias_section(
@@ -6494,10 +6525,8 @@ def _render_forecast_bias_section(
     item_master_df: Optional[pd.DataFrame],
     filters: ComparisonFilters,
 ) -> None:
-    """Render the Forecast Bias (Lag 1) section — tiles + foldable segment tree."""
-    st.markdown(
-        f"#### 🎯 Forecast Bias — Lag 1 (prior cycle {filters.prior_cycle}) "
-        "by Segment × Month")
+    """Render the Forecast Bias (rolling Lag 1) section — tiles + foldable tree."""
+    st.markdown("#### 🎯 Forecast Bias — Rolling Lag 1 by Segment × Month")
 
     # "Actual" = IBP ORDERS for the 6 bias months + the seasonal-naive
     # benchmark (the same months a year earlier).
@@ -6506,28 +6535,29 @@ def _render_forecast_bias_section(
     ibp_naive_df, _ = _load_demand_comparison_ibp_orders(
         months=tuple(sorted(_shift_year_back(m) for m in bias_cur)))
 
+    # Rolling lag-1 depends on the tracker's cycle horizons (captured by the
+    # tracker signature) + the Prior Month + the search-to-hide filter.
     sig = (
         _signature_for(tracker_df), _signature_for(ibp_actuals_df),
         _signature_for(ibp_naive_df), _signature_for(pdh_df),
-        _signature_for(item_master_df), filters.prior_cycle,
+        _signature_for(item_master_df),
         filters.prior_month.isoformat(),
-        tuple(sorted(filters.combo_filter)),
+        tuple(sorted(filters.combo_exclude)),
     )
-    table, months, available = _cached_forecast_bias(
+    table, months, available, month_meta = _cached_forecast_bias(
         sig, filters, tracker_df, ibp_actuals_df, ibp_naive_df, pdh_df, item_master_df)
 
     if table is None or table.empty or not available:
         st.info(
-            "ℹ️ No data to compute forecast bias for the selected Prior Month "
-            "and cycle — check that IBP Shipments and the prior-cycle plan are "
-            "populated."
+            "ℹ️ No data to compute forecast bias for the selected Prior Month — "
+            "check that IBP Orders and the tracker's prior cycles are populated."
         )
         return
 
     by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
     _render_bias_tiles(by_id.get("total_b2c"))
-    _render_bias_instructions(filters.prior_cycle)
-    _render_bias_tree(table, months)
+    _render_bias_instructions(month_meta)
+    _render_bias_tree(table, months, month_meta)
 
 
 def _render_demand_comparison_table(result) -> None:
@@ -8814,10 +8844,11 @@ def render() -> None:
     _render_ro_comparison()
     st.markdown("---")
 
-    _render_demand_summary()
+    # APS above IBP — both are independent, self-contained sections.
+    _render_demand_summary_aps()
     st.markdown("---")
 
-    _render_demand_summary_aps()
+    _render_demand_summary()
     st.markdown("---")
 
     _render_product_line_review()

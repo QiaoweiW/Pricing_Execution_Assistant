@@ -3451,21 +3451,33 @@ def build_forecast_bias_table(
 # Forecast Bias — Corporate group × SKU drivers (lazy, opt-in drill)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Corporate group is the SAME two-hop lookup the Product Line Review uses:
-#   forecast (tracker):   Party Site Number → dp_dimshiptosites.customer_num
-#                         → dp_dimcustomernames.corporate_group
-#   actual   (IBP orders): Customer No        → dp_dimcustomernames.corporate_group
-# Both legs are collapsed to the canonical corporate-group STRING *before*
-# comparing, so the two sides' differing customer keys line up at the
-# (corporate group × SKU) grain.  Column-name spellings mirror
-# data_sources/ship_to_sites.py + customer_dims.py (kept local so this
-# pure-pandas builder needs no Fabric-fetch import); the dim frames are passed
-# in by the page, which owns the cached fetch.
+# Corporate group resolves to the SAME canonical table on both legs:
+#   forecast (tracker):  Party Site Number → dp_dimshiptosites.plan_to_code
+#                        → dp_dimplantosites.customer_num
+#                        → dp_dimcustomernames.corporate_group
+#   actual  (IBP orders): Customer No       → dp_dimcustomernames.corporate_group
+# Both legs END at dp_dimcustomernames.corporate_group, so forecast and actual
+# land in IDENTICAL corporate-group buckets at the (corporate group × SKU)
+# grain.  plan_to_code is the bridge key because dp_dimshiptosites' own
+# customer_num is a different key space that does NOT match dp_dimcustomernames
+# (overlap ~0), whereas dp_dimplantosites.customer_num matches it 1:1.  The dim
+# frames are passed in by the page (which owns the cached Fabric fetch); column
+# spellings mirror ship_to_sites.py / customer_dims.py, kept local so this
+# pure-pandas builder needs no Fabric-fetch import.
 _STS_PARTY_SITE_CANDIDATES: tuple[str, ...] = (
     "party_site_code", "party_site_number", "PartySiteCode", "Party Site Code",
     "Party Site Number",
 )
-_STS_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
+# The bridge key: dp_dimshiptosites' OWN customer_num is a dead-end (different
+# key space from dp_dimcustomernames, overlap ~0); its plan_to_code resolves
+# through dp_dimplantosites to a customer_num that matches dp_dimcustomernames.
+_STS_PLAN_TO_CANDIDATES: tuple[str, ...] = (
+    "plan_to_code", "PlanToCode", "Plan To Code", "plan_to",
+)
+_PTS_PLAN_TO_CANDIDATES: tuple[str, ...] = (
+    "plan_to_code", "PlanToCode", "Plan To Code", "plan_to",
+)
+_PTS_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
     "customer_num", "customer_number", "CustomerNum", "Customer Num",
 )
 _CN_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
@@ -3522,28 +3534,25 @@ def _canonical_corp_form(values) -> dict[str, str]:
 
 def build_corp_group_lookups(
     shiptosites_df: Optional[pd.DataFrame],
+    plantosites_df: Optional[pd.DataFrame],
     customernames_df: Optional[pd.DataFrame],
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Return ``(party_site → customer_num, customer_num → corporate_group)``.
+    """Return ``(party_site → corporate_group, customer_num → corporate_group)``.
 
-    Reuses the Product-Line-Review dimension tables (``dp_dimshiptosites`` +
-    ``dp_dimcustomernames``).  Customer numbers are normalised with the same
-    item-key rule the enriched frames use so the joins align; corporate groups
-    are canonicalised to one surface form per casefold key and blanks dropped.
+    * **Forecast leg** (``party_site → corporate_group``) composes the full
+      three-table chain: ``dp_dimshiptosites`` (party_site_code → plan_to_code)
+      → ``dp_dimplantosites`` (plan_to_code → customer_num) →
+      ``dp_dimcustomernames`` (customer_num → corporate_group).
+    * **Actual leg** (``customer_num → corporate_group``) is the direct
+      ``dp_dimcustomernames`` lookup the orders side uses.
+
+    Both maps END at ``dp_dimcustomernames.corporate_group`` so the two legs
+    agree.  Customer numbers use the shared item-key normalisation so the joins
+    align; corporate groups are canonicalised to one surface form per casefold
+    key and blanks dropped.
     """
-    ps2cn: dict[str, str] = {}
-    if shiptosites_df is not None and not shiptosites_df.empty:
-        ps_col = _resolve_column(shiptosites_df, _STS_PARTY_SITE_CANDIDATES)
-        cn_col = _resolve_column(shiptosites_df, _STS_CUSTOMER_NUM_CANDIDATES)
-        if ps_col and cn_col:
-            tmp = pd.DataFrame({
-                "ps": _vectorised_clean_str(shiptosites_df[ps_col]),
-                "cn": _vectorised_item_key(shiptosites_df[cn_col]),
-            })
-            tmp = tmp[tmp["ps"].astype(bool)].drop_duplicates("ps", keep="last")
-            ps2cn = dict(zip(tmp["ps"], tmp["cn"]))
-
-    cn2cg: dict[str, str] = {}
+    # Shared endpoint: customer_num → canonical corporate_group.
+    cust2corp: dict[str, str] = {}
     if customernames_df is not None and not customernames_df.empty:
         cn_col = _resolve_column(customernames_df, _CN_CUSTOMER_NUM_CANDIDATES)
         cg_col = _resolve_column(customernames_df, _CN_CORP_GROUP_CANDIDATES)
@@ -3556,18 +3565,46 @@ def build_corp_group_lookups(
             tmp = tmp[~tmp["cg"].str.casefold().isin(_CG_BLANK_TOKENS)]
             tmp = tmp.drop_duplicates("cn", keep="last")
             tmp["cg"] = tmp["cg"].map(lambda s: canon.get(s.casefold(), s))
-            cn2cg = dict(zip(tmp["cn"], tmp["cg"]))
-    return ps2cn, cn2cg
+            cust2corp = dict(zip(tmp["cn"], tmp["cg"]))
+
+    # Bridge: plan_to_code → customer_num (dp_dimplantosites).
+    plan2cust: dict[str, str] = {}
+    if plantosites_df is not None and not plantosites_df.empty:
+        p_col = _resolve_column(plantosites_df, _PTS_PLAN_TO_CANDIDATES)
+        c_col = _resolve_column(plantosites_df, _PTS_CUSTOMER_NUM_CANDIDATES)
+        if p_col and c_col:
+            tmp = pd.DataFrame({
+                "p": _vectorised_clean_str(plantosites_df[p_col]),
+                "c": _vectorised_item_key(plantosites_df[c_col]),
+            })
+            tmp = tmp[tmp["p"].astype(bool)].drop_duplicates("p", keep="last")
+            plan2cust = dict(zip(tmp["p"], tmp["c"]))
+
+    # Forecast leg: party_site → plan_to_code → customer_num → corporate_group.
+    party2corp: dict[str, str] = {}
+    if shiptosites_df is not None and not shiptosites_df.empty:
+        ps_col = _resolve_column(shiptosites_df, _STS_PARTY_SITE_CANDIDATES)
+        plan_col = _resolve_column(shiptosites_df, _STS_PLAN_TO_CANDIDATES)
+        if ps_col and plan_col:
+            tmp = pd.DataFrame({
+                "ps": _vectorised_clean_str(shiptosites_df[ps_col]),
+                "plan": _vectorised_clean_str(shiptosites_df[plan_col]),
+            })
+            tmp = tmp[tmp["ps"].astype(bool)].drop_duplicates("ps", keep="last")
+            for ps, plan in zip(tmp["ps"], tmp["plan"]):
+                corp = cust2corp.get(plan2cust.get(plan, ""), "")
+                if corp:
+                    party2corp[ps] = corp
+    return party2corp, cust2corp
 
 
 def _resolve_corp_forecast(
-    trk: pd.DataFrame, ps2cn: dict[str, str], cn2cg: dict[str, str],
+    trk: pd.DataFrame, party2corp: dict[str, str],
 ) -> pd.Series:
-    """Corporate group per tracker row via party_site→num→group (else Unattributed)."""
+    """Corporate group per tracker row via the party_site chain (else Unattributed)."""
     if trk.empty:
         return pd.Series([], dtype="object")
-    cn = trk["party_site"].map(ps2cn).fillna("")
-    cg = cn.map(cn2cg).fillna("")
+    cg = trk["party_site"].map(party2corp).fillna("")
     return cg.where(cg.astype(bool), CORP_UNATTRIBUTED)
 
 
@@ -3649,6 +3686,7 @@ def build_forecast_bias_corp_sku_drivers(
     *,
     segment_row_id: str,
     shiptosites_df: Optional[pd.DataFrame] = None,
+    plantosites_df: Optional[pd.DataFrame] = None,
     customernames_df: Optional[pd.DataFrame] = None,
     item_master_df: Optional[pd.DataFrame] = None,
     n_months: int = 6,
@@ -3669,7 +3707,8 @@ def build_forecast_bias_corp_sku_drivers(
     segment_label = bi.template_by_id.get(
         segment_row_id, TemplateRow(segment_row_id, segment_row_id, 0)).label
 
-    ps2cn, cn2cg = build_corp_group_lookups(shiptosites_df, customernames_df)
+    party2corp, cust2corp = build_corp_group_lookups(
+        shiptosites_df, plantosites_df, customernames_df)
     leaves = _segment_leaf_rows(segment_row_id, bi.template)
 
     # Slice each source to the segment; forecast is Base Plan only (excl. R&O).
@@ -3686,10 +3725,10 @@ def build_forecast_bias_corp_sku_drivers(
     if trk.empty and act.empty:
         return empty
 
-    trk["corp"] = _resolve_corp_forecast(trk, ps2cn, cn2cg)
-    act["corp"], act_soft = _resolve_corp_actual(act, cn2cg)
+    trk["corp"] = _resolve_corp_forecast(trk, party2corp)
+    act["corp"], act_soft = _resolve_corp_actual(act, cust2corp)
     act["_soft"] = act_soft
-    nai["corp"], _ = _resolve_corp_actual(nai, cn2cg)
+    nai["corp"], _ = _resolve_corp_actual(nai, cust2corp)
 
     # Covered = months with a lag-1 cycle AND a non-zero forecast in this slice.
     covered = [

@@ -67,9 +67,24 @@ def test_accuracy_stats_uncovered_month_ignored():
 # ── build_corp_group_lookups ─────────────────────────────────────────────────
 
 def _shiptosites():
+    # party_site_code → plan_to_code.  customer_num here is the WRONG key space
+    # (a dead end) — included to prove the builder ignores it.
     return pd.DataFrame({
         "party_site_code": ["PS1", "PS2", "PS3"],
-        "customer_num": ["CUST1", "CUST2", "CUST3"],
+        "plan_to_code": ["PL1", "PL2", "PL3"],
+        "customer_num": ["WRONG1", "WRONG2", "WRONG3"],
+    })
+
+
+def _plantosites():
+    # plan_to_code → customer_num (the key space that matches customernames).
+    # corporate_group here is deliberately a TYPO form to prove we route through
+    # dp_dimcustomernames (not this denormalised column).
+    return pd.DataFrame({
+        "plan_to_code": ["PL1", "PL2"],
+        "site_name": ["Acme Site", "Beta Site"],
+        "customer_num": ["CUST1", "CUST2"],
+        "corporate_group": ["Acme TYPO", "Beta TYPO"],
     })
 
 
@@ -82,11 +97,14 @@ def _customernames():
     })
 
 
-def test_build_corp_group_lookups_two_hop():
-    ps2cn, cn2cg = build_corp_group_lookups(_shiptosites(), _customernames())
-    assert ps2cn == {"PS1": "CUST1", "PS2": "CUST2", "PS3": "CUST3"}
-    # CUST4 corporate_group is "Blank" → dropped; CUST3 absent from names.
-    assert cn2cg == {"CUST1": "ACME", "CUST2": "Beta"}
+def test_build_corp_group_lookups_full_chain():
+    party2corp, cust2corp = build_corp_group_lookups(
+        _shiptosites(), _plantosites(), _customernames())
+    # party → plan → customer_num → customernames.corporate_group.
+    # PS3→PL3 has no plantosites row → dropped.  Corp comes from customernames
+    # (NOT plantosites' typo column).
+    assert party2corp == {"PS1": "ACME", "PS2": "Beta"}
+    assert cust2corp == {"CUST1": "ACME", "CUST2": "Beta"}
 
 
 def test_build_corp_group_lookups_canonicalises_casing():
@@ -95,16 +113,16 @@ def test_build_corp_group_lookups_canonicalises_casing():
         "customer_name": ["a", "b", "c"],
         "corporate_group": ["Acme Foods", "ACME FOODS", "acme foods"],
     })
-    _ps, cn2cg = build_corp_group_lookups(None, names)
+    _party, cust2corp = build_corp_group_lookups(None, None, names)
     # All three collapse to ONE surface form (they tie 1-1-1 → longest wins).
-    assert len(set(cn2cg.values())) == 1
+    assert len(set(cust2corp.values())) == 1
 
 
 # ── corp resolution + fallbacks ──────────────────────────────────────────────
 
 def test_resolve_corp_forecast_unattributed_when_no_bridge():
     trk = pd.DataFrame({"party_site": ["PS1", "PSX"]})
-    cg = _resolve_corp_forecast(trk, {"PS1": "CUST1"}, {"CUST1": "Acme"})
+    cg = _resolve_corp_forecast(trk, {"PS1": "Acme"})
     assert cg.tolist() == ["Acme", CORP_UNATTRIBUTED]
 
 
@@ -184,8 +202,8 @@ def test_corp_sku_drivers_join_and_rank():
     res = build_forecast_bias_corp_sku_drivers(
         _tracker(), _orders(), None, None, _filters(),
         segment_row_id="fresh_milk",
-        shiptosites_df=_shiptosites(), customernames_df=_customernames(),
-        top_n=3)
+        shiptosites_df=_shiptosites(), plantosites_df=_plantosites(),
+        customernames_df=_customernames(), top_n=3)
     assert isinstance(res, CorpSkuDriversResult) and res.available
     # Both legs attributed cleanly.
     assert res.forecast_attributed_share == pytest.approx(1.0)
@@ -202,13 +220,14 @@ def test_corp_sku_drivers_join_and_rank():
 
 
 def test_corp_sku_drivers_no_bridge_flags_zero_forecast_attribution():
-    """With no ship-to-sites bridge the forecast can't reach a corp group —
-    the guard signal (forecast_attributed_share≈0) must fire so the UI blocks."""
+    """Without the dp_dimplantosites bridge the forecast can't reach a corp
+    group — the guard signal (forecast_attributed_share≈0) must fire so the UI
+    blocks, even though ship-to-sites and customer-names are present."""
     res = build_forecast_bias_corp_sku_drivers(
         _tracker(), _orders(), None, None, _filters(),
         segment_row_id="fresh_milk",
-        shiptosites_df=None, customernames_df=_customernames(),
-        top_n=3)
+        shiptosites_df=_shiptosites(), plantosites_df=None,
+        customernames_df=_customernames(), top_n=3)
     assert res.forecast_attributed_share == pytest.approx(0.0)
-    # Actual side still maps, so its coverage stays high.
+    # Actual side still maps (customer_no → customernames), coverage stays high.
     assert res.attributed_share == pytest.approx(1.0)

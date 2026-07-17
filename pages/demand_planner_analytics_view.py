@@ -247,6 +247,7 @@ from data_sources.plan_lift import (
 from data_sources.ship_to_sites import (
     ShipToSitesSourceError,
     fetch_dimshiptosites_df,
+    fetch_dp_dimplantosites_df,
 )
 from data_sources.holistic_demand_plan_aps import (
     APS_OUTPUT_NAME,
@@ -6669,29 +6670,37 @@ def _cached_corp_sku_drivers(
     _pdh_df: Optional[pd.DataFrame],
     _item_master_df: Optional[pd.DataFrame],
     _shiptosites_df: Optional[pd.DataFrame],
+    _plantosites_df: Optional[pd.DataFrame],
     _customernames_df: Optional[pd.DataFrame],
 ) -> tuple:
     """Cache the corp×SKU driver build (native tuple → dodges the pickle hazard)."""
     res = build_forecast_bias_corp_sku_drivers(
         _tracker_df, _actuals_df, _naive_df, _pdh_df, filters,
         segment_row_id=segment_row_id,
-        shiptosites_df=_shiptosites_df, customernames_df=_customernames_df,
-        item_master_df=_item_master_df, top_n=3)
+        shiptosites_df=_shiptosites_df, plantosites_df=_plantosites_df,
+        customernames_df=_customernames_df, item_master_df=_item_master_df, top_n=3)
     return (res.drivers, res.months, res.segment_label, res.segment_volume,
             res.attributed_share, res.forecast_attributed_share, res.available)
 
 
-def _load_corp_group_dims() -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
-    """Fetch the two corp-group dims (cached).  Returns (shiptosites, names, warning)."""
+def _load_corp_group_dims() -> tuple[
+    Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], str
+]:
+    """Fetch the three corp-group dims (cached).
+
+    Returns ``(shiptosites, plantosites, customernames, warning)`` — the chain
+    party_site → plan_to_code → customer_num → corporate_group.
+    """
     try:
         sts = fetch_dimshiptosites_df()
+        pts = fetch_dp_dimplantosites_df()
     except (ShipToSitesSourceError, Exception) as exc:  # noqa: BLE001
-        return None, None, f"ship-to-sites dim — {exc}"
+        return None, None, None, f"ship-to / plan-to dims — {exc}"
     try:
         names = fetch_dp_dimcustomernames_df()
     except (CustomerDimsError, Exception) as exc:  # noqa: BLE001
-        return sts, None, f"customer-names dim — {exc}"
-    return sts, names, ""
+        return sts, pts, None, f"customer-names dim — {exc}"
+    return sts, pts, names, ""
 
 
 def _bias_default_segment(table: pd.DataFrame) -> str:
@@ -6735,14 +6744,35 @@ def _render_bias_corp_sku_drivers(
             "cells actually moving the number.  Loads on demand so it never "
             "slows the report above."
         )
+        with st.expander("ℹ️ How corporate group is derived", expanded=False):
+            st.markdown(
+                "Corporate group resolves to the **same** table on both sides, so "
+                "forecast and orders land in identical buckets:\n"
+                "- **Forecast (tracker)** — the tracker only carries a **Party "
+                "Site Number**, so it's resolved through a bridge:\n"
+                "  `party_site → dp_dimshiptosites.plan_to_code → "
+                "dp_dimplantosites.customer_num → dp_dimcustomernames."
+                "corporate_group`.\n"
+                "- **Orders (actual)** — carry a Customer No directly: "
+                "`customer_no → dp_dimcustomernames.corporate_group`.\n\n"
+                "**Why `plan_to_code` is the bridge key (not `customer_num`):** "
+                "`dp_dimshiptosites`'s own `customer_num` is a *different key "
+                "space* that doesn't match `dp_dimcustomernames` (≈0% overlap), "
+                "so it's a dead end.  Its **`plan_to_code`** maps through "
+                "`dp_dimplantosites` to a `customer_num` that matches "
+                "`dp_dimcustomernames` **1:1** — the working path (~98% of the "
+                "forecast).  Rows that can't be mapped show as **Unattributed** "
+                "(and `~name` marks a softer customer-name fallback on the orders "
+                "side)."
+            )
         if not st.session_state.get(_BIAS_DRIVERS_LOADED_KEY):
             if st.button("📥 Load / refresh drivers", key="bias_drivers_load_btn"):
                 st.session_state[_BIAS_DRIVERS_LOADED_KEY] = True
                 st.rerun()
             return
 
-        sts, names, dim_warn = _load_corp_group_dims()
-        if sts is None or names is None:
+        sts, pts, names, dim_warn = _load_corp_group_dims()
+        if sts is None or pts is None or names is None:
             st.warning(f"⚠️ Could not load the corporate-group dimensions ({dim_warn}).")
             return
 
@@ -6763,13 +6793,14 @@ def _render_bias_corp_sku_drivers(
         sig = (
             _signature_for(tracker_df), _signature_for(ibp_actuals_df),
             _signature_for(ibp_naive_df), _signature_for(pdh_df),
-            _signature_for(item_master_df), _signature_for(sts), _signature_for(names),
+            _signature_for(item_master_df), _signature_for(sts),
+            _signature_for(pts), _signature_for(names),
             filters.prior_month.isoformat(), tuple(sorted(filters.combo_exclude)), seg,
         )
         (drivers, months, seg_label, seg_vol, attr, fcst_attr, avail
          ) = _cached_corp_sku_drivers(
             sig, filters, seg, tracker_df, ibp_actuals_df, ibp_naive_df,
-            pdh_df, item_master_df, sts, names)
+            pdh_df, item_master_df, sts, pts, names)
 
         if not avail or drivers is None or drivers.empty:
             st.info("No drivers for this segment / prior month.")
@@ -6781,13 +6812,14 @@ def _render_bias_corp_sku_drivers(
         if pd.isna(fcst_attr) or fcst_attr < _BIAS_DRIVERS_MIN_FCST_ATTR:
             shown = 0.0 if pd.isna(fcst_attr) else fcst_attr
             st.warning(
-                f"⚠️ **Corporate attribution unavailable — only {shown:.0%} of "
+                f"⚠️ **Corporate attribution low — only {shown:.0%} of "
                 f"{seg_label}'s base-plan forecast mapped to a corporate group.**  "
-                "The forecast's `party_site → dp_dimshiptosites.customer_num → "
-                "dp_dimcustomernames.customer_num → corporate_group` chain isn't "
-                "reconciling (the two `customer_num` key spaces don't overlap).  "
-                "Once that's fixed upstream, this view populates automatically — "
-                "no code change needed."
+                "The forecast chain is `party_site → dp_dimshiptosites.plan_to_code "
+                "→ dp_dimplantosites.customer_num → dp_dimcustomernames."
+                "corporate_group`; a low rate means party sites are missing a "
+                "`plan_to_code` (in dp_dimshiptosites) or their `plan_to_code` "
+                "isn't in dp_dimplantosites.  Fix those rows upstream and this view "
+                "fills in automatically."
             )
             return
 

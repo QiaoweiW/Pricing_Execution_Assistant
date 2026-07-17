@@ -49,6 +49,10 @@ _WORKSPACE_GUID = "bb11c51d-03c8-4f1b-938c-e20657a8f31d"
 _LAKEHOUSE_GUID = "a01f513d-eee7-41eb-8c15-670bc40e7fc8"
 _SCHEMA = "dbo"
 _TABLE = "dp_dimshiptosites"
+# Plan-to-sites bridge: plan_to_code → customer_num (→ corporate_group).  It is
+# the working Hop-2 key space for the forecast-side corporate-group chain
+# (dp_dimshiptosites' own customer_num does NOT match dp_dimcustomernames).
+_TABLE_PLAN_TO_SITES = "dp_dimplantosites"
 
 # 15-minute cache TTL — a slow-moving dimension; match the IBP connector.
 _CACHE_TTL_SECONDS = 15 * 60
@@ -77,23 +81,22 @@ class ShipToSitesSourceError(RuntimeError):
     """
 
 
-def _build_table_uri() -> str:
-    """Construct the OneLake ``abfss://`` URI for the dimension table."""
+def _build_table_uri(table: str) -> str:
+    """Construct the OneLake ``abfss://`` URI for a dimension table."""
     return (
         f"abfss://{_WORKSPACE_GUID}@onelake.dfs.fabric.microsoft.com/"
-        f"{_LAKEHOUSE_GUID}/Tables/{_SCHEMA}/{_TABLE}"
+        f"{_LAKEHOUSE_GUID}/Tables/{_SCHEMA}/{table}"
     )
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
-def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, str]:
-    """Streamlit-cached read of the dimension table.
+def _cached_fetch(table: str) -> tuple[pd.DataFrame, str]:
+    """Streamlit-cached full-table read of *table* (native values only).
 
-    Returns ``(df, source_uri)`` — native values only (see module
-    docstring for why no custom class is returned).  The leading-
-    underscore arg is the documented Streamlit cache-busting flag.
+    Returns ``(df, source_uri)`` — no custom class (see module docstring).  The
+    table name doubles as the cache key, so each dim caches independently.
     """
-    table_uri = _build_table_uri()
+    table_uri = _build_table_uri(table)
     try:
         token = acquire_storage_token()
     except FabricAuthError as exc:
@@ -116,7 +119,7 @@ def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, str]:
             f"Underlying error: {exc}{_tls_hint(exc)}"
         ) from exc
 
-    logger.info("Loaded dp_dimshiptosites (%s rows) from %s", len(df), table_uri)
+    logger.info("Loaded %s (%s rows) from %s", table, len(df), table_uri)
     return df, table_uri
 
 
@@ -127,13 +130,28 @@ def fetch_dimshiptosites_df(*, force_refresh: bool = False) -> pd.DataFrame:
     """
     if force_refresh:
         _cached_fetch.clear()
-    df, _uri = _cached_fetch("default")
+    df, _uri = _cached_fetch(_TABLE)
+    return df
+
+
+def fetch_dp_dimplantosites_df(*, force_refresh: bool = False) -> pd.DataFrame:
+    """Return the plan-to-sites dimension (``dbo.dp_dimplantosites``).
+
+    Schema: ``plan_to_code │ site_name │ customer_num │ corporate_group``.  It
+    bridges ``dp_dimshiptosites.plan_to_code`` → a ``customer_num`` that matches
+    ``dp_dimcustomernames`` — the working Hop-2 for forecast-side corporate
+    group.  Raises :class:`ShipToSitesSourceError` on any read failure.
+    """
+    if force_refresh:
+        _cached_fetch.clear()
+    df, _uri = _cached_fetch(_TABLE_PLAN_TO_SITES)
     return df
 
 
 __all__ = [
     "ShipToSitesSourceError",
     "fetch_dimshiptosites_df",
+    "fetch_dp_dimplantosites_df",
     "PARTY_SITE_CANDIDATES",
     "CUSTOMER_NUM_CANDIDATES",
     "ACCOUNT_DESC_CANDIDATES",

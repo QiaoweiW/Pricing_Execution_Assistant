@@ -523,6 +523,21 @@ def generate_aps_from_upload(
     return replace(partial, history_rows=history_rows)
 
 
+def fetch_aps_history_df() -> Optional[pd.DataFrame]:
+    """Read the rolling APS history tracker (``None`` if it doesn't exist yet)."""
+    df, _etag = read_csv(
+        _SECRETS_SECTION, _APS_HISTORY_BLOB,
+        read_csv_kwargs={"dtype": str, "keep_default_na": False})
+    return df
+
+
+def list_aps_history_cycles(history_df: Optional[pd.DataFrame]) -> list[str]:
+    """Distinct Cycle labels present in the APS history tracker (sorted)."""
+    if history_df is None or history_df.empty or COL_CYCLE not in history_df.columns:
+        return []
+    return sorted(history_df[COL_CYCLE].astype(str).str.strip().replace("", pd.NA).dropna().unique())
+
+
 def aps_full_path() -> str:
     """OneLake path of the this-cycle APS plan (for UI messages)."""
     return f"Files/{_APS_FULL_BLOB}"

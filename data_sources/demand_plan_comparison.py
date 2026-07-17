@@ -1164,11 +1164,16 @@ def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
 
 
 def _vectorised_forecast_type(series: pd.Series) -> pd.Series:
-    """Vectorised forecast-type bucketing (Base Plan / R&O / passthrough)."""
+    """Vectorised forecast-type bucketing (Base Plan / R&O / passthrough).
+
+    ``"APS Base Plan"`` (the APS history tracker's base label) folds to the same
+    ``Base Plan`` bucket so the comparison treats it identically — the IBP
+    tracker never carries that label, so the fold is harmless there.
+    """
     s = series.astype("string").str.strip()
     folded = s.str.casefold()
     out = s.fillna("").astype("object").copy()
-    out[folded == "base plan"] = FORECAST_BASE_PLAN
+    out[folded.isin({"base plan", "aps base plan"})] = FORECAST_BASE_PLAN
     out[folded.isin({"r&o", "r and o", "ro", "r & o", "r_and_o"})] = FORECAST_R_AND_O
     return out
 

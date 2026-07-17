@@ -4,8 +4,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+import datetime as dt
+
 from data_sources.aps_upload_pipeline import (
     APS_HIST_COLUMNS,
+    ApsUploadResult,
     COL_CORP,
     COL_CYCLE,
     COL_DEMAND_LBS,
@@ -14,12 +17,18 @@ from data_sources.aps_upload_pipeline import (
     COL_INCLUSION,
     COL_ITEM,
     COL_MONTH,
+    COL_PARTY,
     COL_SALES_LBS,
+    _finalize,
+    _shape_ro_history,
     _to_excel_serial,
+    apply_ro_corp_overrides,
     build_aps_history_rows,
+    parse_corp_override_csv,
     replace_cycle_fy_slice,
     today_inclusion_serial,
 )
+from data_sources.holistic_demand_plan_aps import _ro_frame
 
 
 # ── serial helpers ───────────────────────────────────────────────────────────
@@ -149,3 +158,62 @@ def test_replace_cycle_fy_slice_is_idempotent():
     hist3 = replace_cycle_fy_slice(hist2, other, "C6", 2027)
     assert len(hist3) == len(rows) * 2
     assert set(hist3[COL_CYCLE]) == {"C5", "C6"}
+
+
+# ── R&O corporate-group override ─────────────────────────────────────────────
+
+def test_parse_corp_override_csv():
+    csv = (
+        "Customer,Corporate Group,Match\n"
+        "URM,URM,Fuzzy\n"
+        "Costco,,Exact\n"            # blank -> skipped
+        "HEB,(Unmapped),Exact\n"     # Unmapped -> skipped
+        "Kroger,Kroger Co,Exact\n"
+    ).encode("utf-8")
+    assert parse_corp_override_csv(csv) == {"URM": "URM", "Kroger": "Kroger Co"}
+
+
+def _ro_result():
+    """A minimal result carrying R&O re-apply state (URM mis-fuzzed to DFS)."""
+    ro_detail = pd.DataFrame({
+        "Start of Month": [dt.date(2026, 7, 1), dt.date(2026, 7, 1)],
+        "Item": ["310180", "310180"],
+        "Customer": ["URM", "Kroger"],
+        "Demand Plan Pounds": [100.0, 200.0],
+    })
+    base_corp = {"URM": "DFS Gormet", "Kroger": "Kroger"}
+    ro_dims = {"pmaj": {"310180": "Butter"}, "sfmt": {"310180": "Western Quarters"},
+               "pminor": {"310180": "Packaged Butter"}}
+    ro_leg = _shape_ro_history(_ro_frame(ro_detail, base_corp), ro_dims)
+    aps_leg = pd.DataFrame({
+        COL_MONTH: [46204], COL_ITEM: ["310180"], "Item Description": ["DG Btr"],
+        COL_PARTY: ["10036"], COL_SALES_LBS: [50.0], COL_DEMAND_LBS: [60.0],
+        COL_FORECAST: ["APS Base Plan"], "Portfolio Major": ["Butter"],
+        "Portfolio Minor": ["Packaged Butter"], "Supply Format": ["Western Quarters"],
+        COL_CORP: ["Costco"],
+    })
+    rows = _finalize([aps_leg, ro_leg], "C5", 2027, 46220)
+    log = pd.DataFrame({
+        "Customer": ["URM", "Kroger"], "Corporate Group": ["DFS Gormet", "Kroger"],
+        "Match": ["Fuzzy", "Exact"]})
+    return ApsUploadResult(
+        rows=rows, aps_rows=1, ro_rows=len(ro_leg), history_rows=0,
+        corp_coverage=1.0, match_log=log, cycle="C5", fy=2027,
+        ro_detail=ro_detail, ro_dims=ro_dims, base_corp=base_corp)
+
+
+def test_apply_ro_corp_overrides_remaps_and_tags():
+    res = _ro_result()
+    patched = apply_ro_corp_overrides(res, {"URM": "URM"}, inclusion_serial=46220)
+    ro = patched.rows[patched.rows[COL_FORECAST] == "R&O"]
+    corps = set(ro[COL_CORP])
+    assert "URM" in corps and "DFS Gormet" not in corps   # remapped
+    assert set(patched.rows[patched.rows[COL_FORECAST] == "APS Base Plan"][COL_CORP]) == {"Costco"}
+    log = patched.match_log
+    assert log.loc[log["Customer"] == "URM", "Match"].iloc[0] == "Override"
+    assert log.loc[log["Customer"] == "URM", "Corporate Group"].iloc[0] == "URM"
+
+
+def test_apply_ro_corp_overrides_noop_without_overrides():
+    res = _ro_result()
+    assert apply_ro_corp_overrides(res, {}) is res

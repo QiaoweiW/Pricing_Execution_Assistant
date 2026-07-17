@@ -266,6 +266,8 @@ from data_sources.aps_upload_pipeline import (
     FISCAL_YEARS as APS_FISCAL_YEARS,
     aps_history_path,
     generate_aps_from_upload,
+    parse_corp_override_csv,
+    save_aps_override,
 )
 from data_sources.product_line_review import (
     cy_full_year_months as _plr_cy_full_year_months,
@@ -3332,6 +3334,8 @@ _APS_UPLOAD_RESULT_KEY: str = "aps_upload_result"
 # Bumped after a successful build so the file_uploader widget resets (a re-run
 # doesn't re-ingest the same file).
 _APS_UPLOAD_NONCE_KEY: str = "aps_upload_nonce"
+# Bumped after a successful corp-group patch so the patch uploader resets.
+_APS_PATCH_NONCE_KEY: str = "aps_patch_nonce"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -3346,13 +3350,16 @@ def _cached_persisted_aps_plan() -> Optional[pd.DataFrame]:
     return df
 
 
-def _render_aps_match_log(match_log: Optional[pd.DataFrame]) -> None:
-    """Read-only R&O Customer → Corporate Group fuzzy match log (download + peek).
+def _render_aps_match_log(res) -> None:
+    """R&O Customer → Corporate Group match log: review + download + patch upload.
 
     The APS base-plan leg is attributed deterministically (plan-to bridge +
-    native code), so only the R&O leg's fuzzy matches warrant a look.  Surfaced
-    for transparency; the rows that need attention are shown first.
+    native code), so only the R&O leg's fuzzy matches warrant a look.  Download
+    the log, fix any wrong / Unmapped Corporate Group, upload it back, and
+    **Apply patch & save** re-attributes those customers' R&O rows and re-writes
+    the Fabric file + history (rows needing attention are shown first).
     """
+    match_log = res.match_log
     if match_log is None or match_log.empty:
         return
     review = filter_needs_review(match_log)
@@ -3364,8 +3371,10 @@ def _render_aps_match_log(match_log: Optional[pd.DataFrame]) -> None:
     with st.expander(f"🧾 {label}", expanded=bool(n_review)):
         st.caption(
             "How each RO_Seed **Customer** resolved to a **Corporate Group** "
-            "(Exact / Fuzzy / Unmapped).  Fix any Unmapped upstream in "
-            "`dp_dimcustomernames`, then re-upload the cycle."
+            "(Exact / Fuzzy / Unmapped).  To fix: **download** the log, correct "
+            "the **Corporate Group** cells, **upload** it back, and click "
+            "**Apply patch & save** — that re-attributes those customers' R&O "
+            "rows and rewrites the Fabric file + history."
         )
         st.download_button(
             label="⬇️ Download match log (CSV)",
@@ -3375,6 +3384,42 @@ def _render_aps_match_log(match_log: Optional[pd.DataFrame]) -> None:
             key="aps_match_log_download",
         )
         st.dataframe(match_log, use_container_width=True, hide_index=True)
+
+        st.markdown("**Apply a fixed match log**")
+        patch_nonce = st.session_state.get(_APS_PATCH_NONCE_KEY, 0)
+        patch = st.file_uploader(
+            "Upload fixed match log (CSV)", type=["csv"],
+            key=f"aps_patch_upload_{patch_nonce}",
+            help="The downloaded log with corrected Corporate Group values "
+                 "(Customer + Corporate Group columns).",
+        )
+        if st.button(
+            "✅ Apply patch & save to Fabric", key="aps_patch_apply",
+            disabled=patch is None,
+        ) and patch is not None:
+            try:
+                overrides = parse_corp_override_csv(patch.getvalue())
+                if not overrides:
+                    st.warning(
+                        "No usable Customer → Corporate Group rows found "
+                        "(blank / (Unmapped) values are skipped)."
+                    )
+                    return
+                with st.spinner("Applying overrides and saving to Fabric…"):
+                    patched = save_aps_override(res, overrides)
+                _cached_persisted_aps_plan.clear()
+                st.session_state[_APS_UPLOAD_RESULT_KEY] = patched
+                st.session_state[_APS_PATCH_NONCE_KEY] = patch_nonce + 1
+                remaining = len(filter_needs_review(patched.match_log) or [])
+                st.success(
+                    f"✅ Applied **{len(overrides)}** override(s) and saved.  "
+                    f"History now **{patched.history_rows:,}** rows"
+                    + (f"; {remaining} customer(s) still need a group." if remaining
+                       else " — the match log is clean.")
+                )
+                st.rerun()
+            except (ApsUploadError, LakehouseIOError, ValueError) as exc:
+                st.error(f"❌ Could not apply the patch.\n\n{exc}")
 
 
 def _render_demand_summary_aps() -> None:
@@ -3472,7 +3517,7 @@ def _render_demand_summary_aps() -> None:
                 f"**{res.history_rows:,}** rows."
             )
             _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
-            _render_aps_match_log(res.match_log)
+            _render_aps_match_log(res)
             return
 
         # ── Load path: no session result → serve the persisted Fabric file.

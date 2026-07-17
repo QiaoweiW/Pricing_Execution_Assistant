@@ -3023,18 +3023,24 @@ BIAS_COL_WMAPE: str      = "_wmape"
 BIAS_COL_FVA: str        = "_fva"
 BIAS_COL_FLAG_DIR: str   = "_flag_dir"
 BIAS_COL_FLAG_SEV: str   = "_flag_sev"
+BIAS_COL_FLAG_FVA: str   = "_flag_fva"
 
 # Flag thresholds (planner-confirmed): severity from WMAPE, direction from the
-# 6-month average bias.
+# 6-month average bias, plus a Forecast-Value-Added verdict.
 _BIAS_WMAPE_PRIORITY: float = 0.15
 _BIAS_WMAPE_MONITOR: float  = 0.10
 _BIAS_DIR_BAND: float       = 0.02   # ±2 pp around zero reads as "Balanced"
+# FVA best practice (IBF / Gilliland): a forecast should beat the seasonal-naive
+# benchmark.  FVA below −0.5 pp means the naive guess was more accurate, so the
+# planning effort is destroying value — the actionable "Below naive" flag.
+_BIAS_FVA_BAND: float       = 0.005
 
 BIAS_FLAG_PRIORITY: str = "Priority"
 BIAS_FLAG_MONITOR: str  = "Monitor"
 BIAS_DIR_OVER: str      = "Over"
 BIAS_DIR_UNDER: str     = "Under"
 BIAS_DIR_BALANCED: str  = "Balanced"
+BIAS_FVA_BELOW: str     = "Below naive"   # negative FVA → naive would beat us
 
 
 @dataclass(frozen=True)
@@ -3115,9 +3121,21 @@ def _map_lag1_cycles(
     return out
 
 
-def _bias_flag(avg_bias: float, wmape: float) -> tuple[str, str]:
-    """Return ``(direction, severity)`` for the segment's Flag cell."""
-    if avg_bias is None or (isinstance(avg_bias, float) and math.isnan(avg_bias)):
+def _is_nan(x: object) -> bool:
+    """True for None or float NaN (guards the flag inputs uniformly)."""
+    return x is None or (isinstance(x, float) and math.isnan(x))
+
+
+def _bias_flag(avg_bias: float, wmape: float, fva: float) -> tuple[str, str, str]:
+    """Return ``(direction, severity, fva_verdict)`` for the segment's Flag cell.
+
+    * direction — from the 6-month average bias (Over / Under / Balanced).
+    * severity  — from WMAPE (Priority ≥ 15 %, Monitor 10–15 %, else blank).
+    * fva_verdict — ``"Below naive"`` when FVA < −0.5 pp (the plan is less
+      accurate than a same-month-last-year guess), else blank; positive FVA is
+      the expected good case and stays unlabelled to avoid chip clutter.
+    """
+    if _is_nan(avg_bias):
         direction = ""
     elif avg_bias > _BIAS_DIR_BAND:
         direction = BIAS_DIR_OVER
@@ -3125,7 +3143,7 @@ def _bias_flag(avg_bias: float, wmape: float) -> tuple[str, str]:
         direction = BIAS_DIR_UNDER
     else:
         direction = BIAS_DIR_BALANCED
-    if wmape is None or (isinstance(wmape, float) and math.isnan(wmape)):
+    if _is_nan(wmape):
         severity = ""
     elif wmape >= _BIAS_WMAPE_PRIORITY:
         severity = BIAS_FLAG_PRIORITY
@@ -3133,7 +3151,8 @@ def _bias_flag(avg_bias: float, wmape: float) -> tuple[str, str]:
         severity = BIAS_FLAG_MONITOR
     else:
         severity = ""
-    return direction, severity
+    fva_verdict = "" if _is_nan(fva) or fva >= -_BIAS_FVA_BAND else BIAS_FVA_BELOW
+    return direction, severity, fva_verdict
 
 
 def _bias_leaf_series(
@@ -3299,7 +3318,7 @@ def build_forecast_bias_table(
                        if denom > 1e-9 else float("nan"))
         fva = (wmape_naive - wmape
                if not (math.isnan(wmape) or math.isnan(wmape_naive)) else float("nan"))
-        direction, severity = _bias_flag(avg_bias, wmape)
+        direction, severity, fva_verdict = _bias_flag(avg_bias, wmape, fva)
         rec = {
             COL_ROW_ID: tpl.row_id,
             COL_INDENT: tpl.indent,
@@ -3311,6 +3330,7 @@ def build_forecast_bias_table(
             BIAS_COL_FVA: round(fva, 4) if not math.isnan(fva) else fva,
             BIAS_COL_FLAG_DIR: direction,
             BIAS_COL_FLAG_SEV: severity,
+            BIAS_COL_FLAG_FVA: fva_verdict,
         }
         for key, b in zip(month_keys, bias):
             rec[key] = round(b, 4) if not math.isnan(b) else b

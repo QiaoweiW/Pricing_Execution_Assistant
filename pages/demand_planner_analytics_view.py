@@ -149,8 +149,10 @@ from data_sources.demand_plan_comparison import (
     BIAS_COL_FVA,
     BIAS_COL_FLAG_DIR,
     BIAS_COL_FLAG_SEV,
+    BIAS_COL_FLAG_FVA,
     BIAS_FLAG_PRIORITY,
     BIAS_FLAG_MONITOR,
+    BIAS_FVA_BELOW,
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
@@ -6082,6 +6084,39 @@ def _summary_clean_label(r: pd.Series) -> str:
     return str(r.get(DPC_COL_LABEL, "")).replace("• ", "")
 
 
+# ── Shared column picker: hide + reorder, one widget, used by every table ────
+# A single ``st.multiselect`` drives BOTH visibility and order: unticking hides
+# a column, and Streamlit preserves selection order, so the sequence a planner
+# ticks columns in IS their left-to-right order.  Keeping one helper means the
+# ⚙️ Columns popover behaves identically on every table (no per-table variants).
+def _render_column_picker(key: str, options: list[str], *, help_suffix: str = "") -> None:
+    """Render the ⚙️ Columns popover for one table (binds to ``session_state[key]``).
+
+    Options default to *all shown, canonical order* on first render.  The label
+    column is fixed by the caller and never appears here.
+    """
+    st.session_state.setdefault(key, list(options))
+    with st.popover("⚙️ Columns", use_container_width=False):
+        st.multiselect(
+            "Show columns", options=options, key=key,
+            help="Untick to hide a column; re-tick columns in the order you want "
+                 "them to appear (selection order = left-to-right order)."
+                 + help_suffix,
+        )
+
+
+def _picked_columns(key: str, options: list[str]) -> list[str]:
+    """Visible columns in the planner's chosen order (all *options* if unset).
+
+    Filters stale picks no longer in *options* so a changed schema can't crash
+    the render; falls back to the full canonical list when nothing is selected.
+    """
+    picked = st.session_state.get(key) or options
+    valid = set(options)
+    ordered = [c for c in picked if c in valid]
+    return ordered or list(options)
+
+
 def _render_comparison_summary_col_picker() -> None:
     """⚙️ Columns popover for the summary table — rendered ABOVE the metrics row.
 
@@ -6090,13 +6125,10 @@ def _render_comparison_summary_col_picker() -> None:
     session_state (Category is always shown, every metric column is hidable).
     """
     all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
-    st.session_state.setdefault(_DPC_SUMMARY_COLS_KEY, all_headers)
-    with st.popover("⚙️ Columns", use_container_width=False):
-        st.multiselect(
-            "Show columns", options=all_headers, key=_DPC_SUMMARY_COLS_KEY,
-            help="Untick a column to hide it in the summary table below.  "
-                 "The Category column always shows.",
-        )
+    _render_column_picker(
+        _DPC_SUMMARY_COLS_KEY, all_headers,
+        help_suffix="  The Category column always shows.",
+    )
 
 
 def _render_comparison_summary_table(result) -> None:
@@ -6114,11 +6146,11 @@ def _render_comparison_summary_table(result) -> None:
         return
     by_id = {str(r[DPC_COL_ROW_ID]): r for _, r in table.iterrows()}
 
-    # Visible columns (Category always shown) — selection lives in the picker
-    # rendered above the metrics; default to all when unset.
+    # Visible columns (Category always shown) in the planner's chosen ORDER —
+    # selection + ordering live in the picker rendered above the metrics.
     all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
-    visible = set(st.session_state.get(_DPC_SUMMARY_COLS_KEY) or all_headers)
-    cols = [c for c in _DPC_SUMMARY_COLS if c[1] in visible]
+    col_by_header = {spec[1]: spec for spec in _DPC_SUMMARY_COLS}
+    cols = [col_by_header[h] for h in _picked_columns(_DPC_SUMMARY_COLS_KEY, all_headers)]
 
     head_html = '<th class="lbl">Category</th>' + "".join(
         f"<th>{_esc_html(header)}</th>" for _key, header, _kind in cols
@@ -6311,6 +6343,10 @@ _BIAS_CSS: str = """
 .bias .chip.pri {background:#fde2e1; color:#c0392b;}
 .bias .chip.mon {background:#fdf0d5; color:#9a6a00;}
 .bias .chip.dir {background:#eef1f4; color:#55606e; font-weight:600; margin-left:4px;}
+.bias .chip.fva {background:#fce8d5; color:#9a4b00; margin-left:4px;}
+/* WMAPE font echoes the severity chip colour: pink = Priority, amber = Monitor. */
+.bias .wmape-pri {color:#c0392b; font-weight:700;}
+.bias .wmape-mon {color:#9a6a00; font-weight:700;}
 </style>
 """
 
@@ -6356,8 +6392,22 @@ def _bias_spark(values: list) -> str:
     return f'<span class="spark">{"".join(bars)}</span>'
 
 
-def _bias_flag_html(direction: object, severity: object) -> str:
-    """Flag cell: a severity chip (Priority/Monitor) + an Over/Under chip."""
+def _wmape_severity_cls(severity: object) -> str:
+    """CSS class colouring the WMAPE cell to match its severity chip."""
+    if severity == BIAS_FLAG_PRIORITY:
+        return "wmape-pri"
+    if severity == BIAS_FLAG_MONITOR:
+        return "wmape-mon"
+    return ""
+
+
+def _bias_flag_html(direction: object, severity: object, fva_verdict: object) -> str:
+    """Flag cell: severity chip (Priority/Monitor) + Over/Under + FVA verdict.
+
+    The FVA chip only appears in its actionable state (``Below naive`` — the
+    plan lost to a same-month-last-year guess); positive FVA is the expected
+    good case and stays unlabelled to keep the cell readable.
+    """
     chips: list[str] = []
     if severity == BIAS_FLAG_PRIORITY:
         chips.append('<span class="chip pri">Priority</span>')
@@ -6365,6 +6415,8 @@ def _bias_flag_html(direction: object, severity: object) -> str:
         chips.append('<span class="chip mon">Monitor</span>')
     if direction and str(direction) not in ("", "Balanced"):
         chips.append(f'<span class="chip dir">{_esc_html(direction)}</span>')
+    if fva_verdict == BIAS_FVA_BELOW:
+        chips.append(f'<span class="chip fva">{_esc_html(BIAS_FVA_BELOW)}</span>')
     return "".join(chips) if chips else "—"
 
 
@@ -6421,17 +6473,21 @@ def _render_bias_instructions(month_meta: tuple) -> None:
             "- **Bias %** = (Forecast − Actual) ÷ Actual.  Negative = "
             "**under-forecast** (ordered more than planned); positive = "
             "over-forecast.\n"
-            "- **6-Mo Avg** = simple average of the monthly Bias %.\n"
+            "- **6-Mo Avg Bias** = simple average of the monthly Bias %.\n"
             "- **WMAPE** (volume-weighted MAPE) = Σ|Actual − Forecast| ÷ "
             "Σ|Actual| across the shown months.  0% = perfect; it weights big "
             "SKUs more than a plain average of percentages, so one tiny line "
-            "can't dominate — the most representative single accuracy number.\n"
+            "can't dominate — the most representative single accuracy number.  "
+            "Coloured **pink** when Priority, **amber** when Monitor.\n"
             "- **FVA vs Seasonal-Naive** = WMAPE(same-month-last-year orders) − "
             "WMAPE(forecast), in percentage points.  Positive = the plan beats "
             "just repeating last year (adds value); ≤ 0 = it doesn't.\n"
-            "- **Flag** — severity from WMAPE: **Priority** ≥ 15%, **Monitor** "
-            "10–15%, else blank; direction from the 6-Mo Avg bias: **Over** if "
-            "> +2pp, **Under** if < −2pp, else Balanced.\n\n"
+            "- **Flag** combines three reads: **severity** from WMAPE "
+            "(**Priority** ≥ 15%, **Monitor** 10–15%, else blank); **direction** "
+            "from the 6-Mo Avg Bias (**Over** > +2pp, **Under** < −2pp, else "
+            "Balanced); and a **Below naive** tag when FVA < −0.5pp — the "
+            "forecast lost to a seasonal-naive guess and is destroying value "
+            "(the FVA best-practice signal to simplify the plan).\n\n"
             "_The search-to-hide filter (Portfolio Major · Supply Format · "
             "Brand) at the top narrows this section too._"
         )
@@ -6466,12 +6522,16 @@ def _render_bias_tree(
         parts.append(f'<span class="wide">{_bias_spark([row.get(mk) for mk in months])}</span>')
         avg_txt, avg_c = _bias_fmt_pct(row.get(BIAS_COL_AVG))
         parts.append(f'<span class="{avg_c}">{_esc_html(avg_txt)}</span>')
-        parts.append(f'<span>{_esc_html(_bias_wmape_txt(row.get(BIAS_COL_WMAPE)))}</span>')
+        wmape_cls = _wmape_severity_cls(row.get(BIAS_COL_FLAG_SEV))
+        parts.append(
+            f'<span class="{wmape_cls}">'
+            f'{_esc_html(_bias_wmape_txt(row.get(BIAS_COL_WMAPE)))}</span>')
         fva_txt, fva_c = _bias_pp(row.get(BIAS_COL_FVA))
         parts.append(f'<span class="{fva_c}">{_esc_html(fva_txt)}</span>')
-        parts.append(
-            f'<span class="wide">'
-            f'{_bias_flag_html(row.get(BIAS_COL_FLAG_DIR), row.get(BIAS_COL_FLAG_SEV))}</span>')
+        flag_html = _bias_flag_html(
+            row.get(BIAS_COL_FLAG_DIR), row.get(BIAS_COL_FLAG_SEV),
+            row.get(BIAS_COL_FLAG_FVA))
+        parts.append(f'<span class="wide">{flag_html}</span>')
         return _cls(row), "".join(parts)
 
     head = ['<span class="lbl">Segment</span>']
@@ -6479,7 +6539,7 @@ def _render_bias_tree(
         f'<span>{_esc_html(mk)}{"*" if meta_by_key.get(mk, ("", 0, False))[2] else ""}</span>'
         for mk in months
     ]
-    head += ['<span class="wide">Trend</span>', "<span>6-Mo Avg</span>",
+    head += ['<span class="wide">Trend</span>', "<span>6-Mo Avg Bias</span>",
              "<span>WMAPE</span>", "<span>FVA</span>", '<span class="wide">Flag</span>']
     header = '<div class="rw hdr">' + "".join(head) + "</div>"
     body = _foldable_tree_body(len(rows), indent_flags, _make_row)
@@ -6554,9 +6614,11 @@ def _render_forecast_bias_section(
         )
         return
 
+    # Instructions first (definitions before the numbers), then the headline
+    # tiles, then the segment tree.
+    _render_bias_instructions(month_meta)
     by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
     _render_bias_tiles(by_id.get("total_b2c"))
-    _render_bias_instructions(month_meta)
     _render_bias_tree(table, months, month_meta)
 
 
@@ -6585,11 +6647,12 @@ def _render_demand_comparison_table(result) -> None:
     # table); session_state carries it across the rerun the widget triggers.
     # Every metric column is individually hidable; the default-visible set is
     # everything except COLS_HIDDEN_BY_DEFAULT (the screenshot-3 column set).
+    # Seed the default BEFORE the table reads it (the picker renders below the
+    # table but its state is read up-front via session_state).
     all_detail_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER]
     _hidden_default = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT}
     default_visible = [lbl for lbl in all_detail_labels if lbl not in _hidden_default]
     st.session_state.setdefault(_DPC_DETAIL_COLS_KEY, default_visible)
-    visible_labels = set(st.session_state.get(_DPC_DETAIL_COLS_KEY) or default_visible)
 
     # Percent ids → display labels; stored values are fractions, ×100 to show.
     percent_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_PERCENT_COLS]
@@ -6609,9 +6672,9 @@ def _render_demand_comparison_table(result) -> None:
         if label in display_df.columns:
             display_df[label] = display_df[label] * 100.0
 
-    # Visible metric columns = the planner's picks (from the Columns popover
-    # below), kept in the canonical DISPLAY_ORDER.
-    visible_metric_cols = [lbl for lbl in all_detail_labels if lbl in visible_labels]
+    # Visible metric columns = the planner's picks, in the ORDER they were
+    # ticked (from the Columns popover below); Category stays fixed at the left.
+    visible_metric_cols = _picked_columns(_DPC_DETAIL_COLS_KEY, all_detail_labels)
 
     # Foldable tree — navy header + white font, light-blue Total B2C, orange
     # (#f8cbad) Portfolio-Major rows (incl. Butter); click a parent row to fold.
@@ -6640,19 +6703,16 @@ def _render_demand_comparison_table(result) -> None:
 def _render_comparison_table_controls(all_labels: list[str]) -> None:
     """⚙️ Columns picker for the detailed table, rendered below it.
 
-    Lists EVERY metric column so the planner can show/hide any of them (incl.
-    the extra-detail columns that start hidden).  Binds to session_state by key
-    only (no ``default`` arg) so :func:`_render_demand_comparison_table` can
-    read the same selection up-front without Streamlit's "value set via both"
-    warning.  Category always shows; Download / Save always include every
-    column.  (Row folding is native per-row — no global control.)
+    Lists EVERY metric column so the planner can show/hide/reorder any of them
+    (incl. the extra-detail columns that start hidden), via the shared
+    :func:`_render_column_picker`.  Category always shows; Download / Save
+    always include every column.  (Row folding is native per-row.)
     """
-    with st.popover("⚙️ Columns", use_container_width=False):
-        st.multiselect(
-            "Show columns", options=all_labels, key=_DPC_DETAIL_COLS_KEY,
-            help="Tick / untick any metric column.  The Category column always "
-                 "shows; Download and Save to Fabric always include every column.",
-        )
+    _render_column_picker(
+        _DPC_DETAIL_COLS_KEY, all_labels,
+        help_suffix="  The Category column always shows; Download and Save to "
+                    "Fabric always include every column.",
+    )
 
 
 def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:

@@ -65,6 +65,12 @@ PARTY_SITE_CANDIDATES: tuple[str, ...] = (
 CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
     "customer_num", "customer_number", "CustomerNum", "Customer Num",
 )
+# The bridge key into dp_dimplantosites.  Shared by every consumer that resolves
+# corporate group off a Party Site Number, so the join spelling lives in ONE
+# place (both dp_dimshiptosites and dp_dimplantosites carry ``plan_to_code``).
+PLAN_TO_CANDIDATES: tuple[str, ...] = (
+    "plan_to_code", "PlanToCode", "Plan To Code", "plan_to",
+)
 ACCOUNT_DESC_CANDIDATES: tuple[str, ...] = (
     "account_description", "account_desc", "AccountDescription",
 )
@@ -154,6 +160,7 @@ __all__ = [
     "fetch_dp_dimplantosites_df",
     "PARTY_SITE_CANDIDATES",
     "CUSTOMER_NUM_CANDIDATES",
+    "PLAN_TO_CANDIDATES",
     "ACCOUNT_DESC_CANDIDATES",
     "SITE_NAME_CANDIDATES",
 ]

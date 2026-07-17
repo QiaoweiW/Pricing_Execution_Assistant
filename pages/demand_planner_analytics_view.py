@@ -160,6 +160,10 @@ from data_sources.demand_plan_comparison import (
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
+    # Shared month-window helpers (one definition, in the data layer).
+    months_in_range,
+    shift_year_back,
+    last_n_months,
     # Demand MOM Summary (actuals-stitched-onto-forecast pivot).
     DemandMomFilters,
     DemandMomResult,
@@ -3894,7 +3898,7 @@ def _render_demand_pivot_fragment() -> None:
 
     # 5. Load actuals for the actual window only (predicate-pushed slim read).
     actual_window = tuple(sorted(
-        _months_in_range_local(filters.actual_start, filters.actual_end)
+        months_in_range(filters.actual_start, filters.actual_end)
     ))
     ibp_df: Optional[pd.DataFrame] = None
     try:
@@ -5098,7 +5102,7 @@ def _render_demand_plan_comparison_fragment() -> None:
     #    short-circuit the others; the builder degrades gracefully.
     pdh_df = _load_demand_comparison_pdh()
     item_master_df = _load_mom_item_master()   # RO_Item_Master fallback dims
-    actual_months = _months_in_range_local(
+    actual_months = months_in_range(
         filters.actual_start, filters.actual_end)
     prior_month_set = {filters.prior_month.replace(day=1)}
     ibp_month_filter = tuple(sorted(actual_months | prior_month_set))
@@ -5110,16 +5114,16 @@ def _render_demand_plan_comparison_fragment() -> None:
     # forecast end) shifted back 12 months — e.g. actual Apr 2026 … forecast
     # Mar 2027 → PY Apr 2025 … Mar 2026.  Shipments over that window feed the
     # PY Actual column.
-    py_window = tuple(sorted(_months_in_range_local(
-        _shift_year_back(filters.actual_start),
-        _shift_year_back(filters.forecast_end),
+    py_window = tuple(sorted(months_in_range(
+        shift_year_back(filters.actual_start),
+        shift_year_back(filters.forecast_end),
     )))
     ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
     # Trailing-6-month shipments (current + prior year), anchored on the Actual
     # end month, for the T3M / T6M YoY KPI tiles.  T3M = last 3 of these 6.
-    recent_cur = _last_n_months_local(filters.actual_end, 6)
+    recent_cur = last_n_months(filters.actual_end, 6)
     recent_window = tuple(sorted(recent_cur))
-    recent_py_window = tuple(sorted(_shift_year_back(m) for m in recent_cur))
+    recent_py_window = tuple(sorted(shift_year_back(m) for m in recent_cur))
     ibp_recent_df, _ = _load_demand_comparison_ibp(months=recent_window)
     ibp_recent_py_df, _ = _load_demand_comparison_ibp(months=recent_py_window)
     ro_lookup = fetch_ro_summary_total_delta_by_path()
@@ -5257,36 +5261,6 @@ def _render_demand_plan_comparison_fragment() -> None:
         )
 
 
-def _shift_year_back(d: date) -> date:
-    """Return the same month one year earlier (first-of-month)."""
-    return date(d.year - 1, d.month, 1)
-
-
-def _last_n_months_local(end: date, n: int) -> set[date]:
-    """Return the set of *n* first-of-month dates ending at *end* (inclusive)."""
-    months: set[date] = set()
-    cur = end.replace(day=1)
-    for _ in range(max(0, n)):
-        months.add(cur)
-        cur = cur.replace(year=cur.year - 1, month=12) if cur.month == 1 \
-            else cur.replace(month=cur.month - 1)
-    return months
-
-
-def _months_in_range_local(start: date, end: date) -> set[date]:
-    """Return the inclusive first-of-month set covered by [start, end]."""
-    out: set[date] = set()
-    cur = start.replace(day=1)
-    end_norm = end.replace(day=1)
-    while cur <= end_norm:
-        out.add(cur)
-        if cur.month == 12:
-            cur = cur.replace(year=cur.year + 1, month=1)
-        else:
-            cur = cur.replace(month=cur.month + 1)
-    return out
-
-
 def _render_comparison_not_captured_logs(nc: ComparisonNotCaptured) -> None:
     """Render the three 'SKUs not captured' logs (prior · current · actuals).
 
@@ -5358,6 +5332,16 @@ def _render_one_comparison_not_captured(
 # tags Fresh Milk as "HTST"); combos still filter on the raw value.
 _DPC_PMAJ_DISPLAY: dict[str, str] = {"HTST": "Fresh Milk"}
 
+# Planner-preferred default windows for the comparison filters (FY26–27 cycle).
+# Named here — not inline in the widget renderer — so rolling to a new fiscal
+# year is a one-line edit.  Each falls back to first/last available month when
+# the preferred month isn't in the picker's options.
+_DPC_DEFAULT_ACTUAL_START: date = date(2026, 4, 1)
+_DPC_DEFAULT_ACTUAL_END: date = date(2026, 5, 1)
+_DPC_DEFAULT_FORECAST_START: date = date(2026, 6, 1)
+_DPC_DEFAULT_FORECAST_END: date = date(2027, 3, 1)
+_DPC_DEFAULT_PRIOR_MONTH: date = date(2026, 5, 1)
+
 
 def _render_demand_comparison_filters(
     cycles: list[str], months: list[date], actual_months: list[date],
@@ -5411,11 +5395,12 @@ def _render_demand_comparison_filters(
         """Index of *target* in the IBP month list, or *fallback*."""
         return actual_months.index(target) if target in actual_months else fallback
 
-    actual_start_idx = _actual_idx(date(2026, 4, 1), 0)
-    actual_end_idx = _actual_idx(date(2026, 5, 1), last_actual_idx)
-    fc_start_idx = _month_idx(date(2026, 6, 1), min(prior_fallback_idx + 1, last_idx))
-    fc_end_idx = _month_idx(date(2027, 3, 1), last_idx)
-    prior_default_idx = _month_idx(date(2026, 5, 1), prior_fallback_idx)
+    actual_start_idx = _actual_idx(_DPC_DEFAULT_ACTUAL_START, 0)
+    actual_end_idx = _actual_idx(_DPC_DEFAULT_ACTUAL_END, last_actual_idx)
+    fc_start_idx = _month_idx(
+        _DPC_DEFAULT_FORECAST_START, min(prior_fallback_idx + 1, last_idx))
+    fc_end_idx = _month_idx(_DPC_DEFAULT_FORECAST_END, last_idx)
+    prior_default_idx = _month_idx(_DPC_DEFAULT_PRIOR_MONTH, prior_fallback_idx)
 
     fmt_cycle = lambda c: c  # noqa: E731 — trivial identity for clarity
     # Spell the month out ("Apr 2026") so the selected value is easy to
@@ -6430,8 +6415,11 @@ def _render_bias_tiles(total: pd.Series | None) -> None:
     wmape = None if total is None else _dpc_num(total, BIAS_COL_WMAPE)
     avg = None if total is None else _dpc_num(total, BIAS_COL_AVG)
     fva = None if total is None else _dpc_num(total, BIAS_COL_FVA)
-    avg_txt, avg_cls = _fmt_yoy(avg)          # signed %, up/down colour
-    fva_txt, fva_cls = _bias_pp(fva)
+    avg_txt, avg_cls = _fmt_yoy(avg)          # signed %, up/down/flat colour
+    # FVA keeps the "+X.Xpp" text from _bias_pp but must use the KPI-tile CSS
+    # vocab (up/down/flat) — the tile stylesheet has no pos/neg rule.
+    fva_txt, _fva_pp_cls = _bias_pp(fva)
+    fva_cls = {"pos": "up", "neg": "down"}.get(_fva_pp_cls, "flat")
     tiles = (
         ("Total B2C WMAPE — 6-Mo", _bias_wmape_txt(wmape), "",
          "Volume-weighted error: Σ|Actual−Forecast| ÷ Σ|Actual| over the last "
@@ -6612,10 +6600,10 @@ def _render_forecast_bias_section(
 
     # "Actual" = IBP ORDERS for the 6 bias months + the seasonal-naive
     # benchmark (the same months a year earlier).
-    bias_cur = _last_n_months_local(filters.prior_month, 6)
+    bias_cur = last_n_months(filters.prior_month, 6)
     ibp_actuals_df, _ = _load_demand_comparison_ibp_orders(months=tuple(sorted(bias_cur)))
     ibp_naive_df, _ = _load_demand_comparison_ibp_orders(
-        months=tuple(sorted(_shift_year_back(m) for m in bias_cur)))
+        months=tuple(sorted(shift_year_back(m) for m in bias_cur)))
 
     # Rolling lag-1 depends on the tracker's cycle horizons (captured by the
     # tracker signature) + the Prior Month + the search-to-hide filter.
@@ -7839,6 +7827,14 @@ def _render_product_line_review_fragment() -> None:
     except ShipToSitesSourceError as exc:
         logger.warning("dp_dimshiptosites load failed: %s", exc)
         ship_to_sites_dim = None
+    # dp_dimplantosites bridges party_site's plan_to_code → the customer_num
+    # that actually matches dp_dimcustomernames (dp_dimshiptosites' own
+    # customer_num does not), so Base Plan rows resolve to a real corp group.
+    try:
+        plantosites_dim = fetch_dp_dimplantosites_df()
+    except ShipToSitesSourceError as exc:
+        logger.warning("dp_dimplantosites load failed: %s", exc)
+        plantosites_dim = None
 
     # 2) Common filters (apply to every PM table & chart).  Months come
     #    from the detail CSV's ``Start of Month`` so the planner can only
@@ -7881,6 +7877,7 @@ def _render_product_line_review_fragment() -> None:
         _signature_for(pdh_df),
         _signature_for(customer_names_dim),
         _signature_for(ship_to_sites_dim),
+        _signature_for(plantosites_dim),
         cy_actual_months,
         _detail_df=detail_df,
         _ibp_orders_df=ibp_orders_df,
@@ -7888,6 +7885,7 @@ def _render_product_line_review_fragment() -> None:
         _pdh_df=pdh_df,
         _customer_names_dim=customer_names_dim,
         _ship_to_sites_dim=ship_to_sites_dim,
+        _plantosites_dim=plantosites_dim,
     )
 
     for msg in plr_warnings:
@@ -7957,6 +7955,7 @@ def _cached_prepare_plr_inputs(
     pdh_sig: tuple,
     customer_names_sig: tuple,
     ship_to_sites_sig: tuple,
+    plantosites_sig: tuple,
     cy_actual_months: tuple,
     *,
     _detail_df: Optional[pd.DataFrame],
@@ -7965,6 +7964,7 @@ def _cached_prepare_plr_inputs(
     _pdh_df: Optional[pd.DataFrame],
     _customer_names_dim: Optional[pd.DataFrame],
     _ship_to_sites_dim: Optional[pd.DataFrame],
+    _plantosites_dim: Optional[pd.DataFrame],
 ) -> tuple[
     pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
     tuple[int, int], tuple[str, ...],
@@ -8007,7 +8007,7 @@ def _cached_prepare_plr_inputs(
     #       filter detail (drop CY-Actual months)
     #         ⊕ synthesise Actual rows from IBP SHIPMENTS
     #         → back-fill Customer No on Base Plan rows via
-    #           dp_dimshiptosites
+    #           dp_dimshiptosites.plan_to_code → dp_dimplantosites.customer_num
     #         → resolve Corporate Group per row by Forecast Type
     #           (exact customer_num for Actual + Base Plan; fuzzy
     #           Customer Name for R&O).
@@ -8018,6 +8018,7 @@ def _cached_prepare_plr_inputs(
         pdh_df=_pdh_df,
         customer_names_dim=_customer_names_dim,
         ship_to_sites_dim=_ship_to_sites_dim,
+        plantosites_df=_plantosites_dim,
         cy_actual_months=cy_actual_months,
     )
 

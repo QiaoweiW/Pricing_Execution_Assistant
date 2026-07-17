@@ -146,6 +146,7 @@ from data_sources.fabric_lakehouse_io import LakehouseIOError, read_csv, write_c
 from data_sources.ship_to_sites import (
     CUSTOMER_NUM_CANDIDATES as _STS_CUSTOMER_NUM_CANDIDATES,
     PARTY_SITE_CANDIDATES as _STS_PARTY_SITE_CANDIDATES,
+    PLAN_TO_CANDIDATES as _STS_PLAN_TO_CANDIDATES,
 )
 
 
@@ -914,29 +915,45 @@ def attach_corporate_group_by_forecast_type(
 # Customer No back-fill via the ship-to-sites dim (Base Plan rows only)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _dedup_str_map(keys: pd.Series, vals: pd.Series) -> dict[str, str]:
+    """``{key → val}`` over non-blank/non-"nan" pairs (last write wins)."""
+    keys = keys.astype(str).str.strip()
+    vals = vals.astype(str).str.strip()
+    keep = (keys != "") & (vals != "") & (vals.str.casefold() != "nan")
+    return (
+        pd.DataFrame({"k": keys[keep], "v": vals[keep]})
+        .drop_duplicates(subset="k", keep="last")
+        .set_index("k")["v"]
+        .to_dict()
+    )
+
+
 def attach_customer_no_from_ship_to_sites(
     unified_df: pd.DataFrame,
     ship_to_sites_dim: Optional[pd.DataFrame],
+    plantosites_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """Back-fill ``Customer No`` on Base Plan rows from the ship-to-sites dim.
+    """Back-fill ``Customer No`` on Base Plan rows from the site dims.
 
-    The upstream ``qry_demand_item_customer_detail.csv`` does NOT
-    publish ``Customer No``; planners only get ``Party Site Number``
-    there.  We translate that to the ``customer_num`` the rest of the
-    Fabric tables already use:
+    The upstream ``qry_demand_item_customer_detail.csv`` does NOT publish
+    ``Customer No``; planners only get ``Party Site Number``.  We translate that
+    to the ``customer_num`` the rest of the Fabric tables use, via the bridge
+    that actually reconciles with ``dp_dimcustomernames``:
 
-        unified.Party Site Number  →  dp_dimshiptosites.party_site_code
-                                  →  dp_dimshiptosites.customer_num
-                                  →  unified.Customer No
+        Party Site Number → dp_dimshiptosites.plan_to_code
+                          → dp_dimplantosites.customer_num  → Customer No
 
-    Only Base Plan rows are touched — Actual rows already carry
-    ``Customer No`` from the shipments source, and R&O rows are left
-    blank (planner spec: Customer No is N/A for R&O).
+    ``plan_to_code`` is the bridge key on purpose: ``dp_dimshiptosites``'s OWN
+    ``customer_num`` is a different key space that does NOT match
+    ``dp_dimcustomernames`` (so the downstream corp-group join would miss and
+    fall back to Customer Name).  When *plantosites_df* is absent the function
+    degrades to that legacy direct ``dp_dimshiptosites.customer_num`` path.
 
-    A row whose Party Site Number is missing from the dim keeps its
-    existing (blank) ``Customer No``; the universal fallback in
-    :func:`attach_corporate_group_by_forecast_type` then resolves its
-    Corporate Group to the row's Customer Name.
+    Only Base Plan rows are touched — Actual rows already carry ``Customer No``
+    from shipments, and R&O rows stay blank (planner spec).  A party site
+    missing from the dims keeps its blank ``Customer No``; the universal
+    fallback in :func:`attach_corporate_group_by_forecast_type` then resolves
+    its Corporate Group to the row's Customer Name.
     """
     if unified_df is None or unified_df.empty:
         return unified_df.copy() if unified_df is not None else pd.DataFrame()
@@ -948,26 +965,33 @@ def attach_customer_no_from_ship_to_sites(
         return out
 
     ps_col = _resolve_column(ship_to_sites_dim, _STS_PARTY_SITE_CANDIDATES)
-    cn_col = _resolve_column(ship_to_sites_dim, _STS_CUSTOMER_NUM_CANDIDATES)
-    if not (ps_col and cn_col):
-        logger.warning(
-            "dp_dimshiptosites missing required columns "
-            "(party_site=%r, customer_num=%r); Base Plan rows will "
-            "keep blank Customer No.",
-            ps_col, cn_col,
-        )
-        return out
-
-    # Build the party-site → customer_num lookup once.
-    keys = ship_to_sites_dim[ps_col].astype(str).str.strip()
-    vals = ship_to_sites_dim[cn_col].astype(str).str.strip()
-    keep = (keys != "") & (vals != "") & (vals.str.casefold() != "nan")
-    lookup = (
-        pd.DataFrame({"k": keys[keep], "v": vals[keep]})
-        .drop_duplicates(subset="k", keep="last")
-        .set_index("k")["v"]
-        .to_dict()
+    plan_col = _resolve_column(ship_to_sites_dim, _STS_PLAN_TO_CANDIDATES)
+    pts_plan_col = (
+        _resolve_column(plantosites_df, _STS_PLAN_TO_CANDIDATES)
+        if plantosites_df is not None else None
     )
+    pts_cust_col = (
+        _resolve_column(plantosites_df, _STS_CUSTOMER_NUM_CANDIDATES)
+        if plantosites_df is not None else None
+    )
+
+    if ps_col and plan_col and pts_plan_col and pts_cust_col:
+        # Preferred bridge: party_site → plan_to_code → customer_num.
+        party2plan = _dedup_str_map(ship_to_sites_dim[ps_col], ship_to_sites_dim[plan_col])
+        plan2cust = _dedup_str_map(plantosites_df[pts_plan_col], plantosites_df[pts_cust_col])
+        lookup = {ps: plan2cust[plan] for ps, plan in party2plan.items() if plan in plan2cust}
+    else:
+        # Legacy fallback: direct dp_dimshiptosites.customer_num (a different key
+        # space — usually misses dp_dimcustomernames, so corp falls back to name).
+        cn_col = _resolve_column(ship_to_sites_dim, _STS_CUSTOMER_NUM_CANDIDATES)
+        if not (ps_col and cn_col):
+            logger.warning(
+                "dp_dimshiptosites missing required columns (party_site=%r, "
+                "plan_to=%r, customer_num=%r); Base Plan rows keep blank "
+                "Customer No.", ps_col, plan_col, cn_col,
+            )
+            return out
+        lookup = _dedup_str_map(ship_to_sites_dim[ps_col], ship_to_sites_dim[cn_col])
 
     # Only Base Plan rows opt in.  We mask the assignment so an Actual
     # row that already carries a Customer No is never overwritten with
@@ -1093,6 +1117,7 @@ def build_demand_order_item_customer(
     pdh_df: Optional[pd.DataFrame],
     customer_names_dim: Optional[pd.DataFrame],
     ship_to_sites_dim: Optional[pd.DataFrame],
+    plantosites_df: Optional[pd.DataFrame] = None,
     cy_actual_months: Iterable[date],
     fuzzy_threshold: int = DEFAULT_FUZZY_THRESHOLD,
 ) -> DemandOrderItemCustomerBuild:
@@ -1152,7 +1177,8 @@ def build_demand_order_item_customer(
     # Back-fill Customer No on Base Plan rows (upstream CSV doesn't
     # publish it) BEFORE the corp-group attach — the dispatcher's
     # exact branch needs it populated to score the Base Plan rows.
-    unified = attach_customer_no_from_ship_to_sites(unified, ship_to_sites_dim)
+    unified = attach_customer_no_from_ship_to_sites(
+        unified, ship_to_sites_dim, plantosites_df)
     n_base_plan_filled_customer_no = (
         int(
             (

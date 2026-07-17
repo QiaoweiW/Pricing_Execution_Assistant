@@ -269,6 +269,27 @@ def test_attach_customer_no_handles_missing_dim_table():
     assert out[COL_CUSTOMER_NO].iloc[0] == ""
 
 
+def test_attach_customer_no_uses_plan_to_bridge_when_plantosites_present():
+    """With a dp_dimplantosites frame, Customer No is resolved via the bridge
+    party_site → plan_to_code → customer_num — NOT dp_dimshiptosites' own
+    (wrong-key-space) customer_num."""
+    unified = pd.DataFrame({
+        COL_FORECAST_TYPE: ["Base Plan"],
+        COL_PARTY_SITE_NUMBER: ["10244"],
+        COL_CUSTOMER_NO: [""],
+        COL_CUSTOMER_NAME: ["Albertsons"],
+    })
+    ship_to = pd.DataFrame([
+        {"party_site_code": "10244", "plan_to_code": "PL1", "customer_num": "WRONG"},
+    ])
+    plan_to = pd.DataFrame([
+        {"plan_to_code": "PL1", "customer_num": "9001", "corporate_group": "Albertsons"},
+    ])
+    out = attach_customer_no_from_ship_to_sites(unified, ship_to, plan_to)
+    # 9001 (via plantosites), never WRONG (shiptosites' own customer_num).
+    assert out[COL_CUSTOMER_NO].iloc[0] == "9001"
+
+
 def test_attach_customer_no_handles_party_site_miss():
     """Per Q4 (planner): a Base Plan row whose Party Site Number is NOT
     in the dim keeps a blank Customer No — the universal Corporate

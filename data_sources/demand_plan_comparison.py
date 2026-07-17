@@ -234,11 +234,6 @@ _RO_SUMMARY_TOTAL_DELTA_CANDIDATES: tuple[str, ...] = (
     "FY27 Probabilized|Total Delta",
     "FY27 Probabilized  | Total Delta",
 )
-_RO_SUMMARY_CURRENT_PLAN_CANDIDATES: tuple[str, ...] = (
-    "FY27 Probabilized | Current Plan",
-    "FY27 Probabilized|Current Plan",
-    "FY27 Probabilized  | Current Plan",
-)
 # Non-breaking space used by the RO Summary exporter to indent the tree.
 _NBSP: str = "\u00A0"
 
@@ -247,29 +242,6 @@ _NBSP: str = "\u00A0"
 
 BRAND_BRANDED: str = "Branded"
 BRAND_PRIVATE: str = "Private"
-
-
-def derive_brand(item_description: object) -> str:
-    """Return ``"Branded"`` / ``"Private"`` from a PDH item description.
-
-    Planner rule: look at the **first two characters** of the PDH
-    ``Item Description``.  ``"DG"`` (case-insensitive) → *Branded*
-    (Darigold's own brand); anything else → *Private* (private label /
-    co-pack).  Blank / missing descriptions fall to *Private* — the
-    conservative default (a Darigold-branded SKU would carry the ``DG``
-    prefix, so an unlabelled row is treated as not-branded).
-    """
-    if item_description is None:
-        return BRAND_PRIVATE
-    try:
-        if pd.isna(item_description):
-            return BRAND_PRIVATE
-    except (TypeError, ValueError):
-        pass
-    text = str(item_description).strip()
-    if text[:2].upper() == "DG":
-        return BRAND_BRANDED
-    return BRAND_PRIVATE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -814,43 +786,13 @@ def validate_filters(filters: ComparisonFilters) -> list[str]:
 # Enrichment — PDH join + dimension/brand attachment
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
-class _ItemDims:
-    """Per-item dimensions resolved from PDH (the join payload)."""
-    pmaj: str
-    sfmt: str
-    pminor: str
-    brand: str
-    desc: str = ""
-
-
-def build_item_dim_lookup(pdh_df: Optional[pd.DataFrame]) -> dict[str, _ItemDims]:
-    """Return ``{normalised_item_key -> _ItemDims}`` from PDH.
-
-    Kept for backward compatibility with any caller that needs a plain
-    dict; the comparison + driver builders themselves use the faster
-    DataFrame-shaped lookup returned by :func:`build_item_dim_frame`.
-    """
-    frame = build_item_dim_frame(pdh_df)
-    if frame.empty:
-        return {}
-    return {
-        row["__item_key"]: _ItemDims(
-            pmaj=row["pmaj"], sfmt=row["sfmt"], pminor=row["pminor"],
-            brand=row["brand"], desc=row["desc"],
-        )
-        for row in frame.to_dict(orient="records")
-    }
-
-
 def build_item_dim_frame(pdh_df: Optional[pd.DataFrame]) -> pd.DataFrame:
     """Return a vectorised PDH lookup as a DataFrame.
 
     Columns: ``__item_key, pmaj, sfmt, pminor, brand, desc``.  The
     ``__item_key`` column is the canonical join key produced by
     :func:`_vectorised_item_key` so it matches the same coercion used on
-    the tracker / IBP sides.  Last row wins on duplicate items (matches
-    the legacy ``build_item_dim_lookup`` contract).
+    the tracker / IBP sides.  Last row wins on duplicate items.
 
     Replacing the ``iterrows`` lookup with a vectorised frame turns the
     PDH preparation from O(n) Python calls into a handful of pandas
@@ -1135,7 +1077,8 @@ def _vectorised_item_key(series: pd.Series) -> pd.Series:
 
 
 def _vectorised_brand(desc_series: pd.Series) -> pd.Series:
-    """Vectorised analogue of :func:`derive_brand` (first 2 chars ``DG`` → Branded)."""
+    """Brand from a PDH item description: first 2 chars ``DG`` → Branded, else
+    Private (the planner rule; blank/missing descriptions fall to Private)."""
     s = desc_series.astype("string").str.strip()
     is_branded = s.str[:2].str.upper() == "DG"
     return is_branded.map({True: BRAND_BRANDED, False: BRAND_PRIVATE}).astype("object")
@@ -1276,10 +1219,8 @@ def _enrich_tracker(
 
     Output columns: ``item_key, item_desc, party_site, month (date),
     pounds (float), forecast_type, cycle, pmaj, sfmt, pminor, brand``.
-    Rows with an unparseable month are dropped.
-
-    Accepts either the new vectorised dim frame (preferred) or the
-    legacy ``dict`` lookup (back-compat for external callers).
+    Rows with an unparseable month are dropped.  *dims_or_frame* is the
+    vectorised dim frame from :func:`build_item_dim_frame`.
     """
     if tracker_df is None or tracker_df.empty:
         return _empty_enriched()
@@ -1337,9 +1278,8 @@ def _enrich_ibp(
     Output columns: ``item_key, item_desc, customer_no, customer_name,
     month (date), pounds (float), pmaj, sfmt, pminor, brand``.  Source
     column names are auto-detected from the candidate whitelists.
-
-    Accepts either the new vectorised dim frame (preferred) or the
-    legacy ``dict`` lookup (back-compat for external callers).
+    *dims_or_frame* is the vectorised dim frame from
+    :func:`build_item_dim_frame`.
     """
     if ibp_df is None or ibp_df.empty:
         return _empty_enriched(actuals=True)
@@ -1393,27 +1333,9 @@ def _enrich_ibp(
 
 
 def _coerce_dims_to_frame(dims_or_frame) -> pd.DataFrame:
-    """Accept either a legacy ``dict[str, _ItemDims]`` or a dim frame.
-
-    Lets the enrichment helpers stay back-compatible with any caller
-    that still passes :func:`build_item_dim_lookup`'s dict — we lift it
-    into the new frame shape on the fly.  No-op when already a frame.
-    """
-    if dims_or_frame is None:
-        return pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
+    """Normalise the dim argument to a DataFrame (None → empty schema)."""
     if isinstance(dims_or_frame, pd.DataFrame):
         return dims_or_frame
-    if isinstance(dims_or_frame, dict):
-        if not dims_or_frame:
-            return pd.DataFrame(
-                columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
-        return pd.DataFrame.from_records([
-            {
-                "__item_key": k, "pmaj": d.pmaj, "sfmt": d.sfmt,
-                "pminor": d.pminor, "brand": d.brand, "desc": d.desc,
-            }
-            for k, d in dims_or_frame.items()
-        ])
     return pd.DataFrame(columns=["__item_key", "pmaj", "sfmt", "pminor", "brand", "desc"])
 
 
@@ -1570,18 +1492,19 @@ def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
     return _fetch_ro_summary_metric_by_path(_RO_SUMMARY_TOTAL_DELTA_CANDIDATES)
 
 
-def fetch_ro_summary_current_plan_by_path() -> dict[tuple[str, ...], float]:
-    """Return ``{label_path -> FY27 Current Plan}`` from the saved RO Summary.
-
-    Used by Product Line Review for the **R&O FY** column (millions of
-    lbs, already on the report's display scale).
-    """
-    return _fetch_ro_summary_metric_by_path(_RO_SUMMARY_CURRENT_PLAN_CANDIDATES)
-
-
 def months_in_range(start: date, end: date) -> set[date]:
     """Inclusive first-of-month set from *start* through *end*."""
     return _months_in_range(start, end)
+
+
+def shift_year_back(d: date) -> date:
+    """Return the same month one calendar year earlier (first-of-month)."""
+    return _shift_year_back(d)
+
+
+def last_n_months(end: date, n: int) -> set[date]:
+    """Return the set of *n* first-of-month dates ending at *end* (inclusive)."""
+    return _last_n_months(end, n)
 
 
 def enrich_ibp_orders_df(
@@ -1647,16 +1570,6 @@ def resolve_ro_summary_path(
         return (_RO_TOTAL, _RO_FRESH_MILK, ro_sfmt)
 
     return None
-
-
-def _indent_depth(indented_label: str) -> int:
-    """Return the tree depth encoded in an RO-Summary indented label.
-
-    The RO Summary exporter prefixes ``"\\u00A0\\u00A0" * indent`` (two
-    NBSPs per level).  We count leading NBSPs and divide by two.
-    """
-    leading = len(indented_label) - len(indented_label.lstrip(_NBSP))
-    return leading // 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2374,7 +2287,8 @@ def _assemble_table(
 
     Adds the derived + ratio columns, the indented label, the internal
     metadata columns (for the page's row styling), rounds metric values
-    to one decimal, and applies the display column order + labels.
+    (two decimals for millions, four for ratios), and applies the display
+    column order + labels.
     """
     records: list[dict] = []
     for tpl in template:
@@ -3471,10 +3385,9 @@ _STS_PARTY_SITE_CANDIDATES: tuple[str, ...] = (
 # The bridge key: dp_dimshiptosites' OWN customer_num is a dead-end (different
 # key space from dp_dimcustomernames, overlap ~0); its plan_to_code resolves
 # through dp_dimplantosites to a customer_num that matches dp_dimcustomernames.
-_STS_PLAN_TO_CANDIDATES: tuple[str, ...] = (
-    "plan_to_code", "PlanToCode", "Plan To Code", "plan_to",
-)
-_PTS_PLAN_TO_CANDIDATES: tuple[str, ...] = (
+# The SAME ``plan_to_code`` spelling appears on both dp_dimshiptosites and
+# dp_dimplantosites, so one constant serves both sides of the bridge.
+_PLAN_TO_CANDIDATES: tuple[str, ...] = (
     "plan_to_code", "PlanToCode", "Plan To Code", "plan_to",
 )
 _PTS_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
@@ -3570,7 +3483,7 @@ def build_corp_group_lookups(
     # Bridge: plan_to_code → customer_num (dp_dimplantosites).
     plan2cust: dict[str, str] = {}
     if plantosites_df is not None and not plantosites_df.empty:
-        p_col = _resolve_column(plantosites_df, _PTS_PLAN_TO_CANDIDATES)
+        p_col = _resolve_column(plantosites_df, _PLAN_TO_CANDIDATES)
         c_col = _resolve_column(plantosites_df, _PTS_CUSTOMER_NUM_CANDIDATES)
         if p_col and c_col:
             tmp = pd.DataFrame({
@@ -3584,7 +3497,7 @@ def build_corp_group_lookups(
     party2corp: dict[str, str] = {}
     if shiptosites_df is not None and not shiptosites_df.empty:
         ps_col = _resolve_column(shiptosites_df, _STS_PARTY_SITE_CANDIDATES)
-        plan_col = _resolve_column(shiptosites_df, _STS_PLAN_TO_CANDIDATES)
+        plan_col = _resolve_column(shiptosites_df, _PLAN_TO_CANDIDATES)
         if ps_col and plan_col:
             tmp = pd.DataFrame({
                 "ps": _vectorised_clean_str(shiptosites_df[ps_col]),
@@ -5180,14 +5093,13 @@ __all__ = [
     "budget_by_row_id_from_workbook",
     "Fy27BudgetLoadResult",
     "COL_LABEL",
-    "derive_brand",
-    "build_item_dim_lookup",
     "list_tracker_cycles",
     "list_tracker_months",
     "validate_filters",
     "fetch_ro_summary_total_delta_by_path",
-    "fetch_ro_summary_current_plan_by_path",
     "months_in_range",
+    "shift_year_back",
+    "last_n_months",
     "enrich_ibp_orders_df",
     "resolve_ro_summary_path",
     "build_enriched_sources",

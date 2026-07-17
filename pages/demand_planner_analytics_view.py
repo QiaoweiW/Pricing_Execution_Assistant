@@ -257,19 +257,15 @@ from data_sources.ship_to_sites import (
 from data_sources.holistic_demand_plan_aps import (
     APS_OUTPUT_NAME,
     HolisticDemandPlanError,
-    MATCH_COL_CORP,
-    MATCH_COL_CUSTOMER,
-    MATCH_COL_STATUS,
-    MATCH_EXACT,
-    MATCH_FUZZY,
-    MATCH_OVERRIDE,
-    MATCH_UNMAPPED,
-    apply_customer_corp_overrides,
-    aps_output_path,
     filter_needs_review,
-    generate_holistic_demand_plan_aps,
     load_persisted_aps_plan,
-    save_aps_plan,
+)
+from data_sources.aps_upload_pipeline import (
+    ApsUploadError,
+    CYCLES as APS_CYCLES,
+    FISCAL_YEARS as APS_FISCAL_YEARS,
+    aps_history_path,
+    generate_aps_from_upload,
 )
 from data_sources.product_line_review import (
     cy_full_year_months as _plr_cy_full_year_months,
@@ -3330,20 +3326,12 @@ def _render_demand_summary() -> None:
         _render_demand_plan_comparison_section()
 
 
-# Session key holding the last-built Holistic Demand Plan result so download /
-# preview interactions don't re-run the heavy Fabric build.
-_HDP_APS_RESULT_KEY: str = "holistic_demand_plan_aps_result"
-# Planner's manual Customer → Corporate Group overrides for the R&O leg
-# ({stripped Customer -> corp}).  Applied in-memory to every R&O row of that
-# Customer; survives reruns and Fabric rebuilds until explicitly cleared.
-_HDP_APS_OVERRIDES_KEY: str = "holistic_demand_plan_aps_overrides"
-# Bumped whenever the underlying data changes (fresh Generate) or the planner
-# clears overrides, so the keyed mapping editor re-initialises cleanly instead
-# of replaying stale cell edits onto a different row set.
-_HDP_APS_EDITOR_NONCE_KEY: str = "holistic_demand_plan_aps_editor_nonce"
-# Bumped after a successful mapping-patch upload so the file_uploader widget
-# resets (a re-run doesn't re-ingest the same file).
-_HDP_APS_UPLOAD_NONCE_KEY: str = "holistic_demand_plan_aps_upload_nonce"
+# Session key holding the last upload-build result so download / preview
+# interactions don't re-run the transform.
+_APS_UPLOAD_RESULT_KEY: str = "aps_upload_result"
+# Bumped after a successful build so the file_uploader widget resets (a re-run
+# doesn't re-ingest the same file).
+_APS_UPLOAD_NONCE_KEY: str = "aps_upload_nonce"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -3351,62 +3339,67 @@ def _cached_persisted_aps_plan() -> Optional[pd.DataFrame]:
     """Cached read of the persisted APS plan from Fabric (``None`` if absent).
 
     Cached so the existence-check + preview/download don't re-read the (large)
-    CSV on every rerun; cleared explicitly after a Generate or Apply-patch save
-    so the fresh file is picked up.
+    CSV on every rerun; cleared explicitly after a successful build so the fresh
+    file is picked up.
     """
     df, _etag = load_persisted_aps_plan()
     return df
 
 
-def _parse_uploaded_mapping(uploaded) -> dict[str, str]:
-    """Parse an uploaded mapping-log CSV → ``{Customer -> Corporate Group}``.
+def _render_aps_match_log(match_log: Optional[pd.DataFrame]) -> None:
+    """Read-only R&O Customer → Corporate Group fuzzy match log (download + peek).
 
-    Accepts the downloaded log shape (``Customer``, ``Corporate Group``, …);
-    rows with a blank / ``(Unmapped)`` Corporate Group are skipped so a
-    half-filled sheet only patches the rows the planner actually completed.
+    The APS base-plan leg is attributed deterministically (plan-to bridge +
+    native code), so only the R&O leg's fuzzy matches warrant a look.  Surfaced
+    for transparency; the rows that need attention are shown first.
     """
-    raw = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
-    cols = {c.strip().lower(): c for c in raw.columns}
-    cust_col = cols.get(MATCH_COL_CUSTOMER.lower())
-    corp_col = cols.get(MATCH_COL_CORP.lower())
-    if not cust_col or not corp_col:
-        raise ValueError(
-            f"The uploaded CSV must have '{MATCH_COL_CUSTOMER}' and "
-            f"'{MATCH_COL_CORP}' columns (found: {list(raw.columns)})."
+    if match_log is None or match_log.empty:
+        return
+    review = filter_needs_review(match_log)
+    n_review = 0 if review is None else len(review)
+    label = (
+        f"⚠️ {n_review} R&O customer(s) need a Corporate Group review"
+        if n_review else "R&O Corporate Group match log (all resolved)"
+    )
+    with st.expander(f"🧾 {label}", expanded=bool(n_review)):
+        st.caption(
+            "How each RO_Seed **Customer** resolved to a **Corporate Group** "
+            "(Exact / Fuzzy / Unmapped).  Fix any Unmapped upstream in "
+            "`dp_dimcustomernames`, then re-upload the cycle."
         )
-    out: dict[str, str] = {}
-    for cust, corp in zip(raw[cust_col], raw[corp_col]):
-        k, v = str(cust).strip(), str(corp).strip()
-        if k and v and v != CORP_GROUP_UNMAPPED:
-            out[k] = v
-    return out
+        st.download_button(
+            label="⬇️ Download match log (CSV)",
+            data=match_log.to_csv(index=False).encode("utf-8"),
+            file_name="aps_ro_corp_group_match_log.csv",
+            mime="text/csv",
+            key="aps_match_log_download",
+        )
+        st.dataframe(match_log, use_container_width=True, hide_index=True)
 
 
 def _render_demand_summary_aps() -> None:
-    """Render the Demand Summary (APS) section — the Holistic Demand Plan build.
+    """Render the Demand Summary (APS) section — the upload-driven APS plan.
 
-    A foldable, self-contained section: **Generate / Rebuild** pulls
-    ``dp_factscurrentaps`` (APS Base Plan) + expands ``RO_Seed.csv`` into the
-    R&O portion, merges + enriches them into ``qry_mgmt_plan_full_aps.csv``
-    (Start of Month · Item · Item Description · Party Site Number · Demand
-    Plan Pounds · Forecast Type · Business Unit · Portfolio Major/Minor ·
-    Supply Format · Corporate Group), and **saves it to Fabric**
-    (``Files/RO Tracking/APS/``).  Once the file exists it loads from there
-    (preview + download) **without regenerating**, so hand-applied Corporate
-    Group fixes survive.
+    A foldable, self-contained section: the planner **uploads an APS bulk
+    export** and picks a **Cycle** + **Fiscal Year**; the pipeline transforms it
+    into the history-tracker schema (dims by item code · Corporate Group via the
+    plan-to bridge with the file's native code as fallback · Forecast Type
+    *APS Base Plan*), appends the current **RO_Seed** R&O leg (fuzzy corporate
+    group), writes **`qry_mgmt_plan_full_aps.csv`** (this cycle) and **upserts**
+    the rows into **`qry_mgmt_plan_full_aps_history.csv`** (re-uploading a cycle
+    replaces its slice).  B2C-only.
     """
     with st.expander("📈 Demand Summary (APS)", expanded=False):
         st.caption(
-            "**Holistic Demand Plan** — merges the **APS Base Plan** "
-            "(`dbo.dp_factscurrentaps`, tagged *APS Base Plan*) with the "
-            "**R&O** portion expanded from `RO_Seed.csv` into "
-            "**`qry_mgmt_plan_full_aps.csv`**, matching the "
-            "`qry_mgmt_plan_full.csv` structure (+ **Corporate Group** last). "
-            "Item Description / Portfolio / Supply are resolved PDH → "
-            "RO_Item_Master; R&O rows are attributed to a Corporate Group by "
-            "fuzzy-matching RO_Seed's Customer to `dp_dimcustomernames`.  The "
-            f"file is **saved to `{aps_output_path()}`** and reused on later "
-            "visits (no regeneration) so mapping fixes stick."
+            "**APS demand plan (upload-driven).**  Upload an **APS bulk export** "
+            "CSV and pick the **Cycle** + **Fiscal Year** it represents.  The "
+            "APS Base Plan is shaped to the history schema (Portfolio / Supply "
+            "resolved by **item code** via PDH → RO_Item_Master; Corporate Group "
+            "via the `plan_to_code → dp_dimplantosites → dp_dimcustomernames` "
+            "bridge, native `corporate_group_code` as fallback), the current "
+            "**RO_Seed** R&O leg is appended (fuzzy Customer → Corporate Group), "
+            f"and the rows are appended to **`{aps_history_path()}`** "
+            "(idempotent per Cycle + FY).  B2C only."
         )
 
         # Auth gate — match every other Fabric-backed section here.
@@ -3417,64 +3410,69 @@ def _render_demand_summary_aps() -> None:
             )
             return
 
-        generate_clicked = st.button(
-            "▶️ Generate / Rebuild Holistic Demand Plan",
-            key="hdp_aps_generate",
+        pick = st.columns(2)
+        with pick[0]:
+            cycle = st.selectbox(
+                "Cycle", options=APS_CYCLES, key="aps_upload_cycle",
+                help="The planning cycle this uploaded export represents.",
+            )
+        with pick[1]:
+            fy = st.selectbox(
+                "Fiscal Year", options=APS_FISCAL_YEARS, key="aps_upload_fy",
+                help="The fiscal year this uploaded export represents.",
+            )
+        nonce = st.session_state.get(_APS_UPLOAD_NONCE_KEY, 0)
+        uploaded = st.file_uploader(
+            "Upload APS bulk export (CSV)", type=["csv"],
+            key=f"aps_upload_file_{nonce}",
+            help="e.g. FY27_C5_APS_bulk_export_per_month_YYYYMMDD.csv — one row "
+                 "per party-site × item × month.",
+        )
+        build_clicked = st.button(
+            "▶️ Build & append to history",
+            key="aps_upload_build",
             type="primary",
             use_container_width=True,
-            help=(
-                "Pulls dp_factscurrentaps + RO_Seed + supporting dims from "
-                "Fabric, builds qry_mgmt_plan_full_aps.csv and SAVES it to "
-                f"{aps_output_path()}.  Heavy (full APS scan + 36-month RO "
-                "expansion) — runs only on click.  Rebuilding overwrites the "
-                "saved file with a fresh fuzzy match (re-apply overrides "
-                "afterward to restore manual fixes)."
-            ),
+            disabled=uploaded is None,
+            help="Transforms the upload, resolves Corporate Group, appends the "
+                 "RO_Seed R&O leg, and upserts the rows into the APS history "
+                 "tracker (replacing this Cycle + FY if already present).",
         )
 
-        result = st.session_state.get(_HDP_APS_RESULT_KEY)
-        if generate_clicked:
+        if build_clicked and uploaded is not None:
             try:
                 with st.spinner(
-                    "Building Holistic Demand Plan (APS) and saving to Fabric…"
+                    "Transforming upload, resolving corporate groups, appending "
+                    "to the APS history tracker…"
                 ):
-                    result = generate_holistic_demand_plan_aps()
-                    save_aps_plan(result.frame)
+                    res = generate_aps_from_upload(
+                        uploaded.getvalue(), filename=uploaded.name,
+                        cycle=str(cycle), fy=int(fy),
+                    )
                 _cached_persisted_aps_plan.clear()
-                st.session_state[_HDP_APS_RESULT_KEY] = result
-                # Fresh data → reset the mapping editor's widget state.
-                st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
-                    st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
-                )
-                st.success(f"✅ Built and saved to `{aps_output_path()}`.")
+                st.session_state[_APS_UPLOAD_RESULT_KEY] = res
+                st.session_state[_APS_UPLOAD_NONCE_KEY] = nonce + 1
             except (
-                HolisticDemandPlanError, PlanLiftError, CustomerDimsError,
-                LakehouseIOError, ValueError,
+                ApsUploadError, HolisticDemandPlanError, PlanLiftError,
+                CustomerDimsError, ShipToSitesSourceError, LakehouseIOError,
+                ValueError,
             ) as exc:
-                st.session_state.pop(_HDP_APS_RESULT_KEY, None)
-                st.error(f"❌ Could not build the Holistic Demand Plan.\n\n{exc}")
+                st.session_state.pop(_APS_UPLOAD_RESULT_KEY, None)
+                st.error(f"❌ Could not build the APS plan from the upload.\n\n{exc}")
                 return
 
-        # ── Interactive path: a freshly built / rebuilt result is in session.
-        #    Full mapping editor + patch upload + download reflect edits live.
-        if result is not None:
-            overrides = _render_hdp_match_editor(result)
-            effective = apply_customer_corp_overrides(result, overrides)
-            frame = effective.frame
-            if frame.empty:
-                st.info(
-                    "The build produced no rows — check that "
-                    "`dp_factscurrentaps` and `RO_Seed.csv` are populated."
-                )
-            else:
-                st.success(
-                    f"✅ Built **{len(frame):,}** rows — "
-                    f"{effective.aps_rows:,} APS Base Plan + "
-                    f"{effective.ro_rows:,} R&O.  Corporate Group edits below "
-                    "apply to the download now; click **Apply patch & save** "
-                    "to write them to the Fabric file."
-                )
-                _render_aps_download_preview(frame, key_prefix="hdp_aps_live")
+        # ── Post-build path: show the just-built cycle + match log.
+        res = st.session_state.get(_APS_UPLOAD_RESULT_KEY)
+        if res is not None:
+            cov = "—" if pd.isna(res.corp_coverage) else f"{res.corp_coverage:.0%}"
+            st.success(
+                f"✅ Built **{len(res.rows):,}** rows for **{res.cycle} / "
+                f"FY{res.fy}** — {res.aps_rows:,} APS Base Plan + {res.ro_rows:,} "
+                f"R&O.  Corporate-group coverage **{cov}**.  History tracker now "
+                f"**{res.history_rows:,}** rows."
+            )
+            _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
+            _render_aps_match_log(res.match_log)
             return
 
         # ── Load path: no session result → serve the persisted Fabric file.
@@ -3485,25 +3483,17 @@ def _render_demand_summary_aps() -> None:
             st.warning(f"Could not read the saved APS file: {exc}")
         if persisted is not None and not persisted.empty:
             st.success(
-                f"✅ Loaded existing **{APS_OUTPUT_NAME}** from Fabric "
-                f"({len(persisted):,} rows).  It is **not regenerated** on "
-                "load — click **Generate / Rebuild** above to refresh from "
-                "source, or fix Corporate Group mappings there."
+                f"✅ Loaded the last-built **{APS_OUTPUT_NAME}** from Fabric "
+                f"({len(persisted):,} rows).  Upload a new export + Cycle/FY "
+                "above to build and append the next cycle."
             )
-            _render_aps_download_preview(persisted, key_prefix="hdp_aps_saved")
-            st.caption(
-                "_To correct Corporate Group mappings, click **Generate / "
-                "Rebuild** — that loads the R&O detail needed to re-map, then "
-                "use the mapping-patch upload._"
-            )
+            _render_aps_download_preview(persisted, key_prefix="aps_upload_saved")
             return
 
         # ── Empty state: nothing built and nothing saved yet.
         st.caption(
-            "_Click **Generate / Rebuild Holistic Demand Plan** to build the "
-            f"merged APS + R&O file and save it to `{aps_output_path()}`.  "
-            "Once saved it loads from there on later visits without "
-            "rebuilding._"
+            "_Upload an APS bulk export, pick its **Cycle** + **Fiscal Year**, "
+            "then click **Build & append to history**._"
         )
 
 
@@ -3522,216 +3512,6 @@ def _render_aps_download_preview(frame: pd.DataFrame, *, key_prefix: str) -> Non
     )
     with st.expander("👁️ Preview (first 100 rows)", expanded=False):
         st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
-
-
-def _render_hdp_match_editor(result) -> dict[str, str]:
-    """Render the editable R&O Customer → Corporate Group mapping + match log.
-
-    Foldable, at the top of the Holistic Demand Plan results.  Shows — by
-    default — only the rows that need a look (Fuzzy / Unmapped / blank
-    Corporate Group / already-overridden); a toggle reveals every Customer.
-    The **Corporate Group** cell is editable: typing a value overrides that
-    Customer's group for **all** its R&O rows in the downloaded file.
-    Auto-expands when there is anything to review.
-
-    Returns the merged ``{stripped Customer -> corp}`` override dict (also
-    persisted to session) so the caller can re-apply it to the frame.
-    """
-    overrides: dict[str, str] = dict(st.session_state.get(_HDP_APS_OVERRIDES_KEY, {}))
-    base_log = result.customer_match_log
-    if base_log is None or base_log.empty:
-        return overrides
-
-    # Original resolution per Customer — the yardstick for "is this an edit?".
-    base_corp = {
-        str(c).strip(): str(g)
-        for c, g in zip(base_log[MATCH_COL_CUSTOMER], base_log[MATCH_COL_CORP])
-    }
-    status = base_log[MATCH_COL_STATUS]
-    n_unmapped = int((status == MATCH_UNMAPPED).sum())
-    n_fuzzy = int((status == MATCH_FUZZY).sum())
-    n_exact = int((status == MATCH_EXACT).sum())
-
-    with st.expander(
-        f"🔗 R&O Customer → Corporate Group mapping — "
-        f"{n_unmapped} unmapped · {n_fuzzy} fuzzy · {n_exact} exact"
-        + (f" · {len(overrides)} edited" if overrides else ""),
-        expanded=(n_unmapped > 0 or n_fuzzy > 0 or bool(overrides)),
-    ):
-        st.caption(
-            "How each **R&O** Customer resolved to a Corporate Group (APS "
-            "rows use `dp_factscurrentaps`'s own `corporate_group_code`).  "
-            "**Edit the Corporate Group cell to fix a mapping** — the change "
-            "applies to *every* R&O row of that Customer in the downloaded "
-            "`qry_mgmt_plan_full_aps.csv`.  By default this shows only rows "
-            "needing review (Fuzzy / Unmapped / blank); edited rows are "
-            "tagged **Override**."
-        )
-
-        top_l, top_r = st.columns([3, 1.4])
-        with top_l:
-            show_all = st.toggle(
-                "Show all customers",
-                value=False,
-                key="hdp_aps_show_all",
-                help=(
-                    "Off (default): only rows needing review.  On: every "
-                    "distinct R&O Customer — use it to re-map a Customer that "
-                    "matched confidently but to the wrong group."
-                ),
-            )
-        with top_r:
-            if overrides and st.button(
-                "↩️ Clear overrides",
-                key="hdp_aps_clear_overrides",
-                use_container_width=True,
-                help="Discard all manual Corporate Group edits.",
-            ):
-                st.session_state.pop(_HDP_APS_OVERRIDES_KEY, None)
-                st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
-                    st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
-                )
-                st.rerun()
-
-        display_log = base_log if show_all else filter_needs_review(base_log)
-
-        if display_log is None or display_log.empty:
-            st.success(
-                "✅ Every R&O Customer resolved to a real Corporate Group — "
-                "nothing to review.  Tick **Show all customers** to re-map one "
-                "anyway."
-            )
-        else:
-            # Seed the editable frame with the CURRENT effective group
-            # (override if set, else the resolved group; blanks for Unmapped
-            # so the planner types into an empty cell).
-            def _display_corp(cust: object) -> str:
-                key = str(cust).strip()
-                val = overrides.get(key, base_corp.get(key, ""))
-                return "" if val == CORP_GROUP_UNMAPPED else str(val)
-
-            view = display_log[[MATCH_COL_CUSTOMER, MATCH_COL_STATUS]].copy()
-            view[MATCH_COL_CORP] = display_log[MATCH_COL_CUSTOMER].map(_display_corp)
-
-            editor_nonce = st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0)
-            edited = st.data_editor(
-                view,
-                hide_index=True,
-                use_container_width=True,
-                num_rows="fixed",
-                # Key varies with the row set (show_all) and a reset nonce so
-                # stale cell edits never replay onto a different set of rows.
-                key=f"hdp_aps_match_editor_{int(show_all)}_{editor_nonce}",
-                column_config={
-                    MATCH_COL_CUSTOMER: st.column_config.TextColumn(
-                        "Customer", disabled=True),
-                    MATCH_COL_STATUS: st.column_config.TextColumn(
-                        "Match", disabled=True, width="small"),
-                    MATCH_COL_CORP: st.column_config.TextColumn(
-                        "Corporate Group",
-                        help=(
-                            "Type to override — applied to ALL R&O rows of "
-                            "this Customer. Leave blank to keep it unmapped."
-                        ),
-                    ),
-                },
-                column_order=[MATCH_COL_CUSTOMER, MATCH_COL_STATUS, MATCH_COL_CORP],
-            )
-
-            # Fold the visible edits into the override set: a cell that now
-            # differs from the original resolution is an override; one reset
-            # back to the original (or blanked) drops any prior override.
-            for _, r in edited.iterrows():
-                cust = str(r[MATCH_COL_CUSTOMER]).strip()
-                val = str(r[MATCH_COL_CORP]).strip()
-                base = str(base_corp.get(cust, "")).strip()
-                # A real value that differs from the original resolution is an
-                # override; blank / "(Unmapped)" / unchanged drops any prior one.
-                if val and val != CORP_GROUP_UNMAPPED and val != base:
-                    overrides[cust] = val
-                else:
-                    overrides.pop(cust, None)
-
-        st.session_state[_HDP_APS_OVERRIDES_KEY] = overrides
-
-        # Download the mapping AS APPLIED (overrides folded in) for the record.
-        applied_log = apply_customer_corp_overrides(result, overrides).customer_match_log
-        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-        st.download_button(
-            label="⬇️ Download mapping log (CSV)",
-            data=applied_log.to_csv(index=False).encode("utf-8"),
-            file_name=f"holistic_demand_plan_match_log_{today}.csv",
-            mime="text/csv",
-            key="hdp_aps_match_log_download",
-        )
-
-        # ── Bulk patch round-trip: download log → fill → upload → apply ──────
-        # The patch is written to the Fabric file ONLY when the planner clicks
-        # "Apply patch & save" (inline edits + uploaded rows are merged).
-        st.markdown("---")
-        st.markdown(
-            "**Patch mappings from a file.**  Download the log above, fill the "
-            "**Corporate Group** column for the unmapped rows, upload it here, "
-            "then **Apply patch & save** to write the corrections into "
-            f"`{APS_OUTPUT_NAME}` in Fabric (the file is not otherwise "
-            "regenerated)."
-        )
-        upload_nonce = st.session_state.get(_HDP_APS_UPLOAD_NONCE_KEY, 0)
-        uploaded = st.file_uploader(
-            "Upload filled mapping log (CSV)",
-            type=["csv"],
-            key=f"hdp_aps_mapping_upload_{upload_nonce}",
-            help="Must carry Customer + Corporate Group columns (the "
-                 "downloaded log's shape).  Blank / (Unmapped) rows are ignored.",
-        )
-        if st.button(
-            "✅ Apply patch & save to Fabric",
-            key="hdp_aps_apply_patch",
-            type="primary",
-            use_container_width=True,
-            help="Applies uploaded + inline Corporate Group edits to every R&O "
-                 "row of each Customer, then overwrites the saved Fabric file.",
-        ):
-            merged = dict(overrides)
-            try:
-                if uploaded is not None:
-                    merged.update(_parse_uploaded_mapping(uploaded))
-            except (ValueError, pd.errors.ParserError) as exc:
-                st.error(f"❌ Could not read the uploaded mapping.\n\n{exc}")
-            else:
-                if not merged:
-                    st.warning(
-                        "Nothing to apply — edit a Corporate Group cell above "
-                        "or upload a filled log first."
-                    )
-                else:
-                    patched = apply_customer_corp_overrides(result, merged)
-                    try:
-                        with st.spinner("Applying patch and saving to Fabric…"):
-                            save_aps_plan(patched.frame)
-                    except (LakehouseIOError, HolisticDemandPlanError) as exc:
-                        st.error(f"❌ Save failed.\n\n{exc}")
-                    else:
-                        st.session_state[_HDP_APS_OVERRIDES_KEY] = merged
-                        _cached_persisted_aps_plan.clear()
-                        st.session_state[_HDP_APS_UPLOAD_NONCE_KEY] = upload_nonce + 1
-                        st.session_state[_HDP_APS_EDITOR_NONCE_KEY] = (
-                            st.session_state.get(_HDP_APS_EDITOR_NONCE_KEY, 0) + 1
-                        )
-                        remaining = len(filter_needs_review(patched.customer_match_log))
-                        if remaining:
-                            st.warning(
-                                f"Patch saved to `{APS_OUTPUT_NAME}`, but "
-                                f"**{remaining}** customer(s) still need a "
-                                "Corporate Group."
-                            )
-                        else:
-                            st.success(
-                                f"✅ Patch applied and saved to "
-                                f"`{APS_OUTPUT_NAME}` — the mapping log is clean."
-                            )
-                        st.rerun()
-    return overrides
 
 
 def _render_demand_summary_file(

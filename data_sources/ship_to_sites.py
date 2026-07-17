@@ -36,7 +36,9 @@ from data_sources.fabric_auth import (
     bind_storage_token,
     duckdb_lock,
     get_duckdb_connection,
+    prepare_duckdb_tls,
 )
+from data_sources.fabric_tls import tls_error_hint as _tls_hint
 
 
 logger = logging.getLogger(__name__)
@@ -97,10 +99,13 @@ def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, str]:
     except FabricAuthError as exc:
         raise ShipToSitesSourceError(str(exc)) from exc
 
+    # Honor [fabric_htst] ca_cert_file / ssl_verify for the OneLake TLS
+    # handshake (corporate MITM proxy → else DuckDB libcurl "SSL connect error").
+    ssl_verify = prepare_duckdb_tls()
     try:
         con = get_duckdb_connection()
         with duckdb_lock():
-            bind_storage_token(con, token)
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
             df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
     except FabricAuthError as exc:
         raise ShipToSitesSourceError(str(exc)) from exc
@@ -108,7 +113,7 @@ def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, str]:
         raise ShipToSitesSourceError(
             f"Could not read Delta table via DuckDB at {table_uri}.  "
             f"Verify the lakehouse identifiers and your Read access.  "
-            f"Underlying error: {exc}"
+            f"Underlying error: {exc}{_tls_hint(exc)}"
         ) from exc
 
     logger.info("Loaded dp_dimshiptosites (%s rows) from %s", len(df), table_uri)

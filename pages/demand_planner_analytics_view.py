@@ -144,9 +144,13 @@ from data_sources.demand_plan_comparison import (
     list_tracker_cycles,
     list_comparison_combos,
     build_forecast_bias_table,
+    build_forecast_bias_corp_sku_drivers,
+    CORP_UNATTRIBUTED,
     BIAS_COL_AVG,
     BIAS_COL_WMAPE,
     BIAS_COL_FVA,
+    BIAS_COL_VOLUME,
+    BIAS_COL_IMPACT,
     BIAS_COL_FLAG_DIR,
     BIAS_COL_FLAG_SEV,
     BIAS_COL_FLAG_FVA,
@@ -6462,7 +6466,8 @@ def _render_bias_instructions(month_meta: tuple) -> None:
             "column is the same 1-step-ahead horizon, so months are comparable.\n"
             + (f"\n_This run's source per month: {mapping}._\n" if mapping else "")
             + "\n"
-            "- **Forecast** = that month's lag-1 cycle plan = **Base + R&O**.\n"
+            "- **Forecast** = that month's lag-1 cycle **Base Plan** (R&O "
+            "excluded — this tracks the committed base plan vs orders).\n"
             "- **Actual** = **IBP Orders (ordered lbs)** — bias measures the "
             "plan vs what customers actually ordered.\n"
             "- The six columns are the months **ending at (and including) the "
@@ -6602,7 +6607,7 @@ def _render_forecast_bias_section(
     filters: ComparisonFilters,
 ) -> None:
     """Render the Forecast Bias (rolling Lag 1) section — tiles + foldable tree."""
-    st.markdown("#### 🎯 Forecast Bias — Rolling Lag 1 by Segment × Month")
+    st.markdown("#### 🎯 Forecast Bias (excl. R&O) — Rolling Lag 1 by Segment × Month")
 
     # "Actual" = IBP ORDERS for the 6 bias months + the seasonal-naive
     # benchmark (the same months a year earlier).
@@ -6636,6 +6641,228 @@ def _render_forecast_bias_section(
     by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
     _render_bias_tiles(by_id.get("total_b2c"))
     _render_bias_tree(table, months, month_meta)
+
+    # Opt-in drill: Corporate group × SKU drivers of the segment miss.
+    _render_bias_corp_sku_drivers(
+        tracker_df, pdh_df, item_master_df, filters,
+        ibp_actuals_df, ibp_naive_df, table)
+
+
+# ── Corporate group × SKU drivers (opt-in drill under the bias tree) ─────────
+_BIAS_DRIVERS_LOADED_KEY: str = "bias_corp_sku_drivers_loaded"
+_BIAS_DRIVERS_SEG_KEY: str = "bias_corp_sku_drivers_segment"
+_BIAS_DRIVER_PICK_KEY: str = "bias_corp_sku_driver_pick"
+# Below this forecast-side attribution the party_site→corporate_group join
+# isn't reconciling, so a corp split would be misleading — show a diagnostic
+# instead of fabricated drivers (the view auto-enables once the dims are fixed).
+_BIAS_DRIVERS_MIN_FCST_ATTR: float = 0.30
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_corp_sku_drivers(
+    sig_key: tuple,
+    filters: ComparisonFilters,
+    segment_row_id: str,
+    _tracker_df: pd.DataFrame,
+    _actuals_df: Optional[pd.DataFrame],
+    _naive_df: Optional[pd.DataFrame],
+    _pdh_df: Optional[pd.DataFrame],
+    _item_master_df: Optional[pd.DataFrame],
+    _shiptosites_df: Optional[pd.DataFrame],
+    _customernames_df: Optional[pd.DataFrame],
+) -> tuple:
+    """Cache the corp×SKU driver build (native tuple → dodges the pickle hazard)."""
+    res = build_forecast_bias_corp_sku_drivers(
+        _tracker_df, _actuals_df, _naive_df, _pdh_df, filters,
+        segment_row_id=segment_row_id,
+        shiptosites_df=_shiptosites_df, customernames_df=_customernames_df,
+        item_master_df=_item_master_df, top_n=3)
+    return (res.drivers, res.months, res.segment_label, res.segment_volume,
+            res.attributed_share, res.forecast_attributed_share, res.available)
+
+
+def _load_corp_group_dims() -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
+    """Fetch the two corp-group dims (cached).  Returns (shiptosites, names, warning)."""
+    try:
+        sts = fetch_dimshiptosites_df()
+    except (ShipToSitesSourceError, Exception) as exc:  # noqa: BLE001
+        return None, None, f"ship-to-sites dim — {exc}"
+    try:
+        names = fetch_dp_dimcustomernames_df()
+    except (CustomerDimsError, Exception) as exc:  # noqa: BLE001
+        return sts, None, f"customer-names dim — {exc}"
+    return sts, names, ""
+
+
+def _bias_default_segment(table: pd.DataFrame) -> str:
+    """Worst-flagged segment (highest impact among flagged), else Total B2C."""
+    if BIAS_COL_FLAG_SEV in table.columns:
+        flagged = table[table[BIAS_COL_FLAG_SEV].astype(str).str.len() > 0]
+    else:
+        flagged = table.iloc[0:0]
+    pool = flagged if not flagged.empty else table
+    if BIAS_COL_IMPACT in pool.columns and not pool.empty:
+        pool = pool.sort_values(BIAS_COL_IMPACT, ascending=False)
+    return str(pool.iloc[0]["_row_id"]) if not pool.empty else "total_b2c"
+
+
+def _corp_driver_label(row: pd.Series) -> str:
+    """Corporate-group display, marking soft (~name fallback) / Unattributed."""
+    corp = str(row.get("corp_group", ""))
+    if bool(row.get("soft")):
+        return f"~{corp}"      # customer-name fallback → softer attribution
+    return corp
+
+
+def _render_bias_corp_sku_drivers(
+    tracker_df: pd.DataFrame,
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    ibp_actuals_df: Optional[pd.DataFrame],
+    ibp_naive_df: Optional[pd.DataFrame],
+    bias_table: pd.DataFrame,
+) -> None:
+    """Foldable, opt-in Corporate × SKU driver drill for the bias section.
+
+    Lazy by design: nothing computes and no corp-group dims are read until the
+    planner clicks *Load*, so the high-level report above never pays for it.
+    """
+    with st.expander("🔎 Forecast Bias Corporate × SKU Drivers", expanded=False):
+        st.caption(
+            "Drill into the **Corporate group × SKU** cells driving a segment's "
+            "lag-1 base-plan miss — ranked by **pounds of error (impact)**, the "
+            "cells actually moving the number.  Loads on demand so it never "
+            "slows the report above."
+        )
+        if not st.session_state.get(_BIAS_DRIVERS_LOADED_KEY):
+            if st.button("📥 Load / refresh drivers", key="bias_drivers_load_btn"):
+                st.session_state[_BIAS_DRIVERS_LOADED_KEY] = True
+                st.rerun()
+            return
+
+        sts, names, dim_warn = _load_corp_group_dims()
+        if sts is None or names is None:
+            st.warning(f"⚠️ Could not load the corporate-group dimensions ({dim_warn}).")
+            return
+
+        seg_ids = [str(r["_row_id"]) for _, r in bias_table.iterrows()]
+        labels = {
+            str(r["_row_id"]): str(r.get(DPC_COL_LABEL, r["_row_id"]))
+            .replace(" ", "").replace("• ", "").strip()
+            for _, r in bias_table.iterrows()
+        }
+        st.session_state.setdefault(_BIAS_DRIVERS_SEG_KEY, _bias_default_segment(bias_table))
+        seg = st.selectbox(
+            "Segment", options=seg_ids, key=_BIAS_DRIVERS_SEG_KEY,
+            format_func=lambda s: labels.get(s, s),
+            help="Pick a node from the accuracy table; its top-3 Corporate × SKU "
+                 "drivers show below.",
+        )
+
+        sig = (
+            _signature_for(tracker_df), _signature_for(ibp_actuals_df),
+            _signature_for(ibp_naive_df), _signature_for(pdh_df),
+            _signature_for(item_master_df), _signature_for(sts), _signature_for(names),
+            filters.prior_month.isoformat(), tuple(sorted(filters.combo_exclude)), seg,
+        )
+        (drivers, months, seg_label, seg_vol, attr, fcst_attr, avail
+         ) = _cached_corp_sku_drivers(
+            sig, filters, seg, tracker_df, ibp_actuals_df, ibp_naive_df,
+            pdh_df, item_master_df, sts, names)
+
+        if not avail or drivers is None or drivers.empty:
+            st.info("No drivers for this segment / prior month.")
+            return
+
+        # Guard: if the forecast couldn't be attributed to corporate groups, the
+        # corp split is meaningless — show exactly what to fix, and auto-enable
+        # once the upstream dim keys reconcile.
+        if pd.isna(fcst_attr) or fcst_attr < _BIAS_DRIVERS_MIN_FCST_ATTR:
+            shown = 0.0 if pd.isna(fcst_attr) else fcst_attr
+            st.warning(
+                f"⚠️ **Corporate attribution unavailable — only {shown:.0%} of "
+                f"{seg_label}'s base-plan forecast mapped to a corporate group.**  "
+                "The forecast's `party_site → dp_dimshiptosites.customer_num → "
+                "dp_dimcustomernames.customer_num → corporate_group` chain isn't "
+                "reconciling (the two `customer_num` key spaces don't overlap).  "
+                "Once that's fixed upstream, this view populates automatically — "
+                "no code change needed."
+            )
+            return
+
+        _render_corp_sku_driver_rows(drivers, months, seg_label, seg_vol, attr, fcst_attr)
+
+
+def _render_corp_sku_driver_rows(
+    drivers: pd.DataFrame, months: tuple, seg_label: str,
+    seg_vol: float, attr: float, fcst_attr: float,
+) -> None:
+    """Top-3 driver rows (sparkline + severity-coloured WMAPE) + a drill chart."""
+    def _make_row(i: int, _foldable: bool) -> tuple[str, str]:
+        row = drivers.iloc[i]
+        corp = _corp_driver_label(row)
+        sku = f"{row.get('item_key', '')} · {row.get('item_desc', '')}".strip(" ·")
+        parts = [f'<span class="lbl">{_esc_html(corp)}</span>',
+                 f'<span class="wide">{_esc_html(sku)}</span>',
+                 f'<span>{_esc_html(_dpc_fmt_m(row.get(BIAS_COL_VOLUME)))}</span>']
+        wcls = _wmape_severity_cls(row.get(BIAS_COL_FLAG_SEV))
+        parts.append(f'<span class="{wcls}">{_esc_html(_bias_wmape_txt(row.get(BIAS_COL_WMAPE)))}</span>')
+        avg_txt, avg_c = _bias_fmt_pct(row.get(BIAS_COL_AVG))
+        parts.append(f'<span class="{avg_c}">{_esc_html(avg_txt)}</span>')
+        parts.append(f'<span>{row.get(BIAS_COL_IMPACT, float("nan"))*100:.1f}%</span>'
+                     if not pd.isna(row.get(BIAS_COL_IMPACT)) else "<span>—</span>")
+        parts.append(f'<span class="wide">{_bias_spark([row.get(m) for m in months])}</span>')
+        return "", "".join(parts)
+
+    head = ('<div class="rw hdr"><span class="lbl">Corporate group</span>'
+            '<span class="wide">SKU</span><span>Vol (M)</span><span>WMAPE</span>'
+            '<span>Avg Bias</span><span>Impact</span><span class="wide">Trend</span></div>')
+    body = "".join(
+        f'<div class="rw">{_make_row(i, False)[1]}</div>' for i in range(len(drivers)))
+    st.markdown(
+        _BIAS_CSS + '<div class="bias"><div class="bias-in">' + head + body + "</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"Ranked by pound-error within **{seg_label}** (segment orders "
+        f"{seg_vol:,.1f}M lbs).  Forecast attributed {fcst_attr:.0%} · orders "
+        f"attributed {attr:.0%} to a corporate group.  `~name` = softer "
+        "customer-name fallback; **Unattributed** = unmapped pounds."
+    )
+
+    # Drill: pick one driver → monthly forecast-vs-actual + bias% chart.
+    idx = list(range(len(drivers)))
+    st.session_state.setdefault(_BIAS_DRIVER_PICK_KEY, 0)
+    pick = st.selectbox(
+        "Monthly trend for driver", options=idx, key=_BIAS_DRIVER_PICK_KEY,
+        format_func=lambda i: f"{_corp_driver_label(drivers.iloc[i])} · "
+                              f"{drivers.iloc[i].get('item_desc') or drivers.iloc[i].get('item_key')}",
+    )
+    _render_corp_sku_driver_chart(drivers.iloc[pick], months)
+
+
+def _render_corp_sku_driver_chart(row: pd.Series, months: tuple) -> None:
+    """Grouped monthly base-plan vs orders bars + a bias% line (secondary axis)."""
+    fcst = list(row.get("_fcst", ())) or [0.0] * len(months)
+    act = list(row.get("_act", ())) or [0.0] * len(months)
+    bias_pct = [
+        (row.get(m) * 100.0 if row.get(m) is not None and not pd.isna(row.get(m)) else None)
+        for m in months
+    ]
+    fig = go.Figure()
+    fig.add_bar(name="Base plan", x=list(months), y=fcst, marker_color="#9aa7b8")
+    fig.add_bar(name="Orders (actual)", x=list(months), y=act, marker_color="#2f5d8a")
+    fig.add_trace(go.Scatter(
+        name="Bias %", x=list(months), y=bias_pct, yaxis="y2",
+        mode="lines+markers", line=dict(color="#c0392b", width=2)))
+    fig.update_layout(
+        barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10),
+        yaxis=dict(title="M lbs"),
+        yaxis2=dict(title="Bias %", overlaying="y", side="right", zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0.0),
+    )
+    st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
 def _render_demand_comparison_table(result) -> None:

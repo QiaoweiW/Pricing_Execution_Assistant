@@ -3005,10 +3005,10 @@ def _assemble_prior_month_actual_vs_fcst_table(
 # Forecast Bias (Lag 1) by Segment × Month
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Compares each segment's ACTUAL orders (IBP Orders) against the SELECTED
-# prior cycle's ("Lag 1") forecast (Base + R&O) — ``filters.prior_cycle``, whatever the
-# planner picks, not a hard-coded cycle — for the six months ending at (and
-# including) the Prior Month.  Only months the prior cycle actually forecast
+# Compares each segment's ACTUAL orders (IBP Orders) against the rolling lag-1
+# forecast — **Base Plan only** (R&O excluded: this measures the committed base
+# plan vs what customers ordered) — for the six months ending at (and
+# including) the Prior Month.  Only months a lag-1 cycle actually forecast
 # (its horizon overlaps them) are scored; earlier months are blank.  Surfaces
 # monthly Bias%, a 6-month average, WMAPE, and Forecast Value Added vs a
 # seasonal-naive (same-month-last-year) benchmark.
@@ -3175,6 +3175,54 @@ def _bias_fva_verdict(fva: float) -> str:
     return "" if _is_nan(fva) or fva >= -_BIAS_FVA_BAND else BIAS_FVA_BELOW
 
 
+def _round_or_nan(x: float, ndigits: int = 4) -> float:
+    """Round *x* to *ndigits*, passing NaN through untouched."""
+    return x if (isinstance(x, float) and math.isnan(x)) else round(x, ndigits)
+
+
+@dataclass(frozen=True)
+class _AccuracyStats:
+    """Lag-1 accuracy for one Forecast/Actual/Naive triple over covered months."""
+    bias: tuple[float, ...]   # per-month (Forecast−Actual)/Actual; NaN if uncovered
+    avg_bias: float
+    volume: float             # Σ|Actual|
+    abs_error: float          # Σ|Actual − Forecast|
+    wmape: float
+    fva: float                # WMAPE(naive) − WMAPE(forecast)
+    impact: float             # abs_error ÷ total_volume (share of the total miss)
+
+
+def _accuracy_stats(
+    forecast: list[float], actual: list[float], naive: list[float],
+    covered, total_volume: float,
+) -> _AccuracyStats:
+    """Compute Bias / WMAPE / FVA / Impact for one forecast/actual/naive triple.
+
+    The single source of truth for the accuracy arithmetic — used by BOTH the
+    segment table and the Corporate × SKU driver cells so the two can never
+    drift.  ``covered`` = month indices that had a lag-1 cycle forecast;
+    ``total_volume`` = the denominator for Impact (the parent's Σ|Actual|).
+    """
+    n = len(actual)
+    cov = set(covered)
+    bias = [
+        ((forecast[i] - actual[i]) / actual[i])
+        if (i in cov and abs(actual[i]) > 1e-9) else float("nan")
+        for i in range(n)
+    ]
+    valid = [b for i, b in enumerate(bias) if i in cov and not math.isnan(b)]
+    avg_bias = (sum(valid) / len(valid)) if valid else float("nan")
+    volume = sum(abs(actual[i]) for i in cov)
+    abs_error = sum(abs(actual[i] - forecast[i]) for i in cov)
+    wmape = (abs_error / volume) if volume > 1e-9 else float("nan")
+    wmape_naive = (sum(abs(actual[i] - naive[i]) for i in cov) / volume
+                   if volume > 1e-9 else float("nan"))
+    fva = (wmape_naive - wmape
+           if not (math.isnan(wmape) or math.isnan(wmape_naive)) else float("nan"))
+    impact = (abs_error / total_volume) if total_volume > 1e-9 else float("nan")
+    return _AccuracyStats(tuple(bias), avg_bias, volume, abs_error, wmape, fva, impact)
+
+
 def _bias_leaf_series(
     tpl: TemplateRow,
     trk: pd.DataFrame,
@@ -3187,13 +3235,14 @@ def _bias_leaf_series(
     """Return ``(forecast[], actual[], naive[])`` M-lb series for one leaf.
 
     Forecast for each month = the ROLLING lag-1 cycle for that month
-    (``month_cycles[i]``) Base + R&O; actual / naive are orders in the bias
+    (``month_cycles[i]``) **Base Plan only** (R&O excluded — the bias measures
+    the committed base plan vs orders); actual / naive are orders in the bias
     window and the same-month-a-year-ago window respectively.
     """
     if not trk.empty:
         base = (
             _leaf_mask(trk, tpl)
-            & trk["forecast_type"].isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+            & (trk["forecast_type"] == FORECAST_BASE_PLAN)
         )
         trk_cyc = trk["cycle"].astype(str).str.strip()
         f = [
@@ -3235,6 +3284,78 @@ def _sum_leaf_series(
     return total
 
 
+@dataclass(frozen=True)
+class _BiasInputs:
+    """Shared, enriched inputs for the bias builders (segment table + drivers)."""
+    trk: pd.DataFrame
+    actuals: pd.DataFrame
+    naive: pd.DataFrame
+    template: list
+    template_by_id: dict
+    month_cycles: list
+    bias_months: list
+    naive_months: list
+    month_keys: tuple
+    month_meta: tuple
+    prior_month: date
+
+
+def _prepare_bias_inputs(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_actuals_df: Optional[pd.DataFrame],
+    ibp_naive_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    item_master_df: Optional[pd.DataFrame] = None,
+    n_months: int = 6,
+) -> _BiasInputs:
+    """Enrich + filter the sources and resolve the rolling lag-1 month→cycle map.
+
+    Factored out so the Segment table and the Corporate × SKU drivers share ONE
+    enrichment + lag-1 setup (the mapping is grain-agnostic — computed once from
+    the whole tracker's cycle horizons).  "Actual" is IBP **Orders**.
+    """
+    prior_month = filters.prior_month.replace(day=1)
+    bias_months = _months_back(prior_month, n_months)
+    naive_months = [_add_months(m, -12) for m in bias_months]
+    month_keys = tuple(m.strftime("%Y-%m") for m in bias_months)
+
+    dim_frame, _warn = _build_augmented_dim_frame(tracker_df, pdh_df, item_master_df)
+    trk = _apply_dim_filter(
+        _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched(),
+        filters,
+    )
+    # Rolling lag-1 cycle per month (freshest 1-month-ahead view; gaps backfill).
+    lag1_map = _map_lag1_cycles(bias_months, _cycle_horizon_starts(trk))
+    month_cycles = [cyc for cyc, _lag, _fb in lag1_map]
+    month_meta = tuple(
+        (key, cyc or "", lag or 0, fb)
+        for key, (cyc, lag, fb) in zip(month_keys, lag1_map)
+    )
+    actuals = _apply_dim_filter(
+        _enrich_ibp(ibp_actuals_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
+        if ibp_actuals_df is not None else _empty_enriched(actuals=True),
+        filters,
+    )
+    naive = _apply_dim_filter(
+        _enrich_ibp(ibp_naive_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
+        if ibp_naive_df is not None else _empty_enriched(actuals=True),
+        filters,
+    )
+    template = _build_runtime_template_for_filters(
+        trk, actuals, filters,
+        actual_months=set(bias_months), forecast_months=set(), prior_month=prior_month,
+        butter_catalog=butter_catalog_combos(pdh_df, item_master_df),
+    )
+    return _BiasInputs(
+        trk=trk, actuals=actuals, naive=naive,
+        template=template, template_by_id={t.row_id: t for t in template},
+        month_cycles=month_cycles, bias_months=bias_months, naive_months=naive_months,
+        month_keys=month_keys, month_meta=month_meta, prior_month=prior_month,
+    )
+
+
 def build_forecast_bias_table(
     tracker_df: Optional[pd.DataFrame],
     ibp_actuals_df: Optional[pd.DataFrame],
@@ -3258,42 +3379,13 @@ def build_forecast_bias_table(
     detail) and honour the section's Portfolio Major · Supply Format · Brand
     filter.
     """
-    prior_month = filters.prior_month.replace(day=1)
-    bias_months = _months_back(prior_month, n_months)
-    naive_months = [_add_months(m, -12) for m in bias_months]
-    month_keys = tuple(m.strftime("%Y-%m") for m in bias_months)
-
-    dim_frame, _warn = _build_augmented_dim_frame(tracker_df, pdh_df, item_master_df)
-    trk = _apply_dim_filter(
-        _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched(),
-        filters,
-    )
-    # Rolling lag-1 cycle per month (freshest 1-month-ahead view; gaps backfill).
-    lag1_map = _map_lag1_cycles(bias_months, _cycle_horizon_starts(trk))
-    month_cycles = [cyc for cyc, _lag, _fb in lag1_map]
-    month_meta = tuple(
-        (key, cyc or "", lag or 0, fb)
-        for key, (cyc, lag, fb) in zip(month_keys, lag1_map)
-    )
-    # "Actual" here is ORDERS (IBP Orders), so enrich with the ordered-qty
-    # column — bias/WMAPE measure forecast vs what customers ordered.
-    actuals = _apply_dim_filter(
-        _enrich_ibp(ibp_actuals_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
-        if ibp_actuals_df is not None else _empty_enriched(actuals=True),
-        filters,
-    )
-    naive = _apply_dim_filter(
-        _enrich_ibp(ibp_naive_df, dim_frame, qty_candidates=_IBP_ORDERED_QTY_CANDIDATES)
-        if ibp_naive_df is not None else _empty_enriched(actuals=True),
-        filters,
-    )
-
-    template = _build_runtime_template_for_filters(
-        trk, actuals, filters,
-        actual_months=set(bias_months), forecast_months=set(), prior_month=prior_month,
-        butter_catalog=butter_catalog_combos(pdh_df, item_master_df),
-    )
-    template_by_id = {t.row_id: t for t in template}
+    bi = _prepare_bias_inputs(
+        tracker_df, ibp_actuals_df, ibp_naive_df, pdh_df, filters,
+        item_master_df=item_master_df, n_months=n_months)
+    trk, actuals, naive = bi.trk, bi.actuals, bi.naive
+    template, template_by_id = bi.template, bi.template_by_id
+    month_cycles, bias_months, naive_months = bi.month_cycles, bi.bias_months, bi.naive_months
+    month_keys, month_meta = bi.month_keys, bi.month_meta
 
     # Per-leaf forecast / actual / naive series, then roll subtotals up.
     fser: dict[str, list[float]] = {}
@@ -3328,47 +3420,376 @@ def build_forecast_bias_table(
 
     records: list[dict] = []
     for tpl in template:
-        f, a, nv = fser[tpl.row_id], aser[tpl.row_id], nser[tpl.row_id]
-        bias = [
-            ((f[i] - a[i]) / a[i]) if (i in covered and abs(a[i]) > 1e-9)
-            else float("nan")
-            for i in range(n_months)
-        ]
-        valid = [bias[i] for i in covered if not math.isnan(bias[i])]
-        avg_bias = (sum(valid) / len(valid)) if valid else float("nan")
-        volume = sum(abs(a[i]) for i in covered)              # segment Σ|Actual|
-        abs_error = sum(abs(a[i] - f[i]) for i in covered)    # segment Σ|error|
-        wmape = (abs_error / volume) if volume > 1e-9 else float("nan")
-        wmape_naive = (sum(abs(a[i] - nv[i]) for i in covered) / volume
-                       if volume > 1e-9 else float("nan"))
-        fva = (wmape_naive - wmape
-               if not (math.isnan(wmape) or math.isnan(wmape_naive)) else float("nan"))
-        # Impact = this segment's pound-error as a share of the WHOLE business
-        # (= WMAPE × the segment's volume share) — what its % miss really costs.
-        impact = (abs_error / total_volume) if total_volume > 1e-9 else float("nan")
+        s = _accuracy_stats(
+            fser[tpl.row_id], aser[tpl.row_id], nser[tpl.row_id], covered, total_volume)
         rec = {
             COL_ROW_ID: tpl.row_id,
             COL_INDENT: tpl.indent,
             COL_IS_SUBTOTAL: tpl.is_subtotal,
             COL_IS_MEMO: tpl.is_memo,
             COL_LABEL: _make_indented_label(tpl.label, tpl.indent, tpl.is_memo),
-            BIAS_COL_AVG: round(avg_bias, 4) if not math.isnan(avg_bias) else avg_bias,
-            BIAS_COL_WMAPE: round(wmape, 4) if not math.isnan(wmape) else wmape,
-            BIAS_COL_FVA: round(fva, 4) if not math.isnan(fva) else fva,
-            BIAS_COL_VOLUME: round(volume, 4) if not math.isnan(volume) else volume,
-            BIAS_COL_IMPACT: round(impact, 4) if not math.isnan(impact) else impact,
-            BIAS_COL_FLAG_DIR: _bias_direction(avg_bias),
-            BIAS_COL_FLAG_SEV: _bias_severity(wmape, impact),
-            BIAS_COL_FLAG_FVA: _bias_fva_verdict(fva),
+            BIAS_COL_AVG: _round_or_nan(s.avg_bias),
+            BIAS_COL_WMAPE: _round_or_nan(s.wmape),
+            BIAS_COL_FVA: _round_or_nan(s.fva),
+            BIAS_COL_VOLUME: _round_or_nan(s.volume),
+            BIAS_COL_IMPACT: _round_or_nan(s.impact),
+            BIAS_COL_FLAG_DIR: _bias_direction(s.avg_bias),
+            BIAS_COL_FLAG_SEV: _bias_severity(s.wmape, s.impact),
+            BIAS_COL_FLAG_FVA: _bias_fva_verdict(s.fva),
         }
-        for key, b in zip(month_keys, bias):
-            rec[key] = round(b, 4) if not math.isnan(b) else b
+        for key, b in zip(month_keys, s.bias):
+            rec[key] = _round_or_nan(b)
         records.append(rec)
 
     table = pd.DataFrame.from_records(records)
     available = bool(len(table)) and (trk is not None and not trk.empty)
     return ForecastBiasResult(
         table=table, months=month_keys, available=available, month_meta=month_meta)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forecast Bias — Corporate group × SKU drivers (lazy, opt-in drill)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Corporate group is the SAME two-hop lookup the Product Line Review uses:
+#   forecast (tracker):   Party Site Number → dp_dimshiptosites.customer_num
+#                         → dp_dimcustomernames.corporate_group
+#   actual   (IBP orders): Customer No        → dp_dimcustomernames.corporate_group
+# Both legs are collapsed to the canonical corporate-group STRING *before*
+# comparing, so the two sides' differing customer keys line up at the
+# (corporate group × SKU) grain.  Column-name spellings mirror
+# data_sources/ship_to_sites.py + customer_dims.py (kept local so this
+# pure-pandas builder needs no Fabric-fetch import); the dim frames are passed
+# in by the page, which owns the cached fetch.
+_STS_PARTY_SITE_CANDIDATES: tuple[str, ...] = (
+    "party_site_code", "party_site_number", "PartySiteCode", "Party Site Code",
+    "Party Site Number",
+)
+_STS_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
+    "customer_num", "customer_number", "CustomerNum", "Customer Num",
+)
+_CN_CUSTOMER_NUM_CANDIDATES: tuple[str, ...] = (
+    "customer_num", "customer_number", "Customer Num", "CustomerNum",
+    "Customer No", "customer_no",
+)
+_CN_CORP_GROUP_CANDIDATES: tuple[str, ...] = (
+    "corporate_group", "Corporate Group", "CorporateGroup", "corp_group",
+)
+_CG_BLANK_TOKENS: frozenset = frozenset({"", "blank", "nan", "none", "null"})
+CORP_UNATTRIBUTED: str = "Unattributed"
+
+
+@dataclass(frozen=True)
+class CorpSkuDriversResult:
+    """Top-N Corporate × SKU drivers of a segment's lag-1 forecast error.
+
+    ``drivers`` — one row per driver (ranked by pound-error), carrying the
+    accuracy metrics, per-month Bias% columns (``YYYY-MM``, for the sparkline),
+    ``_fcst`` / ``_act`` per-month tuples (M lbs, for the drill chart), and
+    ``soft`` / ``unattributed`` attribution flags.  ``attributed_share`` is the
+    fraction of the segment's actual volume that mapped to a real corporate
+    group (the rest is soft/unattributed) — surfaced so ops can judge trust.
+    """
+    drivers: pd.DataFrame
+    months: tuple[str, ...]
+    segment_label: str
+    segment_volume: float
+    attributed_share: float           # actual-side: mapped orders ÷ segment orders
+    forecast_attributed_share: float  # forecast-side: mapped base plan ÷ segment base plan
+    available: bool
+    month_meta: tuple = ()
+
+
+def _canonical_corp_form(values) -> dict[str, str]:
+    """Map each corporate-group casefold key → its most common surface form.
+
+    Collapses casing / spacing drift ("ASSOCIATED FOODS" vs "Associated Foods")
+    to one display string (winner: most frequent, then longest, then first) —
+    the same idea as the PLR canonical map, kept compact and dependency-free.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for v in values:
+        s = str(v).strip()
+        if s.casefold() in _CG_BLANK_TOKENS:
+            continue
+        counts.setdefault(s.casefold(), {})
+        counts[s.casefold()][s] = counts[s.casefold()].get(s, 0) + 1
+    return {
+        key: max(forms.items(), key=lambda kv: (kv[1], len(kv[0])))[0]
+        for key, forms in counts.items()
+    }
+
+
+def build_corp_group_lookups(
+    shiptosites_df: Optional[pd.DataFrame],
+    customernames_df: Optional[pd.DataFrame],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return ``(party_site → customer_num, customer_num → corporate_group)``.
+
+    Reuses the Product-Line-Review dimension tables (``dp_dimshiptosites`` +
+    ``dp_dimcustomernames``).  Customer numbers are normalised with the same
+    item-key rule the enriched frames use so the joins align; corporate groups
+    are canonicalised to one surface form per casefold key and blanks dropped.
+    """
+    ps2cn: dict[str, str] = {}
+    if shiptosites_df is not None and not shiptosites_df.empty:
+        ps_col = _resolve_column(shiptosites_df, _STS_PARTY_SITE_CANDIDATES)
+        cn_col = _resolve_column(shiptosites_df, _STS_CUSTOMER_NUM_CANDIDATES)
+        if ps_col and cn_col:
+            tmp = pd.DataFrame({
+                "ps": _vectorised_clean_str(shiptosites_df[ps_col]),
+                "cn": _vectorised_item_key(shiptosites_df[cn_col]),
+            })
+            tmp = tmp[tmp["ps"].astype(bool)].drop_duplicates("ps", keep="last")
+            ps2cn = dict(zip(tmp["ps"], tmp["cn"]))
+
+    cn2cg: dict[str, str] = {}
+    if customernames_df is not None and not customernames_df.empty:
+        cn_col = _resolve_column(customernames_df, _CN_CUSTOMER_NUM_CANDIDATES)
+        cg_col = _resolve_column(customernames_df, _CN_CORP_GROUP_CANDIDATES)
+        if cn_col and cg_col:
+            canon = _canonical_corp_form(customernames_df[cg_col])
+            tmp = pd.DataFrame({
+                "cn": _vectorised_item_key(customernames_df[cn_col]),
+                "cg": _vectorised_clean_str(customernames_df[cg_col]),
+            })
+            tmp = tmp[~tmp["cg"].str.casefold().isin(_CG_BLANK_TOKENS)]
+            tmp = tmp.drop_duplicates("cn", keep="last")
+            tmp["cg"] = tmp["cg"].map(lambda s: canon.get(s.casefold(), s))
+            cn2cg = dict(zip(tmp["cn"], tmp["cg"]))
+    return ps2cn, cn2cg
+
+
+def _resolve_corp_forecast(
+    trk: pd.DataFrame, ps2cn: dict[str, str], cn2cg: dict[str, str],
+) -> pd.Series:
+    """Corporate group per tracker row via party_site→num→group (else Unattributed)."""
+    if trk.empty:
+        return pd.Series([], dtype="object")
+    cn = trk["party_site"].map(ps2cn).fillna("")
+    cg = cn.map(cn2cg).fillna("")
+    return cg.where(cg.astype(bool), CORP_UNATTRIBUTED)
+
+
+def _resolve_corp_actual(
+    act: pd.DataFrame, cn2cg: dict[str, str],
+) -> tuple[pd.Series, pd.Series]:
+    """Corporate group per orders row via customer_no→group.
+
+    Unmapped rows fall back to the Customer Name (soft attribution), else
+    Unattributed.  Returns ``(corp_group, is_soft)`` — soft marks the
+    customer-name fallback so the UI can label it as weaker attribution.
+    """
+    if act.empty:
+        return pd.Series([], dtype="object"), pd.Series([], dtype=bool)
+    cg = act["customer_no"].map(cn2cg).fillna("")
+    mapped = cg.astype(bool)
+    name = act["customer_name"].astype(str).str.strip()
+    soft = (~mapped) & name.astype(bool)
+    cg = cg.where(mapped, name.where(name.astype(bool), CORP_UNATTRIBUTED))
+    return cg, soft
+
+
+def _segment_leaf_rows(node_id: str, template: list) -> list:
+    """All non-memo leaf TemplateRows at or under *node_id* (deduped).
+
+    Subtotals carry no dimension mask, so a segment slice is the OR of its leaf
+    descendants' masks.  Memo leaves (Cottage Cheese / Sour Cream) overlap the
+    supply-format leaves and are excluded to avoid double-counting the slice.
+    """
+    by_id = {t.row_id: t for t in template}
+    node = by_id.get(node_id)
+    if node is None:
+        return []
+    out, seen, stack = [], set(), [node]
+    while stack:
+        t = stack.pop()
+        if t.is_subtotal:
+            stack.extend(by_id[c] for c in t.children if c in by_id)
+        elif not t.is_memo and t.row_id not in seen:
+            seen.add(t.row_id)
+            out.append(t)
+    return out
+
+
+def _slice_to_segment(df: pd.DataFrame, leaves: list) -> pd.Series:
+    """Boolean mask = union of the segment leaves' dimension masks."""
+    if df.empty or not leaves:
+        return pd.Series([False] * len(df), index=df.index, dtype=bool)
+    mask = pd.Series(False, index=df.index)
+    for lf in leaves:
+        mask |= _leaf_mask(df, lf)
+    return mask
+
+
+def _corp_sku_month_pivot(
+    df: pd.DataFrame, months: list, month_keys: tuple, covered: list,
+) -> pd.DataFrame:
+    """Pivot (corp, item_key) × month_key of summed pounds (M lbs), covered only.
+
+    *months* aligns positionally with *month_keys*; naive uses the year-ago
+    months but the SAME month_key labels so forecast/actual/naive align.
+    """
+    parts = []
+    for i in covered:
+        sub = df[df["month"] == months[i]]
+        if sub.empty:
+            continue
+        g = sub.groupby(["corp", "item_key"])["pounds"].sum() / _LBS_PER_MILLION
+        parts.append(g.rename(month_keys[i]))
+    return pd.concat(parts, axis=1) if parts else pd.DataFrame()
+
+
+def build_forecast_bias_corp_sku_drivers(
+    tracker_df: Optional[pd.DataFrame],
+    ibp_actuals_df: Optional[pd.DataFrame],
+    ibp_naive_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    segment_row_id: str,
+    shiptosites_df: Optional[pd.DataFrame] = None,
+    customernames_df: Optional[pd.DataFrame] = None,
+    item_master_df: Optional[pd.DataFrame] = None,
+    n_months: int = 6,
+    top_n: int = 3,
+) -> CorpSkuDriversResult:
+    """Top-*top_n* Corporate × SKU drivers of *segment_row_id*'s lag-1 error.
+
+    Reuses the shared bias inputs (same enrichment + rolling lag-1 map), slices
+    to the chosen segment's leaves, resolves corporate group on both legs, then
+    groups by (corporate group × SKU) and ranks cells by **pound-error**
+    (Impact) — the materiality-consistent "what's actually moving the miss".
+    """
+    bi = _prepare_bias_inputs(
+        tracker_df, ibp_actuals_df, ibp_naive_df, pdh_df, filters,
+        item_master_df=item_master_df, n_months=n_months)
+    month_keys, month_cycles = bi.month_keys, bi.month_cycles
+    bias_months, naive_months = bi.bias_months, bi.naive_months
+    segment_label = bi.template_by_id.get(
+        segment_row_id, TemplateRow(segment_row_id, segment_row_id, 0)).label
+
+    ps2cn, cn2cg = build_corp_group_lookups(shiptosites_df, customernames_df)
+    leaves = _segment_leaf_rows(segment_row_id, bi.template)
+
+    # Slice each source to the segment; forecast is Base Plan only (excl. R&O).
+    trk = bi.trk[
+        _slice_to_segment(bi.trk, leaves)
+        & (bi.trk["forecast_type"] == FORECAST_BASE_PLAN)
+    ].copy()
+    act = bi.actuals[_slice_to_segment(bi.actuals, leaves)].copy()
+    nai = bi.naive[_slice_to_segment(bi.naive, leaves)].copy()
+
+    empty = CorpSkuDriversResult(
+        pd.DataFrame(), month_keys, segment_label, 0.0, float("nan"), float("nan"),
+        False, bi.month_meta)
+    if trk.empty and act.empty:
+        return empty
+
+    trk["corp"] = _resolve_corp_forecast(trk, ps2cn, cn2cg)
+    act["corp"], act_soft = _resolve_corp_actual(act, cn2cg)
+    act["_soft"] = act_soft
+    nai["corp"], _ = _resolve_corp_actual(nai, cn2cg)
+
+    # Covered = months with a lag-1 cycle AND a non-zero forecast in this slice.
+    covered = [
+        i for i, (cyc, m) in enumerate(zip(month_cycles, bias_months))
+        if cyc is not None
+        and trk[(trk["cycle"] == cyc) & (trk["month"] == m)]["pounds"].sum() > 1e-3
+    ]
+    if not covered:
+        return empty
+
+    # Forecast uses each covered month's lag-1 cycle; actual/naive use the month.
+    f_parts = []
+    for i in covered:
+        sub = trk[(trk["cycle"] == month_cycles[i]) & (trk["month"] == bias_months[i])]
+        if not sub.empty:
+            g = sub.groupby(["corp", "item_key"])["pounds"].sum() / _LBS_PER_MILLION
+            f_parts.append(g.rename(month_keys[i]))
+    f_piv = pd.concat(f_parts, axis=1) if f_parts else pd.DataFrame()
+    a_piv = _corp_sku_month_pivot(act, bias_months, month_keys, covered)
+    n_piv = _corp_sku_month_pivot(nai, naive_months, month_keys, covered)
+
+    cells = f_piv.index.union(a_piv.index) if not (f_piv.empty and a_piv.empty) else []
+    # Segment actual volume (the Impact denominator) + attribution coverage.
+    act_cov = act[act["month"].isin([bias_months[i] for i in covered])]
+    seg_volume = float(act_cov["pounds"].abs().sum()) / _LBS_PER_MILLION
+    mapped_vol = float(
+        act_cov.loc[~act_cov["_soft"] & (act_cov["corp"] != CORP_UNATTRIBUTED),
+                    "pounds"].abs().sum()) / _LBS_PER_MILLION
+    attributed_share = (mapped_vol / seg_volume) if seg_volume > 1e-9 else float("nan")
+    # Forecast-side coverage: the fraction of the (covered-month) base plan that
+    # reached a real corporate group — the leg that party_site→corp must resolve.
+    # This gates the UI: a near-zero share means the dim keys don't reconcile.
+    trk_cov = trk[trk["month"].isin([bias_months[i] for i in covered])]
+    fcst_total = float(trk_cov["pounds"].abs().sum())
+    fcst_mapped = float(
+        trk_cov.loc[trk_cov["corp"] != CORP_UNATTRIBUTED, "pounds"].abs().sum())
+    forecast_attributed_share = (
+        (fcst_mapped / fcst_total) if fcst_total > 1e-9 else float("nan"))
+
+    pos = {mk: i for i, mk in enumerate(month_keys)}
+
+    def _series(piv: pd.DataFrame, key) -> list:
+        arr = [0.0] * n_months
+        if not piv.empty and key in piv.index:
+            row = piv.loc[key]
+            for mk in piv.columns:
+                v = row[mk]
+                arr[pos[mk]] = float(v) if not pd.isna(v) else 0.0
+        return arr
+
+    desc_map: dict[str, str] = {}
+    for src in (trk, act):
+        if "item_desc" in src.columns:
+            for k, d in zip(src["item_key"], src["item_desc"]):
+                if k and d and k not in desc_map:
+                    desc_map[k] = d
+    soft_corps = set(act.loc[act["_soft"], "corp"])
+
+    records = []
+    for corp, item_key in cells:
+        f = _series(f_piv, (corp, item_key))
+        a = _series(a_piv, (corp, item_key))
+        nv = _series(n_piv, (corp, item_key))
+        s = _accuracy_stats(f, a, nv, covered, seg_volume)
+        if s.volume <= 1e-9 and s.abs_error <= 1e-9:
+            continue
+        rec = {
+            "corp_group": corp,
+            "item_key": item_key,
+            "item_desc": desc_map.get(item_key, ""),
+            "soft": (corp in soft_corps) and (corp != CORP_UNATTRIBUTED),
+            "unattributed": corp == CORP_UNATTRIBUTED,
+            "_driver_id": f"{corp}␟{item_key}",
+            "_abs_error": s.abs_error,
+            BIAS_COL_VOLUME: _round_or_nan(s.volume),
+            BIAS_COL_WMAPE: _round_or_nan(s.wmape),
+            BIAS_COL_AVG: _round_or_nan(s.avg_bias),
+            BIAS_COL_FVA: _round_or_nan(s.fva),
+            BIAS_COL_IMPACT: _round_or_nan(s.impact),
+            BIAS_COL_FLAG_SEV: _bias_severity(s.wmape, s.impact),
+            "_fcst": tuple(round(x, 4) for x in f),
+            "_act": tuple(round(x, 4) for x in a),
+        }
+        for mk, b in zip(month_keys, s.bias):
+            rec[mk] = _round_or_nan(b)
+        records.append(rec)
+
+    if not records:
+        return empty
+    drivers = (
+        pd.DataFrame.from_records(records)
+        .sort_values("_abs_error", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+    return CorpSkuDriversResult(
+        drivers=drivers, months=month_keys, segment_label=segment_label,
+        segment_volume=seg_volume, attributed_share=attributed_share,
+        forecast_attributed_share=forecast_attributed_share,
+        available=bool(len(drivers)), month_meta=bi.month_meta)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

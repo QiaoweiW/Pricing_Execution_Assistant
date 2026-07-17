@@ -3017,18 +3017,30 @@ def _assemble_prior_month_actual_vs_fcst_table(
 #   6-Mo Avg   = simple mean of the monthly Bias%
 #   WMAPE      = Σ|Actual − Forecast| / Σ|Actual|         (volume-weighted; 0 best)
 #   FVA vs SN  = WMAPE(seasonal-naive) − WMAPE(forecast)  (pp; + = beats naive)
+#   Impact     = Σ|Actual − Forecast| / Total-B2C volume  (= WMAPE × vol share)
+# Severity is impact-aware: Priority = WMAPE ≥ floor AND material (Impact ≥
+# threshold); Monitor = an accuracy gap on a small business; blank otherwise —
+# so a tiny line's large % error can't outrank a large line's costlier one.
 
 BIAS_COL_AVG: str        = "_avg_bias"
 BIAS_COL_WMAPE: str      = "_wmape"
 BIAS_COL_FVA: str        = "_fva"
+BIAS_COL_VOLUME: str     = "_volume"   # segment Σ|Actual| over covered months (M lbs)
+BIAS_COL_IMPACT: str     = "_impact"   # segment |error| ÷ Total-B2C volume (share of total miss)
 BIAS_COL_FLAG_DIR: str   = "_flag_dir"
 BIAS_COL_FLAG_SEV: str   = "_flag_sev"
 BIAS_COL_FLAG_FVA: str   = "_flag_fva"
 
-# Flag thresholds (planner-confirmed): severity from WMAPE, direction from the
-# 6-month average bias, plus a Forecast-Value-Added verdict.
-_BIAS_WMAPE_PRIORITY: float = 0.15
-_BIAS_WMAPE_MONITOR: float  = 0.10
+# Flag thresholds.  Severity now blends ACCURACY and BUSINESS SIZE so a tiny
+# segment with a big % error can't outrank a large segment's smaller % error:
+#   • WMAPE floor  — below it the forecast is accurate enough; never flag.
+#   • Impact       — the segment's absolute pound-error as a share of the WHOLE
+#                    B2C business (= WMAPE × the segment's volume share).  It is
+#                    what a high % error actually COSTS at the total level.
+#   Priority = an accuracy gap that is ALSO material (impact ≥ threshold);
+#   Monitor  = an accuracy gap that is immaterial to the total (small business).
+_BIAS_WMAPE_FLOOR: float    = 0.10   # ≥10% WMAPE = a real accuracy gap worth a flag
+_BIAS_IMPACT_PRIORITY: float = 0.01  # segment causes ≥1pp of total-B2C volume error
 _BIAS_DIR_BAND: float       = 0.02   # ±2 pp around zero reads as "Balanced"
 # FVA best practice (IBF / Gilliland): a forecast should beat the seasonal-naive
 # benchmark.  FVA below −0.5 pp means the naive guess was more accurate, so the
@@ -3126,33 +3138,41 @@ def _is_nan(x: object) -> bool:
     return x is None or (isinstance(x, float) and math.isnan(x))
 
 
-def _bias_flag(avg_bias: float, wmape: float, fva: float) -> tuple[str, str, str]:
-    """Return ``(direction, severity, fva_verdict)`` for the segment's Flag cell.
-
-    * direction — from the 6-month average bias (Over / Under / Balanced).
-    * severity  — from WMAPE (Priority ≥ 15 %, Monitor 10–15 %, else blank).
-    * fva_verdict — ``"Below naive"`` when FVA < −0.5 pp (the plan is less
-      accurate than a same-month-last-year guess), else blank; positive FVA is
-      the expected good case and stays unlabelled to avoid chip clutter.
-    """
+def _bias_direction(avg_bias: float) -> str:
+    """Over / Under / Balanced from the 6-month average bias (±2 pp dead-band)."""
     if _is_nan(avg_bias):
-        direction = ""
-    elif avg_bias > _BIAS_DIR_BAND:
-        direction = BIAS_DIR_OVER
-    elif avg_bias < -_BIAS_DIR_BAND:
-        direction = BIAS_DIR_UNDER
-    else:
-        direction = BIAS_DIR_BALANCED
-    if _is_nan(wmape):
-        severity = ""
-    elif wmape >= _BIAS_WMAPE_PRIORITY:
-        severity = BIAS_FLAG_PRIORITY
-    elif wmape >= _BIAS_WMAPE_MONITOR:
-        severity = BIAS_FLAG_MONITOR
-    else:
-        severity = ""
-    fva_verdict = "" if _is_nan(fva) or fva >= -_BIAS_FVA_BAND else BIAS_FVA_BELOW
-    return direction, severity, fva_verdict
+        return ""
+    if avg_bias > _BIAS_DIR_BAND:
+        return BIAS_DIR_OVER
+    if avg_bias < -_BIAS_DIR_BAND:
+        return BIAS_DIR_UNDER
+    return BIAS_DIR_BALANCED
+
+
+def _bias_severity(wmape: float, impact: float) -> str:
+    """Severity that blends accuracy (WMAPE) with business size (impact).
+
+    A forecast that is accurate enough (WMAPE below the floor) never flags,
+    however big the segment.  Among segments WITH an accuracy gap, the ones
+    whose error is material to the whole business (``impact`` ≥ threshold) are
+    **Priority**; the rest — a real % miss but on a small business — are
+    **Monitor**.  This stops a tiny line's big percentage from outranking a
+    large line's smaller, costlier percentage.
+    """
+    if _is_nan(wmape) or wmape < _BIAS_WMAPE_FLOOR:
+        return ""
+    if not _is_nan(impact) and impact >= _BIAS_IMPACT_PRIORITY:
+        return BIAS_FLAG_PRIORITY
+    return BIAS_FLAG_MONITOR
+
+
+def _bias_fva_verdict(fva: float) -> str:
+    """``"Below naive"`` when FVA < −0.5 pp (naive would beat the plan), else "".
+
+    Positive FVA is the expected good case and stays unlabelled to avoid chip
+    clutter.
+    """
+    return "" if _is_nan(fva) or fva >= -_BIAS_FVA_BAND else BIAS_FVA_BELOW
 
 
 def _bias_leaf_series(
@@ -3301,6 +3321,11 @@ def build_forecast_bias_table(
         if month_cycles[i] is not None and abs(total_f[i]) > 1e-9
     ]
 
+    # Total-B2C volume anchors the "impact" (materiality) of every segment's
+    # error — computed here so the per-row loop can normalise against it.
+    total_a = aser.get("total_b2c", [0.0] * n_months)
+    total_volume = sum(abs(total_a[i]) for i in covered)
+
     records: list[dict] = []
     for tpl in template:
         f, a, nv = fser[tpl.row_id], aser[tpl.row_id], nser[tpl.row_id]
@@ -3311,14 +3336,16 @@ def build_forecast_bias_table(
         ]
         valid = [bias[i] for i in covered if not math.isnan(bias[i])]
         avg_bias = (sum(valid) / len(valid)) if valid else float("nan")
-        denom = sum(abs(a[i]) for i in covered)
-        wmape = (sum(abs(a[i] - f[i]) for i in covered) / denom
-                 if denom > 1e-9 else float("nan"))
-        wmape_naive = (sum(abs(a[i] - nv[i]) for i in covered) / denom
-                       if denom > 1e-9 else float("nan"))
+        volume = sum(abs(a[i]) for i in covered)              # segment Σ|Actual|
+        abs_error = sum(abs(a[i] - f[i]) for i in covered)    # segment Σ|error|
+        wmape = (abs_error / volume) if volume > 1e-9 else float("nan")
+        wmape_naive = (sum(abs(a[i] - nv[i]) for i in covered) / volume
+                       if volume > 1e-9 else float("nan"))
         fva = (wmape_naive - wmape
                if not (math.isnan(wmape) or math.isnan(wmape_naive)) else float("nan"))
-        direction, severity, fva_verdict = _bias_flag(avg_bias, wmape, fva)
+        # Impact = this segment's pound-error as a share of the WHOLE business
+        # (= WMAPE × the segment's volume share) — what its % miss really costs.
+        impact = (abs_error / total_volume) if total_volume > 1e-9 else float("nan")
         rec = {
             COL_ROW_ID: tpl.row_id,
             COL_INDENT: tpl.indent,
@@ -3328,9 +3355,11 @@ def build_forecast_bias_table(
             BIAS_COL_AVG: round(avg_bias, 4) if not math.isnan(avg_bias) else avg_bias,
             BIAS_COL_WMAPE: round(wmape, 4) if not math.isnan(wmape) else wmape,
             BIAS_COL_FVA: round(fva, 4) if not math.isnan(fva) else fva,
-            BIAS_COL_FLAG_DIR: direction,
-            BIAS_COL_FLAG_SEV: severity,
-            BIAS_COL_FLAG_FVA: fva_verdict,
+            BIAS_COL_VOLUME: round(volume, 4) if not math.isnan(volume) else volume,
+            BIAS_COL_IMPACT: round(impact, 4) if not math.isnan(impact) else impact,
+            BIAS_COL_FLAG_DIR: _bias_direction(avg_bias),
+            BIAS_COL_FLAG_SEV: _bias_severity(wmape, impact),
+            BIAS_COL_FLAG_FVA: _bias_fva_verdict(fva),
         }
         for key, b in zip(month_keys, bias):
             rec[key] = round(b, 4) if not math.isnan(b) else b

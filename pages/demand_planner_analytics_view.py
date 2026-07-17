@@ -265,7 +265,9 @@ from data_sources.aps_upload_pipeline import (
     CYCLES as APS_CYCLES,
     FISCAL_YEARS as APS_FISCAL_YEARS,
     aps_history_path,
+    fetch_aps_history_df,
     generate_aps_from_upload,
+    list_aps_history_cycles,
     parse_corp_override_csv,
     save_aps_override,
 )
@@ -6013,21 +6015,31 @@ def _picked_columns(key: str, options: list[str]) -> list[str]:
     return ordered or list(options)
 
 
-def _render_comparison_summary_col_picker() -> None:
+def _ns_key(base: str, ns: str) -> str:
+    """Namespace a widget/session key so a second section can't collide.
+
+    ``ns=""`` returns *base* unchanged (the IBP section keeps its exact keys);
+    a non-empty ns (e.g. ``"aps"``) prefixes it.
+    """
+    return base if not ns else f"{ns}_{base}"
+
+
+def _render_comparison_summary_col_picker(ns: str = "") -> None:
     """⚙️ Columns popover for the summary table — rendered ABOVE the metrics row.
 
     Kept separate from :func:`_render_comparison_summary_table` so it can sit at
     the very top of the section; the table reads its selection from
     session_state (Category is always shown, every metric column is hidable).
+    *ns* namespaces the widget key so an APS mirror can coexist with the IBP one.
     """
     all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
     _render_column_picker(
-        _DPC_SUMMARY_COLS_KEY, all_headers,
+        _ns_key(_DPC_SUMMARY_COLS_KEY, ns), all_headers,
         help_suffix="  The Category column always shows.",
     )
 
 
-def _render_comparison_summary_table(result) -> None:
+def _render_comparison_summary_table(result, ns: str = "") -> None:
     """Render the executive current-plan summary table (screenshot 1).
 
     A condensed, current-plan-anchored projection of the SAME (filtered)
@@ -6046,7 +6058,8 @@ def _render_comparison_summary_table(result) -> None:
     # selection + ordering live in the picker rendered above the metrics.
     all_headers = [header for _key, header, _kind in _DPC_SUMMARY_COLS]
     col_by_header = {spec[1]: spec for spec in _DPC_SUMMARY_COLS}
-    cols = [col_by_header[h] for h in _picked_columns(_DPC_SUMMARY_COLS_KEY, all_headers)]
+    cols = [col_by_header[h]
+            for h in _picked_columns(_ns_key(_DPC_SUMMARY_COLS_KEY, ns), all_headers)]
 
     head_html = '<th class="lbl">Category</th>' + "".join(
         f"<th>{_esc_html(header)}</th>" for _key, header, _kind in cols
@@ -6793,6 +6806,7 @@ def _render_corp_sku_driver_chart(row: pd.Series, months: tuple) -> None:
 
 def _render_demand_comparison_table(
     result, filters: Optional[ComparisonFilters] = None,
+    *, ns: str = "", allow_save: bool = True,
 ) -> None:
     """Render the detailed comparison table (foldable tree) + controls + exports.
 
@@ -6801,7 +6815,10 @@ def _render_demand_comparison_table(
     parent row) — there is no global fold control.  The column toggle lives
     below the table but its state is read up-front via session_state.  When
     *filters* is given, the two total-plan column headers are anchored on the
-    chosen cycles (e.g. "C3 Plan (incl. R&O)" / "C4 Plan (incl. R&O)").
+    chosen cycles (e.g. "C3 Plan (incl. R&O)" / "C4 Plan (incl. R&O)").  *ns*
+    namespaces the widget keys (so an APS mirror coexists with the IBP one);
+    *allow_save* gates the Save-to-Fabric button (off for the APS view, which
+    must not overwrite the IBP comparison output).
     """
     table = result.table
     if table is None or table.empty:
@@ -6822,10 +6839,11 @@ def _render_demand_comparison_table(
     # everything except COLS_HIDDEN_BY_DEFAULT (the screenshot-3 column set).
     # Seed the default BEFORE the table reads it (the picker renders below the
     # table but its state is read up-front via session_state).
+    detail_cols_key = _ns_key(_DPC_DETAIL_COLS_KEY, ns)
     all_detail_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER]
     _hidden_default = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT}
     default_visible = [lbl for lbl in all_detail_labels if lbl not in _hidden_default]
-    st.session_state.setdefault(_DPC_DETAIL_COLS_KEY, default_visible)
+    st.session_state.setdefault(detail_cols_key, default_visible)
 
     # Percent ids → display labels; stored values are fractions, ×100 to show.
     percent_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_PERCENT_COLS]
@@ -6847,7 +6865,7 @@ def _render_demand_comparison_table(
 
     # Visible metric columns = the planner's picks, in the ORDER they were
     # ticked (from the Columns popover below); Category stays fixed at the left.
-    visible_metric_cols = _picked_columns(_DPC_DETAIL_COLS_KEY, all_detail_labels)
+    visible_metric_cols = _picked_columns(detail_cols_key, all_detail_labels)
 
     # Cycle-anchored header text for the two total-plan columns (display only —
     # the df column keys stay the DISPLAY_LABELS names so all lookups hold).
@@ -6882,43 +6900,49 @@ def _render_demand_comparison_table(
         )
 
     # Column picker + exports, below the table (per planner layout).
-    _render_comparison_table_controls(all_detail_labels, header_labels)
-    _render_comparison_table_exports(result, save_df)
+    _render_comparison_table_controls(all_detail_labels, header_labels, ns=ns)
+    _render_comparison_table_exports(result, save_df, ns=ns, allow_save=allow_save)
 
 
 def _render_comparison_table_controls(
     all_labels: list[str], label_overrides: Optional[dict[str, str]] = None,
+    *, ns: str = "",
 ) -> None:
     """⚙️ Columns picker for the detailed table, rendered below it.
 
     Lists EVERY metric column so the planner can show/hide/reorder any of them
     (incl. the extra-detail columns that start hidden), via the shared
     :func:`_render_column_picker`.  *label_overrides* keeps the picker's visible
-    names in sync with the table's cycle-anchored headers.  Category always
-    shows; Download / Save always include every column.
+    names in sync with the table's cycle-anchored headers.  *ns* namespaces the
+    widget key.  Category always shows; Download / Save always include every
+    column.
     """
     _render_column_picker(
-        _DPC_DETAIL_COLS_KEY, all_labels, label_overrides=label_overrides,
+        _ns_key(_DPC_DETAIL_COLS_KEY, ns), all_labels, label_overrides=label_overrides,
         help_suffix="  The Category column always shows; Download and Save to "
                     "Fabric always include every column.",
     )
 
 
-def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:
-    """Download + Save-to-Fabric buttons, rendered at the very bottom.
+def _render_comparison_table_exports(
+    result, save_df: pd.DataFrame, *, ns: str = "", allow_save: bool = True,
+) -> None:
+    """Download (+ optional Save-to-Fabric) buttons, rendered at the very bottom.
 
     Both act on the FULL frame (``save_df`` / ``result``), never the folded /
-    column-trimmed on-screen view.
+    column-trimmed on-screen view.  *ns* namespaces the widget keys; *allow_save*
+    gates the Save button (the APS view is download-only — it must not overwrite
+    the IBP comparison output file).
     """
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    dl_col, save_col = st.columns(2)
-    with dl_col:
+    cols = st.columns(2) if allow_save else st.columns(1)
+    with cols[0]:
         st.download_button(
             label="⬇️ Download Demand Plan Comparison Summary (CSV)",
             data=comparison_to_csv_bytes(result),
             file_name=f"demand_plan_comparison_summary_{today}.csv",
             mime="text/csv",
-            key="demand_plan_comparison_download",
+            key=_ns_key("demand_plan_comparison_download", ns),
             type="primary",
             width="stretch",
             help=(
@@ -6926,10 +6950,12 @@ def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:
                 "regardless of the on-screen fold level."
             ),
         )
-    with save_col:
+    if not allow_save:
+        return
+    with cols[1]:
         if st.button(
             "💾 Save to Fabric (overwrite)",
-            key="demand_plan_comparison_save",
+            key=_ns_key("demand_plan_comparison_save", ns),
             type="primary",
             width="stretch",
             help=(
@@ -6945,6 +6971,172 @@ def _render_comparison_table_exports(result, save_df: pd.DataFrame) -> None:
                 st.error(f"❌ Save failed.\n\n{exc}")
             else:
                 st.success(f"✅ Saved to `Files/{blob_path}` ({len(save_df)} rows).")
+
+
+# ── APS Demand Plan Comparison Summary (mirror of the IBP section) ───────────
+_APS_CMP_ENABLED_KEY: str = "aps_comparison_enabled"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_aps_history() -> Optional[pd.DataFrame]:
+    """Cached read of the APS history tracker (``None`` until a cycle is built)."""
+    return fetch_aps_history_df()
+
+
+def _build_aps_merged_tracker(
+    aps_hist: pd.DataFrame, ibp_tracker: pd.DataFrame,
+    current_cycle: str, prior_cycle: str,
+) -> tuple[pd.DataFrame, str]:
+    """Merge APS[current cycle] (current) with IBP[prior cycle] (prior baseline).
+
+    Returns ``(merged_raw_tracker, effective_prior_label)``.  If the two cycle
+    labels collide, the IBP prior rows are relabelled so the comparison's cycle
+    filter can distinguish current from prior.
+    """
+    aps_cur = aps_hist[
+        aps_hist["Cycle"].astype(str).str.strip() == str(current_cycle)].copy()
+    ibp_prior = ibp_tracker[
+        ibp_tracker["Cycle"].astype(str).str.strip() == str(prior_cycle)].copy()
+    prior_label = str(prior_cycle)
+    if str(current_cycle) == prior_label:
+        prior_label = f"{prior_cycle} (IBP prior)"
+        ibp_prior["Cycle"] = prior_label
+    merged = pd.concat([aps_cur, ibp_prior], ignore_index=True, sort=False)
+    return merged, prior_label
+
+
+def _aps_default_filters(current_cycle: str, prior_label: str) -> ComparisonFilters:
+    """Comparison filters for the APS mirror (standard windows + chosen cycles)."""
+    return ComparisonFilters(
+        current_cycle=str(current_cycle), prior_cycle=str(prior_label),
+        actual_start=_DPC_DEFAULT_ACTUAL_START, actual_end=_DPC_DEFAULT_ACTUAL_END,
+        forecast_start=_DPC_DEFAULT_FORECAST_START, forecast_end=_DPC_DEFAULT_FORECAST_END,
+        prior_month=_DPC_DEFAULT_PRIOR_MONTH, combo_exclude=frozenset(),
+    )
+
+
+def _render_aps_comparison_section() -> None:
+    """APS mirror of Demand Plan Comparison Summary (no bias; incl. Prior Month).
+
+    Current cycle = the APS history tracker; prior baseline = a chosen cycle of
+    the IBP ``qry_mgmt_plan_history_tracker.csv``.  RO-Summary / Budget are
+    zeroed (APS has none); actuals reuse IBP Orders / Shipments.  Reuses the IBP
+    renderers with an ``"aps"`` key namespace so both sections coexist.
+    """
+    with st.expander("🧭 APS Demand Plan Comparison Summary", expanded=False):
+        st.caption(
+            "Compares the **APS plan** (current cycle, from the APS history "
+            "tracker) against a chosen **prior cycle of the IBP tracker** "
+            "(`qry_mgmt_plan_history_tracker.csv`).  Same YoY / summary / mix / "
+            "cycle-over-cycle / Prior-Month views as the IBP section; actuals "
+            "reuse IBP Orders / Shipments.  (No forecast-accuracy section here.)"
+        )
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
+            return
+
+        aps_hist = _cached_aps_history()
+        if aps_hist is None or aps_hist.empty:
+            st.info(
+                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS)** "
+                "above; this comparison lights up once "
+                "`qry_mgmt_plan_full_aps_history.csv` exists."
+            )
+            return
+        try:
+            ibp_tracker = fetch_mgmt_plan_history_tracker().df
+        except DemandSummaryError as exc:
+            st.error(f"❌ Could not load the IBP tracker for the prior baseline.\n\n{exc}")
+            return
+        aps_cycles = list_aps_history_cycles(aps_hist)
+        ibp_cycles = list_tracker_cycles(ibp_tracker) if ibp_tracker is not None else []
+        if not aps_cycles:
+            st.warning("The APS history has no Cycle values yet.")
+            return
+        if not ibp_cycles:
+            st.warning("The IBP tracker has no Cycle values for the prior baseline.")
+            return
+
+        pick = st.columns(2)
+        with pick[0]:
+            current_cycle = st.selectbox(
+                "Current cycle (APS)", options=aps_cycles,
+                index=len(aps_cycles) - 1, key="aps_cmp_current_cycle")
+        with pick[1]:
+            prior_cycle = st.selectbox(
+                "Prior cycle (IBP tracker)", options=ibp_cycles,
+                index=len(ibp_cycles) - 1, key="aps_cmp_prior_cycle")
+
+        enabled = st.session_state.get(_APS_CMP_ENABLED_KEY, False)
+        if st.button("▶️ Generate APS Comparison", key="aps_cmp_generate", type="primary"):
+            enabled = True
+            st.session_state[_APS_CMP_ENABLED_KEY] = True
+        if not enabled:
+            st.info("👆 Click **Generate APS Comparison** to build the tables.")
+            return
+
+        merged, prior_label = _build_aps_merged_tracker(
+            aps_hist, ibp_tracker, current_cycle, prior_cycle)
+        if merged.empty:
+            st.warning("No rows for the chosen cycle pair.")
+            return
+        filters = _aps_default_filters(current_cycle, prior_label)
+
+        # Supporting sources (dims + IBP actuals); RO-Summary / Budget zeroed.
+        pdh_df = _load_demand_comparison_pdh()
+        item_master_df = _load_mom_item_master()
+        actual_months = months_in_range(filters.actual_start, filters.actual_end)
+        prior_month_set = {filters.prior_month.replace(day=1)}
+        ibp_df, _ = _load_demand_comparison_ibp(
+            months=tuple(sorted(actual_months | prior_month_set)))
+        ibp_orders_df, _ = _load_demand_comparison_ibp_orders(
+            months=tuple(sorted(prior_month_set)))
+        py_window = tuple(sorted(months_in_range(
+            shift_year_back(filters.actual_start), shift_year_back(filters.forecast_end))))
+        ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
+        recent_cur = last_n_months(filters.actual_end, 6)
+        ibp_recent_df, _ = _load_demand_comparison_ibp(months=tuple(sorted(recent_cur)))
+        ibp_recent_py_df, _ = _load_demand_comparison_ibp(
+            months=tuple(sorted(shift_year_back(m) for m in recent_cur)))
+
+        tracker_sig = _signature_for(merged)
+        enrich_sig = (
+            tracker_sig, _signature_for(ibp_df), _signature_for(ibp_orders_df),
+            _signature_for(ibp_py_df), _signature_for(ibp_recent_df),
+            _signature_for(ibp_recent_py_df), _signature_for(pdh_df),
+            _signature_for(item_master_df))
+        empty_ro_sig, empty_budget_key = (0, 0.0), ()
+
+        with st.spinner("Building APS Demand Plan Comparison…"):
+            enriched = _cached_enriched_sources(
+                *enrich_sig, merged, ibp_df, ibp_orders_df, ibp_py_df,
+                ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df)
+            table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
+                enrich_sig + (empty_ro_sig, empty_budget_key), filters,
+                empty_ro_sig, empty_budget_key, enriched, {}, {})
+            prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
+                enrich_sig + (filters.prior_month,), filters, enriched)
+        result = ComparisonResult(
+            table=table, warnings=build_warnings, ro_summary_available=ro_available)
+
+        for msg in build_warnings:
+            st.warning(f"⚠️ {msg}")
+
+        st.markdown("#### 📈 YoY Comparison")
+        _render_comparison_summary_col_picker(ns="aps")
+        kpis = build_comparison_kpis(
+            result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters)
+        _render_comparison_kpis_yoy(kpis)
+        _render_comparison_summary_table(result, ns="aps")
+        _render_comparison_mix_table(result)
+
+        st.markdown("---")
+        st.markdown("#### 🔄 Cycle over Cycle Comparison")
+        _render_comparison_kpis_walk(kpis, filters)
+        _render_demand_comparison_table(result, filters, ns="aps", allow_save=False)
+        _render_prior_month_actual_vs_fcst_table(
+            prior_month_vs_fcst, prior_cycle=filters.prior_cycle,
+            prior_month=filters.prior_month, ns="aps")
 
 
 def _render_one_driver_table(
@@ -7293,7 +7485,7 @@ def _render_pmaf_html(table: pd.DataFrame, *, prior_cycle: str, prior_month: dat
 
 
 def _render_prior_month_actual_vs_fcst_table(
-    table: pd.DataFrame, *, prior_cycle: str, prior_month: date,
+    table: pd.DataFrame, *, prior_cycle: str, prior_month: date, ns: str = "",
 ) -> None:
     """Render the *Prior Month Actual vs Fcst* summary table.
 
@@ -7326,7 +7518,7 @@ def _render_prior_month_actual_vs_fcst_table(
         data=out_df.to_csv(index=False).encode("utf-8"),
         file_name=f"prior_month_actual_vs_fcst_{today}.csv",
         mime="text/csv",
-        key="dpc_prior_month_vs_fcst_download",
+        key=_ns_key("dpc_prior_month_vs_fcst_download", ns),
         width="stretch",
     )
 
@@ -9108,6 +9300,7 @@ def render() -> None:
 
     # APS above IBP — both are independent, self-contained sections.
     _render_demand_summary_aps()
+    _render_aps_comparison_section()
     st.markdown("---")
 
     _render_demand_summary()

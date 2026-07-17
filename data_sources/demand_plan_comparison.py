@@ -3540,6 +3540,33 @@ def _resolve_corp_actual(
     return cg, soft
 
 
+def build_plan_to_corp_group(
+    plantosites_df: Optional[pd.DataFrame],
+    customernames_df: Optional[pd.DataFrame],
+) -> dict[str, str]:
+    """Return ``{plan_to_code → corporate_group}`` (the direct plan-to bridge).
+
+    Composes ``dp_dimplantosites`` (plan_to_code → customer_num) with the
+    canonical ``dp_dimcustomernames`` (customer_num → corporate_group) map from
+    :func:`build_corp_group_lookups`.  This is the same chain, minus the
+    party_site → plan_to_code hop — useful when a source already carries
+    ``plan_to_code`` (e.g. the APS bulk export), which avoids the ship-to-sites
+    coverage bottleneck and reuses one canonicalisation.
+    """
+    _party2corp, cust2corp = build_corp_group_lookups(None, plantosites_df, customernames_df)
+    out: dict[str, str] = {}
+    if plantosites_df is not None and not plantosites_df.empty and cust2corp:
+        p_col = _resolve_column(plantosites_df, _PLAN_TO_CANDIDATES)
+        c_col = _resolve_column(plantosites_df, _PTS_CUSTOMER_NUM_CANDIDATES)
+        if p_col and c_col:
+            plans = _vectorised_clean_str(plantosites_df[p_col])
+            custs = _vectorised_item_key(plantosites_df[c_col])
+            for plan, cust in zip(plans, custs):
+                if plan and cust in cust2corp:
+                    out[plan] = cust2corp[cust]
+    return out
+
+
 def _segment_leaf_rows(node_id: str, template: list) -> list:
     """All non-memo leaf TemplateRows at or under *node_id* (deduped).
 

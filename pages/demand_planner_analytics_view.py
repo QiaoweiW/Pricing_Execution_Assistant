@@ -91,6 +91,7 @@ from data_sources.demand_plan_comparison import (
     fetch_fy27_budget_by_row_id,
     fy27_budget_blob_path,
     COL_LABEL as DPC_COL_LABEL,
+    COL_LAST_PLAN as DPC_COL_LAST_PLAN,
     COL_CURRENT_PLAN as DPC_COL_CURRENT_PLAN,
     COL_CURRENT_PLAN_RO as DPC_COL_CURRENT_PLAN_RO,
     COL_PY_ACTUAL as DPC_COL_PY_ACTUAL,
@@ -2514,7 +2515,26 @@ def _render_summary_report_fragment() -> None:
             "Prior / LE pickers to a month pair with comparison data."
         )
     else:
+        _render_ro_summary_header_editor()
         _render_ro_summary_html(display_df)
+        with st.expander("ℹ️ What the FY28 Probabilized columns mean", expanded=False):
+            st.markdown(
+                "**FY28 Probabilized** is the risk-adjusted demand plan for the "
+                "**next fiscal year** (the first full year beyond the current "
+                "one).  *Probabilized* means every line is weighted by how likely "
+                "it is to land — an expected-value view, not a best-case wish "
+                "list — so it's a sober read on where next year is trending.\n\n"
+                "**Why it's here:** the FY27 columns tell you what this cycle did "
+                "to the *current* year; these three tell you what it did to "
+                "**next** year — the early-warning signal so a shift shows up a "
+                "year out, while there's still time to act on capacity, pricing, "
+                "and customer commitments.\n\n"
+                "**How to read it:** **Prior** = where next year stood before this "
+                "cycle; **Latest** = where it stands now; **Change** = the swing "
+                "(Latest − Prior).  A large **Change** — especially concentrated "
+                "in one segment — is the line to investigate: it's this cycle "
+                "quietly re-shaping the forward year."
+            )
 
     # ── Download + Save — always the FULL, unfiltered report ─────
     #
@@ -2700,10 +2720,12 @@ _RO_SR_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (SR_COL_DELTA_EXIT, "Exit"),
         (SR_COL_DELTA_CHANGE, "Change"),
     )),
-    ("Year 1 Probabilized", (
+    # Prior → Latest → Change (planner-requested order: where it started, where
+    # it landed, then the swing).  Group renamed FY28 Probabilized (see below).
+    ("FY28 Probabilized", (
         (SR_COL_Y1_PRIOR, "Prior"),
-        (SR_COL_Y1_CHANGE, "Change"),
         (SR_COL_Y1_LATEST, "Latest"),
+        (SR_COL_Y1_CHANGE, "Change"),
     )),
 )
 # First metric column of each group carries the vertical divider.
@@ -2729,6 +2751,51 @@ _RO_SR_CSS: str = """
 .ro-sr tr.subtotal td {font-weight:700;}
 </style>
 """
+
+
+# ── Editable headers (session-scoped) ────────────────────────────────────────
+# The group + sub-column labels above are the DEFAULTS.  A planner can rename
+# any header via the editor expander; the override lives in session_state
+# (keyed per group index / per column id) and the table reads it back.  Scope is
+# the current session — a full page reload restores the defaults.
+def _ro_sr_group_label(i: int) -> str:
+    """Effective group-band label for group *i* (session override or default)."""
+    return st.session_state.get(f"ro_sr_grp_{i}") or _RO_SR_GROUPS[i][0]
+
+
+def _ro_sr_sub_default(col_id: str) -> str:
+    """The code-default sub-column label for *col_id*."""
+    for _grp, cols in _RO_SR_GROUPS:
+        for col, label in cols:
+            if col == col_id:
+                return label
+    return col_id
+
+
+def _ro_sr_sub_label(col_id: str) -> str:
+    """Effective sub-column label for *col_id* (session override or default)."""
+    return st.session_state.get(f"ro_sr_sub_{col_id}") or _ro_sr_sub_default(col_id)
+
+
+def _render_ro_summary_header_editor() -> None:
+    """Foldable editor to rename any RO-Summary header (session-scoped)."""
+    with st.expander("✏️ Edit report headers", expanded=False):
+        st.caption(
+            "Rename any column header — changes apply to the table below for "
+            "this session (a full page reload restores the defaults)."
+        )
+        editor_cols = st.columns(len(_RO_SR_GROUPS))
+        for i, (grp_name, sub_cols) in enumerate(_RO_SR_GROUPS):
+            with editor_cols[i]:
+                gkey = f"ro_sr_grp_{i}"
+                st.session_state.setdefault(gkey, grp_name)
+                st.text_input("Group band", key=gkey)
+                for col_id, label in sub_cols:
+                    skey = f"ro_sr_sub_{col_id}"
+                    st.session_state.setdefault(skey, label)
+                    # Widget label = the default, so the planner can see which
+                    # column each input renames even after editing its value.
+                    st.text_input(f"↳ {label}", key=skey)
 
 
 def _fmt_ro_sr_num(value: object) -> str:
@@ -2770,17 +2837,18 @@ def _render_ro_summary_html(df: pd.DataFrame) -> None:
     """
     data_cols = [col for _grp, cols in _RO_SR_GROUPS for col, _lbl in cols]
 
-    # ── Header: group band + sub-column row ───────────────────────
+    # ── Header: group band + sub-column row (labels are session-editable) ──
     band = ['<th></th>']
-    for group_name, cols in _RO_SR_GROUPS:
+    for i, (_group_name, cols) in enumerate(_RO_SR_GROUPS):
         band.append(
-            f'<th class="grp" colspan="{len(cols)}">{_esc_html(group_name)}</th>'
+            f'<th class="grp" colspan="{len(cols)}">'
+            f'{_esc_html(_ro_sr_group_label(i))}</th>'
         )
     subhead = ['<th class="lbl">Millions of lbs.</th>']
     for _grp, cols in _RO_SR_GROUPS:
-        for col, label in cols:
+        for col, _label in cols:
             cls = ' class="grp"' if col in _RO_SR_GROUP_START_COLS else ""
-            subhead.append(f'<th{cls}>{_esc_html(label)}</th>')
+            subhead.append(f'<th{cls}>{_esc_html(_ro_sr_sub_label(col))}</th>')
 
     # ── Body rows ─────────────────────────────────────────────────
     body: list[str] = []
@@ -5232,8 +5300,9 @@ def _render_demand_plan_comparison_fragment() -> None:
 
     st.markdown("#### 🔄 Cycle over Cycle Comparison")
     _render_comparison_kpis_walk(kpis, filters)
-    # 7. Render the comparison table + download / save.
-    _render_demand_comparison_table(result)
+    # 7. Render the comparison table + download / save (plan columns anchored
+    #    on the chosen prior / current cycles).
+    _render_demand_comparison_table(result, filters)
 
     # 8. Prior Month Actual vs Fcst summary (between comparison and drivers).
     _render_prior_month_actual_vs_fcst_table(
@@ -5911,14 +5980,19 @@ def _render_comparison_tree(
     subtotal_flags: list[bool],
     memo_flags: list[bool],
     indent_flags: list[int],
+    header_labels: dict[str, str] | None = None,
 ) -> None:
     """Render the comparison rows as a natively-foldable ``<details>`` tree.
 
     All nodes start expanded; clicking a parent row collapses its subtree with
     no server round-trip.  The NBSP hierarchy indent in each label is preserved
-    and a rotating triangle marks foldable rows.
+    and a rotating triangle marks foldable rows.  *header_labels* optionally
+    overrides the DISPLAYED text of a column header (keyed by the metric-col /
+    df-column name) without changing the underlying data key — used to anchor
+    the plan columns on the chosen cycles (e.g. "C3 Plan (incl. R&O)").
     """
     percent_set = set(percent_labels)
+    hdr = header_labels or {}
 
     def _make_row(i: int, foldable: bool) -> tuple[str, str]:
         cls = _dpc_cmp_row_class(
@@ -5936,7 +6010,7 @@ def _render_comparison_tree(
 
     header = (
         '<div class="rw hdr"><span class="lbl">' + _esc_html(label_col) + "</span>"
-        + "".join(f"<span>{_esc_html(c)}</span>" for c in metric_cols)
+        + "".join(f"<span>{_esc_html(hdr.get(c, c))}</span>" for c in metric_cols)
         + "</div>"
     )
     parts = [header] + _foldable_tree_body(len(display_df), indent_flags, _make_row)
@@ -6079,16 +6153,23 @@ def _summary_clean_label(r: pd.Series) -> str:
 # a column, and Streamlit preserves selection order, so the sequence a planner
 # ticks columns in IS their left-to-right order.  Keeping one helper means the
 # ⚙️ Columns popover behaves identically on every table (no per-table variants).
-def _render_column_picker(key: str, options: list[str], *, help_suffix: str = "") -> None:
+def _render_column_picker(
+    key: str, options: list[str], *,
+    help_suffix: str = "", label_overrides: Optional[dict[str, str]] = None,
+) -> None:
     """Render the ⚙️ Columns popover for one table (binds to ``session_state[key]``).
 
     Options default to *all shown, canonical order* on first render.  The label
-    column is fixed by the caller and never appears here.
+    column is fixed by the caller and never appears here.  *label_overrides*
+    maps an option to the text shown for it (the stored value stays the option),
+    so the picker can mirror cycle-anchored table headers.
     """
+    ov = label_overrides or {}
     st.session_state.setdefault(key, list(options))
     with st.popover("⚙️ Columns", use_container_width=False):
         st.multiselect(
             "Show columns", options=options, key=key,
+            format_func=lambda o: ov.get(o, o),
             help="Untick to hide a column; re-tick columns in the order you want "
                  "them to appear (selection order = left-to-right order)."
                  + help_suffix,
@@ -6885,13 +6966,17 @@ def _render_corp_sku_driver_chart(row: pd.Series, months: tuple) -> None:
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
-def _render_demand_comparison_table(result) -> None:
+def _render_demand_comparison_table(
+    result, filters: Optional[ComparisonFilters] = None,
+) -> None:
     """Render the detailed comparison table (foldable tree) + controls + exports.
 
     Layout: the tree first, then (below it) the detail-column toggle, then the
     Download / Save-to-Fabric buttons.  Folding is per-row and native (click a
     parent row) — there is no global fold control.  The column toggle lives
-    below the table but its state is read up-front via session_state.
+    below the table but its state is read up-front via session_state.  When
+    *filters* is given, the two total-plan column headers are anchored on the
+    chosen cycles (e.g. "C3 Plan (incl. R&O)" / "C4 Plan (incl. R&O)").
     """
     table = result.table
     if table is None or table.empty:
@@ -6939,6 +7024,18 @@ def _render_demand_comparison_table(result) -> None:
     # ticked (from the Columns popover below); Category stays fixed at the left.
     visible_metric_cols = _picked_columns(_DPC_DETAIL_COLS_KEY, all_detail_labels)
 
+    # Cycle-anchored header text for the two total-plan columns (display only —
+    # the df column keys stay the DISPLAY_LABELS names so all lookups hold).
+    header_labels = (
+        {
+            DPC_DISPLAY_LABELS[DPC_COL_LAST_PLAN]:
+                f"{filters.prior_cycle} Plan (incl. R&O)",
+            DPC_DISPLAY_LABELS[DPC_COL_CURRENT_PLAN]:
+                f"{filters.current_cycle} Plan (incl. R&O)",
+        }
+        if filters is not None else {}
+    )
+
     # Foldable tree — navy header + white font, light-blue Total B2C, orange
     # (#f8cbad) Portfolio-Major rows (incl. Butter); click a parent row to fold.
     _render_comparison_tree(
@@ -6950,6 +7047,7 @@ def _render_demand_comparison_table(result) -> None:
         subtotal_flags=subtotal_flags,
         memo_flags=memo_flags,
         indent_flags=indent_flags,
+        header_labels=header_labels,
     )
 
     if not result.ro_summary_available:
@@ -6959,20 +7057,23 @@ def _render_demand_comparison_table(result) -> None:
         )
 
     # Column picker + exports, below the table (per planner layout).
-    _render_comparison_table_controls(all_detail_labels)
+    _render_comparison_table_controls(all_detail_labels, header_labels)
     _render_comparison_table_exports(result, save_df)
 
 
-def _render_comparison_table_controls(all_labels: list[str]) -> None:
+def _render_comparison_table_controls(
+    all_labels: list[str], label_overrides: Optional[dict[str, str]] = None,
+) -> None:
     """⚙️ Columns picker for the detailed table, rendered below it.
 
     Lists EVERY metric column so the planner can show/hide/reorder any of them
     (incl. the extra-detail columns that start hidden), via the shared
-    :func:`_render_column_picker`.  Category always shows; Download / Save
-    always include every column.  (Row folding is native per-row.)
+    :func:`_render_column_picker`.  *label_overrides* keeps the picker's visible
+    names in sync with the table's cycle-anchored headers.  Category always
+    shows; Download / Save always include every column.
     """
     _render_column_picker(
-        _DPC_DETAIL_COLS_KEY, all_labels,
+        _DPC_DETAIL_COLS_KEY, all_labels, label_overrides=label_overrides,
         help_suffix="  The Category column always shows; Download and Save to "
                     "Fabric always include every column.",
     )

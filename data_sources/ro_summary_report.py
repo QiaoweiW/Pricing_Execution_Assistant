@@ -64,9 +64,9 @@ Data columns (8)
 * ``Delta Breakdown   | New``              — Σ ``Change Current Fiscal Probabilized Lbs`` where Driver = "New"
 * ``Delta Breakdown   | Exit``             — Σ same, Driver = "Exit"
 * ``Delta Breakdown   | Change``           — Σ same, Driver = "Change"
-* ``Year 1 Probabilized | Prior``          — Σ ``Prior Year1 Probabilized Lbs``
-* ``Year 1 Probabilized | Change``         — ``Latest − Prior``  (recomputed)
-* ``Year 1 Probabilized | Latest``         — Σ ``LE Year1 Probabilized Lbs``
+* ``FY28 Probabilized | Prior``            — Σ ``Prior Year1 Probabilized Lbs``
+* ``FY28 Probabilized | Change``           — ``Latest − Prior``  (recomputed)
+* ``FY28 Probabilized | Latest``           — Σ ``LE Year1 Probabilized Lbs``
 
 Numbers are stored in **millions of lbs** (raw ÷ 1,000,000, rounded
 to 1 decimal) — both for display and for the saved CSV — so the
@@ -149,7 +149,7 @@ _COMPARISON_OUTPUT_CACHE_TTL_SECONDS: int = 15 * 60
 #
 # We deliberately use distinct internal IDs for the 8 data columns
 # because the planner's labels have a collision ("Change" appears
-# under both Delta Breakdown and Year 1 Probabilized).  pandas
+# under both Delta Breakdown and FY28 Probabilized).  pandas
 # DataFrames don't tolerate duplicate column names; the column_config
 # in the page maps these IDs to clean display labels.
 
@@ -178,9 +178,9 @@ SAVED_COLUMN_LABELS: dict[str, str] = {
     COL_DELTA_NEW:    "Delta Breakdown | New",
     COL_DELTA_EXIT:   "Delta Breakdown | Exit",
     COL_DELTA_CHANGE: "Delta Breakdown | Change",
-    COL_Y1_PRIOR:     "Year 1 Probabilized | Prior",
-    COL_Y1_CHANGE:    "Year 1 Probabilized | Change",
-    COL_Y1_LATEST:    "Year 1 Probabilized | Latest",
+    COL_Y1_PRIOR:     "FY28 Probabilized | Prior",
+    COL_Y1_CHANGE:    "FY28 Probabilized | Change",
+    COL_Y1_LATEST:    "FY28 Probabilized | Latest",
 }
 
 # Structural / display columns kept alongside the data columns.

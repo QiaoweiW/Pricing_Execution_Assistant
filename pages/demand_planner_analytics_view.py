@@ -45,7 +45,7 @@ widget interaction.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime
 from typing import Callable, Optional
 
@@ -3410,6 +3410,7 @@ def _render_aps_match_log(res) -> None:
                 with st.spinner("Applying overrides and saving to Fabric…"):
                     patched = save_aps_override(res, overrides)
                 _cached_persisted_aps_plan.clear()
+                _cached_aps_history.clear()   # comparison picks up the patched history
                 st.session_state[_APS_UPLOAD_RESULT_KEY] = patched
                 st.session_state[_APS_PATCH_NONCE_KEY] = patch_nonce + 1
                 remaining = len(filter_needs_review(patched.match_log) or [])
@@ -3497,6 +3498,7 @@ def _render_demand_summary_aps() -> None:
                         cycle=str(cycle), fy=int(fy),
                     )
                 _cached_persisted_aps_plan.clear()
+                _cached_aps_history.clear()   # so the APS comparison sees the new cycle
                 st.session_state[_APS_UPLOAD_RESULT_KEY] = res
                 st.session_state[_APS_UPLOAD_NONCE_KEY] = nonce + 1
             except (
@@ -5242,6 +5244,11 @@ _DPC_DEFAULT_PRIOR_MONTH: date = date(2026, 5, 1)
 def _render_demand_comparison_filters(
     cycles: list[str], months: list[date], actual_months: list[date],
     combo_options: list[tuple[str, str, str]] | None = None,
+    *,
+    prior_cycles: list[str] | None = None,
+    ns: str = "",
+    current_label: str = "Current cycle",
+    prior_label: str = "Prior cycle",
 ) -> ComparisonFilters:
     """Render the cycle + month-range pickers; return a filter selection.
 
@@ -5263,12 +5270,20 @@ def _render_demand_comparison_filters(
     #    before it is "prior".  This stays correct as new cycles land —
     #    e.g. when C4 arrives it becomes the default current with C3 prior —
     #    rather than pinning to a specific label that goes stale each cycle.
+    # Prior cycle may come from a DIFFERENT list than current (the APS mirror
+    # picks current from the APS tracker, prior from the IBP tracker).  Default
+    # prior = newest of its own list when the lists differ; the "one-before-
+    # current" logic only applies when both share one list (the IBP section).
+    prior_cycles = list(prior_cycles) if prior_cycles is not None else list(cycles)
     default_current = cycles[-1]
-    default_prior = cycles[-2] if len(cycles) >= 2 else cycles[-1]
-    if default_prior == default_current:  # guard very small cycle lists
-        default_prior = next(
-            (c for c in reversed(cycles) if c != default_current), cycles[0]
-        )
+    if prior_cycles == list(cycles):
+        default_prior = cycles[-2] if len(cycles) >= 2 else cycles[-1]
+        if default_prior == default_current:  # guard very small cycle lists
+            default_prior = next(
+                (c for c in reversed(cycles) if c != default_current), cycles[0]
+            )
+    else:
+        default_prior = prior_cycles[-1]
 
     # ── Month defaults ─────────────────────────────────────────────────
     # The computed disjoint split is the FALLBACK; the planner's preferred
@@ -5306,16 +5321,16 @@ def _render_demand_comparison_filters(
     row1 = st.columns(2)
     with row1[0]:
         current_cycle = st.selectbox(
-            "Current cycle", options=cycles,
+            current_label, options=cycles,
             index=cycles.index(default_current),
-            key="dpc_current_cycle", format_func=fmt_cycle,
+            key=_ns_key("dpc_current_cycle", ns), format_func=fmt_cycle,
             help="The cycle whose plan you're evaluating.",
         )
     with row1[1]:
         prior_cycle = st.selectbox(
-            "Prior cycle", options=cycles,
-            index=cycles.index(default_prior),
-            key="dpc_prior_cycle", format_func=fmt_cycle,
+            prior_label, options=prior_cycles,
+            index=prior_cycles.index(default_prior),
+            key=_ns_key("dpc_prior_cycle", ns), format_func=fmt_cycle,
             help="The earlier cycle to compare against (drives Base Plan).",
         )
 
@@ -5324,12 +5339,12 @@ def _render_demand_comparison_filters(
     with row2[0]:
         actual_start = st.selectbox(
             "Actual — beginning month", options=actual_months, index=actual_start_idx,
-            key="dpc_actual_start", format_func=fmt_month,
+            key=_ns_key("dpc_actual_start", ns), format_func=fmt_month,
         )
     with row2[1]:
         actual_end = st.selectbox(
             "Actual — end month", options=actual_months, index=actual_end_idx,
-            key="dpc_actual_end", format_func=fmt_month,
+            key=_ns_key("dpc_actual_end", ns), format_func=fmt_month,
         )
 
     st.markdown("**Forecast month range** (must not overlap the actual range)")
@@ -5337,18 +5352,18 @@ def _render_demand_comparison_filters(
     with row3[0]:
         forecast_start = st.selectbox(
             "Forecast — beginning month", options=months, index=fc_start_idx,
-            key="dpc_forecast_start", format_func=fmt_month,
+            key=_ns_key("dpc_forecast_start", ns), format_func=fmt_month,
         )
     with row3[1]:
         forecast_end = st.selectbox(
             "Forecast — end month", options=months, index=fc_end_idx,
-            key="dpc_forecast_end", format_func=fmt_month,
+            key=_ns_key("dpc_forecast_end", ns), format_func=fmt_month,
         )
 
     prior_month = st.selectbox(
         "Prior Month (for PM Actual / Prior Month Forecast)",
         options=months, index=prior_default_idx,
-        key="dpc_prior_month", format_func=fmt_month,
+        key=_ns_key("dpc_prior_month", ns), format_func=fmt_month,
         help="The single month used for the Prior-Month columns.",
     )
 
@@ -5373,7 +5388,7 @@ def _render_demand_comparison_filters(
         )
         hidden = st.multiselect(
             "Hide combinations", options=all_labels,
-            key="dpc_combo_exclude", label_visibility="collapsed",
+            key=_ns_key("dpc_combo_exclude", ns), label_visibility="collapsed",
             placeholder="Search to hide, e.g. “butter private”…",
             help="Type to search; each pick is REMOVED from every table in "
                  "this section.  Powders / Cheese / Bulk Fluid aren't listed "
@@ -7005,31 +7020,22 @@ def _build_aps_merged_tracker(
     return merged, prior_label
 
 
-def _aps_default_filters(current_cycle: str, prior_label: str) -> ComparisonFilters:
-    """Comparison filters for the APS mirror (standard windows + chosen cycles)."""
-    return ComparisonFilters(
-        current_cycle=str(current_cycle), prior_cycle=str(prior_label),
-        actual_start=_DPC_DEFAULT_ACTUAL_START, actual_end=_DPC_DEFAULT_ACTUAL_END,
-        forecast_start=_DPC_DEFAULT_FORECAST_START, forecast_end=_DPC_DEFAULT_FORECAST_END,
-        prior_month=_DPC_DEFAULT_PRIOR_MONTH, combo_exclude=frozenset(),
-    )
-
-
 def _render_aps_comparison_section() -> None:
     """APS mirror of Demand Plan Comparison Summary (no bias; incl. Prior Month).
 
     Current cycle = the APS history tracker; prior baseline = a chosen cycle of
-    the IBP ``qry_mgmt_plan_history_tracker.csv``.  RO-Summary / Budget are
-    zeroed (APS has none); actuals reuse IBP Orders / Shipments.  Reuses the IBP
-    renderers with an ``"aps"`` key namespace so both sections coexist.
+    the IBP ``qry_mgmt_plan_history_tracker.csv``.  Same filters + tables as the
+    IBP section (reused via an ``"aps"`` widget-key namespace so both coexist).
+    RO-Summary / Budget are zeroed (APS has none); actuals reuse IBP Orders /
+    Shipments.  All controls appear whenever the APS history file exists.
     """
     with st.expander("🧭 APS Demand Plan Comparison Summary", expanded=False):
         st.caption(
             "Compares the **APS plan** (current cycle, from the APS history "
             "tracker) against a chosen **prior cycle of the IBP tracker** "
-            "(`qry_mgmt_plan_history_tracker.csv`).  Same YoY / summary / mix / "
-            "cycle-over-cycle / Prior-Month views as the IBP section; actuals "
-            "reuse IBP Orders / Shipments.  (No forecast-accuracy section here.)"
+            "(`qry_mgmt_plan_history_tracker.csv`).  Same filters + YoY / summary "
+            "/ mix / cycle-over-cycle / Prior-Month tables as the IBP section; "
+            "actuals reuse IBP Orders / Shipments.  (No forecast-accuracy section.)"
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
@@ -7057,30 +7063,48 @@ def _render_aps_comparison_section() -> None:
             st.warning("The IBP tracker has no Cycle values for the prior baseline.")
             return
 
-        pick = st.columns(2)
-        with pick[0]:
-            current_cycle = st.selectbox(
-                "Current cycle (APS)", options=aps_cycles,
-                index=len(aps_cycles) - 1, key="aps_cmp_current_cycle")
-        with pick[1]:
-            prior_cycle = st.selectbox(
-                "Prior cycle (IBP tracker)", options=ibp_cycles,
-                index=len(ibp_cycles) - 1, key="aps_cmp_prior_cycle")
+        # Month + combo options span BOTH trackers (current = APS, prior = IBP).
+        months = sorted(set(list_tracker_months(ibp_tracker)) | set(list_tracker_months(aps_hist)))
+        try:
+            actual_months = list(fetch_ibp_shipments_months())
+        except IBPOfficialSourceError:
+            actual_months = months
+        if not actual_months:
+            actual_months = months
+        combo_options = list_comparison_combos(aps_hist, _load_demand_comparison_pdh())
+
+        # Same filter widget as the IBP section (current cycles = APS, prior = IBP).
+        with st.expander("🔍 Filters", expanded=True):
+            filters = _render_demand_comparison_filters(
+                aps_cycles, months, actual_months, combo_options,
+                prior_cycles=ibp_cycles, ns="aps",
+                current_label="Current cycle (APS)",
+                prior_label="Prior cycle (IBP tracker)")
 
         enabled = st.session_state.get(_APS_CMP_ENABLED_KEY, False)
-        if st.button("▶️ Generate APS Comparison", key="aps_cmp_generate", type="primary"):
+        if st.button(
+            "▶️ Generate Demand Plan Comparison Summary (APS)",
+            key="aps_cmp_generate", type="primary", use_container_width=True,
+        ):
             enabled = True
             st.session_state[_APS_CMP_ENABLED_KEY] = True
         if not enabled:
-            st.info("👆 Click **Generate APS Comparison** to build the tables.")
+            st.info("👆 Click **Generate Demand Plan Comparison Summary (APS)** to build the tables.")
             return
 
+        # Merge APS[current] + IBP[prior]; relabel prior on a label collision so
+        # the comparison's cycle filter can tell them apart, then align filters.
         merged, prior_label = _build_aps_merged_tracker(
-            aps_hist, ibp_tracker, current_cycle, prior_cycle)
+            aps_hist, ibp_tracker, filters.current_cycle, filters.prior_cycle)
         if merged.empty:
             st.warning("No rows for the chosen cycle pair.")
             return
-        filters = _aps_default_filters(current_cycle, prior_label)
+        filters = replace(filters, prior_cycle=prior_label)
+        errors = validate_filters(filters)
+        if errors:
+            for msg in errors:
+                st.error(f"❌ {msg}")
+            return
 
         # Supporting sources (dims + IBP actuals); RO-Summary / Budget zeroed.
         pdh_df = _load_demand_comparison_pdh()

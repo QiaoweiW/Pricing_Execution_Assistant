@@ -93,6 +93,9 @@ from data_sources.demand_plan_comparison import (
     COL_LAST_PLAN as DPC_COL_LAST_PLAN,
     COL_CURRENT_PLAN as DPC_COL_CURRENT_PLAN,
     COL_CURRENT_PLAN_RO as DPC_COL_CURRENT_PLAN_RO,
+    COL_PM_ACTUAL as DPC_COL_PM_ACTUAL,
+    COL_BASE_PLAN as DPC_COL_BASE_PLAN,
+    COL_R_AND_O as DPC_COL_R_AND_O,
     COL_PY_ACTUAL as DPC_COL_PY_ACTUAL,
     COL_O_PCT as DPC_COL_O_PCT,
     COL_BUDGET as DPC_COL_BUDGET,
@@ -4711,8 +4714,14 @@ def _render_demand_plan_comparison_section() -> None:
             "- **Base Plan Var %** — Base Plan Var. as a share of the "
             "prior cycle's baseline forecast (i.e. Base Plan Var. ÷ "
             "(Current Plan (Base) − Base Plan Var.)).\n"
-            "- **R&O Var.** — *FY27 Probabilized | Total Δ* from the saved "
-            "RO Summary Report (same cell surfaced in the R&O Var. tile)."
+            "- **R&O Var.** — wired to the **RO Comparison** table: it reads "
+            "the *FY27 Probabilized | Total Δ* by hierarchy path from the saved "
+            "**RO Summary Report** (the output of the 🔁 RO Comparison section "
+            "above), matched to each row. It is an external opportunity figure — "
+            "**not** a cycle-over-cycle delta of the tracker's R&O rows — so use "
+            "the RO Comparison table as its source of truth / sanity check. "
+            "(The APS section computes its R&O Var differently: the current − "
+            "prior cycle delta of the tracker's own R&O rows.)"
         )
     _render_demand_plan_comparison_fragment()
 
@@ -4938,6 +4947,7 @@ def _cached_demand_plan_comparison_payload(
     _ro_lookup: dict,
     _budget_by_row_id: dict[str, float],
     shift_last_plan_window: bool = True,
+    ro_var_from_tracker: bool = False,
 ) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
     """Cache the comparison build, returning a NATIVE tuple.
 
@@ -4957,6 +4967,7 @@ def _cached_demand_plan_comparison_payload(
         enriched=_enriched,
         budget_by_row_id=_budget_by_row_id,
         shift_last_plan_window=shift_last_plan_window,
+        ro_var_from_tracker=ro_var_from_tracker,
     )
     return result.table, tuple(result.warnings), bool(result.ro_summary_available)
 
@@ -5291,14 +5302,17 @@ def _render_demand_plan_comparison_fragment() -> None:
         )
 
 
-def _render_comparison_not_captured_logs(nc: ComparisonNotCaptured) -> None:
+def _render_comparison_not_captured_logs(
+    nc: ComparisonNotCaptured, *, ns: str = "",
+) -> None:
     """Render the three 'SKUs not captured' logs (prior · current · actuals).
 
     A SKU is *not captured* when its Portfolio Major / Supply Format / Brand /
     Portfolio Minor match no comparison-template family, so its pounds never
     reach a row — the exact gap between a raw source total and the table.
     One foldable, clearly-labelled section per leg, each with a jump link to
-    RO_Item_Master.csv and a CSV download.
+    RO_Item_Master.csv and a CSV download.  *ns* namespaces the widget keys so
+    the APS mirror can coexist with the IBP one on the same page.
     """
     st.markdown("**🧾 SKUs not captured in the comparison**")
     st.caption(
@@ -5313,24 +5327,24 @@ def _render_comparison_not_captured_logs(nc: ComparisonNotCaptured) -> None:
         nc.prior_cycle,
         title=f"Prior cycle ({nc.prior_cycle_label}) — forecast SKUs",
         empty_note=f"Every **prior-cycle ({nc.prior_cycle_label})** forecast SKU is captured.",
-        key_suffix="prior",
+        key_suffix="prior", ns=ns,
     )
     _render_one_comparison_not_captured(
         nc.current_cycle,
         title=f"Current cycle ({nc.current_cycle_label}) — forecast SKUs",
         empty_note=f"Every **current-cycle ({nc.current_cycle_label})** forecast SKU is captured.",
-        key_suffix="current",
+        key_suffix="current", ns=ns,
     )
     _render_one_comparison_not_captured(
         nc.actuals,
         title=f"Actual shipments ({nc.actual_window_label}) — shipped SKUs",
         empty_note=f"Every **actual-shipment ({nc.actual_window_label})** SKU is captured.",
-        key_suffix="actuals",
+        key_suffix="actuals", ns=ns,
     )
 
 
 def _render_one_comparison_not_captured(
-    df: pd.DataFrame, *, title: str, empty_note: str, key_suffix: str,
+    df: pd.DataFrame, *, title: str, empty_note: str, key_suffix: str, ns: str = "",
 ) -> None:
     """Render one not-captured leg (success note when empty)."""
     if df is None or df.empty:
@@ -5353,7 +5367,7 @@ def _render_one_comparison_not_captured(
                 data=df.to_csv(index=False).encode("utf-8"),
                 file_name=f"comparison_not_captured_{key_suffix}_{today}.csv",
                 mime="text/csv",
-                key=f"cmp_not_captured_dl_{key_suffix}",
+                key=_ns_key(f"cmp_not_captured_dl_{key_suffix}", ns),
                 use_container_width=True,
             )
 
@@ -5822,6 +5836,9 @@ _DPC_TREE_CSS: str = """
   position:sticky; top:0; z-index:1;}
 .dpc-tree .hdr > span {text-align:center;}
 .dpc-tree .hdr > span.lbl {text-align:left;}
+/* Period sub-label (2nd header line): same dark-blue bg (inherited) + white
+   bold font, a touch smaller so it reads as the window the variance covers. */
+.dpc-tree .hdr .per {display:block; font-weight:700; font-size:0.82em;}
 /* Native disclosure: the summary IS the row; hide the default marker and use
    our own triangle that rotates when the node is open. */
 .dpc-tree summary.rw {cursor:pointer; list-style:none;}
@@ -5955,6 +5972,7 @@ def _render_comparison_tree(
     memo_flags: list[bool],
     indent_flags: list[int],
     header_labels: dict[str, str] | None = None,
+    period_labels: dict[str, str] | None = None,
 ) -> None:
     """Render the comparison rows as a natively-foldable ``<details>`` tree.
 
@@ -5964,9 +5982,12 @@ def _render_comparison_tree(
     overrides the DISPLAYED text of a column header (keyed by the metric-col /
     df-column name) without changing the underlying data key — used to anchor
     the plan columns on the chosen cycles (e.g. "C3 Plan (incl. R&O)").
+    *period_labels* optionally adds a 2nd header line (same dark-blue bg / white
+    bold font) under a column — used to stamp each variance with its window.
     """
     percent_set = set(percent_labels)
     hdr = header_labels or {}
+    periods = period_labels or {}
 
     def _make_row(i: int, foldable: bool) -> tuple[str, str]:
         cls = _dpc_cmp_row_class(
@@ -5982,9 +6003,19 @@ def _render_comparison_tree(
         )
         return cls, cells
 
+    def _hdr_cell(c: str) -> str:
+        main = _esc_html(hdr.get(c, c))
+        period = periods.get(c)
+        # 2nd line inherits the header's dark-blue bg + white bold font; the
+        # <span class="per"> just relaxes the size a touch so it reads as a
+        # sub-label rather than a second header.
+        if period:
+            return f'<span>{main}<br><span class="per">{_esc_html(period)}</span></span>'
+        return f"<span>{main}</span>"
+
     header = (
         '<div class="rw hdr"><span class="lbl">' + _esc_html(label_col) + "</span>"
-        + "".join(f"<span>{_esc_html(hdr.get(c, c))}</span>" for c in metric_cols)
+        + "".join(_hdr_cell(c) for c in metric_cols)
         + "</div>"
     )
     parts = [header] + _foldable_tree_body(len(display_df), indent_flags, _make_row)
@@ -7026,6 +7057,21 @@ def _render_demand_comparison_table(
         if filters is not None else {}
     )
 
+    # Period sub-labels rendered as a 2nd header line on the three variance
+    # columns, so each variance reads with the window it covers: PM Actual Var.
+    # is anchored on the selected prior month; Base Plan Var. and R&O Var. on the
+    # selected forecast window.
+    period_labels = (
+        {
+            DPC_DISPLAY_LABELS[DPC_COL_PM_ACTUAL]: f"({filters.prior_month:%b%y})",
+            DPC_DISPLAY_LABELS[DPC_COL_BASE_PLAN]:
+                f"({filters.forecast_start:%b%y}-{filters.forecast_end:%b%y})",
+            DPC_DISPLAY_LABELS[DPC_COL_R_AND_O]:
+                f"({filters.forecast_start:%b%y}-{filters.forecast_end:%b%y})",
+        }
+        if filters is not None else {}
+    )
+
     # Foldable tree — navy header + white font, light-blue Total B2C, orange
     # (#f8cbad) Portfolio-Major rows (incl. Butter); click a parent row to fold.
     _render_comparison_tree(
@@ -7038,6 +7084,7 @@ def _render_demand_comparison_table(
         memo_flags=memo_flags,
         indent_flags=indent_flags,
         header_labels=header_labels,
+        period_labels=period_labels,
     )
 
     if not result.ro_summary_available:
@@ -7196,7 +7243,12 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
             "tracker) against a chosen **prior cycle of the IBP tracker** "
             "(`qry_mgmt_plan_history_tracker.csv`).  Same filters + YoY / summary "
             "/ mix / cycle-over-cycle / Prior-Month tables as the IBP section; "
-            "actuals reuse IBP Orders / Shipments.  (No forecast-accuracy section.)"
+            "actuals reuse IBP Orders / Shipments.  (No forecast-accuracy section.)  "
+            "**R&O Var.** here is the cycle-over-cycle delta of the tracker's own "
+            "R&O rows — current-cycle APS R&O minus prior-cycle IBP R&O over the "
+            "forecast window (unlike the IBP section, which reads the RO Summary "
+            "Report).  Cross-check it against the 🔁 RO Comparison table.  "
+            "**PM Actual Var. + Base Plan Var. + R&O Var. = Total Delta.**"
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
@@ -7285,19 +7337,21 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
             _signature_for(ibp_py_df), _signature_for(ibp_recent_df),
             _signature_for(ibp_recent_py_df), _signature_for(pdh_df),
             _signature_for(item_master_df))
-        empty_ro_sig = (0, 0.0)   # APS carries no RO-Summary lookup
+        empty_ro_sig = (0, 0.0)   # APS R&O Var comes from the tracker, not RO Summary
 
         with st.spinner("Building APS Demand Plan Comparison…"):
             enriched = _cached_enriched_sources(
                 *enrich_sig, merged, ibp_df, ibp_orders_df, ibp_py_df,
                 ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df)
             # shift_last_plan_window=False → the Prior Plan (an IBP cycle) uses
-            # the same window as the current plan, so it equals the IBP file's
-            # plan for that cycle (not the one-month-ago snapshot).
+            # the same window as the current plan (= the IBP file's plan for that
+            # cycle).  ro_var_from_tracker=True → R&O Var is the cycle-over-cycle
+            # delta of the tracker's R&O rows (current APS − prior IBP), so it
+            # ties to the tracker and reconciles with the RO Comparison table.
             table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-                enrich_sig + (empty_ro_sig, budget_lookup_key, "noshift"), filters,
-                empty_ro_sig, budget_lookup_key, enriched, {}, budget_by_row_id,
-                shift_last_plan_window=False)
+                enrich_sig + (empty_ro_sig, budget_lookup_key, "noshift", "rotrk"),
+                filters, empty_ro_sig, budget_lookup_key, enriched, {}, budget_by_row_id,
+                shift_last_plan_window=False, ro_var_from_tracker=True)
             prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
                 enrich_sig + (filters.prior_month,), filters, enriched)
         result = ComparisonResult(
@@ -7305,6 +7359,18 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
 
         for msg in list(build_warnings) + list(budget_warnings):
             st.warning(f"⚠️ {msg}")
+
+        # Not-captured log (same design as the IBP section): rows that meet the
+        # filters but roll into NO comparison row — with the reason (their
+        # Portfolio Major / Supply Format / Brand / Portfolio Minor match no
+        # comparison-template family) — surfaced ABOVE the tables so the planner
+        # reconciles before trusting the totals.
+        _aps_nc_dim = build_item_dim_frame_cascade(pdh_df, item_master_df)
+        _render_comparison_not_captured_logs(
+            build_comparison_not_captured(
+                enriched.tracker, filters,
+                ibp_enriched=enriched.ibp, dim_frame=_aps_nc_dim),
+            ns="aps")
 
         st.markdown("#### 📈 YoY Comparison")
         _render_comparison_summary_col_picker(ns="aps")

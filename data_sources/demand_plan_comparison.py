@@ -1891,8 +1891,16 @@ def build_demand_plan_comparison(
     budget_by_row_id: Optional[dict[str, float]] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
     shift_last_plan_window: bool = True,
+    ro_var_from_tracker: bool = False,
 ) -> ComparisonResult:
     """Build the Demand Plan Comparison Summary table.
+
+    ``ro_var_from_tracker`` (default ``False``) selects how the **R&O Var.**
+    column is sourced.  ``False`` (IBP): the RO Summary Report's FY27
+    Probabilized Total Delta, matched by label path.  ``True`` (APS): the
+    cycle-over-cycle delta of the tracker's own R&O rows (current-cycle R&O −
+    prior-cycle R&O over the forecast window).  Base Plan Var. remains the
+    residual in both cases, so PM Actual + Base Plan + R&O ≡ Total Delta.
 
     ``shift_last_plan_window`` (default ``True``) controls the Last / Prior Plan
     window.  When ``True`` (the IBP cycle-walk) the prior plan is the
@@ -1946,6 +1954,7 @@ def build_demand_plan_comparison(
         budget_by_row_id=budget_by_row_id,
         ibp_py_df=ibp_py_df,
         shift_last_plan_window=shift_last_plan_window,
+        ro_var_from_tracker=ro_var_from_tracker,
     )
 
     # 4 + 5. Assemble the display frame.
@@ -1989,6 +1998,7 @@ def _build_runtime_artifacts(
     budget_by_row_id: Optional[dict[str, float]] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
     shift_last_plan_window: bool = True,
+    ro_var_from_tracker: bool = False,
 ) -> _RuntimeBuildArtifacts:
     """Build reusable runtime artifacts for comparison-style rollups."""
     warnings: list[str] = []
@@ -2094,6 +2104,7 @@ def _build_runtime_artifacts(
             prior_forecast_months=prior_forecast_months,
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
+            ro_var_from_tracker=ro_var_from_tracker,
             ibp_py=ibp_py,
             ibp_recent=ibp_recent, ibp_recent_py=ibp_recent_py,
             m3_cur=m3_cur, m6_cur=m6_cur, m3_py=m3_py, m6_py=m6_py,
@@ -2129,6 +2140,7 @@ def _compute_leaf_measures(
     prior_forecast_months: set[date],
     prior_month: date,
     ro_total_delta_by_path: dict[tuple[str, ...], float],
+    ro_var_from_tracker: bool = False,
     ibp_py: Optional[pd.DataFrame] = None,
     ibp_recent: Optional[pd.DataFrame] = None,
     ibp_recent_py: Optional[pd.DataFrame] = None,
@@ -2220,10 +2232,21 @@ def _compute_leaf_measures(
     last_plan_forecast = _sum_millions(
         trk, trk_mask & prior_cycle & is_base_or_ro & trk_in_prior_forecast)
 
-    # ── R&O (RO Summary FY27 Total Delta, matched by label path) ─────
-    r_and_o = 0.0
-    if tpl.ro_summary_path is not None:
-        r_and_o = float(ro_total_delta_by_path.get(tpl.ro_summary_path, 0.0))
+    # ── R&O Var ──────────────────────────────────────────────────────
+    # Default (IBP): the RO Summary Report's FY27 Probabilized Total Delta,
+    # matched to this row by label path — an external opportunity figure.
+    # ``ro_var_from_tracker`` (APS): the cycle-over-cycle delta of the plan's
+    # OWN R&O rows — current-cycle R&O minus prior-cycle R&O over the (prior)
+    # forecast window — so it ties directly to the tracker rows.  Either way the
+    # identity holds: Base Plan Var. = Total Delta − PM Actual − R&O (residual).
+    if ro_var_from_tracker:
+        prior_plan_ro = _sum_millions(
+            trk, trk_mask & prior_cycle & is_ro & trk_in_prior_forecast)
+        r_and_o = current_plan_ro - prior_plan_ro
+    else:
+        r_and_o = 0.0
+        if tpl.ro_summary_path is not None:
+            r_and_o = float(ro_total_delta_by_path.get(tpl.ro_summary_path, 0.0))
 
     # ── Trailing 3-/6-month shipments (this leaf, this year vs a year ago).
     # Sums (not ratios) so they roll up additively; the YoY ratio is derived

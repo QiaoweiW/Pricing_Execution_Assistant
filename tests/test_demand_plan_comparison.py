@@ -317,6 +317,47 @@ def test_last_plan_unshifted_window_matches_current_basis():
     assert float(row["Total Delta"]) == 1.0
 
 
+def test_ro_var_from_tracker_is_cycle_delta():
+    """ro_var_from_tracker=True → R&O Var = current-cycle R&O − prior-cycle R&O
+    over the forecast window (APS behaviour), ignoring the RO Summary lookup;
+    PM Actual + Base Plan + R&O still sum to Total Delta."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4",
+         "pounds": 10_000_000.0},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4",
+         "pounds": 5_000_000.0},                        # current R&O
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C3",
+         "pounds": 9_000_000.0},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C3",
+         "pounds": 3_000_000.0},                        # prior R&O
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": m, "pounds": p,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
+        for m, p in ((_APR, 1_000_000.0), (_MAY, 2_000_000.0), (_JUN, 4_000_000.0))
+    ])
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={},          # deliberately empty — must be ignored
+        shift_last_plan_window=False, ro_var_from_tracker=True,
+    )
+    row = result.table.loc[result.table["_row_id"] == "esl_lc_branded"].iloc[0]
+    # R&O Var = current C4 R&O (5) − prior C3 R&O (3) = 2 (from the tracker rows).
+    assert float(row["R&O Var."]) == 2.0
+    # Identity still holds regardless of the R&O source.
+    identity = (
+        float(row["PM Actual Var."])
+        + float(row["Base Plan Var."])
+        + float(row["R&O Var."])
+    )
+    assert round(identity, 6) == round(float(row["Total Delta"]), 6)
+
+
 def test_current_plan_split_o_pct_and_py_actual():
     """Current Plan (Base)/(R&O) split, O% = R&O/Current Plan, and PY Actual."""
     filters = _filters_apr_jun_actual()

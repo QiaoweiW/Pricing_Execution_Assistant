@@ -266,6 +266,7 @@ from data_sources.aps_upload_pipeline import (
     FISCAL_YEARS as APS_FISCAL_YEARS,
     aps_history_path,
     fetch_aps_history_df,
+    generate_aps_from_fabric,
     generate_aps_from_upload,
     list_aps_history_cycles,
     parse_corp_override_csv,
@@ -3439,8 +3440,9 @@ def _render_demand_summary_aps() -> None:
     """
     with st.expander("📈 Demand Summary (APS)", expanded=False):
         st.caption(
-            "**APS demand plan (upload-driven).**  Upload an **APS bulk export** "
-            "CSV and pick the **Cycle** + **Fiscal Year** it represents.  The "
+            "**APS demand plan.**  Pick a **Cycle** + **Fiscal Year**, then either "
+            "**generate from Fabric** (the live `dp_factscurrentaps` fact — no "
+            "upload) or **upload an APS bulk export** CSV.  Either way, the "
             "APS Base Plan is shaped to the history schema (Portfolio / Supply "
             "resolved by **item code** via PDH → RO_Item_Master; Corporate Group "
             "via the `plan_to_code → dp_dimplantosites → dp_dimcustomernames` "
@@ -3476,39 +3478,62 @@ def _render_demand_summary_aps() -> None:
             help="e.g. FY27_C5_APS_bulk_export_per_month_YYYYMMDD.csv — one row "
                  "per party-site × item × month.",
         )
-        build_clicked = st.button(
-            "▶️ Build & append to history",
-            key="aps_upload_build",
-            type="primary",
-            use_container_width=True,
-            disabled=uploaded is None,
-            help="Transforms the upload, resolves Corporate Group, appends the "
-                 "RO_Seed R&O leg, and upserts the rows into the APS history "
-                 "tracker (replacing this Cycle + FY if already present).",
-        )
+        # Two ways to build the chosen Cycle + FY: from an uploaded export, or
+        # straight from the live Fabric fact (dp_factscurrentaps) — no upload.
+        b_cols = st.columns(2)
+        with b_cols[0]:
+            build_clicked = st.button(
+                "▶️ Build from upload & append",
+                key="aps_upload_build",
+                type="primary",
+                use_container_width=True,
+                disabled=uploaded is None,
+                help="Transforms the uploaded export, resolves Corporate Group, "
+                     "appends the RO_Seed R&O leg, and upserts the rows into the "
+                     "APS history tracker (replacing this Cycle + FY if present).",
+            )
+        with b_cols[1]:
+            fabric_clicked = st.button(
+                "🔄 Generate / refresh from Fabric (no upload)",
+                key="aps_fabric_build",
+                use_container_width=True,
+                help="Builds this Cycle + FY straight from the live "
+                     "`dp_factscurrentaps` fact — same transform, no CSV needed. "
+                     "(Corporate Group from the fact's native code; no party "
+                     "site / sales-forecast columns.)",
+            )
 
-        if build_clicked and uploaded is not None:
-            try:
+        # Both buttons feed the same result/session + cache-clear path.
+        res_new: Optional[object] = None
+        try:
+            if build_clicked and uploaded is not None:
                 with st.spinner(
                     "Transforming upload, resolving corporate groups, appending "
                     "to the APS history tracker…"
                 ):
-                    res = generate_aps_from_upload(
+                    res_new = generate_aps_from_upload(
                         uploaded.getvalue(), filename=uploaded.name,
                         cycle=str(cycle), fy=int(fy),
                     )
-                _cached_persisted_aps_plan.clear()
-                _cached_aps_history.clear()   # so the APS comparison sees the new cycle
-                st.session_state[_APS_UPLOAD_RESULT_KEY] = res
                 st.session_state[_APS_UPLOAD_NONCE_KEY] = nonce + 1
-            except (
-                ApsUploadError, HolisticDemandPlanError, PlanLiftError,
-                CustomerDimsError, ShipToSitesSourceError, LakehouseIOError,
-                ValueError,
-            ) as exc:
-                st.session_state.pop(_APS_UPLOAD_RESULT_KEY, None)
-                st.error(f"❌ Could not build the APS plan from the upload.\n\n{exc}")
-                return
+            elif fabric_clicked:
+                with st.spinner(
+                    "Reading dp_factscurrentaps, resolving corporate groups, "
+                    "appending to the APS history tracker…"
+                ):
+                    res_new = generate_aps_from_fabric(cycle=str(cycle), fy=int(fy))
+        except (
+            ApsUploadError, HolisticDemandPlanError, PlanLiftError,
+            CustomerDimsError, ShipToSitesSourceError, LakehouseIOError,
+            ValueError,
+        ) as exc:
+            st.session_state.pop(_APS_UPLOAD_RESULT_KEY, None)
+            st.error(f"❌ Could not build the APS plan.\n\n{exc}")
+            return
+        if res_new is not None:
+            _cached_persisted_aps_plan.clear()
+            _cached_aps_history.clear()   # so the APS comparison sees the new cycle
+            st.session_state[_APS_UPLOAD_RESULT_KEY] = res_new
 
         # ── Post-build path: show the just-built cycle + match log.
         res = st.session_state.get(_APS_UPLOAD_RESULT_KEY)

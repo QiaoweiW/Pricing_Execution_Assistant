@@ -72,6 +72,7 @@ from data_sources.demand_plan_comparison import (
 )
 from data_sources.customer_dims import fetch_dp_dimcustomernames_df
 from data_sources.ship_to_sites import fetch_dp_dimplantosites_df
+from data_sources.plan_lift import fetch_factscurrentaps_holistic_df
 from data_sources.fabric_lakehouse_io import read_csv, update_csv, write_bytes, write_csv
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,8 @@ _UP_PLAN_TO: tuple[str, ...]   = ("plan_to_code", "Plan To Code", "PlanToCode")
 _UP_ITEM: tuple[str, ...]      = ("item_code", "Item Code", "Item No", "Item")
 _UP_ITEM_DESC: tuple[str, ...] = ("item_description", "Item Description", "ItemDescription")
 _UP_SALES: tuple[str, ...]     = ("sales_forecast", "Sales Forecast", "sales_forecast_lbs")
-_UP_CONSENSUS: tuple[str, ...] = ("consensus_forecast", "Consensus Forecast", "consensus_plan_lbs")
+_UP_CONSENSUS: tuple[str, ...] = (
+    "consensus_forecast", "Consensus Forecast", "consensus_plan_lbs", "plan_lbs")
 _UP_CORP: tuple[str, ...]      = ("corporate_group_code", "Corporate Group", "corporate_group")
 
 # Excel/Lotus day-serial epoch — same anchor the coercion helpers parse FROM.
@@ -178,13 +180,14 @@ def _num(series: pd.Series) -> pd.Series:
 
 # ── leg builders ─────────────────────────────────────────────────────────────
 def _dim_maps(dim_frame: pd.DataFrame) -> dict[str, dict[str, str]]:
-    """``{field -> {item_key -> value}}`` for pmaj / sfmt / pminor from the cascade."""
+    """``{field -> {item_key -> value}}`` for pmaj / sfmt / pminor / desc."""
+    fields = ("pmaj", "sfmt", "pminor", "desc")
     if dim_frame is None or dim_frame.empty:
-        return {"pmaj": {}, "sfmt": {}, "pminor": {}}
+        return {f: {} for f in fields}
     keys = dim_frame["__item_key"].astype(str)
     return {
         field: dict(zip(keys, dim_frame[field].astype("string").fillna("")))
-        for field in ("pmaj", "sfmt", "pminor")
+        for field in fields if field in dim_frame.columns
     }
 
 
@@ -248,9 +251,14 @@ def _build_aps_leg(
 
     dims = _dim_maps(dim_frame)
     grouped[COL_FORECAST] = FORECAST_APS_BASE_PLAN
-    grouped[COL_PMAJ] = grouped[COL_ITEM].map(dims["pmaj"]).fillna("")
-    grouped[COL_SFMT] = grouped[COL_ITEM].map(dims["sfmt"]).fillna("")
-    grouped[COL_PMIN] = grouped[COL_ITEM].map(dims["pminor"]).fillna("")
+    grouped[COL_PMAJ] = grouped[COL_ITEM].map(dims.get("pmaj", {})).fillna("")
+    grouped[COL_SFMT] = grouped[COL_ITEM].map(dims.get("sfmt", {})).fillna("")
+    grouped[COL_PMIN] = grouped[COL_ITEM].map(dims.get("pminor", {})).fillna("")
+    # Backfill Item Description from the dim catalog where the source lacked it
+    # (e.g. the Fabric SQL fact, which carries no description column).
+    dim_desc = grouped[COL_ITEM].map(dims.get("desc", {})).fillna("")
+    grouped[COL_ITEM_DESC] = grouped[COL_ITEM_DESC].where(
+        grouped[COL_ITEM_DESC].astype(str).str.strip().astype(bool), dim_desc)
 
     total = float(grouped[COL_DEMAND_LBS].abs().sum())
     mapped = float(
@@ -478,6 +486,47 @@ def _archive_raw_upload(upload_bytes: bytes, filename: str) -> None:
         logger.warning("Could not archive raw APS upload %s: %s", safe, exc)
 
 
+def _validate_cycle_fy(cycle: str, fy: int) -> None:
+    if cycle not in CYCLES:
+        raise ApsUploadError(f"Cycle must be one of {CYCLES}, got {cycle!r}.")
+    if int(fy) not in FISCAL_YEARS:
+        raise ApsUploadError(f"Fiscal Year must be in {FISCAL_YEARS}, got {fy!r}.")
+
+
+def _load_aps_reference_sources() -> tuple:
+    """Read the RO_Seed / months / PDH / RO_Item_Master / customer / plan-to dims.
+
+    Shared by both the upload-driven and Fabric-SQL-driven builds so the source
+    plumbing lives in one place.
+    """
+    kw = {"dtype": str, "keep_default_na": False}
+    ro_seed_df = _read_seed_csv(_RO_SEED_BLOB)
+    tbl_months_df, _ = read_csv(_SECRETS_SECTION, _TBL_MONTHS_BLOB, read_csv_kwargs=kw)
+    pdh_df, _ = read_csv(_SECRETS_SECTION, _PDH_BLOB, read_csv_kwargs=kw)
+    ro_master_df, _ = read_csv(_SECRETS_SECTION, _RO_ITEMS_BLOB, read_csv_kwargs=kw)
+    customer_names_df = fetch_dp_dimcustomernames_df()
+    plantosites_df = fetch_dp_dimplantosites_df()
+    return (ro_seed_df, tbl_months_df, pdh_df, ro_master_df,
+            customer_names_df, plantosites_df)
+
+
+def _build_and_persist(
+    source_df: pd.DataFrame, *, cycle: str, fy: int, anchor_month: date,
+) -> ApsUploadResult:
+    """Transform *source_df* (upload OR Fabric fact) → write full_aps + upsert history."""
+    sources = _load_aps_reference_sources()
+    rows, partial = build_aps_history_rows(
+        source_df, *sources,
+        cycle=cycle, fy=fy, inclusion_serial=today_inclusion_serial(),
+        anchor_month=anchor_month)
+    if rows.empty:
+        raise ApsUploadError(
+            "Transform produced no rows — check the source's columns and that "
+            "RO_Seed is populated.")
+    history_rows = _persist_and_upsert(rows, cycle, fy)
+    return replace(partial, history_rows=history_rows)
+
+
 def generate_aps_from_upload(
     upload_bytes: bytes,
     *,
@@ -486,48 +535,39 @@ def generate_aps_from_upload(
     fy: int,
     anchor_month: date = _DEFAULT_ANCHOR_MONTH,
 ) -> ApsUploadResult:
-    """Full orchestrator: parse upload → build → write full_aps → upsert history.
+    """Orchestrator (upload): parse a bulk export → build → write + upsert history.
 
-    Reads RO_Seed / tblMonths / PDH / RO_Item_Master / customer-names /
-    plan-to-sites from Fabric, writes ``qry_mgmt_plan_full_aps.csv`` (this
-    cycle) and appends to ``qry_mgmt_plan_full_aps_history.csv``.
+    Writes ``qry_mgmt_plan_full_aps.csv`` (this cycle) and appends to
+    ``qry_mgmt_plan_full_aps_history.csv``; archives the raw upload.
     """
-    if cycle not in CYCLES:
-        raise ApsUploadError(f"Cycle must be one of {CYCLES}, got {cycle!r}.")
-    if int(fy) not in FISCAL_YEARS:
-        raise ApsUploadError(f"Fiscal Year must be in {FISCAL_YEARS}, got {fy!r}.")
-
+    _validate_cycle_fy(cycle, fy)
     try:
         upload_df = pd.read_csv(io.BytesIO(upload_bytes), dtype=str, keep_default_na=False)
     except Exception as exc:  # noqa: BLE001
         raise ApsUploadError(f"Could not read the uploaded CSV: {exc}") from exc
     if upload_df.empty:
         raise ApsUploadError("The uploaded APS export is empty.")
-
     _archive_raw_upload(upload_bytes, filename)
+    return _build_and_persist(upload_df, cycle=cycle, fy=fy, anchor_month=anchor_month)
 
-    ro_seed_df = _read_seed_csv(_RO_SEED_BLOB)
-    tbl_months_df, _ = read_csv(_SECRETS_SECTION, _TBL_MONTHS_BLOB,
-                                read_csv_kwargs={"dtype": str, "keep_default_na": False})
-    pdh_df, _ = read_csv(_SECRETS_SECTION, _PDH_BLOB,
-                         read_csv_kwargs={"dtype": str, "keep_default_na": False})
-    ro_master_df, _ = read_csv(_SECRETS_SECTION, _RO_ITEMS_BLOB,
-                               read_csv_kwargs={"dtype": str, "keep_default_na": False})
-    customer_names_df = fetch_dp_dimcustomernames_df()
-    plantosites_df = fetch_dp_dimplantosites_df()
 
-    rows, partial = build_aps_history_rows(
-        upload_df, ro_seed_df, tbl_months_df, pdh_df, ro_master_df,
-        customer_names_df, plantosites_df,
-        cycle=cycle, fy=fy, inclusion_serial=today_inclusion_serial(),
-        anchor_month=anchor_month)
-    if rows.empty:
+def generate_aps_from_fabric(
+    *, cycle: str, fy: int, anchor_month: date = _DEFAULT_ANCHOR_MONTH,
+) -> ApsUploadResult:
+    """Orchestrator (no upload): build from the live ``dp_factscurrentaps`` fact.
+
+    Same transform + RO_Seed append + history upsert as the upload path, but the
+    APS Base Plan leg is sourced from Fabric (``month · item_code · plan_lbs ·
+    corporate_group``) — so the planner can generate / refresh a cycle without a
+    manual bulk-export CSV.  The fact has no party site, so Corporate Group comes
+    from its native ``corporate_group`` and Sales Forecast Pounds is 0.
+    """
+    _validate_cycle_fy(cycle, fy)
+    fact_df = fetch_factscurrentaps_holistic_df()
+    if fact_df is None or fact_df.empty:
         raise ApsUploadError(
-            "Transform produced no rows — check the upload's columns and that "
-            "RO_Seed is populated.")
-
-    history_rows = _persist_and_upsert(rows, cycle, fy)
-    return replace(partial, history_rows=history_rows)
+            "dp_factscurrentaps returned no rows — cannot generate the APS plan.")
+    return _build_and_persist(fact_df, cycle=cycle, fy=fy, anchor_month=anchor_month)
 
 
 def fetch_aps_history_df() -> Optional[pd.DataFrame]:

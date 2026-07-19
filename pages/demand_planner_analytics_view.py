@@ -3352,23 +3352,19 @@ def _cached_persisted_aps_plan() -> Optional[pd.DataFrame]:
     return df
 
 
-def _render_aps_corp_review() -> None:
+def _render_aps_corp_review(history: Optional[pd.DataFrame]) -> None:
     """R&O Corporate Group review + patch — read/written straight on the history file.
 
     The APS base-plan leg is attributed deterministically (plan-to bridge +
     native code), so only the R&O leg's **fuzzy / Unmapped** customers warrant a
-    look.  This reads the review list off ``qry_mgmt_plan_full_aps_history.csv``
-    (available whenever that file exists — no upload needed): **download** the
-    list, correct the **Corporate Group** cells, **upload** it back, and
-    **Apply patch** rewrites *only* those still-reviewable R&O rows on the
-    history file (exact matches and prior patches are left untouched, so earlier
-    fixes never need redoing).
+    look.  Works off the already-loaded ``qry_mgmt_plan_full_aps_history.csv``
+    (*history*, read once by the caller): **download** the list, correct the
+    **Corporate Group** cells, **upload** it back, and **Apply patch** rewrites
+    *only* those still-reviewable R&O rows on the history file (exact matches and
+    prior patches are left untouched, so earlier fixes never need redoing).
     """
     if not fabric_signin_widget.is_fabric_signed_in():
         return
-    # Draw the expander shell FIRST so its bar is visible immediately — the
-    # history read below can be slow (cold ≈1M-row OneLake CSV), and we don't
-    # want the section to look like it vanished while the read runs.
     with st.expander("🧾 R&O Corporate Group review + patch", expanded=False):
         st.caption(
             "R&O **Customers** whose Corporate Group is still **Fuzzy** or "
@@ -3378,11 +3374,6 @@ def _render_aps_corp_review() -> None:
             "those still-reviewable R&O rows directly on the history file "
             "(exact matches and earlier patches are left alone)."
         )
-        try:
-            history = _cached_aps_history()
-        except (LakehouseIOError, ValueError) as exc:
-            st.warning(f"Could not read the APS history tracker: {exc}")
-            return
         if history is None or history.empty:
             st.info(
                 "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS)** "
@@ -3483,9 +3474,20 @@ def _render_demand_summary_aps() -> None:
 
         _render_aps_upload_manage()
 
+        # ② + ③ share ONE history read (the ≈1M-row tracker is the section's
+        # heaviest source).  Reading it here — before either sub-section — means
+        # neither blocks the other on its own read, so both render together and
+        # are independent.  The read is cached (see _cached_aps_history), so the
+        # upload/manage step above and a warm rerun don't pay for it again.
+        try:
+            aps_history = _cached_aps_history()
+        except (LakehouseIOError, ValueError) as exc:
+            aps_history = None
+            st.warning(f"Could not read the APS history tracker: {exc}")
+
         # ② + ③ — native (nested) foldable sub-sections, always available.
-        _render_aps_corp_review()
-        _render_aps_comparison_section()
+        _render_aps_corp_review(aps_history)
+        _render_aps_comparison_section(aps_history)
 
 
 def _render_aps_upload_manage() -> None:
@@ -7155,12 +7157,35 @@ def _build_aps_merged_tracker(
     return merged, prior_label
 
 
-def _render_aps_comparison_section() -> None:
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_aps_comparison_options(
+    _aps_sig: tuple, _ibp_sig: tuple, _pdh_sig: tuple,
+    _aps_hist: pd.DataFrame,
+    _ibp_tracker: Optional[pd.DataFrame],
+    _pdh: Optional[pd.DataFrame],
+) -> tuple[list, list, list, list]:
+    """Cache the APS-comparison filter-option discovery.
+
+    ``list_aps_history_cycles`` / ``list_tracker_months`` / ``list_comparison_
+    combos`` each scan the ≈1M-row tracker; without this they re-ran on every
+    rerun (each filter tweak).  Keyed on the source shape signatures, so the
+    scans recompute only when the underlying data actually changes.
+    """
+    aps_cycles = list_aps_history_cycles(_aps_hist)
+    ibp_cycles = list_tracker_cycles(_ibp_tracker) if _ibp_tracker is not None else []
+    months = sorted(
+        set(list_tracker_months(_ibp_tracker)) | set(list_tracker_months(_aps_hist)))
+    combos = list_comparison_combos(_aps_hist, _pdh)
+    return aps_cycles, ibp_cycles, months, combos
+
+
+def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
     """APS mirror of Demand Plan Comparison Summary (no bias; incl. Prior Month).
 
-    Current cycle = the APS history tracker; prior baseline = a chosen cycle of
-    the IBP ``qry_mgmt_plan_history_tracker.csv``.  Same filters + tables as the
-    IBP section (reused via an ``"aps"`` widget-key namespace so both coexist).
+    Current cycle = the APS history tracker (*aps_hist*, read once by the
+    caller); prior baseline = a chosen cycle of the IBP
+    ``qry_mgmt_plan_history_tracker.csv``.  Same filters + tables as the IBP
+    section (reused via an ``"aps"`` widget-key namespace so both coexist).
     RO-Summary is zeroed (APS has none); Budget is matched identically to the
     IBP section (FY27 workbook by row-id); actuals reuse IBP Orders /
     Shipments.  All controls appear whenever the APS history file exists.
@@ -7177,7 +7202,6 @@ def _render_aps_comparison_section() -> None:
             st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
             return
 
-        aps_hist = _cached_aps_history()
         if aps_hist is None or aps_hist.empty:
             st.info(
                 "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS)** "
@@ -7190,8 +7214,12 @@ def _render_aps_comparison_section() -> None:
         except DemandSummaryError as exc:
             st.error(f"❌ Could not load the IBP tracker for the prior baseline.\n\n{exc}")
             return
-        aps_cycles = list_aps_history_cycles(aps_hist)
-        ibp_cycles = list_tracker_cycles(ibp_tracker) if ibp_tracker is not None else []
+        # Filter-option discovery (cycles / months / combos) scans the whole
+        # tracker; cache it on the source shapes so it doesn't re-run per rerun.
+        pdh_df = _load_demand_comparison_pdh()
+        aps_cycles, ibp_cycles, months, combo_options = _cached_aps_comparison_options(
+            _signature_for(aps_hist), _signature_for(ibp_tracker), _signature_for(pdh_df),
+            aps_hist, ibp_tracker, pdh_df)
         if not aps_cycles:
             st.warning("The APS history has no Cycle values yet.")
             return
@@ -7199,15 +7227,13 @@ def _render_aps_comparison_section() -> None:
             st.warning("The IBP tracker has no Cycle values for the prior baseline.")
             return
 
-        # Month + combo options span BOTH trackers (current = APS, prior = IBP).
-        months = sorted(set(list_tracker_months(ibp_tracker)) | set(list_tracker_months(aps_hist)))
+        # Actual-window months come from IBP Shipments (falls back to the trackers').
         try:
             actual_months = list(fetch_ibp_shipments_months())
         except IBPOfficialSourceError:
             actual_months = months
         if not actual_months:
             actual_months = months
-        combo_options = list_comparison_combos(aps_hist, _load_demand_comparison_pdh())
 
         # Same filter widget as the IBP section (current cycles = APS, prior = IBP).
         with st.expander("🔍 Filters", expanded=True):

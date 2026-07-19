@@ -5733,6 +5733,19 @@ def _fmt_millions(value: Optional[float], *, signed: bool) -> tuple[str, str]:
     return f"{value:.2f}", ""
 
 
+def _fmt_pct_walk(frac: Optional[float]) -> tuple[str, str]:
+    """Format a signed fraction → ("+0.9%", css-class) for a walk KPI tile.
+
+    Mirrors :func:`_fmt_millions` (up/down/flat colouring) so the Total Delta %
+    tile reads consistently with the signed ``Var.`` tiles beside it.
+    """
+    if frac is None or pd.isna(frac):
+        return "—", "flat"
+    pct = frac * 100.0
+    cls = "up" if pct > 0 else "down" if pct < 0 else "flat"
+    return f"{pct:+.1f}%", cls
+
+
 def _render_comparison_kpis_yoy(kpis: ComparisonKpis) -> None:
     """Render the YoY / share KPI row (top of the section).
 
@@ -5777,6 +5790,12 @@ def _render_comparison_kpis_walk(
     """
     prior_cy = filters.prior_cycle
     current_cy = filters.current_cycle
+    # Total Delta % = (Current − Last) ÷ Last Plan — the cycle-over-cycle % move
+    # of the whole plan.  Computed from the same Total B2C plan totals the tiles
+    # show, so it reconciles with the table's Total Delta % by construction.
+    total_delta = kpis.current_plan_total - kpis.last_plan_total
+    total_delta_pct = (
+        total_delta / kpis.last_plan_total if kpis.last_plan_total else None)
     walk = (
         (
             "Last Plan",
@@ -5802,6 +5821,11 @@ def _render_comparison_kpis_walk(
             "Current Plan",
             _fmt_millions(kpis.current_plan_total, signed=False),
             f"{current_cy} total forecast incl. R&O",
+        ),
+        (
+            "Total Delta %",
+            _fmt_pct_walk(total_delta_pct),
+            f"{current_cy} vs {prior_cy}: total plan % change",
         ),
     )
     walk_cards = "".join(

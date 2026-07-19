@@ -28,11 +28,15 @@ from data_sources.aps_upload_pipeline import (
     _finalize,
     _shape_ro_history,
     _to_excel_serial,
+    FORECAST_APS_BASE_PLAN,
+    FORECAST_R_AND_O,
     build_aps_history_rows,
     build_corp_review,
+    delete_history_slice,
+    list_aps_history_forecast_types,
     parse_corp_override_csv,
     patch_history_corp,
-    replace_cycle_fy_slice,
+    replace_cycle_fy_forecast_slice,
     today_inclusion_serial,
 )
 
@@ -151,19 +155,55 @@ def test_empty_upload_yields_no_rows():
 
 # ── upsert ───────────────────────────────────────────────────────────────────
 
-def test_replace_cycle_fy_slice_is_idempotent():
-    rows, _ = _build()
+def test_replace_cycle_fy_forecast_slice_is_leg_scoped():
+    rows, _ = _build()   # Base Plan rows only (ro_seed_df=None)
+    types = (FORECAST_APS_BASE_PLAN,)
     # First insert.
-    hist = replace_cycle_fy_slice(None, rows, "C5", 2027)
+    hist = replace_cycle_fy_forecast_slice(None, rows, "C5", 2027, types)
     assert len(hist) == len(rows)
-    # Re-upload same cycle -> replaces, not doubles.
-    hist2 = replace_cycle_fy_slice(hist, rows, "C5", 2027)
+    # Re-upload the same leg -> replaces, not doubles.
+    hist2 = replace_cycle_fy_forecast_slice(hist, rows, "C5", 2027, types)
     assert len(hist2) == len(rows)
+    # An R&O leg for the SAME cycle appends (different Forecast Type, left intact).
+    ro = rows.assign(**{COL_FORECAST: FORECAST_R_AND_O}).head(1)
+    hist3 = replace_cycle_fy_forecast_slice(hist2, ro, "C5", 2027, (FORECAST_R_AND_O,))
+    assert len(hist3) == len(rows) + 1
+    assert set(hist3[COL_FORECAST]) == {FORECAST_APS_BASE_PLAN, FORECAST_R_AND_O}
+    # Re-uploading the Base Plan leg does NOT drop the R&O rows.
+    hist4 = replace_cycle_fy_forecast_slice(hist3, rows, "C5", 2027, types)
+    assert (hist4[COL_FORECAST] == FORECAST_R_AND_O).sum() == 1
     # A different cycle appends.
     other = rows.assign(**{COL_CYCLE: "C6"})
-    hist3 = replace_cycle_fy_slice(hist2, other, "C6", 2027)
-    assert len(hist3) == len(rows) * 2
-    assert set(hist3[COL_CYCLE]) == {"C5", "C6"}
+    hist5 = replace_cycle_fy_forecast_slice(hist4, other, "C6", 2027, types)
+    assert set(hist5[COL_CYCLE]) == {"C5", "C6"}
+
+
+def test_delete_history_slice_targets_cycle_fy_forecast(monkeypatch):
+    import data_sources.aps_upload_pipeline as aps
+    rows, _ = _build()   # Base Plan rows for C5/2027
+    ro = rows.assign(**{COL_FORECAST: FORECAST_R_AND_O}).head(1)
+    c6 = rows.assign(**{COL_CYCLE: "C6"})
+    hist = pd.concat([rows, ro, c6], ignore_index=True)
+
+    def fake_update_csv(section, blob, mutator, *, initial_default=None, verify=True):
+        return mutator(hist)
+
+    monkeypatch.setattr(aps, "update_csv", fake_update_csv)
+    # Delete only the C5/2027 R&O leg.
+    deleted, total = aps.delete_history_slice("C5", 2027, (FORECAST_R_AND_O,))
+    assert deleted == 1 and total == len(hist) - 1
+    # Delete ALL of C5/2027 (forecast_types=None) — C6 rows survive.
+    deleted2, total2 = aps.delete_history_slice("C5", 2027, None)
+    assert deleted2 == len(rows) + 1 and total2 == len(c6)
+
+
+def test_list_aps_history_forecast_types():
+    rows, _ = _build()
+    ro = rows.assign(**{COL_FORECAST: FORECAST_R_AND_O}).head(1)
+    hist = pd.concat([rows, ro], ignore_index=True)
+    assert list_aps_history_forecast_types(hist) == sorted(
+        {FORECAST_APS_BASE_PLAN, FORECAST_R_AND_O})
+    assert list_aps_history_forecast_types(None) == []
 
 
 # ── R&O corporate-group review + patch ───────────────────────────────────────

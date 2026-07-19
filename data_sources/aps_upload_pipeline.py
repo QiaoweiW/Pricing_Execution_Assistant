@@ -6,23 +6,30 @@ Turns a planner-uploaded **APS bulk export** CSV (one row per party-site × item
 a rolling history tracker — the APS analogue of the IBP
 ``qry_mgmt_plan_history_tracker.csv``.
 
-Flow (see :func:`generate_aps_from_upload`)
-------------------------------------------
-1. Parse the uploaded export; archive the raw bytes to
-   ``Files/RO Tracking/APS/Append_New_File/``.
-2. Shape the **APS Base Plan** leg to the history schema:
-   ``month`` → Start-of-Month Excel serial, ``item_code`` → Item, dims
-   (Portfolio Major/Minor · Supply Format) resolved **by item code** via
-   PDH → RO_Item_Master, ``sales_forecast`` / ``consensus_forecast`` → the two
-   pound measures, Corporate Group re-derived via the deterministic
-   ``plan_to_code → dp_dimplantosites → dp_dimcustomernames`` bridge
-   ("bridge everything"), Forecast Type = ``APS Base Plan``.
-3. Append the current **RO_Seed** R&O leg (reusing the holistic builder's
-   expansion + Customer-name fuzzy corporate-group match).
-4. Stamp Cycle / FY / Inclusion Date (today, as an Excel serial), write
-   ``qry_mgmt_plan_full_aps.csv`` (this cycle), and **upsert** the rows into
-   ``qry_mgmt_plan_full_aps_history.csv`` — re-uploading a (Cycle, FY) replaces
-   that slice, so re-runs are idempotent.
+Flow — two independent legs, each from its own upload
+-----------------------------------------------------
+The **Base Plan** leg and the **R&O** leg are built and persisted separately, so
+a re-upload replaces only that (Cycle, FY, Forecast Type) slice and the other
+leg is left intact.
+
+* :func:`generate_base_plan_from_upload` — an **APS bulk export** →
+  the **APS Base Plan** leg: ``month`` → Start-of-Month Excel serial,
+  ``item_code`` → Item, dims (Portfolio Major/Minor · Supply Format) resolved
+  **by item code** via PDH → RO_Item_Master, ``sales_forecast`` /
+  ``consensus_forecast`` → the two pound measures, Corporate Group re-derived via
+  the deterministic ``plan_to_code → dp_dimplantosites → dp_dimcustomernames``
+  bridge (native ``corporate_group_code`` as fallback), Forecast Type =
+  ``APS Base Plan``.
+* :func:`generate_ro_from_seed` — an uploaded **R&O seed** → the **R&O** leg
+  (reusing the holistic builder's expansion + Customer-name fuzzy
+  corporate-group match), Forecast Type = ``R&O``.
+
+Both stamp Cycle / FY / Inclusion Date (today, as an Excel serial), refresh
+``qry_mgmt_plan_full_aps.csv`` (the whole current-cycle slice) and **upsert**
+their leg into ``qry_mgmt_plan_full_aps_history.csv`` via
+:func:`replace_cycle_fy_forecast_slice` (idempotent per Cycle + FY + Forecast
+Type).  :func:`delete_history_slice` removes a (Cycle, FY[, Forecast Type])
+slice.
 
 Reuse (no duplication): the RO_Seed expansion + fuzzy corp match come from
 :mod:`data_sources.holistic_demand_plan_aps`; dims + date coercion + the
@@ -385,49 +392,98 @@ def build_aps_history_rows(
     return combined, result
 
 
-def replace_cycle_fy_slice(
-    current: Optional[pd.DataFrame], new_rows: pd.DataFrame, cycle: str, fy: int,
-) -> pd.DataFrame:
-    """Return *current* with its (Cycle, FY) slice replaced by *new_rows* (pure).
+def _forecast_type_mask(df: pd.DataFrame, forecast_types) -> pd.Series:
+    """Boolean mask over *df* rows whose Forecast Type ∈ *forecast_types* (stripped)."""
+    types = {str(t).strip() for t in forecast_types}
+    col = (df[COL_FORECAST] if COL_FORECAST in df.columns
+           else pd.Series([""] * len(df), index=df.index))
+    return col.astype(str).str.strip().isin(types)
 
-    Idempotent upsert semantics: any existing rows for the uploaded (Cycle, FY)
-    are dropped before the new rows are appended, so re-uploading a cycle
-    corrects it without stale or doubled rows.
+
+def replace_cycle_fy_forecast_slice(
+    current: Optional[pd.DataFrame], new_rows: pd.DataFrame,
+    cycle: str, fy: int, forecast_types,
+) -> pd.DataFrame:
+    """Return *current* with the (Cycle, FY, Forecast Type ∈ types) slice replaced.
+
+    Leg-scoped idempotent upsert: only the rows for this (Cycle, FY) **and one of
+    the given Forecast Types** are dropped before *new_rows* are appended.  So a
+    re-uploaded APS export replaces only the Base Plan rows and an R&O seed only
+    the R&O rows — the other leg for that cycle is left intact.
     """
     if current is None or current.empty:
         return new_rows.copy()
-    keep = ~(
-        (current[COL_CYCLE].astype(str) == str(cycle))
-        & (current[COL_FY].astype(str) == str(fy))
+    drop = (
+        (current[COL_CYCLE].astype(str).str.strip() == str(cycle))
+        & (current[COL_FY].astype(str).str.strip() == str(fy))
+        & _forecast_type_mask(current, forecast_types)
     )
-    return pd.concat([current[keep], new_rows], ignore_index=True)
+    return pd.concat([current[~drop], new_rows], ignore_index=True)
 
 
-def upsert_aps_history(new_rows: pd.DataFrame, cycle: str, fy: int) -> int:
-    """Replace the (Cycle, FY) slice of the history file with *new_rows*; return total.
+def upsert_aps_history_leg(
+    new_rows: pd.DataFrame, cycle: str, fy: int, forecast_types,
+) -> pd.DataFrame:
+    """Replace the (Cycle, FY, Forecast Type) slice of the history file; return it merged.
 
     Read-modify-write via :func:`update_csv` (ETag-retry) — safe against a
-    concurrent save.
+    concurrent save.  Returns the full merged history frame.
     """
-    merged = update_csv(
+    return update_csv(
         _SECRETS_SECTION, _APS_HISTORY_BLOB,
-        lambda current: replace_cycle_fy_slice(current, new_rows, cycle, fy),
+        lambda current: replace_cycle_fy_forecast_slice(
+            current, new_rows, cycle, fy, forecast_types),
         initial_default=pd.DataFrame(columns=list(APS_HIST_COLUMNS)),
         verify=False,   # large blob — skip the full-file header re-read
     )
-    return len(merged)
 
 
-def _persist_and_upsert(rows: pd.DataFrame, cycle: str, fy: int) -> int:
-    """Write the this-cycle snapshot (overwrite) + upsert the history; return total.
+def delete_history_slice(cycle: str, fy: int, forecast_types=None) -> tuple[int, int]:
+    """Delete the (Cycle, FY[, Forecast Type]) slice from the history file.
 
-    ``verify=False`` on both writes: these frames are large (hundreds of
-    thousands of rows), and write_csv's post-write header check re-downloads the
-    whole blob — pure overhead here since the header contract is pinned.  Skipping
-    it roughly halves the round-trips on a save/patch.
+    *forecast_types* ``None`` deletes every Forecast Type for that (Cycle, FY);
+    otherwise only the listed types.  Read-modify-write (verify=False; large
+    blob).  Returns ``(rows_deleted, total_history_rows_after)``.
     """
-    write_csv(_SECRETS_SECTION, _APS_FULL_BLOB, rows, verify=False)
-    return upsert_aps_history(rows, cycle, fy)
+    counter = {"n": 0}
+
+    def _mutate(current: Optional[pd.DataFrame]) -> pd.DataFrame:
+        if current is None or current.empty:
+            return pd.DataFrame(columns=list(APS_HIST_COLUMNS))
+        df = current.copy()
+        match = (
+            (df[COL_CYCLE].astype(str).str.strip() == str(cycle))
+            & (df[COL_FY].astype(str).str.strip() == str(fy))
+        )
+        if forecast_types is not None:
+            match &= _forecast_type_mask(df, forecast_types)
+        counter["n"] = int(match.sum())
+        return df[~match].reset_index(drop=True)
+
+    merged = update_csv(
+        _SECRETS_SECTION, _APS_HISTORY_BLOB, _mutate,
+        initial_default=pd.DataFrame(columns=list(APS_HIST_COLUMNS)), verify=False)
+    return counter["n"], len(merged)
+
+
+def _persist_leg_and_upsert(
+    rows: pd.DataFrame, cycle: str, fy: int, forecast_types,
+) -> int:
+    """Upsert one leg into the history + refresh the this-cycle snapshot; return total.
+
+    ``verify=False`` on the writes: these frames are large (hundreds of thousands
+    of rows) and the post-write header re-read is pure overhead (the header
+    contract is pinned).  The ``qry_mgmt_plan_full_aps.csv`` snapshot is rewritten
+    to the *whole* (Cycle, FY) slice of the merged history (both legs), so it
+    always reflects the current cycle regardless of which leg was just built.
+    """
+    merged = upsert_aps_history_leg(rows, cycle, fy, forecast_types)
+    slice_df = merged[
+        (merged[COL_CYCLE].astype(str).str.strip() == str(cycle))
+        & (merged[COL_FY].astype(str).str.strip() == str(fy))
+    ]
+    write_csv(_SECRETS_SECTION, _APS_FULL_BLOB, slice_df, verify=False)
+    return len(merged)
 
 
 # ── R&O Corporate-Group override (planner-uploaded fixed match log) ──────────
@@ -543,41 +599,35 @@ def _validate_cycle_fy(cycle: str, fy: int) -> None:
         raise ApsUploadError(f"Fiscal Year must be in {FISCAL_YEARS}, got {fy!r}.")
 
 
-def _load_aps_reference_sources() -> tuple:
-    """Read the RO_Seed / months / PDH / RO_Item_Master / customer / plan-to dims.
+def _load_aps_dim_sources() -> tuple:
+    """Read months / PDH / RO_Item_Master + customer / plan-to dims (NO RO_Seed).
 
-    Shared by both the upload-driven and Fabric-SQL-driven builds so the source
-    plumbing lives in one place.
+    The two legs now come from planner uploads (an APS bulk export or an R&O
+    seed), so the reference plumbing no longer reads the Fabric RO_Seed blob.
+    Returns ``(tbl_months_df, pdh_df, ro_master_df, customer_names_df,
+    plantosites_df)``.
     """
     kw = {"dtype": str, "keep_default_na": False}
-    ro_seed_df = _read_seed_csv(_RO_SEED_BLOB)
     tbl_months_df, _ = read_csv(_SECRETS_SECTION, _TBL_MONTHS_BLOB, read_csv_kwargs=kw)
     pdh_df, _ = read_csv(_SECRETS_SECTION, _PDH_BLOB, read_csv_kwargs=kw)
     ro_master_df, _ = read_csv(_SECRETS_SECTION, _RO_ITEMS_BLOB, read_csv_kwargs=kw)
     customer_names_df = fetch_dp_dimcustomernames_df()
     plantosites_df = fetch_dp_dimplantosites_df()
-    return (ro_seed_df, tbl_months_df, pdh_df, ro_master_df,
-            customer_names_df, plantosites_df)
+    return (tbl_months_df, pdh_df, ro_master_df, customer_names_df, plantosites_df)
 
 
-def _build_and_persist(
-    source_df: pd.DataFrame, *, cycle: str, fy: int, anchor_month: date,
-) -> ApsUploadResult:
-    """Transform *source_df* (upload OR Fabric fact) → write full_aps + upsert history."""
-    sources = _load_aps_reference_sources()
-    rows, partial = build_aps_history_rows(
-        source_df, *sources,
-        cycle=cycle, fy=fy, inclusion_serial=today_inclusion_serial(),
-        anchor_month=anchor_month)
-    if rows.empty:
-        raise ApsUploadError(
-            "Transform produced no rows — check the source's columns and that "
-            "RO_Seed is populated.")
-    history_rows = _persist_and_upsert(rows, cycle, fy)
-    return replace(partial, history_rows=history_rows)
+def _parse_upload_csv(data: bytes, what: str) -> pd.DataFrame:
+    """Parse uploaded CSV bytes → DataFrame (str dtype); raise on empty / unreadable."""
+    try:
+        df = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False)
+    except Exception as exc:  # noqa: BLE001
+        raise ApsUploadError(f"Could not read the uploaded {what}: {exc}") from exc
+    if df.empty:
+        raise ApsUploadError(f"The uploaded {what} is empty.")
+    return df
 
 
-def generate_aps_from_upload(
+def generate_base_plan_from_upload(
     upload_bytes: bytes,
     *,
     filename: str,
@@ -585,20 +635,56 @@ def generate_aps_from_upload(
     fy: int,
     anchor_month: date = _DEFAULT_ANCHOR_MONTH,
 ) -> ApsUploadResult:
-    """Orchestrator (upload): parse a bulk export → build → write + upsert history.
+    """Orchestrator: APS bulk export → **Base Plan leg only** → upsert history.
 
-    Writes ``qry_mgmt_plan_full_aps.csv`` (this cycle) and appends to
-    ``qry_mgmt_plan_full_aps_history.csv``; archives the raw upload.
+    Replaces only the ``APS Base Plan`` rows for this (Cycle, FY); the R&O leg
+    (built separately from an R&O seed) is left untouched.  Refreshes the
+    ``qry_mgmt_plan_full_aps.csv`` snapshot and archives the raw upload.
     """
     _validate_cycle_fy(cycle, fy)
-    try:
-        upload_df = pd.read_csv(io.BytesIO(upload_bytes), dtype=str, keep_default_na=False)
-    except Exception as exc:  # noqa: BLE001
-        raise ApsUploadError(f"Could not read the uploaded CSV: {exc}") from exc
-    if upload_df.empty:
-        raise ApsUploadError("The uploaded APS export is empty.")
+    upload_df = _parse_upload_csv(upload_bytes, "APS export")
     _archive_raw_upload(upload_bytes, filename)
-    return _build_and_persist(upload_df, cycle=cycle, fy=fy, anchor_month=anchor_month)
+    tbl_months_df, pdh_df, ro_master_df, cust_df, plantosites_df = _load_aps_dim_sources()
+    rows, partial = build_aps_history_rows(
+        upload_df, None, tbl_months_df, pdh_df, ro_master_df, cust_df, plantosites_df,
+        cycle=cycle, fy=fy, inclusion_serial=today_inclusion_serial(),
+        anchor_month=anchor_month)
+    if rows.empty:
+        raise ApsUploadError(
+            "Transform produced no Base Plan rows — check the export's columns "
+            "(month / item_code / consensus_forecast) and B2C mapping.")
+    history_rows = _persist_leg_and_upsert(rows, cycle, fy, (FORECAST_APS_BASE_PLAN,))
+    return replace(partial, history_rows=history_rows)
+
+
+def generate_ro_from_seed(
+    seed_bytes: bytes,
+    *,
+    filename: str,
+    cycle: str,
+    fy: int,
+    anchor_month: date = _DEFAULT_ANCHOR_MONTH,
+) -> ApsUploadResult:
+    """Orchestrator: uploaded R&O seed → **R&O leg only** → upsert history.
+
+    Replaces only the ``R&O`` rows for this (Cycle, FY); the Base Plan leg is
+    left untouched.  Refreshes the ``qry_mgmt_plan_full_aps.csv`` snapshot and
+    archives the raw upload.
+    """
+    _validate_cycle_fy(cycle, fy)
+    seed_df = _parse_upload_csv(seed_bytes, "R&O seed")
+    _archive_raw_upload(seed_bytes, filename)
+    tbl_months_df, pdh_df, ro_master_df, cust_df, plantosites_df = _load_aps_dim_sources()
+    rows, partial = build_aps_history_rows(
+        pd.DataFrame(), seed_df, tbl_months_df, pdh_df, ro_master_df, cust_df, plantosites_df,
+        cycle=cycle, fy=fy, inclusion_serial=today_inclusion_serial(),
+        anchor_month=anchor_month)
+    if rows.empty:
+        raise ApsUploadError(
+            "Transform produced no R&O rows — check the R&O seed's columns and "
+            "that it holds B2C rows for this horizon.")
+    history_rows = _persist_leg_and_upsert(rows, cycle, fy, (FORECAST_R_AND_O,))
+    return replace(partial, history_rows=history_rows)
 
 
 def fetch_aps_history_df() -> Optional[pd.DataFrame]:
@@ -614,6 +700,14 @@ def list_aps_history_cycles(history_df: Optional[pd.DataFrame]) -> list[str]:
     if history_df is None or history_df.empty or COL_CYCLE not in history_df.columns:
         return []
     return sorted(history_df[COL_CYCLE].astype(str).str.strip().replace("", pd.NA).dropna().unique())
+
+
+def list_aps_history_forecast_types(history_df: Optional[pd.DataFrame]) -> list[str]:
+    """Distinct Forecast Type labels present in the APS history tracker (sorted)."""
+    if history_df is None or history_df.empty or COL_FORECAST not in history_df.columns:
+        return []
+    return sorted(
+        history_df[COL_FORECAST].astype(str).str.strip().replace("", pd.NA).dropna().unique())
 
 
 def aps_full_path() -> str:

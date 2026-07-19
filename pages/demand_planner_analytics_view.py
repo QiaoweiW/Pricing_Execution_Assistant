@@ -263,10 +263,14 @@ from data_sources.aps_upload_pipeline import (
     ApsUploadError,
     CYCLES as APS_CYCLES,
     FISCAL_YEARS as APS_FISCAL_YEARS,
+    FORECAST_APS_BASE_PLAN as APS_FCST_BASE_PLAN,
+    FORECAST_R_AND_O as APS_FCST_R_AND_O,
     aps_history_path,
     build_corp_review,
+    delete_history_slice,
     fetch_aps_history_df,
-    generate_aps_from_upload,
+    generate_base_plan_from_upload,
+    generate_ro_from_seed,
     list_aps_history_cycles,
     parse_corp_override_csv,
     patch_history_corp,
@@ -3452,27 +3456,25 @@ def _render_aps_corp_review() -> None:
 def _render_demand_summary_aps() -> None:
     """Render the Demand Summary (APS) section — the upload-driven APS plan.
 
-    A foldable, self-contained section: the planner **uploads an APS bulk
-    export** and picks a **Cycle** + **Fiscal Year**; the pipeline transforms it
-    into the history-tracker schema (dims by item code · Corporate Group via the
-    plan-to bridge with the file's native code as fallback · Forecast Type
-    *APS Base Plan*), appends the current **RO_Seed** R&O leg (fuzzy corporate
-    group), writes **`qry_mgmt_plan_full_aps.csv`** (this cycle) and **upserts**
-    the rows into **`qry_mgmt_plan_full_aps_history.csv`** (re-uploading a cycle
-    replaces its slice).  B2C-only.
+    One foldable section containing, top → bottom: ① **upload & manage** (build
+    the Base Plan leg from an APS bulk export **or** the R&O leg from an R&O
+    seed, and a delete tool for a Cycle / FY / Forecast Type slice), ② the
+    **R&O Corporate Group review + patch** sub-section, and ③ the **APS Demand
+    Plan Comparison Summary** sub-section — the last two are native (nested)
+    expanders available whenever the history file exists.  B2C-only.
     """
     with st.expander("📈 Demand Summary (APS)", expanded=False):
         st.caption(
-            "**APS demand plan.**  **Upload an APS bulk export** CSV and pick its "
-            "**Cycle** + **Fiscal Year**.  The APS Base Plan is shaped to the "
-            "history schema (Portfolio / Supply resolved by **item code** via "
-            "PDH → RO_Item_Master; Corporate Group via the `plan_to_code → "
-            "dp_dimplantosites → dp_dimcustomernames` bridge, native "
-            "`corporate_group_code` as fallback), the current **RO_Seed** R&O leg "
-            "is appended (fuzzy Customer → Corporate Group), and the rows are "
-            f"appended to **`{aps_history_path()}`** (idempotent per Cycle + FY).  "
-            "B2C only.  Review / patch corporate groups and build the comparison "
-            "in the sections below (available whenever the history file exists)."
+            "**APS demand plan.**  Upload an **APS bulk export** (builds the "
+            "**Base Plan** leg) **or** an **R&O seed** (builds the **R&O** leg), "
+            "pick the **Cycle** + **Fiscal Year**, and the rows are shaped to the "
+            "history schema (Portfolio / Supply by **item code** via PDH → "
+            "RO_Item_Master; Corporate Group via the `plan_to_code → "
+            "dp_dimplantosites → dp_dimcustomernames` bridge, native code as "
+            f"fallback) and upserted into **`{aps_history_path()}`** — replacing "
+            "only that (Cycle, FY, Forecast Type) leg.  Use the delete tool to "
+            "clear a slice.  Review / patch corporate groups and build the "
+            "comparison in the sub-sections below."
         )
 
         # Auth gate — match every other Fabric-backed section here.
@@ -3483,48 +3485,66 @@ def _render_demand_summary_aps() -> None:
             )
             return
 
-        pick = st.columns(2)
-        with pick[0]:
-            cycle = st.selectbox(
-                "Cycle", options=APS_CYCLES, key="aps_upload_cycle",
-                help="The planning cycle this uploaded export represents.",
-            )
-        with pick[1]:
-            fy = st.selectbox(
-                "Fiscal Year", options=APS_FISCAL_YEARS, key="aps_upload_fy",
-                help="The fiscal year this uploaded export represents.",
-            )
-        nonce = st.session_state.get(_APS_UPLOAD_NONCE_KEY, 0)
-        uploaded = st.file_uploader(
-            "Upload APS bulk export (CSV)", type=["csv"],
-            key=f"aps_upload_file_{nonce}",
-            help="e.g. FY27_C5_APS_bulk_export_per_month_YYYYMMDD.csv — one row "
-                 "per party-site × item × month.",
-        )
-        # Build the chosen Cycle + FY from the uploaded export.
-        build_clicked = st.button(
-            "▶️ Build from upload & append",
-            key="aps_upload_build",
-            type="primary",
-            use_container_width=True,
-            disabled=uploaded is None,
-            help="Transforms the uploaded export, resolves Corporate Group, "
-                 "appends the RO_Seed R&O leg, and upserts the rows into the "
-                 "APS history tracker (replacing this Cycle + FY if present).",
-        )
+        _render_aps_upload_manage()
 
-        res_new: Optional[object] = None
+        # ② + ③ — native (nested) foldable sub-sections, always available.
+        _render_aps_corp_review()
+        _render_aps_comparison_section()
+
+
+def _render_aps_upload_manage() -> None:
+    """① Upload & build one leg (Base Plan or R&O) + delete a history slice."""
+    pick = st.columns(2)
+    with pick[0]:
+        cycle = st.selectbox(
+            "Cycle", options=APS_CYCLES, key="aps_upload_cycle",
+            help="The planning cycle this upload represents.",
+        )
+    with pick[1]:
+        fy = st.selectbox(
+            "Fiscal Year", options=APS_FISCAL_YEARS, key="aps_upload_fy",
+            help="The fiscal year this upload represents.",
+        )
+    kind = st.radio(
+        "What are you uploading?",
+        options=("APS bulk export → Base Plan leg", "R&O seed → R&O leg"),
+        horizontal=True, key="aps_upload_kind",
+        help="An APS export replaces only the Base Plan rows for this Cycle + FY; "
+             "an R&O seed replaces only the R&O rows — the other leg is left intact.",
+    )
+    is_base = kind.startswith("APS bulk export")
+    nonce = st.session_state.get(_APS_UPLOAD_NONCE_KEY, 0)
+    uploaded = st.file_uploader(
+        "Upload APS bulk export (CSV)" if is_base else "Upload R&O seed (CSV)",
+        type=["csv"], key=f"aps_upload_file_{nonce}",
+        help=("e.g. FY27_C5_APS_bulk_export_per_month_YYYYMMDD.csv — one row per "
+              "party-site × item × month." if is_base else
+              "The RO_Seed export (one row per Customer × item × format) used to "
+              "expand the R&O leg."),
+    )
+    build_clicked = st.button(
+        "▶️ Build & append to history", key="aps_upload_build", type="primary",
+        use_container_width=True, disabled=uploaded is None,
+        help="Transforms the upload and upserts the matching leg into the APS "
+             "history tracker (replacing only this Cycle + FY + Forecast Type).",
+    )
+
+    res_new: Optional[object] = None
+    if build_clicked and uploaded is not None:
         try:
-            if build_clicked and uploaded is not None:
-                with st.spinner(
-                    "Transforming upload, resolving corporate groups, appending "
-                    "to the APS history tracker…"
-                ):
-                    res_new = generate_aps_from_upload(
+            with st.spinner(
+                "Transforming the upload, resolving corporate groups, and "
+                "upserting into the APS history tracker…"
+            ):
+                if is_base:
+                    res_new = generate_base_plan_from_upload(
                         uploaded.getvalue(), filename=uploaded.name,
-                        cycle=str(cycle), fy=int(fy),
-                    )
-                st.session_state[_APS_UPLOAD_NONCE_KEY] = nonce + 1
+                        cycle=str(cycle), fy=int(fy))
+                else:
+                    res_new = generate_ro_from_seed(
+                        uploaded.getvalue(), filename=uploaded.name,
+                        cycle=str(cycle), fy=int(fy))
+            st.session_state[_APS_UPLOAD_NONCE_KEY] = nonce + 1
         except (
             ApsUploadError, HolisticDemandPlanError, PlanLiftError,
             CustomerDimsError, ShipToSitesSourceError, LakehouseIOError,
@@ -3532,31 +3552,24 @@ def _render_demand_summary_aps() -> None:
         ) as exc:
             st.session_state.pop(_APS_UPLOAD_RESULT_KEY, None)
             st.error(f"❌ Could not build the APS plan.\n\n{exc}")
-            return
         if res_new is not None:
             _cached_persisted_aps_plan.clear()
-            _cached_aps_history.clear()   # so the APS comparison sees the new cycle
+            _cached_aps_history.clear()   # so the comparison + review see the change
             st.session_state[_APS_UPLOAD_RESULT_KEY] = res_new
 
-        # ── Post-build path: show the just-built cycle + match log.
-        res = st.session_state.get(_APS_UPLOAD_RESULT_KEY)
-        if res is not None:
-            cov = "—" if pd.isna(res.corp_coverage) else f"{res.corp_coverage:.0%}"
-            st.success(
-                f"✅ Built **{len(res.rows):,}** rows for **{res.cycle} / "
-                f"FY{res.fy}** — {res.aps_rows:,} APS Base Plan + {res.ro_rows:,} "
-                f"R&O.  Corporate-group coverage **{cov}**.  History tracker now "
-                f"**{res.history_rows:,}** rows."
-            )
-            st.caption(
-                "Review / patch corporate groups in **R&O Corporate Group "
-                "review** below, then build the **APS Demand Plan Comparison "
-                "Summary**."
-            )
-            _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
-            return
-
-        # ── Load path: no session result → serve the persisted Fabric file.
+    # Build outcome (or persisted / empty state), then the delete tool.
+    res = st.session_state.get(_APS_UPLOAD_RESULT_KEY)
+    if res is not None:
+        cov = "—" if pd.isna(res.corp_coverage) else f"{res.corp_coverage:.0%}"
+        leg = (f"{res.aps_rows:,} Base Plan" if res.aps_rows
+               else f"{res.ro_rows:,} R&O")
+        st.success(
+            f"✅ Built **{len(res.rows):,}** rows ({leg}) for **{res.cycle} / "
+            f"FY{res.fy}** — corporate-group coverage **{cov}**.  History tracker "
+            f"now **{res.history_rows:,}** rows."
+        )
+        _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
+    else:
         try:
             persisted = _cached_persisted_aps_plan()
         except (LakehouseIOError, ValueError) as exc:
@@ -3565,17 +3578,62 @@ def _render_demand_summary_aps() -> None:
         if persisted is not None and not persisted.empty:
             st.success(
                 f"✅ Loaded the last-built **{APS_OUTPUT_NAME}** from Fabric "
-                f"({len(persisted):,} rows).  Upload a new export + Cycle/FY "
-                "above to build and append the next cycle."
+                f"({len(persisted):,} rows)."
             )
             _render_aps_download_preview(persisted, key_prefix="aps_upload_saved")
-            return
+        else:
+            st.caption(
+                "_Pick a **Cycle** + **Fiscal Year**, choose what you're uploading, "
+                "then click **Build & append to history**._"
+            )
 
-        # ── Empty state: nothing built and nothing saved yet.
+    _render_aps_delete_tool()
+
+
+def _render_aps_delete_tool() -> None:
+    """Delete a (Cycle, FY, Forecast Type) slice from the APS history tracker."""
+    with st.container(border=True):
+        st.markdown("**🗑️ Delete rows from the APS history tracker**")
         st.caption(
-            "_Upload an APS bulk export, pick its **Cycle** + **Fiscal Year**, "
-            "then click **Build & append to history**._"
+            "Remove a slice by **Cycle + Fiscal Year + Forecast Type** — e.g. "
+            "clear a bad R&O leg before re-uploading its seed.  Permanent."
         )
+        dc = st.columns(3)
+        with dc[0]:
+            del_cycle = st.selectbox("Cycle", APS_CYCLES, key="aps_del_cycle")
+        with dc[1]:
+            del_fy = st.selectbox("Fiscal Year", APS_FISCAL_YEARS, key="aps_del_fy")
+        with dc[2]:
+            del_type = st.selectbox(
+                "Forecast Type", ("All", APS_FCST_BASE_PLAN, APS_FCST_R_AND_O),
+                key="aps_del_type")
+        confirm = st.checkbox(
+            f"Yes, permanently delete **{del_type}** rows for "
+            f"**{del_cycle} / FY{del_fy}**", key="aps_del_confirm")
+        if st.button(
+            "🗑️ Delete matching rows", key="aps_del_btn", disabled=not confirm,
+        ) and confirm:
+            types = None if del_type == "All" else (del_type,)
+            try:
+                with st.spinner("Deleting from the APS history tracker…"):
+                    deleted, total = delete_history_slice(
+                        str(del_cycle), int(del_fy), types)
+                # Clear caches so the review + comparison sub-sections re-read the
+                # post-delete history later in THIS run (no rerun needed, so the
+                # confirmation banner stays visible).
+                _cached_persisted_aps_plan.clear()
+                _cached_aps_history.clear()
+                if deleted:
+                    st.success(
+                        f"🗑️ Deleted **{deleted:,}** row(s); history tracker now "
+                        f"**{total:,}** rows."
+                    )
+                else:
+                    st.info(
+                        "No rows matched that Cycle / Fiscal Year / Forecast Type."
+                    )
+            except (LakehouseIOError, ValueError) as exc:
+                st.error(f"❌ Could not delete the slice.\n\n{exc}")
 
 
 def _render_aps_download_preview(frame: pd.DataFrame, *, key_prefix: str) -> None:
@@ -7166,21 +7224,28 @@ def _render_aps_comparison_section() -> None:
             _signature_for(ibp_py_df), _signature_for(ibp_recent_df),
             _signature_for(ibp_recent_py_df), _signature_for(pdh_df),
             _signature_for(item_master_df))
-        empty_ro_sig, empty_budget_key = (0, 0.0), ()
+        empty_ro_sig = (0, 0.0)   # APS carries no RO-Summary lookup
+
+        # Budget: pull + match IDENTICALLY to the IBP section (same FY27 budget
+        # workbook, keyed by the shared comparison row-id) so the Budget column
+        # is populated the same way — APS was previously zeroing it.
+        budget_etag = _fy27_budget_workbook_etag()
+        budget_by_row_id, budget_warnings = _cached_fy27_budget_by_row_id(budget_etag)
+        budget_lookup_key = tuple(sorted(budget_by_row_id.items()))
 
         with st.spinner("Building APS Demand Plan Comparison…"):
             enriched = _cached_enriched_sources(
                 *enrich_sig, merged, ibp_df, ibp_orders_df, ibp_py_df,
                 ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df)
             table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-                enrich_sig + (empty_ro_sig, empty_budget_key), filters,
-                empty_ro_sig, empty_budget_key, enriched, {}, {})
+                enrich_sig + (empty_ro_sig, budget_lookup_key), filters,
+                empty_ro_sig, budget_lookup_key, enriched, {}, budget_by_row_id)
             prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
                 enrich_sig + (filters.prior_month,), filters, enriched)
         result = ComparisonResult(
             table=table, warnings=build_warnings, ro_summary_available=ro_available)
 
-        for msg in build_warnings:
+        for msg in list(build_warnings) + list(budget_warnings):
             st.warning(f"⚠️ {msg}")
 
         st.markdown("#### 📈 YoY Comparison")
@@ -9375,12 +9440,10 @@ def render() -> None:
     _render_ro_comparison()
     st.markdown("---")
 
-    # APS above IBP — both are independent, self-contained sections.
-    # Flow: ① upload & append → ② corp-group review + patch (on the history
-    # file) → ③ demand-summary comparison + variance drill-in.
+    # APS above IBP.  The APS section is self-contained: upload & manage, then
+    # the corp-group review + patch and the demand-summary comparison + variance
+    # drill-in are nested foldable sub-sections inside it.
     _render_demand_summary_aps()
-    _render_aps_corp_review()
-    _render_aps_comparison_section()
     st.markdown("---")
 
     _render_demand_summary()

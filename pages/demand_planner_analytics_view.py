@@ -45,7 +45,7 @@ widget interaction.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 from typing import Callable, Optional
 
@@ -4865,6 +4865,67 @@ def _cached_fy27_budget_by_row_id(budget_etag: str) -> tuple[dict[str, float], t
     return dict(result.by_row_id), tuple(result.warnings)
 
 
+@dataclass(frozen=True)
+class _ComparisonSupportingSources:
+    """The IBP / PDH / PY / trailing-window + FY27-budget sources shared by the
+    IBP and APS comparison render paths (see
+    :func:`_load_comparison_supporting_sources`)."""
+    pdh_df: pd.DataFrame
+    item_master_df: pd.DataFrame
+    ibp_df: pd.DataFrame
+    ibp_warning: Optional[str]
+    ibp_orders_df: pd.DataFrame
+    ibp_orders_warning: Optional[str]
+    ibp_py_df: pd.DataFrame
+    ibp_recent_df: pd.DataFrame
+    ibp_recent_py_df: pd.DataFrame
+    budget_by_row_id: dict
+    budget_warnings: tuple
+    budget_lookup_key: tuple
+
+
+def _load_comparison_supporting_sources(
+    filters: ComparisonFilters,
+) -> _ComparisonSupportingSources:
+    """Load every supporting source the comparison build needs (post opt-in).
+
+    Shared verbatim by the IBP fragment and the APS comparison section so the
+    window arithmetic + Fabric reads live in ONE place.  Each loader is
+    independent, so a single failing source degrades to empty/zeros rather than
+    short-circuiting the others.  Windows:
+      * ``ibp_df`` — actuals + prior-month shipments (for PM Actual).
+      * ``ibp_py_df`` — the plan's full horizon shifted back 12 months (PY Actual).
+      * ``ibp_recent_df`` / ``ibp_recent_py_df`` — trailing 6 months (T3M/T6M YoY).
+      * FY27 budget workbook, keyed by comparison ``row_id`` (the Budget column).
+    """
+    pdh_df = _load_demand_comparison_pdh()
+    item_master_df = _load_mom_item_master()   # RO_Item_Master fallback dims
+    actual_months = months_in_range(filters.actual_start, filters.actual_end)
+    prior_month_set = {filters.prior_month.replace(day=1)}
+    ibp_df, ibp_warning = _load_demand_comparison_ibp(
+        months=tuple(sorted(actual_months | prior_month_set)))
+    ibp_orders_df, ibp_orders_warning = _load_demand_comparison_ibp_orders(
+        months=tuple(sorted(prior_month_set)))
+    py_window = tuple(sorted(months_in_range(
+        shift_year_back(filters.actual_start), shift_year_back(filters.forecast_end))))
+    ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
+    recent_cur = last_n_months(filters.actual_end, 6)
+    ibp_recent_df, _ = _load_demand_comparison_ibp(months=tuple(sorted(recent_cur)))
+    ibp_recent_py_df, _ = _load_demand_comparison_ibp(
+        months=tuple(sorted(shift_year_back(m) for m in recent_cur)))
+    budget_etag = _fy27_budget_workbook_etag()
+    budget_by_row_id, budget_warnings = _cached_fy27_budget_by_row_id(budget_etag)
+    budget_lookup_key = tuple(sorted(budget_by_row_id.items()))
+    return _ComparisonSupportingSources(
+        pdh_df=pdh_df, item_master_df=item_master_df,
+        ibp_df=ibp_df, ibp_warning=ibp_warning,
+        ibp_orders_df=ibp_orders_df, ibp_orders_warning=ibp_orders_warning,
+        ibp_py_df=ibp_py_df, ibp_recent_df=ibp_recent_df,
+        ibp_recent_py_df=ibp_recent_py_df,
+        budget_by_row_id=budget_by_row_id, budget_warnings=budget_warnings,
+        budget_lookup_key=budget_lookup_key)
+
+
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_demand_plan_comparison_payload(
     sig_key: tuple,
@@ -5082,42 +5143,23 @@ def _render_demand_plan_comparison_fragment() -> None:
         )
         return
 
-    # 4. Heavy supporting sources — loaded only post opt-in.  Each
-    #    loader is independent so a single failing source doesn't
-    #    short-circuit the others; the builder degrades gracefully.
-    pdh_df = _load_demand_comparison_pdh()
-    item_master_df = _load_mom_item_master()   # RO_Item_Master fallback dims
-    actual_months = months_in_range(
-        filters.actual_start, filters.actual_end)
-    prior_month_set = {filters.prior_month.replace(day=1)}
-    ibp_month_filter = tuple(sorted(actual_months | prior_month_set))
-    ibp_df, ibp_warning = _load_demand_comparison_ibp(months=ibp_month_filter)
-    ibp_orders_df, ibp_orders_warning = _load_demand_comparison_ibp_orders(
-        months=tuple(sorted(prior_month_set)),
-    )
-    # Prior-Year Actual window: the plan's full horizon (actual start →
-    # forecast end) shifted back 12 months — e.g. actual Apr 2026 … forecast
-    # Mar 2027 → PY Apr 2025 … Mar 2026.  Shipments over that window feed the
-    # PY Actual column.
-    py_window = tuple(sorted(months_in_range(
-        shift_year_back(filters.actual_start),
-        shift_year_back(filters.forecast_end),
-    )))
-    ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
-    # Trailing-6-month shipments (current + prior year), anchored on the Actual
-    # end month, for the T3M / T6M YoY KPI tiles.  T3M = last 3 of these 6.
-    recent_cur = last_n_months(filters.actual_end, 6)
-    recent_window = tuple(sorted(recent_cur))
-    recent_py_window = tuple(sorted(shift_year_back(m) for m in recent_cur))
-    ibp_recent_df, _ = _load_demand_comparison_ibp(months=recent_window)
-    ibp_recent_py_df, _ = _load_demand_comparison_ibp(months=recent_py_window)
+    # 4. Heavy supporting sources — loaded only post opt-in, via the shared
+    #    loader (identical windows + FY27 budget as the APS comparison section).
+    _src = _load_comparison_supporting_sources(filters)
+    pdh_df = _src.pdh_df
+    item_master_df = _src.item_master_df
+    ibp_df, ibp_warning = _src.ibp_df, _src.ibp_warning
+    ibp_orders_df, ibp_orders_warning = _src.ibp_orders_df, _src.ibp_orders_warning
+    ibp_py_df = _src.ibp_py_df
+    ibp_recent_df = _src.ibp_recent_df
+    ibp_recent_py_df = _src.ibp_recent_py_df
+    budget_by_row_id = _src.budget_by_row_id
+    budget_warnings = _src.budget_warnings
+    budget_lookup_key = _src.budget_lookup_key
+    # IBP-only supporting sources (the APS section carries no RO Summary; it
+    # loads its dim frame in the driver section).
     ro_lookup = fetch_ro_summary_total_delta_by_path()
     dim_df, dim_warning = _load_demand_comparison_dim()
-
-    # 4b. FY27 Budget workbook (leaf budgets for the Budget column).
-    budget_etag = _fy27_budget_workbook_etag()
-    budget_by_row_id, budget_warnings = _cached_fy27_budget_by_row_id(budget_etag)
-    budget_lookup_key = tuple(sorted(budget_by_row_id.items()))
 
     # 5. Build the shared enrichment ONCE, then reuse it across all
     #    three builders.  Cached on data signatures so repeated reruns
@@ -7119,7 +7161,8 @@ def _render_aps_comparison_section() -> None:
     Current cycle = the APS history tracker; prior baseline = a chosen cycle of
     the IBP ``qry_mgmt_plan_history_tracker.csv``.  Same filters + tables as the
     IBP section (reused via an ``"aps"`` widget-key namespace so both coexist).
-    RO-Summary / Budget are zeroed (APS has none); actuals reuse IBP Orders /
+    RO-Summary is zeroed (APS has none); Budget is matched identically to the
+    IBP section (FY27 workbook by row-id); actuals reuse IBP Orders /
     Shipments.  All controls appear whenever the APS history file exists.
     """
     with st.expander("🧭 APS Demand Plan Comparison Summary", expanded=False):
@@ -7199,22 +7242,16 @@ def _render_aps_comparison_section() -> None:
                 st.error(f"❌ {msg}")
             return
 
-        # Supporting sources (dims + IBP actuals); RO-Summary / Budget zeroed.
-        pdh_df = _load_demand_comparison_pdh()
-        item_master_df = _load_mom_item_master()
-        actual_months = months_in_range(filters.actual_start, filters.actual_end)
-        prior_month_set = {filters.prior_month.replace(day=1)}
-        ibp_df, _ = _load_demand_comparison_ibp(
-            months=tuple(sorted(actual_months | prior_month_set)))
-        ibp_orders_df, _ = _load_demand_comparison_ibp_orders(
-            months=tuple(sorted(prior_month_set)))
-        py_window = tuple(sorted(months_in_range(
-            shift_year_back(filters.actual_start), shift_year_back(filters.forecast_end))))
-        ibp_py_df, _ = _load_demand_comparison_ibp(months=py_window)
-        recent_cur = last_n_months(filters.actual_end, 6)
-        ibp_recent_df, _ = _load_demand_comparison_ibp(months=tuple(sorted(recent_cur)))
-        ibp_recent_py_df, _ = _load_demand_comparison_ibp(
-            months=tuple(sorted(shift_year_back(m) for m in recent_cur)))
+        # Supporting sources via the SAME loader the IBP fragment uses (dims +
+        # IBP actuals + PY / trailing windows + FY27 budget).  RO-Summary is
+        # zeroed (APS has none); Budget is matched identically to IBP.
+        _src = _load_comparison_supporting_sources(filters)
+        pdh_df, item_master_df = _src.pdh_df, _src.item_master_df
+        ibp_df, ibp_orders_df, ibp_py_df = _src.ibp_df, _src.ibp_orders_df, _src.ibp_py_df
+        ibp_recent_df, ibp_recent_py_df = _src.ibp_recent_df, _src.ibp_recent_py_df
+        budget_by_row_id = _src.budget_by_row_id
+        budget_warnings = _src.budget_warnings
+        budget_lookup_key = _src.budget_lookup_key
 
         tracker_sig = _signature_for(merged)
         enrich_sig = (
@@ -7223,13 +7260,6 @@ def _render_aps_comparison_section() -> None:
             _signature_for(ibp_recent_py_df), _signature_for(pdh_df),
             _signature_for(item_master_df))
         empty_ro_sig = (0, 0.0)   # APS carries no RO-Summary lookup
-
-        # Budget: pull + match IDENTICALLY to the IBP section (same FY27 budget
-        # workbook, keyed by the shared comparison row-id) so the Budget column
-        # is populated the same way — APS was previously zeroing it.
-        budget_etag = _fy27_budget_workbook_etag()
-        budget_by_row_id, budget_warnings = _cached_fy27_budget_by_row_id(budget_etag)
-        budget_lookup_key = tuple(sorted(budget_by_row_id.items()))
 
         with st.spinner("Building APS Demand Plan Comparison…"):
             enriched = _cached_enriched_sources(

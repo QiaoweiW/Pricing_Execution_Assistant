@@ -620,6 +620,7 @@ def update_csv(
     initial_default: Optional[pd.DataFrame] = None,
     to_csv_kwargs: Optional[dict[str, Any]] = None,
     read_csv_kwargs: Optional[dict[str, Any]] = None,
+    verify: bool = True,
 ) -> pd.DataFrame:
     """Read-modify-write a CSV blob with bounded ETag-conflict retries.
 
@@ -631,6 +632,9 @@ def update_csv(
         Must return the DataFrame to upload.
     initial_default
         Value to pass to ``mutator`` on first-ever write.
+    verify
+        Passed to :func:`write_csv`.  Set ``False`` for large blobs where the
+        post-write header re-read (a full download) dominates the cost.
 
     Returns the new DataFrame that was successfully written.
     """
@@ -638,7 +642,8 @@ def update_csv(
         blob_path=blob_path,
         read=lambda: read_csv(secrets_section, blob_path, read_csv_kwargs=read_csv_kwargs),
         upload=lambda payload, etag: write_csv(
-            secrets_section, blob_path, payload, etag=etag, to_csv_kwargs=to_csv_kwargs,
+            secrets_section, blob_path, payload, etag=etag,
+            to_csv_kwargs=to_csv_kwargs, verify=verify,
         ),
         mutator=mutator,
         initial_default=initial_default,

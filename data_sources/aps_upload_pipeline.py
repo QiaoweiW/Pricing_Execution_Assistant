@@ -375,13 +375,20 @@ def upsert_aps_history(new_rows: pd.DataFrame, cycle: str, fy: int) -> int:
         _SECRETS_SECTION, _APS_HISTORY_BLOB,
         lambda current: replace_cycle_fy_slice(current, new_rows, cycle, fy),
         initial_default=pd.DataFrame(columns=list(APS_HIST_COLUMNS)),
+        verify=False,   # large blob — skip the full-file header re-read
     )
     return len(merged)
 
 
 def _persist_and_upsert(rows: pd.DataFrame, cycle: str, fy: int) -> int:
-    """Write the this-cycle snapshot (overwrite) + upsert the history; return total."""
-    write_csv(_SECRETS_SECTION, _APS_FULL_BLOB, rows)
+    """Write the this-cycle snapshot (overwrite) + upsert the history; return total.
+
+    ``verify=False`` on both writes: these frames are large (hundreds of
+    thousands of rows), and write_csv's post-write header check re-downloads the
+    whole blob — pure overhead here since the header contract is pinned.  Skipping
+    it roughly halves the round-trips on a save/patch.
+    """
+    write_csv(_SECRETS_SECTION, _APS_FULL_BLOB, rows, verify=False)
     return upsert_aps_history(rows, cycle, fy)
 
 

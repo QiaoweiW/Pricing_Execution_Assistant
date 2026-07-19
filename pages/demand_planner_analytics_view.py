@@ -257,7 +257,6 @@ from data_sources.ship_to_sites import (
 from data_sources.holistic_demand_plan_aps import (
     APS_OUTPUT_NAME,
     HolisticDemandPlanError,
-    filter_needs_review,
     load_persisted_aps_plan,
 )
 from data_sources.aps_upload_pipeline import (
@@ -265,12 +264,12 @@ from data_sources.aps_upload_pipeline import (
     CYCLES as APS_CYCLES,
     FISCAL_YEARS as APS_FISCAL_YEARS,
     aps_history_path,
+    build_corp_review,
     fetch_aps_history_df,
-    generate_aps_from_fabric,
     generate_aps_from_upload,
     list_aps_history_cycles,
     parse_corp_override_csv,
-    save_aps_override,
+    patch_history_corp,
 )
 from data_sources.product_line_review import (
     cy_full_year_months as _plr_cy_full_year_months,
@@ -3353,51 +3352,64 @@ def _cached_persisted_aps_plan() -> Optional[pd.DataFrame]:
     return df
 
 
-def _render_aps_match_log(res) -> None:
-    """R&O Customer → Corporate Group match log: review + download + patch upload.
+def _render_aps_corp_review() -> None:
+    """R&O Corporate Group review + patch — read/written straight on the history file.
 
     The APS base-plan leg is attributed deterministically (plan-to bridge +
-    native code), so only the R&O leg's fuzzy matches warrant a look.  Download
-    the log, fix any wrong / Unmapped Corporate Group, upload it back, and
-    **Apply patch & save** re-attributes those customers' R&O rows and re-writes
-    the Fabric file + history (rows needing attention are shown first).
+    native code), so only the R&O leg's **fuzzy / Unmapped** customers warrant a
+    look.  This reads the review list off ``qry_mgmt_plan_full_aps_history.csv``
+    (available whenever that file exists — no upload needed): **download** the
+    list, correct the **Corporate Group** cells, **upload** it back, and
+    **Apply patch** rewrites *only* those still-reviewable R&O rows on the
+    history file (exact matches and prior patches are left untouched, so earlier
+    fixes never need redoing).
     """
-    match_log = res.match_log
-    if match_log is None or match_log.empty:
+    if not fabric_signin_widget.is_fabric_signed_in():
         return
-    review = filter_needs_review(match_log)
-    n_review = 0 if review is None else len(review)
+    try:
+        history = _cached_aps_history()
+    except (LakehouseIOError, ValueError):
+        history = None
+    if history is None or history.empty:
+        return
+    review = build_corp_review(history)
+    n_review = len(review)
     label = (
         f"⚠️ {n_review} R&O customer(s) need a Corporate Group review"
-        if n_review else "R&O Corporate Group match log (all resolved)"
+        if n_review else "R&O Corporate Group review (all resolved)"
     )
     with st.expander(f"🧾 {label}", expanded=bool(n_review)):
         st.caption(
-            "How each RO_Seed **Customer** resolved to a **Corporate Group** "
-            "(Exact / Fuzzy / Unmapped).  To fix: **download** the log, correct "
-            "the **Corporate Group** cells, **upload** it back, and click "
-            "**Apply patch & save** — that re-attributes those customers' R&O "
-            "rows and rewrites the Fabric file + history."
+            "R&O **Customers** whose Corporate Group is still **Fuzzy** or "
+            "**Unmapped** on the APS history tracker (Unmapped first).  To fix: "
+            "**download** the list, correct the **Corporate Group** cells, "
+            "**upload** it back, and click **Apply patch** — that rewrites *only* "
+            "those still-reviewable R&O rows directly on the history file "
+            "(exact matches and earlier patches are left alone)."
         )
+        if review.empty:
+            st.success("✅ Every R&O customer already has a resolved Corporate Group.")
+        else:
+            st.dataframe(review, use_container_width=True, hide_index=True)
         st.download_button(
-            label="⬇️ Download match log (CSV)",
-            data=match_log.to_csv(index=False).encode("utf-8"),
+            label="⬇️ Download review list (CSV)",
+            data=review.to_csv(index=False).encode("utf-8"),
             file_name="aps_ro_corp_group_match_log.csv",
             mime="text/csv",
-            key="aps_match_log_download",
+            key="aps_corp_review_download",
+            disabled=review.empty,
         )
-        st.dataframe(match_log, use_container_width=True, hide_index=True)
 
-        st.markdown("**Apply a fixed match log**")
+        st.markdown("**Apply a fixed review list**")
         patch_nonce = st.session_state.get(_APS_PATCH_NONCE_KEY, 0)
         patch = st.file_uploader(
-            "Upload fixed match log (CSV)", type=["csv"],
+            "Upload fixed review list (CSV)", type=["csv"],
             key=f"aps_patch_upload_{patch_nonce}",
-            help="The downloaded log with corrected Corporate Group values "
+            help="The downloaded list with corrected Corporate Group values "
                  "(Customer + Corporate Group columns).",
         )
         if st.button(
-            "✅ Apply patch & save to Fabric", key="aps_patch_apply",
+            "✅ Apply patch to history", key="aps_patch_apply",
             disabled=patch is None,
         ) and patch is not None:
             try:
@@ -3408,19 +3420,22 @@ def _render_aps_match_log(res) -> None:
                         "(blank / (Unmapped) values are skipped)."
                     )
                     return
-                with st.spinner("Applying overrides and saving to Fabric…"):
-                    patched = save_aps_override(res, overrides)
+                with st.spinner("Patching the APS history tracker…"):
+                    patched, total = patch_history_corp(overrides)
                 _cached_persisted_aps_plan.clear()
                 _cached_aps_history.clear()   # comparison picks up the patched history
-                st.session_state[_APS_UPLOAD_RESULT_KEY] = patched
                 st.session_state[_APS_PATCH_NONCE_KEY] = patch_nonce + 1
-                remaining = len(filter_needs_review(patched.match_log) or [])
-                st.success(
-                    f"✅ Applied **{len(overrides)}** override(s) and saved.  "
-                    f"History now **{patched.history_rows:,}** rows"
-                    + (f"; {remaining} customer(s) still need a group." if remaining
-                       else " — the match log is clean.")
-                )
+                if patched:
+                    st.success(
+                        f"✅ Patched **{patched:,}** R&O row(s) across "
+                        f"**{len(overrides)}** customer(s); history now "
+                        f"**{total:,}** rows."
+                    )
+                else:
+                    st.info(
+                        "No reviewable rows matched — those customers may already "
+                        "be resolved (exact / previously patched)."
+                    )
                 st.rerun()
             except (ApsUploadError, LakehouseIOError, ValueError) as exc:
                 st.error(f"❌ Could not apply the patch.\n\n{exc}")
@@ -3440,16 +3455,16 @@ def _render_demand_summary_aps() -> None:
     """
     with st.expander("📈 Demand Summary (APS)", expanded=False):
         st.caption(
-            "**APS demand plan.**  Pick a **Cycle** + **Fiscal Year**, then either "
-            "**generate from Fabric** (the live `dp_factscurrentaps` fact — no "
-            "upload) or **upload an APS bulk export** CSV.  Either way, the "
-            "APS Base Plan is shaped to the history schema (Portfolio / Supply "
-            "resolved by **item code** via PDH → RO_Item_Master; Corporate Group "
-            "via the `plan_to_code → dp_dimplantosites → dp_dimcustomernames` "
-            "bridge, native `corporate_group_code` as fallback), the current "
-            "**RO_Seed** R&O leg is appended (fuzzy Customer → Corporate Group), "
-            f"and the rows are appended to **`{aps_history_path()}`** "
-            "(idempotent per Cycle + FY).  B2C only."
+            "**APS demand plan.**  **Upload an APS bulk export** CSV and pick its "
+            "**Cycle** + **Fiscal Year**.  The APS Base Plan is shaped to the "
+            "history schema (Portfolio / Supply resolved by **item code** via "
+            "PDH → RO_Item_Master; Corporate Group via the `plan_to_code → "
+            "dp_dimplantosites → dp_dimcustomernames` bridge, native "
+            "`corporate_group_code` as fallback), the current **RO_Seed** R&O leg "
+            "is appended (fuzzy Customer → Corporate Group), and the rows are "
+            f"appended to **`{aps_history_path()}`** (idempotent per Cycle + FY).  "
+            "B2C only.  Review / patch corporate groups and build the comparison "
+            "in the sections below (available whenever the history file exists)."
         )
 
         # Auth gate — match every other Fabric-backed section here.
@@ -3478,32 +3493,18 @@ def _render_demand_summary_aps() -> None:
             help="e.g. FY27_C5_APS_bulk_export_per_month_YYYYMMDD.csv — one row "
                  "per party-site × item × month.",
         )
-        # Two ways to build the chosen Cycle + FY: from an uploaded export, or
-        # straight from the live Fabric fact (dp_factscurrentaps) — no upload.
-        b_cols = st.columns(2)
-        with b_cols[0]:
-            build_clicked = st.button(
-                "▶️ Build from upload & append",
-                key="aps_upload_build",
-                type="primary",
-                use_container_width=True,
-                disabled=uploaded is None,
-                help="Transforms the uploaded export, resolves Corporate Group, "
-                     "appends the RO_Seed R&O leg, and upserts the rows into the "
-                     "APS history tracker (replacing this Cycle + FY if present).",
-            )
-        with b_cols[1]:
-            fabric_clicked = st.button(
-                "🔄 Generate / refresh from Fabric (no upload)",
-                key="aps_fabric_build",
-                use_container_width=True,
-                help="Builds this Cycle + FY straight from the live "
-                     "`dp_factscurrentaps` fact — same transform, no CSV needed. "
-                     "(Corporate Group from the fact's native code; no party "
-                     "site / sales-forecast columns.)",
-            )
+        # Build the chosen Cycle + FY from the uploaded export.
+        build_clicked = st.button(
+            "▶️ Build from upload & append",
+            key="aps_upload_build",
+            type="primary",
+            use_container_width=True,
+            disabled=uploaded is None,
+            help="Transforms the uploaded export, resolves Corporate Group, "
+                 "appends the RO_Seed R&O leg, and upserts the rows into the "
+                 "APS history tracker (replacing this Cycle + FY if present).",
+        )
 
-        # Both buttons feed the same result/session + cache-clear path.
         res_new: Optional[object] = None
         try:
             if build_clicked and uploaded is not None:
@@ -3516,12 +3517,6 @@ def _render_demand_summary_aps() -> None:
                         cycle=str(cycle), fy=int(fy),
                     )
                 st.session_state[_APS_UPLOAD_NONCE_KEY] = nonce + 1
-            elif fabric_clicked:
-                with st.spinner(
-                    "Reading dp_factscurrentaps, resolving corporate groups, "
-                    "appending to the APS history tracker…"
-                ):
-                    res_new = generate_aps_from_fabric(cycle=str(cycle), fy=int(fy))
         except (
             ApsUploadError, HolisticDemandPlanError, PlanLiftError,
             CustomerDimsError, ShipToSitesSourceError, LakehouseIOError,
@@ -3545,8 +3540,12 @@ def _render_demand_summary_aps() -> None:
                 f"R&O.  Corporate-group coverage **{cov}**.  History tracker now "
                 f"**{res.history_rows:,}** rows."
             )
+            st.caption(
+                "Review / patch corporate groups in **R&O Corporate Group "
+                "review** below, then build the **APS Demand Plan Comparison "
+                "Summary**."
+            )
             _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
-            _render_aps_match_log(res)
             return
 
         # ── Load path: no session result → serve the persisted Fabric file.
@@ -7187,6 +7186,19 @@ def _render_aps_comparison_section() -> None:
             prior_month_vs_fcst, prior_cycle=filters.prior_cycle,
             prior_month=filters.prior_month, ns="aps")
 
+        # Variance drill-in — same driver tables as the IBP section (Top-5 movers
+        # behind PM Actual + Base Plan by Portfolio Major × Supply Format × Brand),
+        # sharing this section's EnrichedSources so it adds no extra Fabric read.
+        dim_df, dim_warning = _load_demand_comparison_dim()
+        if dim_warning:
+            st.caption(f"⚠️ {dim_warning}")
+        dim_sig = _signature_for(dim_df)
+        with st.expander(
+            "📋 APS Demand Plan Comparison & Drivers Validation", expanded=False,
+        ):
+            _render_demand_comparison_driver_tables_cached(
+                enrich_sig, filters, dim_sig, enriched, dim_df, ns="aps")
+
 
 def _render_one_driver_table(
     result: DriverTableResult,
@@ -7646,6 +7658,8 @@ def _render_demand_comparison_driver_tables_cached(
     dim_sig: tuple,
     enriched: EnrichedSources,
     dim_df: Optional[pd.DataFrame],
+    *,
+    ns: str = "",
 ) -> None:
     """Render the PM Actual + Base Plan driver tables (shared enrichment, cached).
 
@@ -7678,17 +7692,18 @@ def _render_demand_comparison_driver_tables_cached(
             enrich_sig, filters, dim_sig, enriched, dim_df,
         )
 
+    prefix = f"{ns}_" if ns else ""
     st.markdown(
         f"**PM Actual drivers**  —  _driver = Customer Name – Customer No "
         f"(prior month: {filters.prior_month.strftime('%b %Y')})_"
     )
-    _render_one_driver_table(pm_result, DRV_PM_ACTUAL_VALUE, "pm_actual_drivers")
+    _render_one_driver_table(pm_result, DRV_PM_ACTUAL_VALUE, f"{prefix}pm_actual_drivers")
 
     st.markdown(
         "**Base Plan drivers**  —  _driver = Customer – Party Site No "
         "(current vs prior cycle, forecast months)_"
     )
-    _render_one_driver_table(bp_result, DRV_BASE_PLAN_VALUE, "base_plan_drivers")
+    _render_one_driver_table(bp_result, DRV_BASE_PLAN_VALUE, f"{prefix}base_plan_drivers")
 
 
 # ── Auto-save hooks (RO Summary + RO Comparison Output) ──────────────────────
@@ -9348,7 +9363,10 @@ def render() -> None:
     st.markdown("---")
 
     # APS above IBP — both are independent, self-contained sections.
+    # Flow: ① upload & append → ② corp-group review + patch (on the history
+    # file) → ③ demand-summary comparison + variance drill-in.
     _render_demand_summary_aps()
+    _render_aps_corp_review()
     _render_aps_comparison_section()
     st.markdown("---")
 

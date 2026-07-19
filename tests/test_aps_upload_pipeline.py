@@ -9,7 +9,13 @@ import datetime as dt
 from data_sources.aps_upload_pipeline import (
     APS_HIST_COLUMNS,
     ApsUploadResult,
+    CORP_SRC_EXACT,
+    CORP_SRC_FUZZY,
+    CORP_SRC_OVERRIDE,
+    CORP_SRC_UNMAPPED,
     COL_CORP,
+    COL_CORP_SRC,
+    COL_CUSTOMER,
     COL_CYCLE,
     COL_DEMAND_LBS,
     COL_FORECAST,
@@ -22,13 +28,13 @@ from data_sources.aps_upload_pipeline import (
     _finalize,
     _shape_ro_history,
     _to_excel_serial,
-    apply_ro_corp_overrides,
     build_aps_history_rows,
+    build_corp_review,
     parse_corp_override_csv,
+    patch_history_corp,
     replace_cycle_fy_slice,
     today_inclusion_serial,
 )
-from data_sources.holistic_demand_plan_aps import _ro_frame
 
 
 # ── serial helpers ───────────────────────────────────────────────────────────
@@ -160,7 +166,48 @@ def test_replace_cycle_fy_slice_is_idempotent():
     assert set(hist3[COL_CYCLE]) == {"C5", "C6"}
 
 
-# ── R&O corporate-group override ─────────────────────────────────────────────
+# ── R&O corporate-group review + patch ───────────────────────────────────────
+
+def _shape_ro_leg():
+    """Shape a two-customer R&O leg: URM fuzzy, Kroger exact, 7-Eleven unmapped."""
+    ro_detail = pd.DataFrame({
+        "Start of Month": [dt.date(2026, 7, 1)] * 3,
+        "Item": ["310180", "310180", "310180"],
+        "Customer": ["URM", "Kroger", "7-Eleven"],
+        "Demand Plan Pounds": [100.0, 200.0, 50.0],
+    })
+    cust_corp = {"URM": "DFS Gormet", "Kroger": "Kroger"}   # 7-Eleven unmapped
+    cust_src = {"URM": CORP_SRC_FUZZY, "Kroger": CORP_SRC_EXACT,
+                "7-Eleven": CORP_SRC_UNMAPPED}
+    dim_maps = {"pmaj": {"310180": "Butter"}, "sfmt": {"310180": "Western Quarters"},
+                "pminor": {"310180": "Packaged Butter"}, "desc": {"310180": "DG Btr"}}
+    return _shape_ro_history(ro_detail, cust_corp, cust_src, dim_maps)
+
+
+def _history_with_ro():
+    """A finalized history frame: one APS Base Plan row + the shaped R&O leg."""
+    aps_leg = pd.DataFrame({
+        COL_MONTH: [46204], COL_ITEM: ["310180"], "Item Description": ["DG Btr"],
+        COL_PARTY: ["10036"], COL_SALES_LBS: [50.0], COL_DEMAND_LBS: [60.0],
+        COL_FORECAST: ["APS Base Plan"], "Portfolio Major": ["Butter"],
+        "Portfolio Minor": ["Packaged Butter"], "Supply Format": ["Western Quarters"],
+        COL_CORP: ["Costco"], COL_CUSTOMER: [""], COL_CORP_SRC: ["bridge"],
+    })
+    return _finalize([aps_leg, _shape_ro_leg()], "C5", 2027, 46220)
+
+
+def test_shape_ro_history_keeps_customer_and_source():
+    leg = _shape_ro_leg()
+    assert (leg[COL_FORECAST] == "R&O").all()
+    by_cust = dict(zip(leg[COL_CUSTOMER], zip(leg[COL_CORP], leg[COL_CORP_SRC])))
+    assert by_cust["URM"] == ("DFS Gormet", CORP_SRC_FUZZY)
+    assert by_cust["Kroger"] == ("Kroger", CORP_SRC_EXACT)
+    # Unmapped customer falls back to the (Unmapped) sentinel corp group.
+    assert by_cust["7-Eleven"][1] == CORP_SRC_UNMAPPED
+    # R&O rows carry no party site / sales forecast, and dims backfill from dims.
+    assert (leg[COL_PARTY] == "").all() and (leg[COL_SALES_LBS] == 0.0).all()
+    assert (leg["Portfolio Major"] == "Butter").all()
+
 
 def test_parse_corp_override_csv():
     csv = (
@@ -173,47 +220,44 @@ def test_parse_corp_override_csv():
     assert parse_corp_override_csv(csv) == {"URM": "URM", "Kroger": "Kroger Co"}
 
 
-def _ro_result():
-    """A minimal result carrying R&O re-apply state (URM mis-fuzzed to DFS)."""
-    ro_detail = pd.DataFrame({
-        "Start of Month": [dt.date(2026, 7, 1), dt.date(2026, 7, 1)],
-        "Item": ["310180", "310180"],
-        "Customer": ["URM", "Kroger"],
-        "Demand Plan Pounds": [100.0, 200.0],
-    })
-    base_corp = {"URM": "DFS Gormet", "Kroger": "Kroger"}
-    ro_dims = {"pmaj": {"310180": "Butter"}, "sfmt": {"310180": "Western Quarters"},
-               "pminor": {"310180": "Packaged Butter"}}
-    ro_leg = _shape_ro_history(_ro_frame(ro_detail, base_corp), ro_dims)
-    aps_leg = pd.DataFrame({
-        COL_MONTH: [46204], COL_ITEM: ["310180"], "Item Description": ["DG Btr"],
-        COL_PARTY: ["10036"], COL_SALES_LBS: [50.0], COL_DEMAND_LBS: [60.0],
-        COL_FORECAST: ["APS Base Plan"], "Portfolio Major": ["Butter"],
-        "Portfolio Minor": ["Packaged Butter"], "Supply Format": ["Western Quarters"],
-        COL_CORP: ["Costco"],
-    })
-    rows = _finalize([aps_leg, ro_leg], "C5", 2027, 46220)
-    log = pd.DataFrame({
-        "Customer": ["URM", "Kroger"], "Corporate Group": ["DFS Gormet", "Kroger"],
-        "Match": ["Fuzzy", "Exact"]})
-    return ApsUploadResult(
-        rows=rows, aps_rows=1, ro_rows=len(ro_leg), history_rows=0,
-        corp_coverage=1.0, match_log=log, cycle="C5", fy=2027,
-        ro_detail=ro_detail, ro_dims=ro_dims, base_corp=base_corp)
+def test_build_corp_review_lists_only_reviewable_unmapped_first():
+    review = build_corp_review(_history_with_ro())
+    # Kroger (exact) is NOT reviewable; URM (fuzzy) + 7-Eleven (unmapped) are.
+    assert list(review.columns) == ["Customer", "Corporate Group", "Match"]
+    assert list(review["Customer"]) == ["7-Eleven", "URM"]   # Unmapped first
+    assert list(review["Match"]) == ["Unmapped", "Fuzzy"]
 
 
-def test_apply_ro_corp_overrides_remaps_and_tags():
-    res = _ro_result()
-    patched = apply_ro_corp_overrides(res, {"URM": "URM"}, inclusion_serial=46220)
-    ro = patched.rows[patched.rows[COL_FORECAST] == "R&O"]
-    corps = set(ro[COL_CORP])
-    assert "URM" in corps and "DFS Gormet" not in corps   # remapped
-    assert set(patched.rows[patched.rows[COL_FORECAST] == "APS Base Plan"][COL_CORP]) == {"Costco"}
-    log = patched.match_log
-    assert log.loc[log["Customer"] == "URM", "Match"].iloc[0] == "Override"
-    assert log.loc[log["Customer"] == "URM", "Corporate Group"].iloc[0] == "URM"
+def test_build_corp_review_empty_without_columns():
+    # A legacy history frame missing Customer / Corp Source yields nothing to review.
+    bare = pd.DataFrame({COL_FORECAST: ["R&O"], COL_CORP: ["X"]})
+    assert build_corp_review(bare).empty
+    assert build_corp_review(None).empty
 
 
-def test_apply_ro_corp_overrides_noop_without_overrides():
-    res = _ro_result()
-    assert apply_ro_corp_overrides(res, {}) is res
+def test_patch_history_corp_targets_reviewable_ro_only(monkeypatch):
+    """The mutator patches only reviewable R&O rows; exact / prior rows untouched."""
+    import data_sources.aps_upload_pipeline as aps
+
+    captured = {}
+
+    def fake_update_csv(section, blob, mutator, *, initial_default=None, verify=True):
+        out = mutator(_history_with_ro())
+        captured["out"] = out
+        return out
+
+    monkeypatch.setattr(aps, "update_csv", fake_update_csv)
+    patched, total = aps.patch_history_corp({"URM": "URM Inc", "7-Eleven": "7-Eleven",
+                                             "Kroger": "SHOULD NOT APPLY"})
+    out = captured["out"]
+    by_cust = dict(zip(out[COL_CUSTOMER], zip(out[COL_CORP], out[COL_CORP_SRC])))
+    assert by_cust["URM"] == ("URM Inc", CORP_SRC_OVERRIDE)         # fuzzy -> patched
+    assert by_cust["7-Eleven"] == ("7-Eleven", CORP_SRC_OVERRIDE)   # unmapped -> patched
+    assert by_cust["Kroger"] == ("Kroger", CORP_SRC_EXACT)          # exact -> untouched
+    assert patched == 2 and total == len(out)
+
+
+def test_patch_history_corp_noop_without_overrides():
+    # No clean overrides -> returns early without touching Fabric.
+    assert patch_history_corp({}) == (0, 0)
+    assert patch_history_corp(None) == (0, 0)

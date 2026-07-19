@@ -283,6 +283,40 @@ def test_current_last_total_delta_and_total_actuals_removed():
     assert round(float(row["Base Plan Var %"]), 4) == round(1.0 / 9.0, 4)
 
 
+def test_last_plan_unshifted_window_matches_current_basis():
+    """shift_last_plan_window=False → the prior plan uses the SAME window as the
+    current plan (the APS section's Prior Plan = the IBP file's plan for that
+    cycle, not the one-month-ago snapshot)."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded",
+               forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([
+        {**esl, "month": _JUL, "cycle": "C4", "pounds": 10_000_000.0},  # current fcst
+        {**esl, "month": _JUN, "cycle": "C3", "pounds": 8_000_000.0},   # prior (shifted-only)
+        {**esl, "month": _JUL, "cycle": "C3", "pounds": 9_000_000.0},   # prior fcst
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": m, "pounds": p,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
+        for m, p in ((_APR, 1_000_000.0), (_MAY, 2_000_000.0), (_JUN, 4_000_000.0))
+    ])
+    result = build_demand_plan_comparison(
+        None, None, None, filters,
+        enriched=_enriched_sources(trk, ibp), ro_total_delta_by_path={},
+        shift_last_plan_window=False,
+    )
+    row = result.table.loc[result.table["_row_id"] == "esl_lc_branded"].iloc[0]
+    # Unshifted: last actuals = the FULL actual window (1+2+4=7); prior forecast
+    # = C3 over the SAME forecast window as current (Jul only = 9).  Last = 16
+    # (vs 20 when shifted — the shifted case is covered by the test above).
+    assert float(row["Last Plan (incl. RO)"]) == 16.0
+    # Current Plan is unchanged (actuals 7 + C4 Jul 10 = 17); Total Delta = 1.
+    assert float(row["Current Plan (incl. RO)"]) == 17.0
+    assert float(row["Total Delta"]) == 1.0
+
+
 def test_current_plan_split_o_pct_and_py_actual():
     """Current Plan (Base)/(R&O) split, O% = R&O/Current Plan, and PY Actual."""
     filters = _filters_apr_jun_actual()

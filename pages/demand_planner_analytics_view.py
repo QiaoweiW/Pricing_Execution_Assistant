@@ -67,7 +67,6 @@ from data_sources.demand_summary import (
     TOTAL_COLUMN_LABEL,
     build_budget_lookup,
     build_monthly_budget_lookup,
-    demand_plan_comparison_blob_path,
     fetch_mgmt_plan_full,
     fetch_mgmt_plan_history_tracker,
     fetch_pdh,
@@ -146,7 +145,6 @@ from data_sources.demand_plan_comparison import (
     list_comparison_combos,
     build_forecast_bias_table,
     build_forecast_bias_corp_sku_drivers,
-    CORP_UNATTRIBUTED,
     BIAS_COL_AVG,
     BIAS_COL_WMAPE,
     BIAS_COL_FVA,
@@ -190,7 +188,6 @@ from data_sources.product_line_review import (
     COL_INDENT,
     COL_IS_CUSTOMER,
     COL_ROW_LABEL,
-    FY_MONTH_LABELS,
     FullYearChartData,
     ProductLineReviewCommonFilters,
     ProductLineReviewFilters,
@@ -344,7 +341,6 @@ from data_sources.ro_summary_report import (
     summary_to_csv_bytes,
 )
 from data_sources.ro_seed_pipeline import (
-    DELETE_TARGETS,
     PipelineResult,
     delete_history_rows_for_month,
     fetch_ro_seed_raw_bytes,
@@ -4878,6 +4874,7 @@ def _cached_demand_plan_comparison_payload(
     _enriched: EnrichedSources,
     _ro_lookup: dict,
     _budget_by_row_id: dict[str, float],
+    shift_last_plan_window: bool = True,
 ) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
     """Cache the comparison build, returning a NATIVE tuple.
 
@@ -4896,6 +4893,7 @@ def _cached_demand_plan_comparison_payload(
         ro_total_delta_by_path=_ro_lookup,
         enriched=_enriched,
         budget_by_row_id=_budget_by_row_id,
+        shift_last_plan_window=shift_last_plan_window,
     )
     return result.table, tuple(result.warnings), bool(result.ro_summary_available)
 
@@ -7237,9 +7235,13 @@ def _render_aps_comparison_section() -> None:
             enriched = _cached_enriched_sources(
                 *enrich_sig, merged, ibp_df, ibp_orders_df, ibp_py_df,
                 ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df)
+            # shift_last_plan_window=False → the Prior Plan (an IBP cycle) uses
+            # the same window as the current plan, so it equals the IBP file's
+            # plan for that cycle (not the one-month-ago snapshot).
             table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-                enrich_sig + (empty_ro_sig, budget_lookup_key), filters,
-                empty_ro_sig, budget_lookup_key, enriched, {}, budget_by_row_id)
+                enrich_sig + (empty_ro_sig, budget_lookup_key, "noshift"), filters,
+                empty_ro_sig, budget_lookup_key, enriched, {}, budget_by_row_id,
+                shift_last_plan_window=False)
             prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
                 enrich_sig + (filters.prior_month,), filters, enriched)
         result = ComparisonResult(
@@ -7291,9 +7293,13 @@ def _render_one_driver_table(
         return
 
     filtered = _render_driver_filters(table, buckets, key_prefix)
+    # Order by IMPACT: the largest-magnitude variance rows sit on top, so the
+    # biggest movers behind this metric read first.  Dimension keys break ties
+    # for a stable, readable secondary order.
     filtered = filtered.sort_values(
-        by=[DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
-        ascending=[True, True, True],
+        by=[value_col, DRV_COL_PMAJ, DRV_COL_SFMT, DRV_COL_BRAND],
+        ascending=[False, True, True, True],
+        key=lambda s: s.abs() if s.name == value_col else s,
         kind="mergesort",
     ).reset_index(drop=True)
 
@@ -7771,17 +7777,19 @@ def _render_demand_comparison_driver_tables_cached(
         )
 
     prefix = f"{ns}_" if ns else ""
-    st.markdown(
-        f"**PM Actual drivers**  —  _driver = Customer Name – Customer No "
-        f"(prior month: {filters.prior_month.strftime('%b %Y')})_"
-    )
-    _render_one_driver_table(pm_result, DRV_PM_ACTUAL_VALUE, f"{prefix}pm_actual_drivers")
-
+    # Base Plan variance analysis FIRST (the planner reviews the baseline move
+    # before the prior-month actual variance), each ordered by impact.
     st.markdown(
         "**Base Plan drivers**  —  _driver = Customer – Party Site No "
         "(current vs prior cycle, forecast months)_"
     )
     _render_one_driver_table(bp_result, DRV_BASE_PLAN_VALUE, f"{prefix}base_plan_drivers")
+
+    st.markdown(
+        f"**PM Actual drivers**  —  _driver = Customer Name – Customer No "
+        f"(prior month: {filters.prior_month.strftime('%b %Y')})_"
+    )
+    _render_one_driver_table(pm_result, DRV_PM_ACTUAL_VALUE, f"{prefix}pm_actual_drivers")
 
 
 # ── Auto-save hooks (RO Summary + RO Comparison Output) ──────────────────────

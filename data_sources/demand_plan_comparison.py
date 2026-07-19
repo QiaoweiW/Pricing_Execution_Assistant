@@ -88,8 +88,6 @@ import pandas as pd
 # one behaviour, for Start-of-Month parsing, item-key normalisation, and
 # Forecast Type bucketing across the whole Demand Planner page.
 from data_sources.demand_summary import (
-    _coerce_start_of_month,
-    _normalise_forecast_type,
     _normalise_item_key,
     _resolve_column,
     FORECAST_BASE_PLAN,
@@ -1892,8 +1890,18 @@ def build_demand_plan_comparison(
     enriched: Optional[EnrichedSources] = None,
     budget_by_row_id: Optional[dict[str, float]] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
+    shift_last_plan_window: bool = True,
 ) -> ComparisonResult:
     """Build the Demand Plan Comparison Summary table.
+
+    ``shift_last_plan_window`` (default ``True``) controls the Last / Prior Plan
+    window.  When ``True`` (the IBP cycle-walk) the prior plan is the
+    "one-month-ago" snapshot — actuals drop the final realised month and the
+    just-closed month reverts to a prior-cycle forecast — so PM Actual variance
+    reads as a genuine forecast-vs-actual move.  When ``False`` (the APS section,
+    comparing an APS cycle against a prior **IBP** cycle) the prior plan uses the
+    SAME window as the current plan, so the Prior Plan column equals the IBP
+    file's plan for that cycle instead of running a month low.
 
     Parameters
     ----------
@@ -1937,6 +1945,7 @@ def build_demand_plan_comparison(
         enriched=enriched,
         budget_by_row_id=budget_by_row_id,
         ibp_py_df=ibp_py_df,
+        shift_last_plan_window=shift_last_plan_window,
     )
 
     # 4 + 5. Assemble the display frame.
@@ -1979,6 +1988,7 @@ def _build_runtime_artifacts(
     enriched: Optional[EnrichedSources],
     budget_by_row_id: Optional[dict[str, float]] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
+    shift_last_plan_window: bool = True,
 ) -> _RuntimeBuildArtifacts:
     """Build reusable runtime artifacts for comparison-style rollups."""
     warnings: list[str] = []
@@ -2025,17 +2035,25 @@ def _build_runtime_artifacts(
     m3_py = {_shift_year_back(m) for m in m3_cur}
     m6_py = {_shift_year_back(m) for m in m6_cur}
 
-    # Last Plan = the "one-month-ago" snapshot, shifted back one calendar
-    # month on both legs (see COL_LAST_PLAN_ACTUALS / COL_LAST_PLAN_FORECAST):
+    # Last Plan window.  Default (IBP cycle-walk): the "one-month-ago" snapshot,
+    # shifted back one calendar month on both legs (see COL_LAST_PLAN_ACTUALS /
+    # COL_LAST_PLAN_FORECAST):
     #   * actuals drop the final realised month  → [actual_start … actual_end − 1]
     #   * the just-closed month reverts to a prior-cycle forecast
     #                                            → [forecast_start − 1 … forecast_end]
     # An empty last-actual window (actual_start == actual_end) yields 0 —
     # _months_in_range returns {} when start > end.
-    last_actual_months = _months_in_range(
-        filters.actual_start, _prev_month(filters.actual_end))
-    prior_forecast_months = _months_in_range(
-        _prev_month(filters.forecast_start), filters.forecast_end)
+    # When ``shift_last_plan_window`` is False (the APS section, prior = an IBP
+    # cycle): use the SAME window as the current plan, so the Prior Plan column
+    # equals the IBP file's plan for that cycle rather than running a month low.
+    if shift_last_plan_window:
+        last_actual_months = _months_in_range(
+            filters.actual_start, _prev_month(filters.actual_end))
+        prior_forecast_months = _months_in_range(
+            _prev_month(filters.forecast_start), filters.forecast_end)
+    else:
+        last_actual_months = actual_months
+        prior_forecast_months = forecast_months
 
     # Guard: Prior Month Forecast benchmarks against the PRIOR cycle's plan
     # for the prior month.  If that cycle carries no Base/R&O rows for the

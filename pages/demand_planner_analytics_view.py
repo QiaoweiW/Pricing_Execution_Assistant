@@ -3366,19 +3366,10 @@ def _render_aps_corp_review() -> None:
     """
     if not fabric_signin_widget.is_fabric_signed_in():
         return
-    try:
-        history = _cached_aps_history()
-    except (LakehouseIOError, ValueError):
-        history = None
-    if history is None or history.empty:
-        return
-    review = build_corp_review(history)
-    n_review = len(review)
-    label = (
-        f"⚠️ {n_review} R&O customer(s) need a Corporate Group review"
-        if n_review else "R&O Corporate Group review (all resolved)"
-    )
-    with st.expander(f"🧾 {label}", expanded=bool(n_review)):
+    # Draw the expander shell FIRST so its bar is visible immediately — the
+    # history read below can be slow (cold ≈1M-row OneLake CSV), and we don't
+    # want the section to look like it vanished while the read runs.
+    with st.expander("🧾 R&O Corporate Group review + patch", expanded=False):
         st.caption(
             "R&O **Customers** whose Corporate Group is still **Fuzzy** or "
             "**Unmapped** on the APS history tracker (Unmapped first).  To fix: "
@@ -3387,6 +3378,23 @@ def _render_aps_corp_review() -> None:
             "those still-reviewable R&O rows directly on the history file "
             "(exact matches and earlier patches are left alone)."
         )
+        try:
+            history = _cached_aps_history()
+        except (LakehouseIOError, ValueError) as exc:
+            st.warning(f"Could not read the APS history tracker: {exc}")
+            return
+        if history is None or history.empty:
+            st.info(
+                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS)** "
+                "above; the review lights up once the history file exists."
+            )
+            return
+        review = build_corp_review(history)
+        n_review = len(review)
+        if n_review:
+            st.warning(
+                f"⚠️ **{n_review}** R&O customer(s) need a Corporate Group review."
+            )
         if review.empty:
             st.success("✅ Every R&O customer already has a resolved Corporate Group.")
         else:
@@ -7016,9 +7024,14 @@ def _render_comparison_table_exports(
 _APS_CMP_ENABLED_KEY: str = "aps_comparison_enabled"
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner="Loading APS history tracker…")
 def _cached_aps_history() -> Optional[pd.DataFrame]:
-    """Cached read of the APS history tracker (``None`` until a cycle is built)."""
+    """Cached read of the APS history tracker (``None`` until a cycle is built).
+
+    The tracker is a large (≈1M-row) OneLake CSV, so a cold read (e.g. right
+    after a build clears this cache) takes a while — ``show_spinner`` surfaces
+    that so the sections below don't look like they vanished.
+    """
     return fetch_aps_history_df()
 
 

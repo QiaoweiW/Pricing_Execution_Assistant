@@ -670,12 +670,16 @@ def _render_business_health() -> None:
             with st.spinner("Loading IBP Orders…"):
                 orders_df, orders_warn = _load_demand_comparison_ibp_orders(months=window)
                 orders_enriched = enrich_ibp_orders_df(orders_df, _load_demand_comparison_pdh())
-                result = build_business_health(orders_enriched, prior_month)
         except (LakehouseIOError, ValueError) as exc:
             st.error(f"❌ Could not load IBP Orders for Business Health.\n\n{exc}")
             return
         if orders_warn:
             st.caption(f"⚠️ {orders_warn}")
+
+        # Dimension filters (Portfolio Major / Minor / Supply Format) — exclude
+        # the chosen values from BOTH the chart and the table before rolling up.
+        orders_enriched = _render_business_health_dim_filters(orders_enriched)
+        result = build_business_health(orders_enriched, prior_month)
 
         _render_business_health_legend(result)
         _render_business_health_chart(result)
@@ -688,6 +692,54 @@ def _render_business_health() -> None:
             "(L12M), **Falling** when decelerating, else **Flat**."
         )
         _render_business_health_table(result)
+
+
+# Dimension columns on the enriched-orders frame (PDH-derived) the Business
+# Health filters act on, with their display labels.
+_BH_DIM_FILTERS: tuple[tuple[str, str], ...] = (
+    ("pmaj", "Portfolio Major"),
+    ("pminor", "Portfolio Minor"),
+    ("sfmt", "Supply Format"),
+)
+
+
+def _bh_dim_options(orders: Optional[pd.DataFrame], col: str) -> list[str]:
+    """Sorted distinct non-blank values of *col* in the enriched orders.
+
+    The orders are PDH-enriched (via ``enrich_ibp_orders_df``), so these options
+    ARE the PDH dimension values present in the loaded window.
+    """
+    if orders is None or orders.empty or col not in orders.columns:
+        return []
+    vals = orders[col].astype(str).str.strip()
+    return sorted({v for v in vals.tolist() if v and v.lower() != "nan"})
+
+
+def _render_business_health_dim_filters(
+    orders: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """Render Portfolio Major / Minor / Supply Format *hide* multiselects.
+
+    Returns the orders with the chosen values excluded (a row is dropped when
+    ANY of its three dimensions is hidden).  Empty selections = show everything.
+    """
+    cols = st.columns(len(_BH_DIM_FILTERS))
+    picks: dict[str, list[str]] = {}
+    for (col_key, label), slot in zip(_BH_DIM_FILTERS, cols):
+        with slot:
+            picks[col_key] = st.multiselect(
+                f"Hide {label}", options=_bh_dim_options(orders, col_key),
+                key=f"bh_hide_{col_key}",
+                help=f"Pick {label} value(s) to exclude from the chart + table "
+                     "(empty = show all).",
+            )
+    if orders is None or orders.empty:
+        return orders
+    mask = pd.Series(True, index=orders.index)
+    for col_key, hidden in picks.items():
+        if hidden and col_key in orders.columns:
+            mask &= ~orders[col_key].astype(str).str.strip().isin(set(hidden))
+    return orders[mask]
 
 
 def _render_business_health_legend(result: "BusinessHealthResult") -> None:

@@ -816,18 +816,23 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
     tick_font = dict(size=13, color=_BH_FONT_COLOR)
     label_font = dict(size=14, color=_BH_FONT_COLOR)
 
+    # Axis assignment matters for layering: Plotly draws the OVERLAYING axis's
+    # traces on top of the base axis's.  Put the volume bars on the base axis
+    # (y, right side) and the YoY line on the OVERLAYING axis (y2, left side) so
+    # the line + every dot always render ON TOP of the bars — otherwise a low
+    # dot inside a tall bar (e.g. L12M) gets hidden behind it.
     fig = go.Figure()
     fig.add_bar(
-        x=labels, y=vols, name="Order volume (M lbs)", yaxis="y2",
+        x=labels, y=vols, name="Order volume (M lbs)", yaxis="y",
         marker_color=["#bdd7ee", "#6fa8dc", "#1f4e79"],
         text=[f"{v:,.0f}" for v in vols], textposition="outside",
         textfont=label_font,
         hovertemplate="%{x}: %{y:,.1f} M lbs<extra></extra>",
     )
     fig.add_scatter(
-        x=labels, y=yoys, name="YoY %", yaxis="y", mode="lines+markers+text",
+        x=labels, y=yoys, name="YoY %", yaxis="y2", mode="lines+markers+text",
         line=dict(color="#c0392b", dash="dot", width=2),
-        marker=dict(color="#c0392b", size=9),
+        marker=dict(color="#c0392b", size=10, line=dict(color="white", width=1.5)),
         text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
         textposition="top center", textfont=dict(size=14, color=_BH_FONT_COLOR),
         hovertemplate="%{x} YoY: %{y:+.1f}%<extra></extra>",
@@ -836,17 +841,48 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
         height=340, margin=dict(l=10, r=10, t=34, b=10),
         font=dict(color=_BH_FONT_COLOR, size=13),   # base font: dark gray, bigger
         xaxis=dict(tickfont=label_font),
-        yaxis=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
-                   side="left", zeroline=True, zerolinecolor="#d0d0d0",
+        # Base axis = volume (right); overlaying axis = YoY % (left, on top).
+        yaxis=dict(title=dict(text="Order volume (M lbs)", font=axis_title),
+                   side="right", showgrid=False, rangemode="tozero",
                    tickfont=tick_font),
-        yaxis2=dict(title=dict(text="Order volume (M lbs)", font=axis_title),
-                    overlaying="y", side="right", showgrid=False,
-                    rangemode="tozero", tickfont=tick_font),
+        yaxis2=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
+                    overlaying="y", side="left", zeroline=True,
+                    zerolinecolor="#d0d0d0", showgrid=True, gridcolor="#eeeeee",
+                    tickfont=tick_font),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
                     font=dict(size=13, color=_BH_FONT_COLOR)),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="business_health_chart")
+
+
+def _bh_plain_label(indented: str) -> str:
+    """Strip the NBSP indent + memo bullet from a Category label → the raw name."""
+    return str(indented).replace(" ", "").replace("•", "").strip()
+
+
+def _render_business_health_rename(tdf: pd.DataFrame) -> dict[str, str]:
+    """Session-only per-row rename controls; returns ``{row_id: new_name}``.
+
+    A collapsed expander with one text box per category (default = its current
+    name).  Edits live in ``st.session_state`` for the session only — nothing is
+    written back to Fabric — and are applied to the table's Category labels.
+    """
+    pairs = list(zip(tdf["_row_id"].tolist(),
+                     [_bh_plain_label(c) for c in tdf[BH_COL_CATEGORY].tolist()]))
+    overrides: dict[str, str] = {}
+    with st.expander("✏️ Rename categories (this view only)", expanded=False):
+        st.caption(
+            "Rename any category for **this view only** — applies to the table "
+            "below; not saved to Fabric."
+        )
+        cols = st.columns(2)
+        for i, (rid, plain) in enumerate(pairs):
+            with cols[i % 2]:
+                val = st.text_input(plain, value=plain, key=f"bh_name_{rid}").strip()
+            if val and val != plain:
+                overrides[rid] = val
+    return overrides
 
 
 def _render_business_health_table(result: "BusinessHealthResult") -> None:
@@ -868,6 +904,8 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
 
     all_labels = list(BH_DISPLAY_ORDER)
     cols = _picked_columns(_BH_TABLE_COLS_KEY, all_labels)
+    # One-time, session-only category renames (e.g. "Butter" → "Butter Branded").
+    name_overrides = _render_business_health_rename(tdf)
 
     # 2nd header line: each level column's exact month range (drives clarity).
     wl = result.window_labels
@@ -900,14 +938,23 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
             return f'<span>{_esc_html(c)}<br><span class="per">{_esc_html(period)}</span></span>'
         return f"<span>{_esc_html(c)}</span>"
 
+    def _label_html(i: int) -> str:
+        """Indented category label, applying a session rename if present."""
+        original = str(tdf.iloc[i][BH_COL_CATEGORY])
+        name = name_overrides.get(row_ids[i])
+        if not name:
+            return _esc_html(original)
+        indent, is_memo = int(indent_flags[i]), bool(memo_flags[i])
+        prefix = "  " * indent + ("• " if is_memo else "")
+        return _esc_html(prefix + name)
+
     def _make_row(i: int, foldable: bool) -> tuple[str, str]:
         cls = _dpc_cmp_row_class(
             row_id=row_ids[i], is_subtotal=bool(subtotal_flags[i]),
             is_memo=bool(memo_flags[i]), indent=int(indent_flags[i]))
         row = tdf.iloc[i]
         cells = (
-            f'<span class="lbl">{_tri_span(foldable)}'
-            f'{_esc_html(row[BH_COL_CATEGORY])}</span>'
+            f'<span class="lbl">{_tri_span(foldable)}{_label_html(i)}</span>'
             + "".join(f"<span>{_fmt(c, row[c])}</span>" for c in cols)
         )
         return cls, cells

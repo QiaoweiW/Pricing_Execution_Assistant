@@ -711,54 +711,73 @@ def _render_business_health() -> None:
         _render_business_health_table(result)
 
 
-# Dimension columns on the enriched-orders frame (PDH-derived) the Business
-# Health filters act on, with their display labels.  ``brand`` is the existing
-# Branded-vs-Private rule (``_vectorised_brand`` in enrich_ibp_orders_df).
-_BH_DIM_FILTERS: tuple[tuple[str, str], ...] = (
-    ("pmaj", "Portfolio Major"),
-    ("pminor", "Portfolio Minor"),
-    ("sfmt", "Supply Format"),
-    ("brand", "Brand (Branded / Private)"),
-)
+def _bh_order_combos(
+    orders: Optional[pd.DataFrame],
+) -> list[tuple[str, str, str]]:
+    """Sorted distinct ``(pmaj, sfmt, brand)`` present in the enriched orders.
 
-
-def _bh_dim_options(orders: Optional[pd.DataFrame], col: str) -> list[str]:
-    """Sorted distinct non-blank values of *col* in the enriched orders.
-
-    The orders are PDH-enriched (via ``enrich_ibp_orders_df``), so these options
-    ARE the PDH dimension values present in the loaded window.
+    The orders are PDH-enriched (``enrich_ibp_orders_df`` attaches pmaj / sfmt /
+    the Branded-vs-Private ``brand`` rule), so these ARE the categorised combos
+    in the loaded window — the same three dimensions the comparison sections'
+    "Hide combinations" filter uses.
     """
-    if orders is None or orders.empty or col not in orders.columns:
+    cols = ("pmaj", "sfmt", "brand")
+    if orders is None or orders.empty or not set(cols).issubset(orders.columns):
         return []
-    vals = orders[col].astype(str).str.strip()
-    return sorted({v for v in vals.tolist() if v and v.lower() != "nan"})
+    sub = orders[list(cols)]
+    seen = {
+        (str(p).strip(), str(s).strip(), str(b).strip())
+        for p, s, b in zip(sub["pmaj"], sub["sfmt"], sub["brand"])
+    }
+    return sorted(c for c in seen if c[0] and c[1])
 
 
 def _render_business_health_dim_filters(
     orders: Optional[pd.DataFrame],
 ) -> Optional[pd.DataFrame]:
-    """Render Portfolio Major / Minor / Supply Format *hide* multiselects.
+    """One "Hide combinations — Portfolio Major · Supply Format · Brand" filter.
 
-    Returns the orders with the chosen values excluded (a row is dropped when
-    ANY of its three dimensions is hidden).  Empty selections = show everything.
+    Identical in design to the comparison / APS sections' filter: a single
+    search-to-hide multiselect over concatenated ``PMaj · SFmt · Brand`` combos
+    (empty = show all).  Hidden combos are excluded from BOTH the chart and the
+    table, matched on the same ``"␟"``-joined key ``_apply_dim_filter`` uses.
     """
-    cols = st.columns(len(_BH_DIM_FILTERS))
-    picks: dict[str, list[str]] = {}
-    for (col_key, label), slot in zip(_BH_DIM_FILTERS, cols):
-        with slot:
-            picks[col_key] = st.multiselect(
-                f"Hide {label}", options=_bh_dim_options(orders, col_key),
-                key=f"bh_hide_{col_key}",
-                help=f"Pick {label} value(s) to exclude from the chart + table "
-                     "(empty = show all).",
-            )
-    if orders is None or orders.empty:
+    labels_to_combo = {
+        f"{_DPC_PMAJ_DISPLAY.get(p, p)} · {s} · {b}": (p, s, b)
+        for p, s, b in _bh_order_combos(orders)
+    }
+    all_labels = sorted(labels_to_combo)
+    combo_exclude: frozenset = frozenset()
+    if all_labels:
+        st.markdown(
+            "**Hide combinations — Portfolio Major · Supply Format · Brand** "
+            "_(empty = show all; search a name and pick it to remove — e.g. type "
+            "**butter private** to drop those rows)_"
+        )
+        hidden = st.multiselect(
+            "Hide combinations", options=all_labels, key="bh_combo_exclude",
+            label_visibility="collapsed",
+            placeholder="Search to hide, e.g. “butter private”…",
+            help="Type to search; each pick is REMOVED from the chart + table.",
+        )
+        combo_exclude = frozenset(
+            labels_to_combo[h] for h in hidden if h in labels_to_combo)
+    else:
+        st.caption(
+            "ℹ️ The Portfolio Major · Supply Format · Brand filter appears once "
+            "IBP Orders load."
+        )
+
+    if (orders is None or orders.empty or not combo_exclude
+            or not {"pmaj", "sfmt", "brand"}.issubset(orders.columns)):
         return orders
-    mask = pd.Series(True, index=orders.index)
-    for col_key, hidden in picks.items():
-        if hidden and col_key in orders.columns:
-            mask &= ~orders[col_key].astype(str).str.strip().isin(set(hidden))
-    return orders[mask]
+    combo = (
+        orders["pmaj"].astype(str).str.strip() + "␟"
+        + orders["sfmt"].astype(str).str.strip() + "␟"
+        + orders["brand"].astype(str).str.strip()
+    )
+    drop = {f"{p}␟{s}␟{b}" for p, s, b in combo_exclude}
+    return orders[~combo.isin(drop)]
 
 
 def _render_business_health_legend(result: "BusinessHealthResult") -> None:

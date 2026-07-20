@@ -2383,7 +2383,17 @@ def _assemble_table(
         pm_actual = m[COL_PRIOR_MONTH_ACTUAL] - m[COL_PRIOR_MONTH_FORECAST]
         total_delta = current_plan - last_plan
         r_and_o = m[COL_R_AND_O]
-        base_plan = total_delta - pm_actual - r_and_o
+        if include_prior_legs:
+            # APS: Base Plan Var. is the DIRECT leg delta (current − prior Base),
+            # matching the two Base columns the APS table shows.  The APS window
+            # is unshifted, so actuals cancel in Total Delta and Base + R&O ≡
+            # Total Delta — there is no PM-Actual term to fold in (and the APS
+            # view omits PM Actual).  This is why equal Base plans → 0 variance.
+            base_plan = current_plan_base - m[COL_PRIOR_PLAN_BASE]
+        else:
+            # IBP: Base Plan Var. is the residual, so PM Actual + Base + R&O ≡
+            # Total Delta (the one-month-ago cycle walk).
+            base_plan = total_delta - pm_actual - r_and_o
         v_budget = current_plan - m[COL_BUDGET]
 
         # Ratio columns — guard divide-by-zero (blank when undefined).

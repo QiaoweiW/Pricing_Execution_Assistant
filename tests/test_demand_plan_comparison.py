@@ -318,9 +318,10 @@ def test_last_plan_unshifted_window_matches_current_basis():
 
 
 def test_ro_var_from_tracker_is_cycle_delta():
-    """ro_var_from_tracker=True → R&O Var = current-cycle R&O − prior-cycle R&O
-    over the forecast window (APS behaviour), ignoring the RO Summary lookup;
-    PM Actual + Base Plan + R&O still sum to Total Delta."""
+    """APS mode (ro_var_from_tracker + unshifted window): R&O Var and Base Plan
+    Var are BOTH direct leg deltas (current − prior over the forecast window),
+    ignoring the RO Summary lookup, and Base + R&O ≡ Total Delta (no PM-Actual
+    term — actuals cancel in the unshifted window)."""
     filters = _filters_apr_jun_actual()
     esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
                pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
@@ -347,14 +348,13 @@ def test_ro_var_from_tracker_is_cycle_delta():
         shift_last_plan_window=False, ro_var_from_tracker=True,
     )
     row = result.table.loc[result.table["_row_id"] == "esl_lc_branded"].iloc[0]
-    # R&O Var = current C4 R&O (5) − prior C3 R&O (3) = 2 (from the tracker rows).
+    # R&O Var  = current C4 R&O (5) − prior C3 R&O (3) = 2 (leg delta).
+    # Base Var = current C4 Base (10) − prior C3 Base (9) = 1 (leg delta, NOT the
+    #            residual — so equal Base plans would give 0).
     assert float(row["R&O Var."]) == 2.0
-    # Identity still holds regardless of the R&O source.
-    identity = (
-        float(row["PM Actual Var."])
-        + float(row["Base Plan Var."])
-        + float(row["R&O Var."])
-    )
+    assert float(row["Base Plan Var."]) == 1.0
+    # APS identity: Base + R&O ≡ Total Delta (PM Actual is not folded in).
+    identity = float(row["Base Plan Var."]) + float(row["R&O Var."])
     assert round(identity, 6) == round(float(row["Total Delta"]), 6)
 
 

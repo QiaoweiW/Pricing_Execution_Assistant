@@ -2865,6 +2865,171 @@ def build_comparison_kpis(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Business Health — trailing-window (L3M / L6M / L12M) YoY on IBP Orders
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A momentum view over IBP ORDERS: for a chosen Prior Month, the trailing 3-,
+# 6- and 12-month windows (ending at that month, inclusive) and their year-ago
+# (YAG) counterparts, rolled up over the same comparison template as the demand
+# plan.  YoY = (window ÷ same-window-a-year-ago) − 1.  A Flag classifies
+# momentum from how the newest window's YoY compares to the trailing year's.
+
+# Window length (months) per bucket — declaration order is display order.
+BH_WINDOW_MONTHS: dict[str, int] = {"L3M": 3, "L6M": 6, "L12M": 12}
+
+# Column labels (display contract).  ``YAG`` = the same window one year earlier.
+BH_COL_CATEGORY: str = "Category"
+BH_LEVEL_LABELS: dict[str, tuple[str, str]] = {
+    "L3M": ("L3M", "L3M YAG"),
+    "L6M": ("L6M", "L6M YAG"),
+    "L12M": ("L12M", "L12M YAG"),
+}
+BH_YOY_LABELS: dict[str, str] = {"L3M": "L3M YoY", "L6M": "L6M YoY", "L12M": "L12M YoY"}
+BH_COL_FLAG: str = "Flag"
+# The six additive level columns (millions of lbs) that roll up as sums.
+BH_LEVEL_COLS: tuple[str, ...] = tuple(
+    lbl for pair in BH_LEVEL_LABELS.values() for lbl in pair)
+BH_YOY_COLS: tuple[str, ...] = tuple(BH_YOY_LABELS.values())
+# Left → right metric order (the last column is the text Flag).
+BH_DISPLAY_ORDER: tuple[str, ...] = (
+    "L3M", "L3M YAG", "L6M", "L6M YAG", "L12M", "L12M YAG",
+    "L3M YoY", "L6M YoY", "L12M YoY", BH_COL_FLAG,
+)
+BH_PERCENT_COLS: frozenset = frozenset(BH_YOY_COLS)
+# Momentum classification thresholds (fraction, i.e. 0.005 = 0.5 pp).  The Flag
+# compares the newest window (L3M) YoY to the trailing-year (L12M) YoY.
+_BH_FLAG_DEADBAND: float = 0.005
+BH_FLAG_RISING: str = "Rising"
+BH_FLAG_FALLING: str = "Falling"
+BH_FLAG_FLAT: str = "Flat"
+_BH_META_COLS: tuple[str, ...] = (COL_ROW_ID, COL_INDENT, COL_IS_SUBTOTAL, COL_IS_MEMO)
+
+
+@dataclass(frozen=True)
+class BusinessHealthResult:
+    """Trailing-window order-momentum table + the window labels for the legend.
+
+    ``table`` — one row per comparison-template row (metadata + the six level
+    columns + three YoY fractions + the text Flag), template order.
+    ``window_labels`` — ``{bucket: (current_range, year_ago_range)}`` where each
+    range is a human string like ``"Apr 2026 – Jun 2026"`` (drives the legend +
+    the explicit YoY definition).  ``prior_month`` — the anchor month.
+    """
+    table: pd.DataFrame
+    window_labels: dict[str, tuple[str, str]]
+    prior_month: date
+
+
+def _month_range_label(months: set[date]) -> str:
+    """Human range for a month set, e.g. ``"Apr 2026 – Jun 2026"`` (— if empty)."""
+    if not months:
+        return "—"
+    lo, hi = min(months), max(months)
+    return f"{lo:%b %Y}" if lo == hi else f"{lo:%b %Y} – {hi:%b %Y}"
+
+
+def _bh_flag(l3m_yoy: Optional[float], l12m_yoy: Optional[float]) -> str:
+    """Classify momentum from newest-window (L3M) vs trailing-year (L12M) YoY.
+
+    Rising when recent growth is accelerating vs the year (L3M − L12M beyond the
+    dead-band), Falling when decelerating, else Flat.  Blank when undefined.
+    """
+    if l3m_yoy is None or l12m_yoy is None or pd.isna(l3m_yoy) or pd.isna(l12m_yoy):
+        return ""
+    slope = l3m_yoy - l12m_yoy
+    if slope > _BH_FLAG_DEADBAND:
+        return BH_FLAG_RISING
+    if slope < -_BH_FLAG_DEADBAND:
+        return BH_FLAG_FALLING
+    return BH_FLAG_FLAT
+
+
+def _bh_rollup(
+    tpl: TemplateRow, measures: dict[str, dict[str, float]],
+    template_by_id: dict[str, TemplateRow],
+) -> dict[str, float]:
+    """Sum a subtotal's six level columns from its (recursively resolved) children."""
+    totals = {c: 0.0 for c in BH_LEVEL_COLS}
+    for child_id in tpl.children:
+        child_tpl = template_by_id[child_id]
+        child = (
+            _bh_rollup(child_tpl, measures, template_by_id)
+            if child_tpl.is_subtotal else measures[child_id]
+        )
+        for c in BH_LEVEL_COLS:
+            totals[c] += child.get(c, 0.0)
+    return totals
+
+
+def build_business_health(
+    orders_enriched: Optional[pd.DataFrame], prior_month: date,
+) -> BusinessHealthResult:
+    """Build the trailing-window order-momentum table from enriched IBP Orders.
+
+    For *prior_month* (first-of-month), the L3M / L6M / L12M windows END at that
+    month (inclusive) and each YAG window is the same span one year earlier.
+    Every leaf's pounds are summed per window (millions), subtotals roll up, and
+    each row gets its three YoY fractions + a momentum Flag.  Degrades to zeros
+    (and blank Flags) when Orders are missing, so the table always renders.
+    """
+    pm = prior_month.replace(day=1)
+    cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
+    yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
+
+    orders = orders_enriched if orders_enriched is not None else _empty_enriched(actuals=True)
+    month_ser = orders["month"] if not orders.empty else pd.Series([], dtype=object)
+    template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
+
+    # Leaf sums, then subtotal roll-ups (memo leaves compute directly, like the
+    # comparison template).
+    measures: dict[str, dict[str, float]] = {}
+    for tpl in COMPARISON_TEMPLATE:
+        if tpl.is_subtotal:
+            continue
+        leaf = _leaf_mask(orders, tpl) if not orders.empty else month_ser
+        vals: dict[str, float] = {}
+        for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
+            if orders.empty:
+                vals[cur_lbl] = vals[yag_lbl] = 0.0
+            else:
+                vals[cur_lbl] = _sum_millions(orders, leaf & month_ser.isin(cur_windows[w]))
+                vals[yag_lbl] = _sum_millions(orders, leaf & month_ser.isin(yag_windows[w]))
+        measures[tpl.row_id] = vals
+    for tpl in COMPARISON_TEMPLATE:
+        if tpl.is_subtotal:
+            measures[tpl.row_id] = _bh_rollup(tpl, measures, template_by_id)
+
+    records: list[dict] = []
+    for tpl in COMPARISON_TEMPLATE:
+        m = measures[tpl.row_id]
+        row = {
+            COL_ROW_ID: tpl.row_id, COL_INDENT: tpl.indent,
+            COL_IS_SUBTOTAL: tpl.is_subtotal, COL_IS_MEMO: tpl.is_memo,
+            BH_COL_CATEGORY: _make_indented_label(tpl.label, tpl.indent, tpl.is_memo),
+        }
+        for c in BH_LEVEL_COLS:
+            row[c] = round(m[c], _MILLIONS_DISPLAY_DECIMALS)
+        yoy: dict[str, Optional[float]] = {}
+        for w in BH_WINDOW_MONTHS:
+            cur_lbl, yag_lbl = BH_LEVEL_LABELS[w]
+            cur, yag = m[cur_lbl], m[yag_lbl]
+            yoy[w] = _safe_ratio(cur - yag, yag) if abs(yag) > 1e-9 else float("nan")
+            row[BH_YOY_LABELS[w]] = None if yoy[w] is None else round(yoy[w], 4)
+        row[BH_COL_FLAG] = _bh_flag(yoy["L3M"], yoy["L12M"])
+        records.append(row)
+
+    df = pd.DataFrame.from_records(records)
+    ordered = [*_BH_META_COLS, BH_COL_CATEGORY, *BH_DISPLAY_ORDER]
+    df = df.loc[:, ordered]
+
+    window_labels = {
+        w: (_month_range_label(cur_windows[w]), _month_range_label(yag_windows[w]))
+        for w in BH_WINDOW_MONTHS
+    }
+    return BusinessHealthResult(table=df, window_labels=window_labels, prior_month=pm)
+
+
 def build_prior_month_actual_vs_fcst_table(
     tracker_df: Optional[pd.DataFrame],
     ibp_shipments_df: Optional[pd.DataFrame],

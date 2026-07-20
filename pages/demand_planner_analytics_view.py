@@ -143,6 +143,16 @@ from data_sources.demand_plan_comparison import (
     build_prior_month_actual_vs_fcst_table,
     build_prior_month_shipment_diagnostic,
     build_pm_actual_driver_table,
+    build_business_health,
+    BusinessHealthResult,
+    BH_COL_CATEGORY,
+    BH_COL_FLAG,
+    BH_DISPLAY_ORDER,
+    BH_PERCENT_COLS,
+    BH_LEVEL_LABELS,
+    BH_YOY_LABELS,
+    BH_FLAG_RISING,
+    BH_FLAG_FALLING,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
@@ -587,6 +597,241 @@ _RO_DISABLED_COLUMNS: tuple[str, ...] = (
     "Prior Probability", "LE Probability", "Change Probability",
     "Change (Days)", "Existing SKUs", "Item #",
 )
+
+
+# ── Business Health (trailing-window order momentum) ─────────────────────────
+# A read-only view above RO Comparison: pick a Prior Month, then see L3M / L6M /
+# L12M order volume + YoY vs the same windows a year ago, plus a per-category
+# table with a momentum Flag.  Reuses the comparison template + trailing-window
+# helpers + the shared column-picker / tree helpers; nothing here writes Fabric.
+
+# Curated hierarchy shown in the Business Health table (matches the executive
+# summary set): Total B2C → majors, with ESL's carton subtotals and Cultured's
+# Cottage Cheese / Sour Cream memos.  Row ids resolve against COMPARISON_TEMPLATE.
+_BH_CURATED_ROWS: tuple[str, ...] = (
+    "total_b2c", "esl", "esl_lc", "esl_sc", "aseptic", "cultured",
+    "cult_cottage_cheese", "cult_sour_cream", "fresh_milk", "butter",
+)
+_BH_TABLE_COLS_KEY: str = "business_health_table_cols"
+# Green/red for signed YoY + Flag, layered onto the shared tree styling.
+_BH_EXTRA_CSS: str = """
+<style>
+.dpc-tree .pos {color:#1b7f3a; font-weight:700;}
+.dpc-tree .neg {color:#c0392b; font-weight:700;}
+.dpc-tree .flag-rise {color:#1b7f3a; font-weight:700;}
+.dpc-tree .flag-fall {color:#c0392b; font-weight:700;}
+.dpc-tree .flag-flat {color:#5a6472; font-weight:700;}
+</style>
+"""
+_BH_FLAG_CSS: dict[str, str] = {
+    BH_FLAG_RISING: "flag-rise", BH_FLAG_FALLING: "flag-fall",
+}
+
+
+def _render_business_health() -> None:
+    """Business Health — trailing-window (L3M/L6M/L12M) order momentum on IBP Orders.
+
+    Pick a **Prior Month**; the L3M / L6M / L12M windows END at it (inclusive)
+    and each is compared YoY against the same span a year earlier.  A dual-axis
+    chart (order volume bars + a dotted YoY line) sits above a per-category table
+    with a momentum **Flag**.  Read-only; sourced entirely from IBP Orders.
+    """
+    with st.expander("🩺 Business Health", expanded=False):
+        st.caption(
+            "Trailing-window **order momentum** from **IBP Orders**.  Pick a "
+            "**Prior Month**; the **L3M / L6M / L12M** windows end at that month "
+            "(inclusive) and are compared **YoY** against the same span one year "
+            "earlier (YAG).  The chart shows order **volume** (bars) and **YoY %** "
+            "(dotted line); the table breaks it down by category with a momentum "
+            "**Flag**."
+        )
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
+            return
+
+        try:
+            months = sorted(fetch_ibp_shipments_months())
+        except IBPOfficialSourceError:
+            months = []
+        if not months:
+            st.info("ℹ️ No IBP months available yet.")
+            return
+        prior_month = st.selectbox(
+            "Prior Month (for PM Actual / Prior Month Forecast)",
+            options=months, index=len(months) - 1, key="bh_prior_month",
+            format_func=lambda d: d.strftime("%b %Y"),
+            help="The L3M / L6M / L12M windows end at this month (inclusive).",
+        )
+
+        # Load exactly the 24 months the L12M current + year-ago windows need.
+        cur12 = last_n_months(prior_month, 12)
+        window = tuple(sorted(cur12 | {shift_year_back(m) for m in cur12}))
+        try:
+            with st.spinner("Loading IBP Orders…"):
+                orders_df, orders_warn = _load_demand_comparison_ibp_orders(months=window)
+                orders_enriched = enrich_ibp_orders_df(orders_df, _load_demand_comparison_pdh())
+                result = build_business_health(orders_enriched, prior_month)
+        except (LakehouseIOError, ValueError) as exc:
+            st.error(f"❌ Could not load IBP Orders for Business Health.\n\n{exc}")
+            return
+        if orders_warn:
+            st.caption(f"⚠️ {orders_warn}")
+
+        _render_business_health_legend(result)
+        _render_business_health_chart(result)
+        st.caption(
+            "**YoY %** = (orders in the window ÷ orders in the **same window one "
+            "year earlier**) − 1.  e.g. **L3M YoY** compares "
+            f"**{result.window_labels['L3M'][0]}** vs "
+            f"**{result.window_labels['L3M'][1]}**.  The **Flag** reads momentum: "
+            "**Rising** when recent (L3M) YoY is accelerating vs the trailing year "
+            "(L12M), **Falling** when decelerating, else **Flat**."
+        )
+        _render_business_health_table(result)
+
+
+def _render_business_health_legend(result: "BusinessHealthResult") -> None:
+    """One-line legend spelling out each window's exact month range (current)."""
+    wl = result.window_labels
+    parts = " · ".join(
+        f"**{w}** {wl[w][0]}  _(vs {wl[w][1]})_" for w in ("L3M", "L6M", "L12M"))
+    st.markdown(
+        f"📅 **Windows** ending **{result.prior_month:%b %Y}** — {parts}")
+
+
+def _render_business_health_chart(result: "BusinessHealthResult") -> None:
+    """Dual-axis chart: order-volume bars (right) + a dotted YoY% line (left).
+
+    X axis = L12M → L6M → L3M (widest → narrowest, matching the momentum read).
+    Values are the Total B2C row, so the chart ties to the table's top row.
+    """
+    table = result.table
+    tot = table.loc[table["_row_id"] == "total_b2c"]
+    if tot.empty:
+        st.info("No Total B2C row to chart.")
+        return
+    row = tot.iloc[0]
+    order = ["L12M", "L6M", "L3M"]
+    vols = [float(row[w]) for w in order]
+
+    def _yoy_pct(w: str) -> Optional[float]:
+        v = row[BH_YOY_LABELS[w]]
+        return None if v is None or pd.isna(v) else float(v) * 100.0
+
+    yoys = [_yoy_pct(w) for w in order]
+
+    fig = go.Figure()
+    fig.add_bar(
+        x=order, y=vols, name="Order volume (M lbs)", yaxis="y2",
+        marker_color=["#bdd7ee", "#6fa8dc", "#1f4e79"],
+        text=[f"{v:,.0f}" for v in vols], textposition="outside",
+        hovertemplate="%{x}: %{y:,.1f} M lbs<extra></extra>",
+    )
+    fig.add_scatter(
+        x=order, y=yoys, name="YoY %", yaxis="y", mode="lines+markers+text",
+        line=dict(color="#c0392b", dash="dot", width=2),
+        marker=dict(color="#c0392b", size=9),
+        text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
+        textposition="top center",
+        hovertemplate="%{x} YoY: %{y:+.1f}%<extra></extra>",
+    )
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=34, b=10),
+        yaxis=dict(title="YoY %", ticksuffix="%", side="left", zeroline=True,
+                   zerolinecolor="#d0d0d0"),
+        yaxis2=dict(title="Order volume (M lbs)", overlaying="y", side="right",
+                    showgrid=False, rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="business_health_chart")
+
+
+def _render_business_health_table(result: "BusinessHealthResult") -> None:
+    """Per-category table: L3M/L6M/L12M + YAG + YoY (green/red) + Flag.
+
+    Curated executive hierarchy (Total B2C → majors + ESL cartons + Cultured
+    memos).  Level columns carry their exact month range as a 2nd header line;
+    columns are hideable / reorderable via the shared picker.
+    """
+    table = result.table
+    if table is None or table.empty:
+        st.info("No Business Health rows to display.")
+        return
+
+    order_ix = {rid: i for i, rid in enumerate(_BH_CURATED_ROWS)}
+    tdf = table[table["_row_id"].isin(order_ix)].copy()
+    tdf = (tdf.assign(_ord=tdf["_row_id"].map(order_ix))
+              .sort_values("_ord").drop(columns="_ord").reset_index(drop=True))
+
+    all_labels = list(BH_DISPLAY_ORDER)
+    cols = _picked_columns(_BH_TABLE_COLS_KEY, all_labels)
+
+    # 2nd header line: each level column's exact month range (drives clarity).
+    wl = result.window_labels
+    periods: dict[str, str] = {}
+    for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
+        periods[cur_lbl] = f"({wl[w][0]})"
+        periods[yag_lbl] = f"({wl[w][1]})"
+
+    percent_set = set(BH_PERCENT_COLS)
+    row_ids = tdf["_row_id"].tolist()
+    subtotal_flags = tdf["_is_subtotal"].tolist()
+    memo_flags = tdf["_is_memo"].tolist()
+    indent_flags = tdf["_indent"].tolist()
+
+    def _fmt(col: str, val: object) -> str:
+        if col == BH_COL_FLAG:
+            flag = "" if val is None else str(val)
+            cls = _BH_FLAG_CSS.get(flag, "flag-flat")
+            return f'<span class="{cls}">{_esc_html(flag or "—")}</span>'
+        if col in percent_set:
+            txt, cls = _dpc_fmt_pct(
+                None if val is None or pd.isna(val) else float(val),
+                signed=True, decimals=1)
+            return f'<span class="{cls}">{_esc_html(txt)}</span>' if cls else _esc_html(txt)
+        return _esc_html(_dpc_fmt_cell(val, is_percent=False))
+
+    def _hdr_cell(c: str) -> str:
+        period = periods.get(c)
+        if period:
+            return f'<span>{_esc_html(c)}<br><span class="per">{_esc_html(period)}</span></span>'
+        return f"<span>{_esc_html(c)}</span>"
+
+    def _make_row(i: int, foldable: bool) -> tuple[str, str]:
+        cls = _dpc_cmp_row_class(
+            row_id=row_ids[i], is_subtotal=bool(subtotal_flags[i]),
+            is_memo=bool(memo_flags[i]), indent=int(indent_flags[i]))
+        row = tdf.iloc[i]
+        cells = (
+            f'<span class="lbl">{_tri_span(foldable)}'
+            f'{_esc_html(row[BH_COL_CATEGORY])}</span>'
+            + "".join(f"<span>{_fmt(c, row[c])}</span>" for c in cols)
+        )
+        return cls, cells
+
+    header = (
+        '<div class="rw hdr"><span class="lbl">' + _esc_html(BH_COL_CATEGORY) + "</span>"
+        + "".join(_hdr_cell(c) for c in cols) + "</div>"
+    )
+    parts = [header] + _foldable_tree_body(len(tdf), indent_flags, _make_row)
+    st.markdown(
+        _DPC_TREE_CSS + _BH_EXTRA_CSS
+        + '<div class="dpc-tree"><div class="dpc-tree-in">'
+        + "".join(parts) + "</div></div>",
+        unsafe_allow_html=True,
+    )
+    _render_column_picker(
+        _BH_TABLE_COLS_KEY, all_labels,
+        help_suffix="  The Category column always shows.")
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        "⬇️ Download Business Health (CSV)",
+        data=tdf.drop(columns=[c for c in ("_row_id", "_indent", "_is_subtotal",
+                                           "_is_memo") if c in tdf.columns]
+                      ).to_csv(index=False).encode("utf-8"),
+        file_name=f"business_health_{today}.csv", mime="text/csv",
+        key="business_health_download", use_container_width=True)
 
 
 def _render_ro_comparison() -> None:
@@ -9737,6 +9982,11 @@ def render() -> None:
     st.markdown("---")
 
     _render_pricing_elasticity_analysis()
+    st.markdown("---")
+
+    # Business Health (trailing-window order momentum) sits directly ABOVE RO
+    # Comparison, separated by a divider — a self-contained read-only view.
+    _render_business_health()
     st.markdown("---")
 
     _render_ro_comparison()

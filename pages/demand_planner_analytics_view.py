@@ -150,13 +150,13 @@ from data_sources.demand_plan_comparison import (
     BH_DISPLAY_ORDER,
     BH_PERCENT_COLS,
     BH_LEVEL_LABELS,
-    BH_YOY_LABELS,
     BH_FLAG_RISING,
     BH_FLAG_FALLING,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
     enrich_ibp_orders_df,
+    enrich_ibp_shipments_df,
     list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
@@ -631,13 +631,18 @@ def _bh_window_display(code: str) -> str:
 # executive legibility.
 _BH_FONT_COLOR: str = "#3a3a3a"
 # Green/red for signed YoY + Flag, layered onto the shared tree styling.
+# Scoped to ``.bh-tree`` so it can't affect the comparison / APS trees: metric
+# cells are CENTER-aligned (the label column stays left), and the YoY / Flag
+# cells get green-up / red-down / grey-flat colouring.
 _BH_EXTRA_CSS: str = """
 <style>
-.dpc-tree .pos {color:#1b7f3a; font-weight:700;}
-.dpc-tree .neg {color:#c0392b; font-weight:700;}
-.dpc-tree .flag-rise {color:#1b7f3a; font-weight:700;}
-.dpc-tree .flag-fall {color:#c0392b; font-weight:700;}
-.dpc-tree .flag-flat {color:#5a6472; font-weight:700;}
+.bh-tree .rw > span {text-align:center;}
+.bh-tree .rw > span.lbl {text-align:left;}
+.bh-tree .pos {color:#1b7f3a; font-weight:700;}
+.bh-tree .neg {color:#c0392b; font-weight:700;}
+.bh-tree .flag-rise {color:#1b7f3a; font-weight:700;}
+.bh-tree .flag-fall {color:#c0392b; font-weight:700;}
+.bh-tree .flag-flat {color:#5a6472; font-weight:700;}
 </style>
 """
 _BH_FLAG_CSS: dict[str, str] = {
@@ -684,19 +689,25 @@ def _render_business_health() -> None:
         cur12 = last_n_months(prior_month, 12)
         window = tuple(sorted(cur12 | {shift_year_back(m) for m in cur12}))
         try:
-            with st.spinner("Loading IBP Orders…"):
+            with st.spinner("Loading IBP Orders + Shipments…"):
+                pdh_df = _load_demand_comparison_pdh()
                 orders_df, orders_warn = _load_demand_comparison_ibp_orders(months=window)
-                orders_enriched = enrich_ibp_orders_df(orders_df, _load_demand_comparison_pdh())
+                orders_enriched = enrich_ibp_orders_df(orders_df, pdh_df)
+                ship_df, ship_warn = _load_demand_comparison_ibp(months=window)
+                shipments_enriched = enrich_ibp_shipments_df(ship_df, pdh_df)
         except (LakehouseIOError, ValueError) as exc:
-            st.error(f"❌ Could not load IBP Orders for Business Health.\n\n{exc}")
+            st.error(f"❌ Could not load IBP data for Business Health.\n\n{exc}")
             return
-        if orders_warn:
-            st.caption(f"⚠️ {orders_warn}")
+        for warn in (orders_warn, ship_warn):
+            if warn:
+                st.caption(f"⚠️ {warn}")
 
-        # Dimension filters (Portfolio Major / Minor / Supply Format) — exclude
-        # the chosen values from BOTH the chart and the table before rolling up.
-        orders_enriched = _render_business_health_dim_filters(orders_enriched)
-        result = build_business_health(orders_enriched, prior_month)
+        # "Hide combinations" filter — applied to BOTH orders + shipments before
+        # rolling up, so chart + table exclude the same combos.
+        combo_exclude = _render_business_health_dim_filters(orders_enriched)
+        orders_enriched = _bh_apply_combo_exclude(orders_enriched, combo_exclude)
+        shipments_enriched = _bh_apply_combo_exclude(shipments_enriched, combo_exclude)
+        result = build_business_health(orders_enriched, shipments_enriched, prior_month)
 
         _render_business_health_legend(result)
         _render_business_health_chart(result)
@@ -732,52 +743,58 @@ def _bh_order_combos(
     return sorted(c for c in seen if c[0] and c[1])
 
 
-def _render_business_health_dim_filters(
-    orders: Optional[pd.DataFrame],
-) -> Optional[pd.DataFrame]:
+def _render_business_health_dim_filters(orders: Optional[pd.DataFrame]) -> frozenset:
     """One "Hide combinations — Portfolio Major · Supply Format · Brand" filter.
 
     Identical in design to the comparison / APS sections' filter: a single
     search-to-hide multiselect over concatenated ``PMaj · SFmt · Brand`` combos
-    (empty = show all).  Hidden combos are excluded from BOTH the chart and the
-    table, matched on the same ``"␟"``-joined key ``_apply_dim_filter`` uses.
+    (empty = show all), sourced from the enriched orders.  Returns the set of
+    excluded ``(pmaj, sfmt, brand)`` combos — the caller applies it to BOTH the
+    orders and the shipments frames via :func:`_bh_apply_combo_exclude`.
     """
     labels_to_combo = {
         f"{_DPC_PMAJ_DISPLAY.get(p, p)} · {s} · {b}": (p, s, b)
         for p, s, b in _bh_order_combos(orders)
     }
     all_labels = sorted(labels_to_combo)
-    combo_exclude: frozenset = frozenset()
-    if all_labels:
-        st.markdown(
-            "**Hide combinations — Portfolio Major · Supply Format · Brand** "
-            "_(empty = show all; search a name and pick it to remove — e.g. type "
-            "**butter private** to drop those rows)_"
-        )
-        hidden = st.multiselect(
-            "Hide combinations", options=all_labels, key="bh_combo_exclude",
-            label_visibility="collapsed",
-            placeholder="Search to hide, e.g. “butter private”…",
-            help="Type to search; each pick is REMOVED from the chart + table.",
-        )
-        combo_exclude = frozenset(
-            labels_to_combo[h] for h in hidden if h in labels_to_combo)
-    else:
+    if not all_labels:
         st.caption(
             "ℹ️ The Portfolio Major · Supply Format · Brand filter appears once "
             "IBP Orders load."
         )
+        return frozenset()
+    st.markdown(
+        "**Hide combinations — Portfolio Major · Supply Format · Brand** "
+        "_(empty = show all; search a name and pick it to remove — e.g. type "
+        "**butter private** to drop those rows)_"
+    )
+    hidden = st.multiselect(
+        "Hide combinations", options=all_labels, key="bh_combo_exclude",
+        label_visibility="collapsed",
+        placeholder="Search to hide, e.g. “butter private”…",
+        help="Type to search; each pick is REMOVED from the chart + table.",
+    )
+    return frozenset(labels_to_combo[h] for h in hidden if h in labels_to_combo)
 
-    if (orders is None or orders.empty or not combo_exclude
-            or not {"pmaj", "sfmt", "brand"}.issubset(orders.columns)):
-        return orders
+
+def _bh_apply_combo_exclude(
+    frame: Optional[pd.DataFrame], combo_exclude: frozenset,
+) -> Optional[pd.DataFrame]:
+    """Drop rows whose ``(pmaj, sfmt, brand)`` is in *combo_exclude*.
+
+    Same ``"␟"``-joined match key the comparison's ``_apply_dim_filter`` uses,
+    so orders + shipments filter identically.
+    """
+    if (frame is None or frame.empty or not combo_exclude
+            or not {"pmaj", "sfmt", "brand"}.issubset(frame.columns)):
+        return frame
     combo = (
-        orders["pmaj"].astype(str).str.strip() + "␟"
-        + orders["sfmt"].astype(str).str.strip() + "␟"
-        + orders["brand"].astype(str).str.strip()
+        frame["pmaj"].astype(str).str.strip() + "␟"
+        + frame["sfmt"].astype(str).str.strip() + "␟"
+        + frame["brand"].astype(str).str.strip()
     )
     drop = {f"{p}␟{s}␟{b}" for p, s, b in combo_exclude}
-    return orders[~combo.isin(drop)]
+    return frame[~combo.isin(drop)]
 
 
 def _render_business_health_legend(result: "BusinessHealthResult") -> None:
@@ -790,59 +807,64 @@ def _render_business_health_legend(result: "BusinessHealthResult") -> None:
         f"📅 **Windows** ending **{result.prior_month:%b %Y}** — {parts}")
 
 
+# Business Health chart palette — Orders vs Shipments kept visually distinct:
+# a blue family for Order volume + a red dotted line for Order YoY; a green
+# family for Shipment volume + a teal dotted line for Shipment YoY.
+_BH_CHART_STYLE: dict[str, dict] = {
+    "Orders":    {"bars": ["#bdd7ee", "#6fa8dc", "#1f4e79"], "line": "#c0392b"},
+    "Shipments": {"bars": ["#c6e0b4", "#8fce7f", "#548235"], "line": "#137d78"},
+}
+
+
 def _render_business_health_chart(result: "BusinessHealthResult") -> None:
-    """Dual-axis chart: order-volume bars (right) + a dotted YoY% line (left).
+    """Dual-axis chart: Order + Shipment volume bars (right) + dotted YoY% lines
+    (left), colour-coded per source.
 
-    X axis = L12M → L6M → L3M (widest → narrowest, matching the momentum read).
-    Values are the Total B2C row, so the chart ties to the table's top row.
+    X axis = L12M → L6M → L3M (widest → narrowest).  Values are the Total B2C
+    row for each source, so the chart ties to the table's top row.
     """
-    table = result.table
-    tot = table.loc[table["_row_id"] == "total_b2c"]
-    if tot.empty:
-        st.info("No Total B2C row to chart.")
-        return
-    row = tot.iloc[0]
-    order = ["L12M", "L6M", "L3M"]                 # widest → narrowest
-    labels = [_bh_window_display(w) for w in order]  # Run-Rate (L12M) …
-    vols = [float(row[w]) for w in order]
-
-    def _yoy_pct(w: str) -> Optional[float]:
-        v = row[BH_YOY_LABELS[w]]
-        return None if v is None or pd.isna(v) else float(v) * 100.0
-
-    yoys = [_yoy_pct(w) for w in order]
-    # Dark-gray label fonts, sized up from Plotly's light-gray defaults.
+    order = ["L12M", "L6M", "L3M"]                    # widest → narrowest
+    labels = [_bh_window_display(w) for w in order]   # Run-Rate (L12M) …
     axis_title = dict(size=14, color=_BH_FONT_COLOR)
     tick_font = dict(size=13, color=_BH_FONT_COLOR)
     label_font = dict(size=14, color=_BH_FONT_COLOR)
 
-    # Axis assignment matters for layering: Plotly draws the OVERLAYING axis's
-    # traces on top of the base axis's.  Put the volume bars on the base axis
-    # (y, right side) and the YoY line on the OVERLAYING axis (y2, left side) so
-    # the line + every dot always render ON TOP of the bars — otherwise a low
-    # dot inside a tall bar (e.g. L12M) gets hidden behind it.
+    # Axis layering: Plotly draws the OVERLAYING axis's traces on top of the base
+    # axis's.  Volume bars on the base axis (y, right); the YoY lines on the
+    # OVERLAYING axis (y2, left) so every dot renders ON TOP of the bars — a low
+    # dot inside a tall bar would otherwise be hidden behind it.
     fig = go.Figure()
-    fig.add_bar(
-        x=labels, y=vols, name="Order volume (M lbs)", yaxis="y",
-        marker_color=["#bdd7ee", "#6fa8dc", "#1f4e79"],
-        text=[f"{v:,.0f}" for v in vols], textposition="outside",
-        textfont=label_font,
-        hovertemplate="%{x}: %{y:,.1f} M lbs<extra></extra>",
-    )
-    fig.add_scatter(
-        x=labels, y=yoys, name="YoY %", yaxis="y2", mode="lines+markers+text",
-        line=dict(color="#c0392b", dash="dot", width=2),
-        marker=dict(color="#c0392b", size=10, line=dict(color="white", width=1.5)),
-        text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
-        textposition="top center", textfont=dict(size=14, color=_BH_FONT_COLOR),
-        hovertemplate="%{x} YoY: %{y:+.1f}%<extra></extra>",
-    )
+    for src in ("Orders", "Shipments"):
+        series = result.chart_series.get(src, {})
+        vols = [float(series.get(w, {}).get("vol") or 0.0) for w in order]
+        yoys = [
+            (None if series.get(w, {}).get("yoy") is None
+             else float(series[w]["yoy"]) * 100.0)
+            for w in order
+        ]
+        style = _BH_CHART_STYLE[src]
+        fig.add_bar(
+            x=labels, y=vols, name=f"{src} volume (M lbs)", yaxis="y",
+            marker_color=style["bars"],
+            text=[f"{v:,.0f}" for v in vols], textposition="outside",
+            textfont=label_font,
+            hovertemplate=f"{src} %{{x}}: %{{y:,.1f}} M lbs<extra></extra>",
+        )
+        fig.add_scatter(
+            x=labels, y=yoys, name=f"{src} YoY %", yaxis="y2",
+            mode="lines+markers+text",
+            line=dict(color=style["line"], dash="dot", width=2),
+            marker=dict(color=style["line"], size=10, line=dict(color="white", width=1.5)),
+            text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
+            textposition="top center", textfont=dict(size=13, color=style["line"]),
+            hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
+        )
     fig.update_layout(
-        height=340, margin=dict(l=10, r=10, t=34, b=10),
+        height=360, margin=dict(l=10, r=10, t=40, b=10), barmode="group",
         font=dict(color=_BH_FONT_COLOR, size=13),   # base font: dark gray, bigger
         xaxis=dict(tickfont=label_font),
         # Base axis = volume (right); overlaying axis = YoY % (left, on top).
-        yaxis=dict(title=dict(text="Order volume (M lbs)", font=axis_title),
+        yaxis=dict(title=dict(text="Volume (M lbs)", font=axis_title),
                    side="right", showgrid=False, rangemode="tozero",
                    tickfont=tick_font),
         yaxis2=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
@@ -850,7 +872,7 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
                     zerolinecolor="#d0d0d0", showgrid=True, gridcolor="#eeeeee",
                     tickfont=tick_font),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=13, color=_BH_FONT_COLOR)),
+                    font=dict(size=12, color=_BH_FONT_COLOR)),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="business_health_chart")
@@ -966,7 +988,7 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
     parts = [header] + _foldable_tree_body(len(tdf), indent_flags, _make_row)
     st.markdown(
         _DPC_TREE_CSS + _BH_EXTRA_CSS
-        + '<div class="dpc-tree"><div class="dpc-tree-in">'
+        + '<div class="dpc-tree bh-tree"><div class="dpc-tree-in">'
         + "".join(parts) + "</div></div>",
         unsafe_allow_html=True,
     )

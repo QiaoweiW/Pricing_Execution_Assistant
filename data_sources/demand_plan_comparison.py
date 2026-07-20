@@ -1535,6 +1535,21 @@ def enrich_ibp_orders_df(
     )
 
 
+def enrich_ibp_shipments_df(
+    ibp_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Return tidy IBP Shipments with PDH dims attached (pmaj/sfmt/pminor/brand).
+
+    Sibling of :func:`enrich_ibp_orders_df` for the shipped-quantity column —
+    used by Business Health to chart shipment volume + YoY beside orders.
+    """
+    dim_frame = build_item_dim_frame(pdh_df)
+    if ibp_df is None or ibp_df.empty:
+        return _empty_enriched(actuals=True)
+    return _enrich_ibp(ibp_df, dim_frame)   # default qty candidates = shipments
+
+
 def resolve_ro_summary_path(
     *,
     pmaj: str,
@@ -2878,14 +2893,17 @@ def build_comparison_kpis(
 # Window length (months) per bucket — declaration order is display order.
 BH_WINDOW_MONTHS: dict[str, int] = {"L3M": 3, "L6M": 6, "L12M": 12}
 
-# Column labels (display contract).  ``YAG`` = the same window one year earlier.
+# Column labels (display contract).  The table is ORDER-based, so every column
+# says "Order(s)" explicitly.  ``YAG`` = the same window one year earlier.
 BH_COL_CATEGORY: str = "Category"
 BH_LEVEL_LABELS: dict[str, tuple[str, str]] = {
-    "L3M": ("L3M", "L3M YAG"),
-    "L6M": ("L6M", "L6M YAG"),
-    "L12M": ("L12M", "L12M YAG"),
+    "L3M": ("L3M Orders", "L3M Orders YAG"),
+    "L6M": ("L6M Orders", "L6M Orders YAG"),
+    "L12M": ("L12M Orders", "L12M Orders YAG"),
 }
-BH_YOY_LABELS: dict[str, str] = {"L3M": "L3M YoY", "L6M": "L6M YoY", "L12M": "L12M YoY"}
+BH_YOY_LABELS: dict[str, str] = {
+    "L3M": "L3M Order YoY", "L6M": "L6M Order YoY", "L12M": "L12M Order YoY",
+}
 BH_COL_FLAG: str = "Flag"
 # The six additive level columns (millions of lbs) that roll up as sums.
 BH_LEVEL_COLS: tuple[str, ...] = tuple(
@@ -2893,8 +2911,10 @@ BH_LEVEL_COLS: tuple[str, ...] = tuple(
 BH_YOY_COLS: tuple[str, ...] = tuple(BH_YOY_LABELS.values())
 # Left → right metric order (the last column is the text Flag).
 BH_DISPLAY_ORDER: tuple[str, ...] = (
-    "L3M", "L3M YAG", "L6M", "L6M YAG", "L12M", "L12M YAG",
-    "L3M YoY", "L6M YoY", "L12M YoY", BH_COL_FLAG,
+    *BH_LEVEL_COLS[:2], BH_YOY_LABELS["L3M"],      # L3M orders + YAG + YoY
+    *BH_LEVEL_COLS[2:4], BH_YOY_LABELS["L6M"],      # L6M …
+    *BH_LEVEL_COLS[4:6], BH_YOY_LABELS["L12M"],     # L12M …
+    BH_COL_FLAG,
 )
 BH_PERCENT_COLS: frozenset = frozenset(BH_YOY_COLS)
 # Momentum classification thresholds (fraction, i.e. 0.005 = 0.5 pp).  The Flag
@@ -2908,17 +2928,19 @@ _BH_META_COLS: tuple[str, ...] = (COL_ROW_ID, COL_INDENT, COL_IS_SUBTOTAL, COL_I
 
 @dataclass(frozen=True)
 class BusinessHealthResult:
-    """Trailing-window order-momentum table + the window labels for the legend.
+    """Trailing-window momentum: the ORDER table + Total-B2C chart series.
 
-    ``table`` — one row per comparison-template row (metadata + the six level
-    columns + three YoY fractions + the text Flag), template order.
-    ``window_labels`` — ``{bucket: (current_range, year_ago_range)}`` where each
-    range is a human string like ``"Apr 2026 – Jun 2026"`` (drives the legend +
-    the explicit YoY definition).  ``prior_month`` — the anchor month.
+    ``table`` — one ORDER-based row per comparison-template row (metadata + the
+    six level columns + three Order-YoY fractions + the text Flag).
+    ``chart_series`` — Total-B2C volume + YoY per window for BOTH sources:
+    ``{"Orders": {bucket: {"vol": float, "yoy": float|None}}, "Shipments": …}``.
+    ``window_labels`` — ``{bucket: (current_range, year_ago_range)}`` human
+    strings for the legend + YoY definition.  ``prior_month`` — the anchor.
     """
     table: pd.DataFrame
     window_labels: dict[str, tuple[str, str]]
     prior_month: date
+    chart_series: dict[str, dict[str, dict[str, Optional[float]]]]
 
 
 def _month_range_label(months: set[date]) -> str:
@@ -2962,47 +2984,71 @@ def _bh_rollup(
     return totals
 
 
+def _bh_window_measures(
+    enriched: Optional[pd.DataFrame],
+    cur_windows: dict[str, set], yag_windows: dict[str, set],
+) -> dict[str, dict[str, float]]:
+    """Per-template-row six-window pound sums (millions) with subtotal roll-up.
+
+    Works on ANY enriched frame (orders or shipments) — both carry the same
+    ``pmaj/sfmt/pminor/brand/month/pounds``.  Empty frame → all zeros.
+    """
+    frame = enriched if enriched is not None else _empty_enriched(actuals=True)
+    month_ser = frame["month"] if not frame.empty else pd.Series([], dtype=object)
+    template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
+    measures: dict[str, dict[str, float]] = {}
+    for tpl in COMPARISON_TEMPLATE:
+        if tpl.is_subtotal:
+            continue
+        leaf = _leaf_mask(frame, tpl) if not frame.empty else month_ser
+        vals: dict[str, float] = {}
+        for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
+            if frame.empty:
+                vals[cur_lbl] = vals[yag_lbl] = 0.0
+            else:
+                vals[cur_lbl] = _sum_millions(frame, leaf & month_ser.isin(cur_windows[w]))
+                vals[yag_lbl] = _sum_millions(frame, leaf & month_ser.isin(yag_windows[w]))
+        measures[tpl.row_id] = vals
+    for tpl in COMPARISON_TEMPLATE:
+        if tpl.is_subtotal:
+            measures[tpl.row_id] = _bh_rollup(tpl, measures, template_by_id)
+    return measures
+
+
+def _bh_total_series(measures: dict[str, dict[str, float]]) -> dict[str, dict[str, Optional[float]]]:
+    """Total-B2C ``{bucket: {"vol": current, "yoy": fraction|None}}`` for the chart."""
+    tot = measures.get("total_b2c", {})
+    out: dict[str, dict[str, Optional[float]]] = {}
+    for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
+        cur, yag = tot.get(cur_lbl, 0.0), tot.get(yag_lbl, 0.0)
+        yoy = _safe_ratio(cur - yag, yag) if abs(yag) > 1e-9 else None
+        out[w] = {"vol": cur, "yoy": yoy}
+    return out
+
+
 def build_business_health(
-    orders_enriched: Optional[pd.DataFrame], prior_month: date,
+    orders_enriched: Optional[pd.DataFrame],
+    shipments_enriched: Optional[pd.DataFrame],
+    prior_month: date,
 ) -> BusinessHealthResult:
-    """Build the trailing-window order-momentum table from enriched IBP Orders.
+    """Trailing-window momentum from enriched IBP **Orders** (+ Shipments chart).
 
     For *prior_month* (first-of-month), the L3M / L6M / L12M windows END at that
     month (inclusive) and each YAG window is the same span one year earlier.
-    Every leaf's pounds are summed per window (millions), subtotals roll up, and
-    each row gets its three YoY fractions + a momentum Flag.  Degrades to zeros
-    (and blank Flags) when Orders are missing, so the table always renders.
+    The per-category **table** is ORDER-based (pound sums, YoY, momentum Flag);
+    the **chart** series carry Total-B2C volume + YoY for BOTH Orders and
+    Shipments.  Degrades to zeros (blank Flags) when a source is missing.
     """
     pm = prior_month.replace(day=1)
     cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
     yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
 
-    orders = orders_enriched if orders_enriched is not None else _empty_enriched(actuals=True)
-    month_ser = orders["month"] if not orders.empty else pd.Series([], dtype=object)
-    template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
-
-    # Leaf sums, then subtotal roll-ups (memo leaves compute directly, like the
-    # comparison template).
-    measures: dict[str, dict[str, float]] = {}
-    for tpl in COMPARISON_TEMPLATE:
-        if tpl.is_subtotal:
-            continue
-        leaf = _leaf_mask(orders, tpl) if not orders.empty else month_ser
-        vals: dict[str, float] = {}
-        for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
-            if orders.empty:
-                vals[cur_lbl] = vals[yag_lbl] = 0.0
-            else:
-                vals[cur_lbl] = _sum_millions(orders, leaf & month_ser.isin(cur_windows[w]))
-                vals[yag_lbl] = _sum_millions(orders, leaf & month_ser.isin(yag_windows[w]))
-        measures[tpl.row_id] = vals
-    for tpl in COMPARISON_TEMPLATE:
-        if tpl.is_subtotal:
-            measures[tpl.row_id] = _bh_rollup(tpl, measures, template_by_id)
+    order_measures = _bh_window_measures(orders_enriched, cur_windows, yag_windows)
+    ship_measures = _bh_window_measures(shipments_enriched, cur_windows, yag_windows)
 
     records: list[dict] = []
     for tpl in COMPARISON_TEMPLATE:
-        m = measures[tpl.row_id]
+        m = order_measures[tpl.row_id]
         row = {
             COL_ROW_ID: tpl.row_id, COL_INDENT: tpl.indent,
             COL_IS_SUBTOTAL: tpl.is_subtotal, COL_IS_MEMO: tpl.is_memo,
@@ -3020,14 +3066,19 @@ def build_business_health(
         records.append(row)
 
     df = pd.DataFrame.from_records(records)
-    ordered = [*_BH_META_COLS, BH_COL_CATEGORY, *BH_DISPLAY_ORDER]
-    df = df.loc[:, ordered]
+    df = df.loc[:, [*_BH_META_COLS, BH_COL_CATEGORY, *BH_DISPLAY_ORDER]]
 
     window_labels = {
         w: (_month_range_label(cur_windows[w]), _month_range_label(yag_windows[w]))
         for w in BH_WINDOW_MONTHS
     }
-    return BusinessHealthResult(table=df, window_labels=window_labels, prior_month=pm)
+    chart_series = {
+        "Orders": _bh_total_series(order_measures),
+        "Shipments": _bh_total_series(ship_measures),
+    }
+    return BusinessHealthResult(
+        table=df, window_labels=window_labels, prior_month=pm,
+        chart_series=chart_series)
 
 
 def build_prior_month_actual_vs_fcst_table(

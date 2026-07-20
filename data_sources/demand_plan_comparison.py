@@ -481,6 +481,12 @@ COL_PY_ACTUAL: str              = "py_actual"
 # so Last Plan = last_plan_actuals + last_plan_forecast (see _assemble_table).
 COL_LAST_PLAN_ACTUALS: str      = "last_plan_actuals"
 COL_LAST_PLAN_FORECAST: str     = "last_plan_forecast"
+# Prior-cycle forecast SPLIT by leg over the (prior) forecast window — the
+# additive counterparts of COL_CURRENT_PLAN_BASE / _RO.  Surfaced as display
+# columns only in the APS view (its cycle-over-cycle table breaks the R&O and
+# Base walk into prior-vs-current legs); IBP never shows them.
+COL_PRIOR_PLAN_BASE: str        = "prior_plan_base"
+COL_PRIOR_PLAN_RO: str          = "prior_plan_ro"
 COL_BASE_PLAN: str              = "base_plan"
 COL_R_AND_O: str                = "r_and_o"
 COL_BUDGET: str                 = "budget"
@@ -534,6 +540,7 @@ _ADDITIVE_COLS: tuple[str, ...] = (
     COL_PRIOR_MONTH_ACTUAL, COL_PRIOR_MONTH_FORECAST,
     COL_CURRENT_PLAN_ACTUAL, COL_CURRENT_PLAN_BASE, COL_CURRENT_PLAN_RO,
     COL_LAST_PLAN_ACTUALS, COL_LAST_PLAN_FORECAST,
+    COL_PRIOR_PLAN_BASE, COL_PRIOR_PLAN_RO,
     COL_R_AND_O, COL_BUDGET,
     COL_T3M_CUR, COL_T3M_PY, COL_T6M_CUR, COL_T6M_PY,
 )
@@ -584,6 +591,11 @@ DISPLAY_LABELS: dict[str, str] = {
     # (deliberately NOT in DISPLAY_ORDER, so the detailed table is unchanged).
     COL_T3M_YOY:               "T3M YoY",
     COL_T6M_YOY:               "T6M YoY",
+    # APS-only columns (added to the frame only in the APS view; NOT in
+    # DISPLAY_ORDER, so the IBP table + picker + download are unchanged).
+    COL_TOTAL_ACTUALS:         "Total Actual",
+    COL_PRIOR_PLAN_BASE:       "Prior Plan (Base)",
+    COL_PRIOR_PLAN_RO:         "Prior Plan (R&O)",
 }
 # Left → right order of the metric columns in the rendered table.  The two
 # Current Plan legs (Base / R&O) sit where the single forecast column used to;
@@ -1957,8 +1969,11 @@ def build_demand_plan_comparison(
         ro_var_from_tracker=ro_var_from_tracker,
     )
 
-    # 4 + 5. Assemble the display frame.
-    table = _assemble_table(artifacts.measures, artifacts.template)
+    # 4 + 5. Assemble the display frame.  The APS view (ro_var_from_tracker)
+    # also gets the Total Actual + prior-cycle Base / R&O leg columns.
+    table = _assemble_table(
+        artifacts.measures, artifacts.template,
+        include_prior_legs=ro_var_from_tracker)
     return ComparisonResult(
         table=table,
         warnings=artifacts.warnings,
@@ -2231,6 +2246,14 @@ def _compute_leaf_measures(
     last_plan_actuals = _sum_millions(ibp, ibp_mask & ibp_in_last_actual)
     last_plan_forecast = _sum_millions(
         trk, trk_mask & prior_cycle & is_base_or_ro & trk_in_prior_forecast)
+    # Prior-cycle forecast SPLIT by leg over the same (prior) forecast window —
+    # the additive counterparts of current_plan_base / _ro.  Always computed
+    # (cheap); the APS view surfaces them as its own columns and derives R&O Var
+    # from them, IBP keeps them internal.
+    prior_plan_base = _sum_millions(
+        trk, trk_mask & prior_cycle & is_base & trk_in_prior_forecast)
+    prior_plan_ro = _sum_millions(
+        trk, trk_mask & prior_cycle & is_ro & trk_in_prior_forecast)
 
     # ── R&O Var ──────────────────────────────────────────────────────
     # Default (IBP): the RO Summary Report's FY27 Probabilized Total Delta,
@@ -2240,8 +2263,6 @@ def _compute_leaf_measures(
     # forecast window — so it ties directly to the tracker rows.  Either way the
     # identity holds: Base Plan Var. = Total Delta − PM Actual − R&O (residual).
     if ro_var_from_tracker:
-        prior_plan_ro = _sum_millions(
-            trk, trk_mask & prior_cycle & is_ro & trk_in_prior_forecast)
         r_and_o = current_plan_ro - prior_plan_ro
     else:
         r_and_o = 0.0
@@ -2268,6 +2289,8 @@ def _compute_leaf_measures(
         COL_CURRENT_PLAN_RO: current_plan_ro,
         COL_LAST_PLAN_ACTUALS: last_plan_actuals,
         COL_LAST_PLAN_FORECAST: last_plan_forecast,
+        COL_PRIOR_PLAN_BASE: prior_plan_base,
+        COL_PRIOR_PLAN_RO: prior_plan_ro,
         COL_R_AND_O: r_and_o,
         COL_BUDGET: tpl.budget_m,
         COL_T3M_CUR: t3m_cur, COL_T3M_PY: t3m_py,
@@ -2328,13 +2351,17 @@ def _rollup_subtotal(
 def _assemble_table(
     measures: dict[str, dict[str, float]],
     template: tuple[TemplateRow, ...],
+    *,
+    include_prior_legs: bool = False,
 ) -> pd.DataFrame:
     """Return the display-ready table from per-row additive measures.
 
     Adds the derived + ratio columns, the indented label, the internal
     metadata columns (for the page's row styling), rounds metric values
     (two decimals for millions, four for ratios), and applies the display
-    column order + labels.
+    column order + labels.  ``include_prior_legs`` (APS view) appends the
+    Total Actual + prior-cycle Base / R&O legs to the frame — NOT to
+    DISPLAY_ORDER, so the IBP table / picker / download are unchanged.
     """
     records: list[dict] = []
     for tpl in template:
@@ -2408,6 +2435,12 @@ def _assemble_table(
             COL_T3M_YOY: t3m_yoy,
             COL_T6M_YOY: t6m_yoy,
         }
+        # APS-only legs (Total Actual + prior-cycle Base / R&O) — added to the
+        # frame only when requested, so the IBP frame stays byte-for-byte the same.
+        if include_prior_legs:
+            row[COL_TOTAL_ACTUALS] = m[COL_TOTAL_ACTUALS]
+            row[COL_PRIOR_PLAN_BASE] = m[COL_PRIOR_PLAN_BASE]
+            row[COL_PRIOR_PLAN_RO] = m[COL_PRIOR_PLAN_RO]
         records.append(row)
 
     df = pd.DataFrame.from_records(records)
@@ -2422,10 +2455,16 @@ def _assemble_table(
     # The trailing-YoY ratios ride alongside (not in DISPLAY_ORDER).
     for col in (COL_T3M_YOY, COL_T6M_YOY):
         df[col] = df[col].round(4)
+    _extra = (
+        (COL_TOTAL_ACTUALS, COL_PRIOR_PLAN_BASE, COL_PRIOR_PLAN_RO)
+        if include_prior_legs else ()
+    )
+    for col in _extra:
+        df[col] = df[col].round(_MILLIONS_DISPLAY_DECIMALS)
 
     # Final column order: metadata + label + metrics (display order) + the
-    # trailing-YoY extras, renamed to the screenshot labels.
-    ordered = [*_META_COLS, COL_LABEL, *DISPLAY_ORDER, COL_T3M_YOY, COL_T6M_YOY]
+    # trailing-YoY extras (+ APS legs when included), renamed to display labels.
+    ordered = [*_META_COLS, COL_LABEL, *DISPLAY_ORDER, COL_T3M_YOY, COL_T6M_YOY, *_extra]
     df = df.loc[:, ordered]
     return df.rename(columns=DISPLAY_LABELS)
 
@@ -2688,6 +2727,10 @@ class ComparisonKpis:
     pm_actual_var: Optional[float] = None
     base_plan_var: Optional[float] = None
     ro_var: Optional[float] = None
+    # Total Actual (shipments over the actual window) at Total B2C — populated
+    # only when the frame carries it (the APS view); drives the APS "Actl% of
+    # Current Plan" tile.  None for the IBP build.
+    total_actual_total: Optional[float] = None
 
 
 def _b2c_shipments_millions(
@@ -2773,6 +2816,7 @@ def build_comparison_kpis(
     pm_actual_var: Optional[float] = None
     base_plan_var: Optional[float] = None
     ro_var: Optional[float] = None
+    total_actual_total: Optional[float] = None
 
     if table is not None and not table.empty and COL_ROW_ID in table.columns:
         tot = table.loc[table[COL_ROW_ID] == "total_b2c"]
@@ -2796,6 +2840,7 @@ def build_comparison_kpis(
             pm_actual_var = _cell(row, COL_PM_ACTUAL)
             base_plan_var = _cell(row, COL_BASE_PLAN)
             ro_var = _cell(row, COL_R_AND_O)
+            total_actual_total = _cell(row, COL_TOTAL_ACTUALS)
 
     return ComparisonKpis(
         t3m_yoy=t3m_yoy, t6m_yoy=t6m_yoy,
@@ -2806,6 +2851,7 @@ def build_comparison_kpis(
         pm_actual_var=pm_actual_var,
         base_plan_var=base_plan_var,
         ro_var=ro_var,
+        total_actual_total=total_actual_total,
     )
 
 

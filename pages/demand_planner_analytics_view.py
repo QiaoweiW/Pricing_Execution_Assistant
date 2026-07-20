@@ -96,6 +96,11 @@ from data_sources.demand_plan_comparison import (
     COL_PM_ACTUAL as DPC_COL_PM_ACTUAL,
     COL_BASE_PLAN as DPC_COL_BASE_PLAN,
     COL_R_AND_O as DPC_COL_R_AND_O,
+    COL_CURRENT_PLAN_BASE as DPC_COL_CURRENT_PLAN_BASE,
+    COL_V_BUDGET as DPC_COL_V_BUDGET,
+    COL_TOTAL_ACTUALS as DPC_COL_TOTAL_ACTUALS,
+    COL_PRIOR_PLAN_BASE as DPC_COL_PRIOR_PLAN_BASE,
+    COL_PRIOR_PLAN_RO as DPC_COL_PRIOR_PLAN_RO,
     COL_PY_ACTUAL as DPC_COL_PY_ACTUAL,
     COL_O_PCT as DPC_COL_O_PCT,
     COL_BUDGET as DPC_COL_BUDGET,
@@ -3379,7 +3384,7 @@ def _render_aps_corp_review(history: Optional[pd.DataFrame]) -> None:
         )
         if history is None or history.empty:
             st.info(
-                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS)** "
+                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS / Oracle)** "
                 "above; the review lights up once the history file exists."
             )
             return
@@ -3444,7 +3449,7 @@ def _render_aps_corp_review(history: Optional[pd.DataFrame]) -> None:
 
 
 def _render_demand_summary_aps() -> None:
-    """Render the Demand Summary (APS) section — the upload-driven APS plan.
+    """Render the Demand Summary (APS / Oracle) section — the upload-driven APS plan.
 
     One foldable section containing, top → bottom: ① **upload & manage** (build
     the Base Plan leg from an APS bulk export **or** the R&O leg from an R&O
@@ -3453,9 +3458,9 @@ def _render_demand_summary_aps() -> None:
     Plan Comparison Summary** sub-section — the last two are native (nested)
     expanders available whenever the history file exists.  B2C-only.
     """
-    with st.expander("📈 Demand Summary (APS)", expanded=False):
+    with st.expander("📈 Demand Summary (APS / Oracle)", expanded=False):
         st.caption(
-            "**APS demand plan.**  Upload an **APS bulk export** (builds the "
+            "**APS / Oracle demand plan.**  Upload an **APS bulk export** (builds the "
             "**Base Plan** leg) **or** an **R&O seed** (builds the **R&O** leg), "
             "pick the **Cycle** + **Fiscal Year**, and the rows are shaped to the "
             "history schema (Portfolio / Supply by **item code** via PDH → "
@@ -5746,6 +5751,17 @@ def _fmt_pct_walk(frac: Optional[float]) -> tuple[str, str]:
     return f"{pct:+.1f}%", cls
 
 
+def _fmt_pct_share(frac: Optional[float]) -> tuple[str, str]:
+    """Format an unsigned share fraction → ("45.2%", "") for a KPI tile.
+
+    Neutral (no +/− sign, no up/down colour) — used for the APS "Actl% of
+    Current Plan" tile, which is a share of the plan, not a signed variance.
+    """
+    if frac is None or pd.isna(frac):
+        return "—", "flat"
+    return f"{frac * 100.0:.1f}%", ""
+
+
 def _render_comparison_kpis_yoy(kpis: ComparisonKpis) -> None:
     """Render the YoY / share KPI row (top of the section).
 
@@ -7191,7 +7207,7 @@ def _render_comparison_table_exports(
                 st.success(f"✅ Saved to `Files/{blob_path}` ({len(save_df)} rows).")
 
 
-# ── APS Demand Plan Comparison Summary (mirror of the IBP section) ───────────
+# ── APS / Oracle Demand Plan Comparison Summary (mirror of the IBP section) ───────────
 _APS_CMP_ENABLED_KEY: str = "aps_comparison_enabled"
 
 
@@ -7250,6 +7266,130 @@ def _cached_aps_comparison_options(
     return aps_cycles, ibp_cycles, months, combos
 
 
+def _render_aps_cycle_kpis(kpis: ComparisonKpis, filters: ComparisonFilters) -> None:
+    """APS cycle-over-cycle top metrics (its own tile set, distinct from IBP's).
+
+    Base Plan Var. · R&O Var. · Total Delta · Total Delta % · Actl% of Current
+    Plan.  Values are read off the Total B2C row (via ``kpis``) so they tie to
+    the table by construction.  Actl% = Total Actual ÷ Current Plan (incl. R&O).
+    """
+    prior_cy, current_cy = filters.prior_cycle, filters.current_cycle
+    total_delta = (
+        kpis.current_plan_total - kpis.last_plan_total
+        if kpis.current_plan_total is not None and kpis.last_plan_total is not None
+        else None)
+    total_delta_pct = (
+        total_delta / kpis.last_plan_total
+        if total_delta is not None and kpis.last_plan_total else None)
+    actl_pct = (
+        kpis.total_actual_total / kpis.current_plan_total
+        if kpis.total_actual_total is not None and kpis.current_plan_total else None)
+    tiles = (
+        ("Base Plan Var.", _fmt_millions(kpis.base_plan_var, signed=True),
+         f"{current_cy} vs {prior_cy} baseline forecast"),
+        ("R&O Var.", _fmt_millions(kpis.ro_var, signed=True),
+         f"{current_cy} vs {prior_cy} R&O forecast"),
+        ("Total Delta", _fmt_millions(total_delta, signed=True),
+         f"{current_cy} vs {prior_cy} total plan move"),
+        ("Total Delta %", _fmt_pct_walk(total_delta_pct),
+         f"{current_cy} vs {prior_cy}: total plan % change"),
+        ("Actl% of Current Plan", _fmt_pct_share(actl_pct),
+         f"actual shipments ÷ {current_cy} plan (incl. R&O)"),
+    )
+    cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk">'
+        f'<div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value {cls}">{_esc_html(text)}</div>'
+        f'<span class="k-sub">{_esc_html(sub)}</span></div>'
+        for label, (text, cls), sub in tiles
+    )
+    st.markdown(
+        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_aps_cycle_table(result, filters: ComparisonFilters) -> None:
+    """APS cycle-over-cycle table — a fixed prior-vs-current leg layout.
+
+    Columns (left→right): prior/current **Base** legs + Base Plan Var., then
+    prior/current **R&O** legs + R&O Var., then Total Actual, Current Plan
+    (incl. R&O), and the budget trio.  Plan legs are anchored on the chosen
+    cycles (e.g. ``C4 IBP Base`` / ``C5 Base``); the forecast / actual windows
+    show as a 2nd header line.  Fixed layout — no column picker.
+    """
+    table = result.table
+    if table is None or table.empty:
+        st.info("No comparison rows to display.")
+        return
+
+    L = DPC_DISPLAY_LABELS
+    cols = [
+        L[DPC_COL_PRIOR_PLAN_BASE], L[DPC_COL_CURRENT_PLAN_BASE], L[DPC_COL_BASE_PLAN],
+        L[DPC_COL_PRIOR_PLAN_RO], L[DPC_COL_CURRENT_PLAN_RO], L[DPC_COL_R_AND_O],
+        L[DPC_COL_TOTAL_ACTUALS], L[DPC_COL_CURRENT_PLAN],
+        L[DPC_COL_V_BUDGET], L[DPC_COL_PCT], L[DPC_COL_BUDGET],
+    ]
+    missing = [c for c in cols if c not in table.columns]
+    if missing:
+        st.warning(
+            "APS cycle table is missing expected columns "
+            f"({', '.join(missing)}) — was the build run in APS mode?"
+        )
+        return
+
+    prior_cy, current_cy = filters.prior_cycle, filters.current_cycle
+    fwin = f"({filters.forecast_start:%b%y}-{filters.forecast_end:%b%y})"
+    awin = f"({filters.actual_start:%b%y}-{filters.actual_end:%b%y})"
+    # Plan legs anchored on the chosen cycles; budget columns given the planner's
+    # preferred "vs Budget" wording.
+    header_labels = {
+        L[DPC_COL_PRIOR_PLAN_BASE]: f"{prior_cy} IBP Base",
+        L[DPC_COL_CURRENT_PLAN_BASE]: f"{current_cy} Base",
+        L[DPC_COL_PRIOR_PLAN_RO]: f"{prior_cy} IBP R&O",
+        L[DPC_COL_CURRENT_PLAN_RO]: f"{current_cy} R&O",
+        L[DPC_COL_CURRENT_PLAN]: f"{current_cy} Plan (incl. R&O)",
+        L[DPC_COL_V_BUDGET]: "vs Budget",
+        L[DPC_COL_PCT]: "vs Budget%",
+    }
+    # 2nd header line: the window each column covers (forecast vs actual).
+    period_labels = {
+        L[DPC_COL_PRIOR_PLAN_BASE]: fwin, L[DPC_COL_CURRENT_PLAN_BASE]: fwin,
+        L[DPC_COL_BASE_PLAN]: fwin,
+        L[DPC_COL_PRIOR_PLAN_RO]: fwin, L[DPC_COL_CURRENT_PLAN_RO]: fwin,
+        L[DPC_COL_R_AND_O]: fwin,
+        L[DPC_COL_TOTAL_ACTUALS]: awin,
+    }
+
+    subtotal_flags = table["_is_subtotal"].tolist()
+    memo_flags = table["_is_memo"].tolist()
+    row_ids = table["_row_id"].tolist() if "_row_id" in table.columns else None
+    indent_flags = table["_indent"].tolist() if "_indent" in table.columns else []
+
+    base_df = table.drop(
+        columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
+                 if c in table.columns]).reset_index(drop=True)
+    pct_label = L[DPC_COL_PCT]
+    display_df = base_df.copy()
+    if pct_label in display_df.columns:               # % is stored as a fraction
+        display_df[pct_label] = display_df[pct_label] * 100.0
+
+    _render_comparison_tree(
+        display_df, label_col=DPC_COL_LABEL, metric_cols=cols,
+        percent_labels=[pct_label], row_ids=row_ids,
+        subtotal_flags=subtotal_flags, memo_flags=memo_flags,
+        indent_flags=indent_flags, header_labels=header_labels,
+        period_labels=period_labels)
+
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        label="⬇️ Download APS / Oracle Cycle-over-Cycle (CSV)",
+        data=base_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"aps_cycle_over_cycle_{today}.csv",
+        mime="text/csv", key=_ns_key("aps_cycle_download", "aps"),
+        use_container_width=True)
+
+
 def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
     """APS mirror of Demand Plan Comparison Summary (no bias; incl. Prior Month).
 
@@ -7261,9 +7401,9 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
     IBP section (FY27 workbook by row-id); actuals reuse IBP Orders /
     Shipments.  All controls appear whenever the APS history file exists.
     """
-    with st.expander("🧭 APS Demand Plan Comparison Summary", expanded=False):
+    with st.expander("🧭 APS / Oracle Demand Plan Comparison Summary", expanded=False):
         st.caption(
-            "Compares the **APS plan** (current cycle, from the APS history "
+            "Compares the **APS / Oracle plan** (current cycle, from the APS history "
             "tracker) against a chosen **prior cycle of the IBP tracker** "
             "(`qry_mgmt_plan_history_tracker.csv`).  Same filters + YoY / summary "
             "/ mix / cycle-over-cycle / Prior-Month tables as the IBP section; "
@@ -7280,7 +7420,7 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
 
         if aps_hist is None or aps_hist.empty:
             st.info(
-                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS)** "
+                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS / Oracle)** "
                 "above; this comparison lights up once "
                 "`qry_mgmt_plan_full_aps_history.csv` exists."
             )
@@ -7321,13 +7461,13 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
 
         enabled = st.session_state.get(_APS_CMP_ENABLED_KEY, False)
         if st.button(
-            "▶️ Generate Demand Plan Comparison Summary (APS)",
+            "▶️ Generate Demand Plan Comparison Summary (APS / Oracle)",
             key="aps_cmp_generate", type="primary", use_container_width=True,
         ):
             enabled = True
             st.session_state[_APS_CMP_ENABLED_KEY] = True
         if not enabled:
-            st.info("👆 Click **Generate Demand Plan Comparison Summary (APS)** to build the tables.")
+            st.info("👆 Click **Generate Demand Plan Comparison Summary (APS / Oracle)** to build the tables.")
             return
 
         # Merge APS[current] + IBP[prior]; relabel prior on a label collision so
@@ -7406,8 +7546,10 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
 
         st.markdown("---")
         st.markdown("#### 🔄 Cycle over Cycle Comparison")
-        _render_comparison_kpis_walk(kpis, filters)
-        _render_demand_comparison_table(result, filters, ns="aps", allow_save=False)
+        # APS uses its OWN top metrics + table (prior-vs-current leg layout),
+        # distinct from the IBP walk/table.
+        _render_aps_cycle_kpis(kpis, filters)
+        _render_aps_cycle_table(result, filters)
         _render_prior_month_actual_vs_fcst_table(
             prior_month_vs_fcst, prior_cycle=filters.prior_cycle,
             prior_month=filters.prior_month, ns="aps")
@@ -7420,7 +7562,7 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
             st.caption(f"⚠️ {dim_warning}")
         dim_sig = _signature_for(dim_df)
         with st.expander(
-            "📋 APS Demand Plan Comparison & Drivers Validation", expanded=False,
+            "📋 APS / Oracle Demand Plan Comparison & Drivers Validation", expanded=False,
         ):
             _render_demand_comparison_driver_tables_cached(
                 enrich_sig, filters, dim_sig, enriched, dim_df, ns="aps")

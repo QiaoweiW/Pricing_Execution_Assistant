@@ -358,6 +358,44 @@ def test_ro_var_from_tracker_is_cycle_delta():
     assert round(identity, 6) == round(float(row["Total Delta"]), 6)
 
 
+def test_aps_prior_leg_columns_present_only_in_aps_mode():
+    """include_prior_legs (driven by ro_var_from_tracker) adds Total Actual +
+    prior-cycle Base / R&O columns to the APS frame; the IBP frame is unchanged."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4",
+         "pounds": 10_000_000.0},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4",
+         "pounds": 5_000_000.0},
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C3",
+         "pounds": 9_000_000.0},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C3",
+         "pounds": 3_000_000.0},
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": m, "pounds": p,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
+        for m, p in ((_APR, 1_000_000.0), (_MAY, 2_000_000.0), (_JUN, 4_000_000.0))
+    ])
+    aps = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={}, shift_last_plan_window=False,
+        ro_var_from_tracker=True)
+    row = aps.table.loc[aps.table["_row_id"] == "esl_lc_branded"].iloc[0]
+    assert float(row["Prior Plan (Base)"]) == 9.0    # C3 base over forecast window
+    assert float(row["Prior Plan (R&O)"]) == 3.0     # C3 R&O over forecast window
+    assert float(row["Total Actual"]) == 7.0         # Apr+May+Jun shipments
+    # IBP build (defaults) does NOT carry the APS-only columns.
+    ibp_res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={})
+    for col in ("Prior Plan (Base)", "Prior Plan (R&O)", "Total Actual"):
+        assert col not in ibp_res.table.columns
+
+
 def test_current_plan_split_o_pct_and_py_actual():
     """Current Plan (Base)/(R&O) split, O% = R&O/Current Plan, and PY Actual."""
     filters = _filters_apr_jun_actual()

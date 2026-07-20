@@ -38,6 +38,7 @@ from data_sources.demand_plan_comparison import (
     TemplateRow,
     _compute_leaf_measures,
     build_business_health,
+    build_sku_cycle_comparison,
     build_comparison_not_captured,
     build_demand_plan_comparison,
     build_comparison_kpis,
@@ -434,6 +435,45 @@ def test_business_health_windows_yoy_and_flag():
     # Window labels drive the legend + the explicit YoY definition.
     assert res.window_labels["L3M"] == ("Apr 2026 – Jun 2026", "Apr 2025 – Jun 2025")
     assert res.window_labels["L12M"] == ("Jul 2025 – Jun 2026", "Jul 2024 – Jun 2025")
+
+
+def test_sku_cycle_comparison_leg_buildup_and_filter():
+    """Per-SKU leg build-up (unshifted / APS): base + R&O legs, actual, plans,
+    deltas; dim filter narrows the SKUs."""
+    filters = _filters_apr_jun_actual()   # C4 current, C3 prior, Fcst Jul–Mar
+    esl = dict(item_key="100", item_desc="DG Milk", pmaj="ESL",
+               sfmt="Large Carton", pminor="", brand="Branded")
+    cult = dict(item_key="200", item_desc="Sour Cream Tub", pmaj="Cultured",
+                sfmt="Large Tub", pminor="Sour Cream", brand="Private")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4", "pounds": 10e6},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4", "pounds": 4e6},
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C3", "pounds": 8e6},
+        {**cult, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4", "pounds": 3e6},
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1",
+         "customer_name": "C", "month": _APR, "pounds": 2e6,
+         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"},
+    ])
+    out = build_sku_cycle_comparison(
+        trk, ibp, filters, shift_last_plan_window=False)
+    # Two SKUs present (ESL + Cultured), sorted by current plan desc → ESL first.
+    assert list(out["SKU"]) == ["DG Milk (100)", "Sour Cream Tub (200)"]
+    esl_row = out.iloc[0]
+    assert float(esl_row["C4 Base"]) == 10.0 and float(esl_row["C3 Base"]) == 8.0
+    assert float(esl_row["Base Δ"]) == 2.0
+    assert float(esl_row["C4 R&O"]) == 4.0 and float(esl_row["R&O Δ"]) == 4.0
+    assert float(esl_row["Total Actual"]) == 2.0
+    # Unshifted: both plans share the actual leg (2).  Current = 2+10+4 = 16;
+    # prior = 2+8+0 = 10; Total Δ = 6 = Base Δ(2) + R&O Δ(4) (actuals cancel).
+    assert float(esl_row["C4 Plan (incl R&O)"]) == 16.0
+    assert float(esl_row["C3 Plan (incl R&O)"]) == 10.0
+    assert float(esl_row["Total Δ"]) == 6.0
+    # Dim filter narrows to ESL only.
+    only_esl = build_sku_cycle_comparison(
+        trk, ibp, filters, dim_filter={"pmaj": {"ESL"}}, shift_last_plan_window=False)
+    assert list(only_esl["SKU"]) == ["DG Milk (100)"]
 
 
 def test_current_plan_split_o_pct_and_py_actual():

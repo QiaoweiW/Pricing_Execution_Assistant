@@ -3081,6 +3081,122 @@ def build_business_health(
         chart_series=chart_series)
 
 
+# ── SKU-level cycle-over-cycle build-up ──────────────────────────────────────
+# The SKUs that compose the cycle-over-cycle roll-up rows, one row per item.
+# Leg build-up only (Base + R&O legs, prior vs current cycle, + actuals →
+# prior/current plan + deltas) — Budget / RO-Summary R&O are per hierarchy row,
+# not per SKU, so they are intentionally absent.
+
+SKU_CYCLE_ITEM: str = "SKU"
+
+
+def _apply_sku_dim_filter(
+    df: Optional[pd.DataFrame], dim_filter: Optional[dict[str, set]],
+) -> Optional[pd.DataFrame]:
+    """Keep rows whose pmaj / pminor / brand / sfmt ∈ the selected values.
+
+    Each dimension is an INCLUDE whitelist (empty / absent = keep all); the
+    filters AND together.
+    """
+    if df is None or df.empty or not dim_filter:
+        return df
+    mask = pd.Series(True, index=df.index)
+    for col, vals in dim_filter.items():
+        if vals and col in df.columns:
+            mask &= df[col].astype(str).str.strip().isin(set(vals))
+    return df[mask]
+
+
+def build_sku_cycle_comparison(
+    enriched_tracker: Optional[pd.DataFrame],
+    enriched_ibp: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    *,
+    dim_filter: Optional[dict[str, set]] = None,
+    shift_last_plan_window: bool = True,
+) -> pd.DataFrame:
+    """One-row-per-SKU build-up of the cycle-over-cycle comparison.
+
+    Columns (cycle-anchored): ``{prior} Base``, ``{current} Base``, ``Base Δ``,
+    ``{prior} R&O``, ``{current} R&O``, ``R&O Δ``, ``Total Actual``,
+    ``{prior} Plan (incl R&O)``, ``{current} Plan (incl R&O)``, ``Total Δ`` — all
+    in millions of lbs.  Windows match the section: current-cycle forecast over
+    the forecast window, prior-cycle forecast over the (optionally shifted)
+    prior window, actuals over the actual window.  Sorted by current-cycle plan
+    descending; SKUs with no activity in any window are dropped.
+    """
+    trk = _apply_sku_dim_filter(
+        enriched_tracker if enriched_tracker is not None else _empty_enriched(),
+        dim_filter)
+    ibp = _apply_sku_dim_filter(
+        enriched_ibp if enriched_ibp is not None else _empty_enriched(actuals=True),
+        dim_filter)
+
+    actual_months = _months_in_range(filters.actual_start, filters.actual_end)
+    forecast_months = _months_in_range(filters.forecast_start, filters.forecast_end)
+    if shift_last_plan_window:
+        last_actual = _months_in_range(filters.actual_start, _prev_month(filters.actual_end))
+        prior_forecast = _months_in_range(_prev_month(filters.forecast_start), filters.forecast_end)
+    else:
+        last_actual, prior_forecast = actual_months, forecast_months
+    cur, pri = str(filters.current_cycle), str(filters.prior_cycle)
+
+    # Per-item tracker leg sums (current + prior cycle, Base + R&O).
+    if trk is None or trk.empty:
+        g = pd.DataFrame(columns=["item_key", "item_desc", "_cb", "_cr", "_pb", "_pr"])
+    else:
+        t = trk.copy()
+        z = t["pounds"]
+        is_base = t["forecast_type"] == FORECAST_BASE_PLAN
+        is_ro = t["forecast_type"] == FORECAST_R_AND_O
+        c = t["cycle"].astype(str).str.strip() == cur
+        p = t["cycle"].astype(str).str.strip() == pri
+        in_fc = t["month"].isin(forecast_months)
+        in_pfc = t["month"].isin(prior_forecast)
+        t["_cb"] = z.where(c & is_base & in_fc, 0.0)
+        t["_cr"] = z.where(c & is_ro & in_fc, 0.0)
+        t["_pb"] = z.where(p & is_base & in_pfc, 0.0)
+        t["_pr"] = z.where(p & is_ro & in_pfc, 0.0)
+        g = t.groupby(["item_key", "item_desc"], as_index=False)[
+            ["_cb", "_cr", "_pb", "_pr"]].sum()
+
+    # Per-item actuals (current window + the last-plan actual window).
+    if ibp is None or ibp.empty:
+        gi = pd.DataFrame(columns=["item_key", "_ta", "_la"])
+    else:
+        i = ibp.copy()
+        z = i["pounds"]
+        i["_ta"] = z.where(i["month"].isin(actual_months), 0.0)
+        i["_la"] = z.where(i["month"].isin(last_actual), 0.0)
+        gi = i.groupby("item_key", as_index=False)[["_ta", "_la"]].sum()
+
+    m = g.merge(gi, on="item_key", how="outer")
+    for col in ("_cb", "_cr", "_pb", "_pr", "_ta", "_la"):
+        m[col] = m[col].fillna(0.0) / _LBS_PER_MILLION
+    m["item_desc"] = m["item_desc"].fillna("")
+    m["current_plan"] = m["_ta"] + m["_cb"] + m["_cr"]
+    m["prior_plan"] = m["_la"] + m["_pb"] + m["_pr"]
+    # Drop SKUs with no activity in ANY window (avoids a wall of zero rows).
+    activity = m[["_cb", "_cr", "_pb", "_pr", "_ta", "_la"]].abs().sum(axis=1)
+    m = m[activity > 1e-9]
+
+    r = _MILLIONS_DISPLAY_DECIMALS
+    cur_plan_col = f"{cur} Plan (incl R&O)"
+    out = pd.DataFrame({
+        SKU_CYCLE_ITEM: (m["item_desc"].astype(str).str.strip()
+                         + " (" + m["item_key"].astype(str) + ")").str.strip(),
+        f"{pri} Base": m["_pb"].round(r), f"{cur} Base": m["_cb"].round(r),
+        "Base Δ": (m["_cb"] - m["_pb"]).round(r),
+        f"{pri} R&O": m["_pr"].round(r), f"{cur} R&O": m["_cr"].round(r),
+        "R&O Δ": (m["_cr"] - m["_pr"]).round(r),
+        "Total Actual": m["_ta"].round(r),
+        f"{pri} Plan (incl R&O)": m["prior_plan"].round(r),
+        cur_plan_col: m["current_plan"].round(r),
+        "Total Δ": (m["current_plan"] - m["prior_plan"]).round(r),
+    })
+    return out.sort_values(cur_plan_col, ascending=False).reset_index(drop=True)
+
+
 def build_prior_month_actual_vs_fcst_table(
     tracker_df: Optional[pd.DataFrame],
     ibp_shipments_df: Optional[pd.DataFrame],

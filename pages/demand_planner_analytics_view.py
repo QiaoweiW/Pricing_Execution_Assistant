@@ -142,6 +142,7 @@ from data_sources.demand_plan_comparison import (
     build_prior_month_shipment_diagnostic,
     build_pm_actual_driver_table,
     build_business_health,
+    build_sku_cycle_comparison,
     BusinessHealthResult,
     BH_COL_CATEGORY,
     BH_COL_FLAG,
@@ -5754,6 +5755,9 @@ def _render_demand_plan_comparison_fragment() -> None:
     #    on the chosen prior / current cycles).
     _render_demand_comparison_table(result, filters)
 
+    # 7b. SKU-level build-up of the cycle-over-cycle rows (foldable, filterable).
+    _render_sku_cycle_drilldown(enriched, filters, ns="", shift_last_plan_window=True)
+
     # 8. Prior Month Actual vs Fcst summary (between comparison and drivers).
     _render_prior_month_actual_vs_fcst_table(
         prior_month_vs_fcst,
@@ -8064,6 +8068,9 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
         # distinct from the IBP walk/table.
         _render_aps_cycle_kpis(kpis, filters)
         _render_aps_cycle_table(result, filters)
+        # SKU-level build-up of the APS cycle-over-cycle rows (unshifted window).
+        _render_sku_cycle_drilldown(
+            enriched, filters, ns="aps", shift_last_plan_window=False)
         _render_prior_month_actual_vs_fcst_table(
             prior_month_vs_fcst, prior_cycle=filters.prior_cycle,
             prior_month=filters.prior_month, ns="aps")
@@ -8536,6 +8543,66 @@ def _render_prior_month_shipment_diagnostic(
             mime="text/csv",
             key="dpc_prior_month_diag_dl",
         )
+
+
+def _sku_dim_options(trk: Optional[pd.DataFrame], col: str) -> list[str]:
+    """Sorted distinct non-blank values of a dimension column on the tracker."""
+    if trk is None or getattr(trk, "empty", True) or col not in trk.columns:
+        return []
+    vals = trk[col].astype(str).str.strip()
+    return sorted({v for v in vals.tolist() if v and v.lower() != "nan"})
+
+
+def _render_sku_cycle_drilldown(
+    enriched, filters: ComparisonFilters, *,
+    ns: str = "", shift_last_plan_window: bool = True,
+) -> None:
+    """Foldable SKU-level build-up of the cycle-over-cycle table above.
+
+    Dimension search filters (Portfolio Major / Minor / Brand / Supply Format,
+    empty = all) narrow to the SKUs that compose the roll-up rows; the table is
+    the leg build-up (Base + R&O legs, prior vs current cycle, + actuals → plans
+    + deltas), sorted by current-cycle plan.  Native ``st.dataframe`` so columns
+    sort / hide / resize for free.  ``shift_last_plan_window`` matches the
+    section (IBP shifted, APS unshifted).
+    """
+    trk = getattr(enriched, "tracker", None)
+    ibp = getattr(enriched, "ibp", None)
+    with st.expander("🔬 SKU-level cycle-over-cycle drill-in", expanded=False):
+        st.caption(
+            "The individual **SKUs** that build up to the cycle-over-cycle rows "
+            "above.  Filter by **Portfolio Major / Portfolio Minor / Brand / "
+            "Supply Format** (empty = all); sorted by current-cycle plan.  Leg "
+            "build-up in **millions of lbs** — Budget / RO-Summary R&O are per "
+            "hierarchy row, not per SKU, so they aren't shown here."
+        )
+        cols = st.columns(4)
+        dim_filter: dict[str, set] = {}
+        for (key, label), slot in zip(
+            (("pmaj", "Portfolio Major"), ("pminor", "Portfolio Minor"),
+             ("brand", "Brand"), ("sfmt", "Supply Format")), cols):
+            with slot:
+                sel = st.multiselect(
+                    label, options=_sku_dim_options(trk, key),
+                    key=_ns_key(f"sku_{key}", ns), placeholder="All")
+            if sel:
+                dim_filter[key] = set(sel)
+        sku_df = build_sku_cycle_comparison(
+            trk, ibp, filters, dim_filter=dim_filter,
+            shift_last_plan_window=shift_last_plan_window)
+        if sku_df.empty:
+            st.info("No SKUs match the current filters.")
+            return
+        st.caption(f"**{len(sku_df):,}** SKU(s)")
+        st.dataframe(
+            sku_df, use_container_width=True, hide_index=True,
+            height=min(35 * (len(sku_df) + 1) + 38, 640))
+        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+        st.download_button(
+            "⬇️ Download SKU drill-in (CSV)",
+            data=sku_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"sku_cycle_over_cycle_{ns or 'ibp'}_{today}.csv",
+            mime="text/csv", key=_ns_key("sku_cycle_dl", ns))
 
 
 def _render_demand_comparison_driver_tables_cached(

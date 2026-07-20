@@ -7412,7 +7412,8 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
             "R&O rows — current-cycle APS R&O minus prior-cycle IBP R&O over the "
             "forecast window (unlike the IBP section, which reads the RO Summary "
             "Report).  Cross-check it against the 🔁 RO Comparison table.  "
-            "**PM Actual Var. + Base Plan Var. + R&O Var. = Total Delta.**"
+            "**Base Plan Var. + R&O Var. = Total Delta** (both are current − prior "
+            "leg deltas over the forecast window)."
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
@@ -7521,7 +7522,12 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
         result = ComparisonResult(
             table=table, warnings=build_warnings, ro_summary_available=ro_available)
 
+        # APS derives R&O from the tracker (not the RO Summary Report), so the
+        # builder's "RO Summary unavailable → R&O is zero" advisory does NOT
+        # apply here — drop it so it doesn't read as a failed generation.
         for msg in list(build_warnings) + list(budget_warnings):
+            if "RO Summary Report" in msg:
+                continue
             st.warning(f"⚠️ {msg}")
 
         # Not-captured log (same design as the IBP section): rows that meet the

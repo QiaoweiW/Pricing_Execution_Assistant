@@ -613,6 +613,23 @@ _BH_CURATED_ROWS: tuple[str, ...] = (
     "cult_cottage_cheese", "cult_sour_cream", "fresh_milk", "butter",
 )
 _BH_TABLE_COLS_KEY: str = "business_health_table_cols"
+# Executive names for the trailing windows (chart + legend): the newest window
+# reads as near-term "Momentum", the mid window as the "Trajectory", and the
+# full year as the structural "Run-Rate".  The L-code is kept in parentheses so
+# the chart still ties cleanly to the L3M / L6M / L12M table columns.
+_BH_WINDOW_NICE: dict[str, str] = {
+    "L3M": "Momentum", "L6M": "Trajectory", "L12M": "Run-Rate",
+}
+
+
+def _bh_window_display(code: str) -> str:
+    """Catchy window name with its L-code, e.g. ``"Momentum (L3M)"``."""
+    return f"{_BH_WINDOW_NICE.get(code, code)} ({code})"
+
+
+# Chart font palette — dark gray, sized up from Plotly's light-gray defaults for
+# executive legibility.
+_BH_FONT_COLOR: str = "#3a3a3a"
 # Green/red for signed YoY + Flag, layered onto the shared tree styling.
 _BH_EXTRA_CSS: str = """
 <style>
@@ -743,10 +760,11 @@ def _render_business_health_dim_filters(
 
 
 def _render_business_health_legend(result: "BusinessHealthResult") -> None:
-    """One-line legend spelling out each window's exact month range (current)."""
+    """One-line legend mapping each catchy window name → exact month range."""
     wl = result.window_labels
     parts = " · ".join(
-        f"**{w}** {wl[w][0]}  _(vs {wl[w][1]})_" for w in ("L3M", "L6M", "L12M"))
+        f"**{_bh_window_display(w)}** {wl[w][0]}  _(vs {wl[w][1]})_"
+        for w in ("L3M", "L6M", "L12M"))
     st.markdown(
         f"📅 **Windows** ending **{result.prior_month:%b %Y}** — {parts}")
 
@@ -763,7 +781,8 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
         st.info("No Total B2C row to chart.")
         return
     row = tot.iloc[0]
-    order = ["L12M", "L6M", "L3M"]
+    order = ["L12M", "L6M", "L3M"]                 # widest → narrowest
+    labels = [_bh_window_display(w) for w in order]  # Run-Rate (L12M) …
     vols = [float(row[w]) for w in order]
 
     def _yoy_pct(w: str) -> Optional[float]:
@@ -771,29 +790,39 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
         return None if v is None or pd.isna(v) else float(v) * 100.0
 
     yoys = [_yoy_pct(w) for w in order]
+    # Dark-gray label fonts, sized up from Plotly's light-gray defaults.
+    axis_title = dict(size=14, color=_BH_FONT_COLOR)
+    tick_font = dict(size=13, color=_BH_FONT_COLOR)
+    label_font = dict(size=14, color=_BH_FONT_COLOR)
 
     fig = go.Figure()
     fig.add_bar(
-        x=order, y=vols, name="Order volume (M lbs)", yaxis="y2",
+        x=labels, y=vols, name="Order volume (M lbs)", yaxis="y2",
         marker_color=["#bdd7ee", "#6fa8dc", "#1f4e79"],
         text=[f"{v:,.0f}" for v in vols], textposition="outside",
+        textfont=label_font,
         hovertemplate="%{x}: %{y:,.1f} M lbs<extra></extra>",
     )
     fig.add_scatter(
-        x=order, y=yoys, name="YoY %", yaxis="y", mode="lines+markers+text",
+        x=labels, y=yoys, name="YoY %", yaxis="y", mode="lines+markers+text",
         line=dict(color="#c0392b", dash="dot", width=2),
         marker=dict(color="#c0392b", size=9),
         text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
-        textposition="top center",
+        textposition="top center", textfont=dict(size=14, color=_BH_FONT_COLOR),
         hovertemplate="%{x} YoY: %{y:+.1f}%<extra></extra>",
     )
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=34, b=10),
-        yaxis=dict(title="YoY %", ticksuffix="%", side="left", zeroline=True,
-                   zerolinecolor="#d0d0d0"),
-        yaxis2=dict(title="Order volume (M lbs)", overlaying="y", side="right",
-                    showgrid=False, rangemode="tozero"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        font=dict(color=_BH_FONT_COLOR, size=13),   # base font: dark gray, bigger
+        xaxis=dict(tickfont=label_font),
+        yaxis=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
+                   side="left", zeroline=True, zerolinecolor="#d0d0d0",
+                   tickfont=tick_font),
+        yaxis2=dict(title=dict(text="Order volume (M lbs)", font=axis_title),
+                    overlaying="y", side="right", showgrid=False,
+                    rangemode="tozero", tickfont=tick_font),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                    font=dict(size=13, color=_BH_FONT_COLOR)),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="business_health_chart")

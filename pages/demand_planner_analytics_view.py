@@ -865,28 +865,41 @@ def _bh_plain_label(indented: str) -> str:
     return str(indented).replace(" ", "").replace("•", "").strip()
 
 
-def _render_business_health_rename(tdf: pd.DataFrame) -> dict[str, str]:
-    """Session-only per-row rename controls; returns ``{row_id: new_name}``.
+def _bh_name_overrides(tdf: pd.DataFrame) -> dict[str, str]:
+    """Read the session-only category renames → ``{row_id: new_name}``.
+
+    Read-only (no widgets), so the table can apply the overrides even though the
+    rename controls render BELOW it — the text boxes write ``bh_name_<row_id>``
+    to session_state, which this reads on the next rerun.
+    """
+    overrides: dict[str, str] = {}
+    for rid, cat in zip(tdf["_row_id"].tolist(), tdf[BH_COL_CATEGORY].tolist()):
+        plain = _bh_plain_label(cat)
+        val = str(st.session_state.get(f"bh_name_{rid}", "") or "").strip()
+        if val and val != plain:
+            overrides[rid] = val
+    return overrides
+
+
+def _render_business_health_rename(tdf: pd.DataFrame) -> None:
+    """Session-only per-row rename controls, rendered BELOW the table.
 
     A collapsed expander with one text box per category (default = its current
     name).  Edits live in ``st.session_state`` for the session only — nothing is
-    written back to Fabric — and are applied to the table's Category labels.
+    written to Fabric — and are picked up by :func:`_bh_name_overrides` on the
+    next rerun, so the table above reflects the rename.
     """
     pairs = list(zip(tdf["_row_id"].tolist(),
                      [_bh_plain_label(c) for c in tdf[BH_COL_CATEGORY].tolist()]))
-    overrides: dict[str, str] = {}
     with st.expander("✏️ Rename categories (this view only)", expanded=False):
         st.caption(
             "Rename any category for **this view only** — applies to the table "
-            "below; not saved to Fabric."
+            "above; not saved to Fabric."
         )
         cols = st.columns(2)
         for i, (rid, plain) in enumerate(pairs):
             with cols[i % 2]:
-                val = st.text_input(plain, value=plain, key=f"bh_name_{rid}").strip()
-            if val and val != plain:
-                overrides[rid] = val
-    return overrides
+                st.text_input(plain, value=plain, key=f"bh_name_{rid}")
 
 
 def _render_business_health_table(result: "BusinessHealthResult") -> None:
@@ -908,8 +921,9 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
 
     all_labels = list(BH_DISPLAY_ORDER)
     cols = _picked_columns(_BH_TABLE_COLS_KEY, all_labels)
-    # One-time, session-only category renames (e.g. "Butter" → "Butter Branded").
-    name_overrides = _render_business_health_rename(tdf)
+    # Session-only category renames — read here (applied to the table), but the
+    # edit controls render BELOW the table (see the call at the end).
+    name_overrides = _bh_name_overrides(tdf)
 
     # 2nd header line: each level column's exact month range (drives clarity).
     wl = result.window_labels
@@ -985,6 +999,8 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
                       ).to_csv(index=False).encode("utf-8"),
         file_name=f"business_health_{today}.csv", mime="text/csv",
         key="business_health_download", use_container_width=True)
+    # Rename controls render BELOW the table (edits apply on the next rerun).
+    _render_business_health_rename(tdf)
 
 
 def _render_ro_comparison() -> None:

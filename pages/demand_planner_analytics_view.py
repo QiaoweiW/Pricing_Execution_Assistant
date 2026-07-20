@@ -807,72 +807,54 @@ def _render_business_health_legend(result: "BusinessHealthResult") -> None:
         f"📅 **Windows** ending **{result.prior_month:%b %Y}** — {parts}")
 
 
-# Business Health chart palette — Orders vs Shipments kept visually distinct:
-# a blue family for Order volume + a red dotted line for Order YoY; a green
-# family for Shipment volume + a teal dotted line for Shipment YoY.
+# Business Health chart palette — Orders vs Shipments YoY lines kept visually
+# distinct: a red dotted line for Order YoY, a teal dotted line for Shipment YoY.
 _BH_CHART_STYLE: dict[str, dict] = {
-    "Orders":    {"bars": ["#bdd7ee", "#6fa8dc", "#1f4e79"], "line": "#c0392b"},
-    "Shipments": {"bars": ["#c6e0b4", "#8fce7f", "#548235"], "line": "#137d78"},
+    "Orders":    {"line": "#c0392b"},
+    "Shipments": {"line": "#137d78"},
 }
 
 
 def _render_business_health_chart(result: "BusinessHealthResult") -> None:
-    """Dual-axis chart: Order + Shipment volume bars (right) + dotted YoY% lines
-    (left), colour-coded per source.
+    """YoY-focused chart: dotted Order-YoY + Shipment-YoY lines (no volume bars).
 
-    X axis = L12M → L6M → L3M (widest → narrowest).  Values are the Total B2C
-    row for each source, so the chart ties to the table's top row.
+    Single axis (YoY %, zero-based).  X axis = L12M → L6M → L3M (widest →
+    narrowest).  Values are the Total B2C row for each source, so the chart ties
+    to the table's top row.
     """
     order = ["L12M", "L6M", "L3M"]                    # widest → narrowest
     labels = [_bh_window_display(w) for w in order]   # Run-Rate (L12M) …
-    axis_title = dict(size=14, color=_BH_FONT_COLOR)
-    tick_font = dict(size=13, color=_BH_FONT_COLOR)
-    label_font = dict(size=14, color=_BH_FONT_COLOR)
+    axis_title = dict(size=15, color=_BH_FONT_COLOR)
+    tick_font = dict(size=14, color=_BH_FONT_COLOR)
+    label_font = dict(size=15, color=_BH_FONT_COLOR)
 
-    # Axis layering: Plotly draws the OVERLAYING axis's traces on top of the base
-    # axis's.  Volume bars on the base axis (y, right); the YoY lines on the
-    # OVERLAYING axis (y2, left) so every dot renders ON TOP of the bars — a low
-    # dot inside a tall bar would otherwise be hidden behind it.
     fig = go.Figure()
     for src in ("Orders", "Shipments"):
         series = result.chart_series.get(src, {})
-        vols = [float(series.get(w, {}).get("vol") or 0.0) for w in order]
         yoys = [
             (None if series.get(w, {}).get("yoy") is None
              else float(series[w]["yoy"]) * 100.0)
             for w in order
         ]
-        style = _BH_CHART_STYLE[src]
-        fig.add_bar(
-            x=labels, y=vols, name=f"{src} volume (M lbs)", yaxis="y",
-            marker_color=style["bars"],
-            text=[f"{v:,.0f}" for v in vols], textposition="outside",
-            textfont=label_font,
-            hovertemplate=f"{src} %{{x}}: %{{y:,.1f}} M lbs<extra></extra>",
-        )
+        color = _BH_CHART_STYLE[src]["line"]
         fig.add_scatter(
-            x=labels, y=yoys, name=f"{src} YoY %", yaxis="y2",
-            mode="lines+markers+text",
-            line=dict(color=style["line"], dash="dot", width=2),
-            marker=dict(color=style["line"], size=10, line=dict(color="white", width=1.5)),
+            x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers+text",
+            line=dict(color=color, dash="dot", width=3),
+            marker=dict(color=color, size=11, line=dict(color="white", width=1.5)),
             text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
-            textposition="top center", textfont=dict(size=13, color=style["line"]),
+            textposition="top center", textfont=dict(size=14, color=color),
             hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
         )
     fig.update_layout(
-        height=360, margin=dict(l=10, r=10, t=40, b=10), barmode="group",
-        font=dict(color=_BH_FONT_COLOR, size=13),   # base font: dark gray, bigger
+        height=340, margin=dict(l=10, r=10, t=44, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=14),   # base font: dark gray, bigger
         xaxis=dict(tickfont=label_font),
-        # Base axis = volume (right); overlaying axis = YoY % (left, on top).
-        yaxis=dict(title=dict(text="Volume (M lbs)", font=axis_title),
-                   side="right", showgrid=False, rangemode="tozero",
-                   tickfont=tick_font),
-        yaxis2=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
-                    overlaying="y", side="left", zeroline=True,
-                    zerolinecolor="#d0d0d0", showgrid=True, gridcolor="#eeeeee",
-                    tickfont=tick_font),
+        # Single YoY axis, zero-based so 0 is the reference line.
+        yaxis=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
+                   rangemode="tozero", zeroline=True, zerolinecolor="#9ca3af",
+                   showgrid=True, gridcolor="#eeeeee", tickfont=tick_font),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=12, color=_BH_FONT_COLOR)),
+                    font=dict(size=15, color=_BH_FONT_COLOR)),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="business_health_chart")

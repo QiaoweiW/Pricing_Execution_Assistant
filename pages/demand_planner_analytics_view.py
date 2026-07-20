@@ -712,11 +712,13 @@ def _render_business_health() -> None:
 
 
 # Dimension columns on the enriched-orders frame (PDH-derived) the Business
-# Health filters act on, with their display labels.
+# Health filters act on, with their display labels.  ``brand`` is the existing
+# Branded-vs-Private rule (``_vectorised_brand`` in enrich_ibp_orders_df).
 _BH_DIM_FILTERS: tuple[tuple[str, str], ...] = (
     ("pmaj", "Portfolio Major"),
     ("pminor", "Portfolio Minor"),
     ("sfmt", "Supply Format"),
+    ("brand", "Brand (Branded / Private)"),
 )
 
 

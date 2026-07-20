@@ -106,8 +106,6 @@ from data_sources.demand_plan_comparison import (
     COL_BUDGET as DPC_COL_BUDGET,
     COL_PCT as DPC_COL_PCT,
     COL_ROW_ID as DPC_COL_ROW_ID,
-    COL_T3M_YOY as DPC_COL_T3M_YOY,
-    COL_T6M_YOY as DPC_COL_T6M_YOY,
     DRV_COL_PMAJ,
     DRV_COL_SFMT,
     DRV_COL_BRAND,
@@ -150,6 +148,7 @@ from data_sources.demand_plan_comparison import (
     BH_DISPLAY_ORDER,
     BH_PERCENT_COLS,
     BH_LEVEL_LABELS,
+    BH_YOY_LABELS,
     BH_FLAG_RISING,
     BH_FLAG_FALLING,
     comparison_to_csv_bytes,
@@ -5316,6 +5315,58 @@ class _ComparisonSupportingSources:
     budget_lookup_key: tuple
 
 
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_comparison_order_yoy(
+    prior_month: date,
+) -> tuple[dict[str, dict[str, Optional[float]]], dict[str, tuple[str, str]]]:
+    """Per-row **L3M / L6M Order YoY** + window labels, anchored on *prior_month*.
+
+    Loads the 24 months of IBP Orders the L12M current + year-ago windows need,
+    enriches them, and reuses :func:`build_business_health` (orders only) so the
+    comparison's L3M/L6M Order YoY reconcile with the Business Health section by
+    construction.  Returns ``({row_id: {"L3M": frac|None, "L6M": frac|None}},
+    window_labels)``; a failed Orders read degrades to empty (blank YoY).
+    """
+    cur12 = last_n_months(prior_month, 12)
+    window = tuple(sorted(cur12 | {shift_year_back(m) for m in cur12}))
+    try:
+        orders_df, _ = _load_demand_comparison_ibp_orders(months=window)
+        enriched = enrich_ibp_orders_df(orders_df, _load_demand_comparison_pdh())
+    except (LakehouseIOError, ValueError):
+        enriched = None
+    res = build_business_health(enriched, None, prior_month)
+    yoy = {
+        str(r[DPC_COL_ROW_ID]): {
+            "L3M": r[BH_YOY_LABELS["L3M"]], "L6M": r[BH_YOY_LABELS["L6M"]]}
+        for _, r in res.table.iterrows()
+    }
+    return yoy, res.window_labels
+
+
+def _comparison_period_labels(
+    filters: ComparisonFilters, order_labels: dict[str, tuple[str, str]],
+) -> dict[str, str]:
+    """Month-range 2nd-row strings for the YoY summary columns / tiles.
+
+    Keyed by the summary column HEADER so both the table header and the metric
+    tiles can look each range up.  Base Plan spells out its two legs explicitly
+    (actuals over the Actual window + baseline over the Forecast window).
+    """
+    def _rng(a: date, b: date) -> str:
+        return f"{a:%b%y}–{b:%b%y}"
+
+    actual = _rng(filters.actual_start, filters.actual_end)
+    forecast = _rng(filters.forecast_start, filters.forecast_end)
+    py = _rng(shift_year_back(filters.actual_start), shift_year_back(filters.forecast_end))
+    return {
+        "Base plan": f"{actual} Actual + {forecast} Fcst",
+        "PY": py,
+        "R&O vol": forecast,
+        "L3M Order YoY": order_labels.get("L3M", ("", ""))[0],
+        "L6M Order YoY": order_labels.get("L6M", ("", ""))[0],
+    }
+
+
 def _load_comparison_supporting_sources(
     filters: ComparisonFilters,
 ) -> _ComparisonSupportingSources:
@@ -5679,8 +5730,14 @@ def _render_demand_plan_comparison_fragment() -> None:
     kpis = build_comparison_kpis(
         result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters,
     )
-    _render_comparison_kpis_yoy(kpis)
-    _render_comparison_summary_table(result)
+    # L3M/L6M **Order** YoY (trailing IBP Orders, anchored on the Prior Month) +
+    # the month-range 2nd rows / tile sub-labels.
+    _order_yoy, _order_labels = _cached_comparison_order_yoy(filters.prior_month)
+    _periods = _comparison_period_labels(filters, _order_labels)
+    _render_comparison_kpis_yoy(
+        kpis, order_yoy_total=_order_yoy.get("total_b2c", {}), periods=_periods)
+    _render_comparison_summary_table(
+        result, order_yoy_by_row=_order_yoy, periods=_periods)
     _render_comparison_mix_table(result)
 
     st.markdown("---")
@@ -6178,23 +6235,34 @@ def _fmt_pct_share(frac: Optional[float]) -> tuple[str, str]:
     return f"{frac * 100.0:.1f}%", ""
 
 
-def _render_comparison_kpis_yoy(kpis: ComparisonKpis) -> None:
+def _render_comparison_kpis_yoy(
+    kpis: ComparisonKpis, *,
+    order_yoy_total: Optional[dict] = None,
+    periods: Optional[dict[str, str]] = None,
+) -> None:
     """Render the YoY / share KPI row (top of the section).
 
-    T3M YoY · T6M YoY · Full-Year YoY · R&O % of Current Plan · **Total B2C
-    Plan vs Budget %** (the last tile — the Total B2C ``%`` cell).  Values are
-    read straight off the assembled table's Total B2C row so tiles reconcile
-    with the table by construction.
+    L3M Order YoY · L6M Order YoY · Full-Year Base vs PY% · R&O % of Current
+    Plan · **Total B2C Plan vs Budget %**.  ``order_yoy_total`` supplies the
+    Total-B2C trailing IBP-Order YoY (same framing as Business Health);
+    ``periods`` adds the covered month range under the relevant tiles.
     """
-    t3m = _fmt_yoy(kpis.t3m_yoy)
-    t6m = _fmt_yoy(kpis.t6m_yoy)
+    order_yoy_total = order_yoy_total or {}
+    per = periods or {}
+    l3m = _fmt_yoy(order_yoy_total.get("L3M"))
+    l6m = _fmt_yoy(order_yoy_total.get("L6M"))
     fy = _fmt_yoy(kpis.full_year_base_vs_py)
     ro = _fmt_share(kpis.ro_pct)
     budget = _fmt_yoy(kpis.budget_pct)
+
+    def _desc(base: str, header: str) -> str:
+        rng = per.get(header)
+        return f"{base} · {rng}" if rng else base
+
     yoy = (
-        ("T3M YoY", t3m, "Current reality"),
-        ("T6M YoY", t6m, "Recent trend"),
-        ("Full-Year Base vs PY%", fy, "Plan assumption"),
+        ("L3M Order YoY", l3m, _desc("Current reality", "L3M Order YoY")),
+        ("L6M Order YoY", l6m, _desc("Recent trend", "L6M Order YoY")),
+        ("Full-Year Base vs PY%", fy, _desc("Plan assumption", "PY")),
         ("R&O % of Current Plan", ro, "Aspiration"),
         ("Total B2C Plan vs Budget %", budget, "Plan vs budget"),
     )
@@ -6322,6 +6390,9 @@ _DPC_LITE_CSS: str = """
 .dpc-lite th, .dpc-lite td {padding:7px 14px; white-space:nowrap; text-align:right;}
 .dpc-lite thead th {color:#6b7280; font-weight:600; font-size:0.9rem;
   border-bottom:2px solid #e5e7eb;}
+/* 2nd header line: the month range a column covers. */
+.dpc-lite thead th .per {display:block; font-weight:400; font-size:0.8em;
+  color:#9ca3af; white-space:nowrap;}
 .dpc-lite th.lbl, .dpc-lite td.lbl {text-align:left;}
 .dpc-lite tbody td {border-bottom:1px solid #f1f2f4;}
 .dpc-lite tr.section td {font-weight:700;}
@@ -6507,16 +6578,18 @@ _DPC_SUMMARY_ROWS: tuple[tuple[str, str], ...] = (
 # RO% sits between R&O vol and Total plan; T3M/T6M YoY follow Base vs PY %.
 # Every column here is individually hidable via the popover; Category is fixed.
 _DPC_SUMMARY_COLS: tuple[tuple[str, str, str], ...] = (
-    ("base_plan",  "Base plan",    "m"),
-    ("py",         "PY",           "m"),
-    ("base_vs_py", "Base vs PY %", "pct_signed"),
-    ("t3m_yoy",    "T3M YoY",      "pct_signed"),
-    ("t6m_yoy",    "T6M YoY",      "pct_signed"),
-    ("ro_vol",     "R&O vol",      "m"),
-    ("ro_pct",     "RO%",          "pct_plain"),
-    ("total_plan", "Total plan",   "m"),
-    ("budget",     "Budget",       "m"),
-    ("vs_budget",  "% vs Budget",  "pct_signed"),
+    ("base_plan",      "Base plan",      "m"),
+    ("py",             "PY",             "m"),
+    ("base_vs_py",     "Base vs PY %",   "pct_signed"),
+    # L3M/L6M Order YoY (trailing IBP Orders, anchored on the Prior Month) —
+    # same framing as Business Health; values injected from the order lookup.
+    ("l3m_order_yoy",  "L3M Order YoY",  "pct_signed"),
+    ("l6m_order_yoy",  "L6M Order YoY",  "pct_signed"),
+    ("ro_vol",         "R&O vol",        "m"),
+    ("ro_pct",         "RO%",            "pct_plain"),
+    ("total_plan",     "Total plan",     "m"),
+    ("budget",         "Budget",         "m"),
+    ("vs_budget",      "% vs Budget",    "pct_signed"),
 )
 _DPC_SUMMARY_COLS_KEY: str = "demand_plan_comparison_summary_cols"
 
@@ -6584,8 +6657,10 @@ def _summary_row_values(r: pd.Series) -> dict[str, Optional[float]]:
         "base_plan": base_plan,
         "py": py,
         "base_vs_py": base_vs_py,
-        "t3m_yoy": _dpc_num(r, DPC_COL_T3M_YOY),
-        "t6m_yoy": _dpc_num(r, DPC_COL_T6M_YOY),
+        # L3M/L6M Order YoY are merged in by the renderer from the order lookup
+        # (they are NOT trailing shipments any more).
+        "l3m_order_yoy": None,
+        "l6m_order_yoy": None,
         "ro_vol": ro_vol,
         "ro_pct": _dpc_num(r, DPC_COL_O_PCT),
         "total_plan": current_plan,
@@ -6673,20 +6748,26 @@ def _render_comparison_summary_col_picker(ns: str = "") -> None:
     )
 
 
-def _render_comparison_summary_table(result, ns: str = "") -> None:
+def _render_comparison_summary_table(
+    result, ns: str = "", *,
+    order_yoy_by_row: Optional[dict] = None,
+    periods: Optional[dict[str, str]] = None,
+) -> None:
     """Render the executive current-plan summary table (screenshot 1).
 
     A condensed, current-plan-anchored projection of the SAME (filtered)
-    comparison data (Base plan = Current Plan − R&O; Base vs PY %; per-row
-    T3M/T6M YoY read off the table), so the Portfolio Major · Supply Format ·
-    Brand filter flows through here too.  Visible columns come from the
-    :func:`_render_comparison_summary_col_picker` popover (session_state).
-    Lightweight style (white, hairline separators, bold section rows).
+    comparison data (Base plan = Current Plan − R&O; Base vs PY %; R&O; Budget),
+    so the Portfolio Major · Supply Format · Brand filter flows through here too.
+    ``order_yoy_by_row`` injects per-row **L3M / L6M Order YoY** (trailing IBP
+    Orders); ``periods`` adds a 2nd header line (month range) under Base Plan /
+    PY / R&O / L3M / L6M.  Visible columns come from the col picker popover.
     """
     table = getattr(result, "table", None)
     if table is None or table.empty or DPC_COL_ROW_ID not in table.columns:
         return
     by_id = {str(r[DPC_COL_ROW_ID]): r for _, r in table.iterrows()}
+    order_yoy = order_yoy_by_row or {}
+    per = periods or {}
 
     # Visible columns (Category always shown) in the planner's chosen ORDER —
     # selection + ordering live in the picker rendered above the metrics.
@@ -6695,9 +6776,13 @@ def _render_comparison_summary_table(result, ns: str = "") -> None:
     cols = [col_by_header[h]
             for h in _picked_columns(_ns_key(_DPC_SUMMARY_COLS_KEY, ns), all_headers)]
 
+    def _th(header: str) -> str:
+        rng = per.get(header)
+        sub = f'<br><span class="per">{_esc_html(rng)}</span>' if rng else ""
+        return f"<th>{_esc_html(header)}{sub}</th>"
+
     head_html = '<th class="lbl">Category</th>' + "".join(
-        f"<th>{_esc_html(header)}</th>" for _key, header, _kind in cols
-    )
+        _th(header) for _key, header, _kind in cols)
 
     body_rows: list[str] = []
     for row_id, cls in _DPC_SUMMARY_ROWS:
@@ -6705,6 +6790,9 @@ def _render_comparison_summary_table(result, ns: str = "") -> None:
         if r is None:
             continue
         vals = _summary_row_values(r)
+        row_orders = order_yoy.get(row_id, {})
+        vals["l3m_order_yoy"] = row_orders.get("L3M")
+        vals["l6m_order_yoy"] = row_orders.get("L6M")
         cells = f'<td class="lbl">{_esc_html(_summary_clean_label(r))}</td>' + "".join(
             _summary_cell_html(kind, vals[key]) for key, _header, kind in cols
         )
@@ -7962,8 +8050,12 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
         _render_comparison_summary_col_picker(ns="aps")
         kpis = build_comparison_kpis(
             result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters)
-        _render_comparison_kpis_yoy(kpis)
-        _render_comparison_summary_table(result, ns="aps")
+        _aps_order_yoy, _aps_order_labels = _cached_comparison_order_yoy(filters.prior_month)
+        _aps_periods = _comparison_period_labels(filters, _aps_order_labels)
+        _render_comparison_kpis_yoy(
+            kpis, order_yoy_total=_aps_order_yoy.get("total_b2c", {}), periods=_aps_periods)
+        _render_comparison_summary_table(
+            result, ns="aps", order_yoy_by_row=_aps_order_yoy, periods=_aps_periods)
         _render_comparison_mix_table(result)
 
         st.markdown("---")

@@ -18,12 +18,13 @@ AS_OF = date(2026, 7, 20)
 
 
 def _sample() -> pd.DataFrame:
-    """Five programs spanning ship buckets, prob tiers, and a locked win."""
+    """Five programs spanning ship buckets, prob tiers, formats, and a locked win."""
     return pd.DataFrame({
         "Customer":            ["Acme", "Beta", "Cee", "Dee", "Eve"],
         "Item #":              ["1", "2", "3", "4", "5"],
         "Description":         ["A", "B", "C", "D", "E"],
         "Portfolio Major":     ["Butter", "Butter", "Cheese", "Cheese", "Butter"],
+        "Supply Format":       ["Cultured", "Extended", "Aseptic", "Cultured", "Cultured"],
         ANNUAL_OPP_LE:         [1000.0, 2000.0, 500.0, 3000.0, 100.0],
         CUR_FISCAL_PROB_LE:    [800.0, 1500.0, 400.0, 0.0, 50.0],
         YEAR1_PROB_LE:         [900.0, 1600.0, 450.0, 100.0, 60.0],
@@ -52,51 +53,41 @@ def test_pipeline_metrics_empty():
     assert m.committed_concentration is None
 
 
-# ── Urgency ranking ──────────────────────────────────────────────────────────
+# ── Urgency ranking (Portfolio × Format) ─────────────────────────────────────
 
-def test_urgency_ranking_buckets_and_sort():
+def test_urgency_ranking_by_portfolio_and_format():
     wide = rpa.build_urgency_ranking(_sample(), as_of=AS_OF)
     assert list(wide.columns) == list(rpa.SHIP_BUCKETS)
-    # Sorted by row total desc: Butter (2350) then Cheese (400).
-    assert list(wide.index) == ["Butter", "Cheese"]
-    # Butter: <30 = Acme 800 + Eve 50 = 850; 30–90 = Beta 1500; >90 = 0.
-    assert wide.loc["Butter", rpa.SHIP_BUCKET_NEAR] == pytest.approx(850.0)
-    assert wide.loc["Butter", rpa.SHIP_BUCKET_MID] == pytest.approx(1500.0)
-    assert wide.loc["Butter", rpa.SHIP_BUCKET_FAR] == pytest.approx(0.0)
-    # Cheese: Cee 400 at >90; Dee has 0 in-year lbs so it drops out.
-    assert wide.loc["Cheese", rpa.SHIP_BUCKET_FAR] == pytest.approx(400.0)
+    # Rows are Portfolio × Format, sorted by total desc.
+    assert list(wide.index) == [
+        "Butter · Extended", "Butter · Cultured", "Cheese · Aseptic"]
+    # Butter · Cultured: Acme 800 + Eve 50 at <30.
+    assert wide.loc["Butter · Cultured", rpa.SHIP_BUCKET_NEAR] == pytest.approx(850.0)
+    # Butter · Extended: Beta 1500 at 30–90.
+    assert wide.loc["Butter · Extended", rpa.SHIP_BUCKET_MID] == pytest.approx(1500.0)
+    # Cheese · Aseptic: Cee 400 at >90 (Dee dropped — 0 in-year lbs).
+    assert wide.loc["Cheese · Aseptic", rpa.SHIP_BUCKET_FAR] == pytest.approx(400.0)
 
 
 # ── High-urgency watchlist ───────────────────────────────────────────────────
 
-def test_action_tiers():
-    assert rpa._action_for_prob(1.0) is None          # locked
-    assert rpa._action_for_prob(float("nan")) is None
-    assert rpa._action_for_prob(0.999) == rpa.ACTION_PROTECT
-    assert rpa._action_for_prob(0.80) == rpa.ACTION_PROTECT
-    assert rpa._action_for_prob(0.79) == rpa.ACTION_CHASE
-    assert rpa._action_for_prob(0.50) == rpa.ACTION_CHASE
-    assert rpa._action_for_prob(0.49) == rpa.ACTION_QUALIFY
-    assert rpa._action_for_prob(0.20) == rpa.ACTION_QUALIFY
-    assert rpa._action_for_prob(0.19) == rpa.ACTION_KILL
-    assert rpa._action_for_prob(0.0) == rpa.ACTION_KILL
-
-
-def test_high_urgency_excludes_locked_and_ranks():
-    # quantile=0.5 keeps the upper half so we can assert ordering + actions.
+def test_high_urgency_blank_action_days_and_ranking():
     high = rpa.build_high_urgency_programs(_sample(), as_of=AS_OF, quantile=0.5)
     assert list(high.columns) == list(rpa.WATCHLIST_COLUMNS)
+    assert rpa.COL_DAYS_TO_SHIP in high.columns
     # Dee (prob 1.0, locked) must never appear.
     assert not high[rpa.COL_PROGRAM].str.contains("Dee").any()
-    # Urgency = vol×(1−prob)×exp(−max(0,days)/90). Beta dominates, Acme next.
+    # Beta dominates, Acme next (urgency = vol×(1−prob)×exp(−max(0,days)/90)).
     beta = 2000.0 * 0.7 * exp(-41.0 / 90.0)
     acme = 1000.0 * 0.10 * exp(-5.0 / 90.0)
     assert list(high[rpa.COL_PROGRAM].str[:4]) == ["Beta", "Acme"]
     assert high.iloc[0][rpa.COL_URGENCY] == pytest.approx(beta, rel=1e-6)
     assert high.iloc[1][rpa.COL_URGENCY] == pytest.approx(acme, rel=1e-6)
-    # Actions are prob-tiered: Beta 0.30 → Qualify; Acme 0.90 → Protect.
-    assert high.iloc[0][rpa.COL_ACTION] == rpa.ACTION_QUALIFY
-    assert high.iloc[1][rpa.COL_ACTION] == rpa.ACTION_PROTECT
+    # Action is blank for the planner to fill in.
+    assert (high[rpa.COL_ACTION] == "").all()
+    # Days-to-Ship is whole days from as_of.
+    assert int(high.iloc[0][rpa.COL_DAYS_TO_SHIP]) == 41   # Beta
+    assert int(high.iloc[1][rpa.COL_DAYS_TO_SHIP]) == 5    # Acme
 
 
 def test_high_urgency_empty_when_all_locked():
@@ -105,19 +96,41 @@ def test_high_urgency_empty_when_all_locked():
     assert rpa.build_high_urgency_programs(df, as_of=AS_OF).empty
 
 
-# ── Probability buckets ──────────────────────────────────────────────────────
+def test_apply_watchlist_filters():
+    tbl = rpa.build_high_urgency_programs(_sample(), as_of=AS_OF, quantile=0.5)
+    # Both survivors are Butter.
+    assert set(rpa.apply_watchlist_filters(tbl, portfolios=["Butter"])
+               [rpa.COL_PORTFOLIO]) == {"Butter"}
+    assert rpa.apply_watchlist_filters(tbl, portfolios=["Cheese"]).empty
+    # Volume ≥ 1500 keeps only Beta (2000); drops Acme (1000).
+    vol = rpa.apply_watchlist_filters(tbl, min_volume=1500.0)
+    assert list(vol[rpa.COL_PROGRAM].str[:4]) == ["Beta"]
+    # Ship window 30–90 keeps only Beta (41 days).
+    ship = rpa.apply_watchlist_filters(tbl, ship_buckets=[rpa.SHIP_BUCKET_MID])
+    assert list(ship[rpa.COL_PROGRAM].str[:4]) == ["Beta"]
+    # Probability 20–50% keeps only Beta (0.30); drops Acme (0.90).
+    prob = rpa.apply_watchlist_filters(tbl, prob_range=(0.20, 0.50))
+    assert list(prob[rpa.COL_PROGRAM].str[:4]) == ["Beta"]
 
-def test_probability_buckets():
-    wide = rpa.build_probability_buckets(_sample())
-    assert list(wide.columns) == list(rpa.PROB_BUCKETS)
-    # Gross (unweighted) lbs. Cheese total 3500 > Butter 3100 → Cheese first.
+
+# ── Pipeline build-up ────────────────────────────────────────────────────────
+
+def test_pipeline_buildup_segments_sum_to_gross():
+    wide = rpa.build_pipeline_buildup(_sample())
+    assert list(wide.columns) == list(rpa.BUILDUP_SEGMENTS)
+    # Sorted by Gross desc: Cheese (3500) then Butter (3100).
     assert list(wide.index) == ["Cheese", "Butter"]
-    # Butter: Dead = Eve 100; In-play = Beta 2000; Committed = Acme 1000.
-    assert wide.loc["Butter", rpa.PROB_BUCKET_DEAD] == pytest.approx(100.0)
-    assert wide.loc["Butter", rpa.PROB_BUCKET_INPLAY] == pytest.approx(2000.0)
-    assert wide.loc["Butter", rpa.PROB_BUCKET_COMMITTED] == pytest.approx(1000.0)
-    # Cheese: Committed = Cee 500 + Dee 3000 = 3500.
-    assert wide.loc["Cheese", rpa.PROB_BUCKET_COMMITTED] == pytest.approx(3500.0)
+    # Butter: FY27=2350, Year-effect=2560−2350=210, Risk=3100−2560=540.
+    assert wide.loc["Butter", rpa.SEG_FY27] == pytest.approx(2350.0)
+    assert wide.loc["Butter", rpa.SEG_YEAR_EFFECT] == pytest.approx(210.0)
+    assert wide.loc["Butter", rpa.SEG_RISK] == pytest.approx(540.0)
+    # Cheese: FY27=400, Year-effect=550−400=150, Risk=3500−550=2950.
+    assert wide.loc["Cheese", rpa.SEG_FY27] == pytest.approx(400.0)
+    assert wide.loc["Cheese", rpa.SEG_YEAR_EFFECT] == pytest.approx(150.0)
+    assert wide.loc["Cheese", rpa.SEG_RISK] == pytest.approx(2950.0)
+    # Each row's three segments sum to that portfolio's Gross Pipeline.
+    assert wide.loc["Butter"].sum() == pytest.approx(3100.0)
+    assert wide.loc["Cheese"].sum() == pytest.approx(3500.0)
 
 
 def test_isclose_guard_sanity():

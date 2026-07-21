@@ -321,6 +321,7 @@ from data_sources.ro_comparison import (
     list_months,
     regenerate_comparison_output,
     ro_item_master_blob_path,
+    save_pipeline_review_snapshot,
     save_ro_comparison_output,
 )
 from data_sources.ro_summary_report import (
@@ -2530,9 +2531,10 @@ def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
     the in-year pipeline).  Values reconcile with the RO Summary Total B2C row.
     """
     m = rpa.compute_pipeline_metrics(comp_df)
-    conc = (
-        f"{m.committed_concentration * 100:.0f}% of in-year"
-        if m.committed_concentration is not None else "—"
+    # Committed tile shows BOTH the volume and its share of the in-year pipeline.
+    committed_val = (
+        f"{_fmt_m_lbs(m.committed_lbs)} · {m.committed_concentration * 100:.0f}%"
+        if m.committed_concentration is not None else _fmt_m_lbs(m.committed_lbs)
     )
     tiles = (
         ("Gross Pipeline", _fmt_m_lbs(m.gross_lbs),
@@ -2541,8 +2543,8 @@ def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
          "FY28 probabilized — Total B2C"),
         ("In-Year, Risk-adjusted", _fmt_m_lbs(m.in_year_lbs),
          "FY27 probabilized — Total B2C"),
-        ("Committed", _fmt_m_lbs(m.committed_lbs),
-         f"in-year probabilized at ≥95% · {conc}"),
+        ("Committed", committed_val,
+         "in-year probabilized at ≥95% · M lbs & % of in-year"),
     )
     cards = "".join(
         f'<div class="dpc-kpi dpc-kpi--walk">'
@@ -2567,30 +2569,31 @@ _RO_CHART_FONT: str = _BH_FONT_COLOR
 
 
 def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
-    """Horizontal stacked bar: FY27 in-year probabilized lbs per Portfolio Major.
+    """Horizontal stacked bar: FY27 in-year probabilized lbs per Portfolio × Format.
 
-    Stacked by first-ship-date urgency window (< 30 / 30–90 / > 90 days),
-    sorted by total volume desc (largest on top).  Values in millions of lbs.
+    One row per Portfolio Major × Supply Format, stacked by first-ship-date
+    urgency window (< 30 / 30–90 / > 90 days), sorted by total volume desc
+    (largest on top).  Values in millions of lbs.
     """
     wide = rpa.build_urgency_ranking(comp_df, as_of=date.today())
     if wide.empty:
         st.info("No in-year probabilized volume to rank under the current filters.")
         return
-    majors = list(wide.index)
+    cats = [str(c) for c in wide.index]
     fig = go.Figure()
     for bucket in rpa.SHIP_BUCKETS:
         fig.add_bar(
-            y=majors, x=(wide[bucket] / 1e6).tolist(), name=bucket,
+            y=cats, x=(wide[bucket] / 1e6).tolist(), name=bucket,
             orientation="h", marker_color=_RO_SHIP_BUCKET_COLORS[bucket],
             hovertemplate=f"%{{y}} · {bucket}: %{{x:,.1f}}M lbs<extra></extra>",
         )
     fig.update_layout(
-        barmode="stack", height=max(240, 46 * len(majors) + 90),
+        barmode="stack", height=max(260, 30 * len(cats) + 100),
         margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_RO_CHART_FONT, size=13),
+        font=dict(color=_RO_CHART_FONT, size=12),
         xaxis=dict(title=dict(text="FY27 Probabilized (M lbs)"),
                    showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
-        yaxis=dict(autorange="reversed"),           # largest bar on top
+        yaxis=dict(autorange="reversed", tickfont=dict(size=11)),  # largest on top
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
@@ -2598,24 +2601,25 @@ def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
 
 
 def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
-    """Top-quartile-urgency programs + a prob-tiered recommended Action.
+    """Editable high-urgency watchlist with filters + a Fabric-archive button.
 
-    Replaces the old "Programs with Early Start Date" watchlist.  Urgency =
-    volume × (1 − prob) × deadline-decay, so big + unlikely + soon rises to the
-    top.  Locked-in wins (prob = 100%) are excluded — there's no action to take.
+    Top-quartile programs by urgency = volume × (1 − prob) × deadline-decay
+    (locked-in 100% wins excluded).  The table is fully editable (blank Action
+    for the planner to fill); the Urgency column is hidden (it only drives the
+    ranking).  Filters narrow by portfolio / annual volume / ship window /
+    probability.  "🔄 Refresh & archive" writes the current edited table to
+    Fabric as a timestamped CSV.
     """
     st.markdown("#### 🚨 High-Urgency Programs")
     st.caption(
         "Top-quartile programs by **urgency** = annual volume × (1 − win "
         "probability) × deadline-decay (`exp(−days-to-ship / 90)`), so large, "
         "uncertain, soon-to-ship programs rise first.  Locked-in wins "
-        "(probability = 100%) are excluded."
+        "(probability = 100%) are excluded.  Edit any cell; assign an **Action** "
+        "(guide below), then **Refresh & archive** to snapshot it to Fabric."
     )
-    # Action rationale, laid out explicitly so the recommendation reads clearly.
     st.markdown(
-        "  ".join(
-            f"**{action}** — {why}" for action, why in rpa.ACTION_RATIONALE
-        )
+        "  ".join(f"**{action}** — {why}" for action, why in rpa.ACTION_RATIONALE)
     )
     tbl = rpa.build_high_urgency_programs(comp_df, as_of=date.today())
     if tbl.empty:
@@ -2624,10 +2628,40 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
             "widen the field filters or check that the comparison has ROs."
         )
         return
+
+    # ── Filters ──────────────────────────────────────────────────
+    f1, f2, f3, f4 = st.columns([2, 1.3, 1.5, 1.7])
+    with f1:
+        portfolios = st.multiselect(
+            "Portfolio", options=sorted(tbl[rpa.COL_PORTFOLIO].unique()),
+            key="ro_wl_portfolio", help="Leave empty to include every portfolio.")
+    with f2:
+        min_vol = int(st.number_input(
+            "Annual Volume ≥ (lbs)", min_value=0, value=0, step=100_000,
+            key="ro_wl_min_vol", help="Keep programs at / above this annual volume."))
+    with f3:
+        buckets = st.multiselect(
+            "Days-to-Ship", options=list(rpa.SHIP_BUCKETS), key="ro_wl_ship",
+            help="Filter by how soon each program ships (vs today).")
+    with f4:
+        lo, hi = st.slider(
+            "Probability (%)", min_value=0, max_value=100, value=(0, 100),
+            step=5, key="ro_wl_prob", help="Keep programs whose win probability is in this band.")
+
+    filtered = rpa.apply_watchlist_filters(
+        tbl, portfolios=portfolios or None,
+        min_volume=min_vol or None, ship_buckets=buckets or None,
+        prob_range=(lo / 100.0, hi / 100.0))
+    if filtered.empty:
+        st.info("No programs match the current filters.")
+        return
+
+    # Urgency is hidden from the view (and the archive) — it only ranks the rows.
+    show = filtered.drop(columns=[rpa.COL_URGENCY])
     cc = st.column_config
-    st.dataframe(
-        tbl, use_container_width=True, hide_index=True,
-        height=min(36 * (len(tbl) + 1) + 38, 480),
+    edited = st.data_editor(
+        show, use_container_width=True, hide_index=True, num_rows="fixed",
+        key="ro_wl_editor", height=min(36 * (len(show) + 1) + 38, 480),
         column_config={
             rpa.COL_PROGRAM:       cc.TextColumn("Program", width="large"),
             rpa.COL_PORTFOLIO:     cc.TextColumn("Portfolio", width="small"),
@@ -2635,43 +2669,67 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
                 "Annual Volume (lbs)", format="accounting", width="medium"),
             rpa.COL_FIRST_SHIP:    cc.DateColumn(
                 "First Ship Date", format="YYYY-MM-DD", width="small"),
+            rpa.COL_DAYS_TO_SHIP:  cc.NumberColumn(
+                "Days-to-Ship", format="%d", width="small"),
             rpa.COL_PROBABILITY:   cc.NumberColumn(
                 "Prob", format="percent", width="small"),
-            rpa.COL_URGENCY:       cc.NumberColumn(
-                "Urgency", format="compact", width="small"),
-            rpa.COL_ACTION:        cc.TextColumn("Action", width="small"),
+            rpa.COL_ACTION:        cc.TextColumn(
+                "Action", width="small", help="Protect / Chase / Qualify / Kill."),
         },
     )
 
+    # ── Refresh & archive to Fabric ──────────────────────────────
+    if st.button("🔄 Refresh & archive snapshot to Fabric",
+                 key="ro_wl_archive", use_container_width=True):
+        try:
+            path = save_pipeline_review_snapshot(edited)
+            st.success(f"✅ Archived snapshot to `Files/{path}`.")
+        except RoComparisonError as exc:
+            st.error(f"❌ Could not archive the snapshot to Fabric.\n\n{exc}")
 
-def _render_ro_probability_chart(comp_df: pd.DataFrame) -> None:
-    """Stacked bar (one bar per win-probability bucket), stacked by Portfolio Major.
 
-    Uses gross (unweighted) annual-opportunity lbs so the planner sees where the
-    raw pipeline sits on the Dead → In-play → Committed spectrum.  Millions of lbs.
+# Build-up segment styling: solid green base (expected in-year) → lighter timing
+# increment → patterned amber headroom (recoverable if probability lifts).
+_RO_BUILDUP_STYLE: dict[str, dict] = {
+    rpa.SEG_FY27:        {"color": "#1b7f3a", "pattern": ""},
+    rpa.SEG_YEAR_EFFECT: {"color": "#7dc47f", "pattern": "/"},
+    rpa.SEG_RISK:        {"color": "#e0b64a", "pattern": "x"},
+}
+
+
+def _render_ro_buildup_chart(comp_df: pd.DataFrame) -> None:
+    """Stacked bar per Portfolio Major: FY27 probabilized → Gross Pipeline.
+
+    Solid FY27 Probabilized base + a Year-effect increment (probabilized volume
+    beyond the fiscal year) + a Risk / probability-headroom increment (the upside
+    recoverable if win probability rose to 100%).  The three sum to the
+    unweighted Gross Pipeline.  Millions of lbs.
     """
-    wide = rpa.build_probability_buckets(comp_df)
+    wide = rpa.build_pipeline_buildup(comp_df)
     if wide.empty:
-        st.info("No gross pipeline volume to bucket under the current filters.")
+        st.info("No gross pipeline volume to build up under the current filters.")
         return
+    majors = [str(x) for x in wide.index]
     fig = go.Figure()
-    for i, major in enumerate(wide.index):
-        color = _PLAN_LIFT_PALETTE[i % len(_PLAN_LIFT_PALETTE)]
+    for seg in rpa.BUILDUP_SEGMENTS:
+        style = _RO_BUILDUP_STYLE[seg]
         fig.add_bar(
-            x=list(rpa.PROB_BUCKETS), y=(wide.loc[major] / 1e6).tolist(),
-            name=str(major), marker_color=color,
-            hovertemplate=f"{major} · %{{x}}: %{{y:,.1f}}M lbs<extra></extra>",
+            x=majors, y=(wide[seg] / 1e6).tolist(), name=seg,
+            marker=dict(color=style["color"],
+                        pattern=dict(shape=style["pattern"])),
+            hovertemplate=f"%{{x}} · {seg}: %{{y:,.1f}}M lbs<extra></extra>",
         )
     fig.update_layout(
-        barmode="stack", height=360, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_RO_CHART_FONT, size=13),
-        xaxis=dict(tickfont=dict(size=13)),
-        yaxis=dict(title=dict(text="Gross Pipeline (M lbs)"),
+        barmode="stack", height=max(260, 30 * len(majors) + 100),
+        margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(color=_RO_CHART_FONT, size=12),
+        xaxis=dict(tickfont=dict(size=11)),
+        yaxis=dict(title=dict(text="Pipeline (M lbs)"),
                    showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
-    st.plotly_chart(fig, use_container_width=True, key="ro_probability_chart")
+    st.plotly_chart(fig, use_container_width=True, key="ro_buildup_chart")
 
 
 def _render_ro_pipeline_analytics_section() -> None:
@@ -2692,22 +2750,26 @@ def _render_ro_pipeline_analytics_section() -> None:
     )
     _render_ro_pipeline_tiles(comp)
 
-    # Urgency ranking + its paired watchlist.
-    st.markdown("#### 🔺 Urgency by Portfolio & Ship Window")
-    st.caption(
-        "FY27 in-year probabilized volume per Portfolio Major, split by how "
-        "soon each program is due to ship."
-    )
-    _render_ro_urgency_chart(comp)
-    _render_ro_high_urgency_table(comp)
+    # Two charts side by side: urgency (left) + FY27→Gross build-up (right).
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### 🔺 Urgency by Portfolio × Format & Ship Window")
+        st.caption(
+            "FY27 in-year probabilized volume per Portfolio Major × Supply "
+            "Format, split by how soon each program is due to ship."
+        )
+        _render_ro_urgency_chart(comp)
+    with right:
+        st.markdown("#### 🧱 Pipeline Build-up (FY27 → Gross)")
+        st.caption(
+            "Per Portfolio Major: solid FY27 probabilized, plus the Year-effect "
+            "and Risk (probability-headroom) increments that build up to the "
+            "unweighted Gross Pipeline."
+        )
+        _render_ro_buildup_chart(comp)
 
-    # Where the gross pipeline sits on the win-probability spectrum.
-    st.markdown("#### 🎲 Pipeline by Win Probability")
-    st.caption(
-        "Gross (unweighted) annual opportunity per win-probability bucket, "
-        "stacked by Portfolio Major."
-    )
-    _render_ro_probability_chart(comp)
+    # The paired high-urgency watchlist, full width below the charts.
+    _render_ro_high_urgency_table(comp)
 
 
 # ── RO Summary Report (hierarchical roll-up) ────────────────────────────────

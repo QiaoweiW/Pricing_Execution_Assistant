@@ -76,6 +76,7 @@ from data_sources.fabric_auth import (
 )
 from data_sources.fabric_lakehouse_io import (
     LakehouseIOError,
+    archive_bytes,
     get_file_properties,
     read_bytes,
     read_csv,
@@ -104,6 +105,9 @@ _RO_HISTORY_BLOB_PATH: str = "RO Tracking/RO_History_Tracker.csv"
 _APPEND_NEW_HISTORY_FOLDER: str = "RO Tracking/Append_New_History"
 _RO_REPORTING_BLOB_PATH: str = "RO Tracking/RO_Reporting/RO_Comparison_Output.csv"
 _RO_ITEM_MASTER_BLOB_PATH: str = "RO Tracking/RO_Item_Master.csv"
+# Append-only archive of planner "RO Pipeline Review" snapshots — one
+# timestamped CSV per Refresh click (see :func:`save_pipeline_review_snapshot`).
+_RO_PIPELINE_REVIEW_ARCHIVE_DIR: str = "RO Tracking/RO Pipeline Review Archive"
 
 # Sidecar storing the SHA-256 fingerprint of the RO_History snapshot
 # that the current ``RO_Comparison_Output.csv`` was generated from.
@@ -1601,6 +1605,36 @@ def save_ro_comparison_output(df: pd.DataFrame) -> str:
             f"'Files/{_RO_REPORTING_BLOB_PATH}': {exc}"
         ) from exc
     return _RO_REPORTING_BLOB_PATH
+
+
+def save_pipeline_review_snapshot(
+    df: pd.DataFrame, *, timestamp: Optional[str] = None,
+) -> str:
+    """Archive a "RO Pipeline Review" table as a timestamped CSV in Fabric.
+
+    Writes ``df`` to ``Files/RO Tracking/RO Pipeline Review Archive/
+    RO_Pipeline_Review_<YYYYmmdd_HHMMSS>.csv`` (append-only — every Refresh
+    click keeps its own copy).  Date-like columns are serialised as
+    ``YYYY-MM-DD`` for readability.  Returns the destination blob path; raises
+    :class:`RoComparisonError` on any write failure.  ``timestamp`` overrides
+    the auto ``YYYYmmdd_HHMMSS`` stamp (used by tests for determinism).
+    """
+    df_out = df.copy()
+    for col in df_out.columns:
+        if pd.api.types.is_datetime64_any_dtype(df_out[col]):
+            as_ts = pd.to_datetime(df_out[col], errors="coerce")
+            df_out[col] = as_ts.dt.strftime("%Y-%m-%d").where(as_ts.notna(), "")
+    payload = df_out.to_csv(index=False).encode("utf-8")
+    try:
+        return archive_bytes(
+            _SECRETS_SECTION, _RO_PIPELINE_REVIEW_ARCHIVE_DIR,
+            "RO_Pipeline_Review.csv", payload, timestamp=timestamp,
+        )
+    except LakehouseIOError as exc:
+        raise RoComparisonError(
+            "Could not archive the RO Pipeline Review snapshot to "
+            f"'Files/{_RO_PIPELINE_REVIEW_ARCHIVE_DIR}': {exc}"
+        ) from exc
 
 
 # ── Auto-regenerate on RO_History refresh ────────────────────────────────────

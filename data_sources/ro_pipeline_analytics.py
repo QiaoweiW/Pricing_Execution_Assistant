@@ -23,20 +23,22 @@ What this module powers (all rendered ABOVE the RO Summary table)
    rest of the section).
 
 2. **Urgency ranking** (:func:`build_urgency_ranking`)
-   FY27 in-year probabilized lbs per Portfolio Major, split into first-
-   ship-date urgency buckets (``< 30 days`` / ``30–90 days`` /
+   FY27 in-year probabilized lbs per Portfolio Major × Supply Format, split
+   into first-ship-date urgency buckets (``< 30 days`` / ``30–90 days`` /
    ``> 90 days``) → a horizontal stacked bar sorted by total desc.
 
-3. **High-urgency programs** (:func:`build_high_urgency_programs`)
-   The top-quartile-urgency programs with a prob-tiered recommended
-   Action.  Urgency = ``volume × (1 − prob) × exp(−max(0, days)/90)``
-   (big + unlikely + soon = urgent).  Replaces the old "Programs with
-   Early Start Date" watchlist.
+3. **High-urgency programs** (:func:`build_high_urgency_programs` +
+   :func:`apply_watchlist_filters`)
+   The top-quartile-urgency programs (urgency = ``volume × (1 − prob) ×
+   exp(−max(0, days)/90)``, big + unlikely + soon = urgent) with a blank
+   Action for the planner to fill in, a Days-to-Ship column, and optional
+   portfolio / volume / ship-window / probability filters.  Replaces the old
+   "Programs with Early Start Date" watchlist.
 
-4. **Probability buckets** (:func:`build_probability_buckets`)
-   Gross (unweighted) lbs per probability bucket (``Dead`` 0–20% /
-   ``In-play`` 20–80% / ``Committed`` >80%), split by Portfolio Major →
-   a stacked bar (one bar per bucket).
+4. **Pipeline build-up** (:func:`build_pipeline_buildup`)
+   Per Portfolio Major, a stacked bar from FY27 probabilized (solid) up to the
+   unweighted Gross Pipeline via a Year-effect and a Risk (probability-headroom)
+   increment — so the reader sees the upside of lifting win probability.
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ _IN_PORTFOLIO: str     = "Portfolio Major"
 _IN_CUSTOMER: str      = "Customer"
 _IN_ITEM_NUM: str      = "Item #"
 _IN_DESCRIPTION: str   = "Description"
+_IN_SUPPLY_FORMAT: str = "Supply Format"
 
 
 # ── Tunables (confirmed with the planner) ────────────────────────────────────
@@ -96,19 +99,29 @@ SHIP_BUCKET_MID: str  = "30–90 days"
 SHIP_BUCKET_FAR: str  = "> 90 days"
 SHIP_BUCKETS: tuple[str, ...] = (SHIP_BUCKET_NEAR, SHIP_BUCKET_MID, SHIP_BUCKET_FAR)
 
-# Probability buckets for the gross-pipeline breakdown.
-PROB_BUCKET_DEAD: str      = "Dead (0–20%)"
-PROB_BUCKET_INPLAY: str    = "In-play (20–80%)"
-PROB_BUCKET_COMMITTED: str = "Committed (>80%)"
-PROB_BUCKETS: tuple[str, ...] = (
-    PROB_BUCKET_DEAD, PROB_BUCKET_INPLAY, PROB_BUCKET_COMMITTED,
-)
+# Pipeline build-up segments (per Portfolio Major): a solid FY27 base plus the
+# two increments that build it up to the unweighted Gross Pipeline —
+#   FY27 Probabilized  = Σ CUR_FISCAL_PROB_LE            (risk-adjusted in-year)
+#   Year-effect        = Σ YEAR1_PROB_LE − Σ CUR_FISCAL  (probabilized volume
+#                                                         beyond the fiscal year)
+#   Risk               = Σ ANNUAL_OPP_LE − Σ YEAR1_PROB  (probability headroom:
+#                                                         upside if prob → 100%)
+# The three sum to Gross, so the reader sees how much lifting probability x→y
+# could recover.
+SEG_FY27: str        = "FY27 Probabilized"
+SEG_YEAR_EFFECT: str = "Year-effect"
+SEG_RISK: str        = "Risk (probability headroom)"
+BUILDUP_SEGMENTS: tuple[str, ...] = (SEG_FY27, SEG_YEAR_EFFECT, SEG_RISK)
 
-# Prob-tiered recommended actions (upper bound exclusive, lower inclusive).
+# Prob-tier action guidance surfaced in the UI (the planner fills Action in by
+# hand; these are the reference bands, not an auto-assignment).
 ACTION_PROTECT: str  = "Protect"
 ACTION_CHASE: str    = "Chase"
 ACTION_QUALIFY: str  = "Qualify"
 ACTION_KILL: str     = "Kill"
+ACTION_OPTIONS: tuple[str, ...] = (
+    "", ACTION_PROTECT, ACTION_CHASE, ACTION_QUALIFY, ACTION_KILL,
+)
 
 # Rationale copy laid out in the UI beside the watchlist.
 ACTION_RATIONALE: tuple[tuple[str, str], ...] = (
@@ -123,13 +136,14 @@ COL_PROGRAM: str       = "Program"
 COL_PORTFOLIO: str     = "Portfolio Major"
 COL_ANNUAL_VOLUME: str = "Annual Volume (lbs)"
 COL_FIRST_SHIP: str    = "First Ship Date"
+COL_DAYS_TO_SHIP: str  = "Days-to-Ship"
 COL_PROBABILITY: str   = "Probability"
 COL_URGENCY: str       = "Urgency"
 COL_ACTION: str        = "Action"
 
 WATCHLIST_COLUMNS: tuple[str, ...] = (
     COL_PROGRAM, COL_PORTFOLIO, COL_ANNUAL_VOLUME, COL_FIRST_SHIP,
-    COL_PROBABILITY, COL_URGENCY, COL_ACTION,
+    COL_DAYS_TO_SHIP, COL_PROBABILITY, COL_URGENCY, COL_ACTION,
 )
 
 
@@ -210,39 +224,46 @@ def _ship_bucket(days: pd.Series) -> pd.Series:
     return out
 
 
-def _prob_bucket(prob: pd.Series) -> pd.Series:
-    """Map LE Probability (0-1) → probability bucket label (NaN → Dead)."""
-    out = pd.Series(PROB_BUCKET_INPLAY, index=prob.index, dtype=object)
-    out[prob < 0.20] = PROB_BUCKET_DEAD
-    out[prob > 0.80] = PROB_BUCKET_COMMITTED
-    out[prob.isna()] = PROB_BUCKET_DEAD          # unknown prob ⇒ not committed
-    return out
+def _clean_str(comp_df: pd.DataFrame, col: str) -> pd.Series:
+    """Cleaned string view of *col*, blanks → "Unclassified"."""
+    if col not in comp_df.columns:
+        return pd.Series("Unclassified", index=comp_df.index, dtype=object)
+    s = comp_df[col].astype(str).str.strip()
+    return s.mask(s.isin(("", "nan", "None")), "Unclassified")
 
 
 def _portfolio(comp_df: pd.DataFrame) -> pd.Series:
     """Portfolio Major as a cleaned string, blanks → "Unclassified"."""
-    if _IN_PORTFOLIO not in comp_df.columns:
-        return pd.Series("Unclassified", index=comp_df.index, dtype=object)
-    s = comp_df[_IN_PORTFOLIO].astype(str).str.strip()
-    return s.mask(s.isin(("", "nan", "None")), "Unclassified")
+    return _clean_str(comp_df, _IN_PORTFOLIO)
 
 
-# ── Urgency ranking (Portfolio Major × ship bucket) ──────────────────────────
+def _supply_format(comp_df: pd.DataFrame) -> pd.Series:
+    """Supply Format as a cleaned string, blanks → "Unclassified"."""
+    return _clean_str(comp_df, _IN_SUPPLY_FORMAT)
+
+
+# ── Urgency ranking (Portfolio Major × Supply Format, by ship bucket) ────────
+
+# Row label joins Portfolio Major and Supply Format so the urgency chart splits
+# each portfolio by its supply-format mix.
+_URGENCY_CAT: str = "Portfolio × Format"
+
 
 def build_urgency_ranking(comp_df: pd.DataFrame, *, as_of: date) -> pd.DataFrame:
-    """FY27 in-year probabilized lbs per Portfolio Major × ship-date bucket.
+    """FY27 in-year probabilized lbs per Portfolio Major × Supply Format.
 
-    Returns a wide frame indexed by Portfolio Major (sorted by row total desc),
-    one column per :data:`SHIP_BUCKETS` label (raw lbs).  Feeds a horizontal
-    stacked bar.  Empty input → empty (but correctly-shaped) frame.
+    Returns a wide frame indexed by a ``"{Portfolio} · {Supply Format}"`` label
+    (sorted by row total desc), one column per :data:`SHIP_BUCKETS` label (raw
+    lbs).  Feeds a horizontal stacked bar.  Empty input → empty frame.
     """
     empty = pd.DataFrame(columns=list(SHIP_BUCKETS))
-    empty.index.name = _IN_PORTFOLIO
+    empty.index.name = _URGENCY_CAT
     if comp_df is None or comp_df.empty:
         return empty
 
+    cat = _portfolio(comp_df).str.cat(_supply_format(comp_df), sep=" · ")
     work = pd.DataFrame({
-        _IN_PORTFOLIO: _portfolio(comp_df),
+        _URGENCY_CAT: cat,
         "_bucket": _ship_bucket(_days_to_ship(comp_df, as_of)),
         "_vol": _num(comp_df, _IN_IN_YEAR),
     })
@@ -250,7 +271,7 @@ def build_urgency_ranking(comp_df: pd.DataFrame, *, as_of: date) -> pd.DataFrame
     if work.empty:
         return empty
 
-    wide = (work.pivot_table(index=_IN_PORTFOLIO, columns="_bucket",
+    wide = (work.pivot_table(index=_URGENCY_CAT, columns="_bucket",
                              values="_vol", aggfunc="sum", fill_value=0.0)
                 .reindex(columns=list(SHIP_BUCKETS), fill_value=0.0))
     wide = wide.loc[wide.sum(axis=1).sort_values(ascending=False).index]
@@ -259,19 +280,6 @@ def build_urgency_ranking(comp_df: pd.DataFrame, *, as_of: date) -> pd.DataFrame
 
 
 # ── High-urgency program watchlist ───────────────────────────────────────────
-
-def _action_for_prob(p: float) -> Optional[str]:
-    """Prob-tiered recommended action; ``None`` for locked (>=100%) / NaN rows."""
-    if p is None or pd.isna(p) or p >= LOCKED_PROB:
-        return None
-    if p >= 0.80:
-        return ACTION_PROTECT
-    if p >= 0.50:
-        return ACTION_CHASE
-    if p >= 0.20:
-        return ACTION_QUALIFY
-    return ACTION_KILL
-
 
 def _compose_program(row: pd.Series) -> str:
     """Single-line ``Program`` identifier: ``Customer — Item# Description``."""
@@ -289,13 +297,14 @@ def build_high_urgency_programs(
     comp_df: pd.DataFrame, *, as_of: date,
     quantile: float = HIGH_URGENCY_QUANTILE,
 ) -> pd.DataFrame:
-    """Top-quartile-urgency programs with a prob-tiered recommended Action.
+    """Top-quartile-urgency programs, with a blank Action for the planner to fill.
 
     Urgency = ``annual_volume × (1 − prob) × exp(−max(0, days)/90)``.  Rows at
     ``LE Probability >= 1.0`` (locked-in wins) are excluded — no action to take.
     Rows are kept when their urgency is at / above the *quantile*-th percentile
-    of all eligible rows, then sorted by urgency desc.  Columns:
-    :data:`WATCHLIST_COLUMNS`.  Empty / no-eligible input → empty frame.
+    of all eligible rows, then sorted by urgency desc.  ``Action`` is left blank
+    (the planner assigns it in the editor); ``Days-to-Ship`` is whole days from
+    *as_of*.  Columns: :data:`WATCHLIST_COLUMNS`.  Empty input → empty frame.
     """
     empty = pd.DataFrame(columns=list(WATCHLIST_COLUMNS))
     if comp_df is None or comp_df.empty:
@@ -314,6 +323,7 @@ def build_high_urgency_programs(
         COL_ANNUAL_VOLUME: volume,
         COL_FIRST_SHIP: pd.to_datetime(
             comp_df.get(_IN_FIRST_SHIP), errors="coerce"),
+        COL_DAYS_TO_SHIP: days,
         COL_PROBABILITY: prob,
         COL_URGENCY: urgency,
         "_prob_raw": prob,
@@ -325,39 +335,79 @@ def build_high_urgency_programs(
 
     threshold = eligible[COL_URGENCY].quantile(quantile)
     high = eligible[eligible[COL_URGENCY] >= threshold].copy()
-    high[COL_ACTION] = high["_prob_raw"].map(_action_for_prob)
+    high[COL_DAYS_TO_SHIP] = high[COL_DAYS_TO_SHIP].astype("Int64")
+    high[COL_ACTION] = ""                       # blank — planner fills it in
     high = (high.sort_values(COL_URGENCY, ascending=False)
                 .drop(columns="_prob_raw")
                 .reset_index(drop=True))
     return high[list(WATCHLIST_COLUMNS)]
 
 
-# ── Probability-bucket breakdown (gross lbs) ─────────────────────────────────
+def apply_watchlist_filters(
+    df: pd.DataFrame, *,
+    portfolios: Optional[list[str]] = None,
+    min_volume: Optional[float] = None,
+    ship_buckets: Optional[list[str]] = None,
+    prob_range: Optional[tuple[float, float]] = None,
+) -> pd.DataFrame:
+    """Narrow a built watchlist frame by the planner's filter selections.
 
-def build_probability_buckets(comp_df: pd.DataFrame) -> pd.DataFrame:
-    """Gross (unweighted) lbs per Portfolio Major × probability bucket.
-
-    Returns a wide frame indexed by Portfolio Major, one column per
-    :data:`PROB_BUCKETS` label (raw lbs).  Feeds a stacked bar with one bar per
-    bucket, each stacked by Portfolio Major.  Empty input → empty frame.
+    * ``portfolios``   — keep rows whose Portfolio Major is in the list (empty /
+      ``None`` = all).
+    * ``min_volume``   — keep rows with Annual Volume ≥ this many lbs.
+    * ``ship_buckets`` — keep rows whose Days-to-Ship falls in one of the given
+      :data:`SHIP_BUCKETS` labels.
+    * ``prob_range``   — ``(lo, hi)`` inclusive probability band (0-1 fractions).
     """
-    empty = pd.DataFrame(columns=list(PROB_BUCKETS))
+    if df is None or df.empty:
+        return df
+    mask = pd.Series(True, index=df.index)
+    if portfolios:
+        mask &= df[COL_PORTFOLIO].isin(portfolios)
+    if min_volume is not None:
+        mask &= pd.to_numeric(df[COL_ANNUAL_VOLUME], errors="coerce").fillna(0.0) >= min_volume
+    if ship_buckets:
+        buckets = _ship_bucket(pd.to_numeric(df[COL_DAYS_TO_SHIP], errors="coerce"))
+        mask &= buckets.isin(ship_buckets)
+    if prob_range is not None:
+        lo, hi = prob_range
+        p = pd.to_numeric(df[COL_PROBABILITY], errors="coerce")
+        mask &= p.between(lo, hi) | p.isna()
+    return df.loc[mask].reset_index(drop=True)
+
+
+# ── Pipeline build-up (per Portfolio Major: FY27 → Gross) ────────────────────
+
+def build_pipeline_buildup(comp_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-Portfolio-Major build-up of FY27 probabilized lbs up to Gross Pipeline.
+
+    Returns a wide frame indexed by Portfolio Major (sorted by Gross desc), with
+    one column per :data:`BUILDUP_SEGMENTS` label (raw lbs).  The three segments
+    sum to the unweighted Gross Pipeline; increments are clamped at 0 so a stray
+    row where probabilized exceeds unweighted can't produce a negative slice.
+    Empty input → empty frame.
+    """
+    empty = pd.DataFrame(columns=list(BUILDUP_SEGMENTS))
     empty.index.name = _IN_PORTFOLIO
     if comp_df is None or comp_df.empty:
         return empty
 
     work = pd.DataFrame({
         _IN_PORTFOLIO: _portfolio(comp_df),
-        "_bucket": _prob_bucket(_prob(comp_df)),
-        "_vol": _num(comp_df, _IN_ANNUAL_OPP),
+        "_fy27": _num(comp_df, _IN_IN_YEAR),
+        "_year1": _num(comp_df, _IN_FULL_YEAR),
+        "_gross": _num(comp_df, _IN_ANNUAL_OPP),
     })
-    work = work[work["_vol"] != 0.0]
-    if work.empty:
+    agg = work.groupby(_IN_PORTFOLIO).sum()
+    agg = agg[agg["_gross"] != 0.0]
+    if agg.empty:
         return empty
 
-    wide = (work.pivot_table(index=_IN_PORTFOLIO, columns="_bucket",
-                             values="_vol", aggfunc="sum", fill_value=0.0)
-                .reindex(columns=list(PROB_BUCKETS), fill_value=0.0))
-    wide = wide.loc[wide.sum(axis=1).sort_values(ascending=False).index]
-    wide.columns.name = None
-    return wide
+    out = pd.DataFrame({
+        SEG_FY27: agg["_fy27"].clip(lower=0.0),
+        SEG_YEAR_EFFECT: (agg["_year1"] - agg["_fy27"]).clip(lower=0.0),
+        SEG_RISK: (agg["_gross"] - agg["_year1"]).clip(lower=0.0),
+    })
+    out = out.loc[agg["_gross"].sort_values(ascending=False).index]
+    out.index.name = _IN_PORTFOLIO
+    return out

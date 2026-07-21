@@ -97,10 +97,7 @@ from data_sources.demand_plan_comparison import (
     COL_BASE_PLAN as DPC_COL_BASE_PLAN,
     COL_R_AND_O as DPC_COL_R_AND_O,
     COL_CURRENT_PLAN_BASE as DPC_COL_CURRENT_PLAN_BASE,
-    COL_V_BUDGET as DPC_COL_V_BUDGET,
     COL_TOTAL_ACTUALS as DPC_COL_TOTAL_ACTUALS,
-    COL_PRIOR_PLAN_BASE as DPC_COL_PRIOR_PLAN_BASE,
-    COL_PRIOR_PLAN_RO as DPC_COL_PRIOR_PLAN_RO,
     COL_PY_ACTUAL as DPC_COL_PY_ACTUAL,
     COL_O_PCT as DPC_COL_O_PCT,
     COL_BUDGET as DPC_COL_BUDGET,
@@ -7525,6 +7522,9 @@ def _render_corp_sku_driver_chart(row: pd.Series, months: tuple) -> None:
 def _render_demand_comparison_table(
     result, filters: Optional[ComparisonFilters] = None,
     *, ns: str = "", allow_save: bool = True,
+    extra_cols: Optional[list[str]] = None,
+    header_overrides: Optional[dict[str, str]] = None,
+    period_overrides: Optional[dict[str, str]] = None,
 ) -> None:
     """Render the detailed comparison table (foldable tree) + controls + exports.
 
@@ -7537,7 +7537,13 @@ def _render_demand_comparison_table(
     namespaces the widget keys (so an APS mirror coexists with the IBP one);
     *allow_save* gates the Save-to-Fabric button (off for the APS view, which
     must not overwrite the IBP comparison output).
+
+    ``extra_cols`` appends APS-only frame columns to the picker universe (hidden
+    by default, so the default view still matches IBP); ``header_overrides`` /
+    ``period_overrides`` merge into the header text / 2nd-line month ranges (used
+    by the APS view to surface "YTD Actuals" + "C5 YTG Fcst w.o. RO").
     """
+    extra_cols = extra_cols or []
     table = result.table
     if table is None or table.empty:
         st.info("No comparison rows to display.")
@@ -7558,8 +7564,11 @@ def _render_demand_comparison_table(
     # Seed the default BEFORE the table reads it (the picker renders below the
     # table but its state is read up-front via session_state).
     detail_cols_key = _ns_key(_DPC_DETAIL_COLS_KEY, ns)
-    all_detail_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER]
-    _hidden_default = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT}
+    # Extra (APS-only) columns are added to the picker universe but hidden by
+    # default, so the DEFAULT view still matches the IBP table exactly.
+    _extra = [c for c in extra_cols if c in table.columns]
+    all_detail_labels = [DPC_DISPLAY_LABELS[c] for c in DPC_DISPLAY_ORDER] + _extra
+    _hidden_default = {DPC_DISPLAY_LABELS[c] for c in DPC_COLS_HIDDEN_BY_DEFAULT} | set(_extra)
     default_visible = [lbl for lbl in all_detail_labels if lbl not in _hidden_default]
     st.session_state.setdefault(detail_cols_key, default_visible)
 
@@ -7611,6 +7620,12 @@ def _render_demand_comparison_table(
         }
         if filters is not None else {}
     )
+
+    # APS-view overrides (e.g. "YTD Actuals", "C5 YTG Fcst w.o. RO" + windows).
+    if header_overrides:
+        header_labels = {**header_labels, **header_overrides}
+    if period_overrides:
+        period_labels = {**period_labels, **period_overrides}
 
     # Foldable tree — navy header + white font, light-blue Total B2C, orange
     # (#f8cbad) Portfolio-Major rows (incl. Butter); click a parent row to fold.
@@ -7809,87 +7824,6 @@ def _render_aps_cycle_kpis(kpis: ComparisonKpis, filters: ComparisonFilters) -> 
     )
 
 
-def _render_aps_cycle_table(result, filters: ComparisonFilters) -> None:
-    """APS cycle-over-cycle table — a fixed prior-vs-current leg layout.
-
-    Columns (left→right): prior/current **Base** legs + Base Plan Var., then
-    prior/current **R&O** legs + R&O Var., then Total Actual, Current Plan
-    (incl. R&O), and the budget trio.  Plan legs are anchored on the chosen
-    cycles (e.g. ``C4 IBP Base`` / ``C5 Base``); the forecast / actual windows
-    show as a 2nd header line.  Fixed layout — no column picker.
-    """
-    table = result.table
-    if table is None or table.empty:
-        st.info("No comparison rows to display.")
-        return
-
-    L = DPC_DISPLAY_LABELS
-    cols = [
-        L[DPC_COL_PRIOR_PLAN_BASE], L[DPC_COL_CURRENT_PLAN_BASE], L[DPC_COL_BASE_PLAN],
-        L[DPC_COL_PRIOR_PLAN_RO], L[DPC_COL_CURRENT_PLAN_RO], L[DPC_COL_R_AND_O],
-        L[DPC_COL_TOTAL_ACTUALS], L[DPC_COL_CURRENT_PLAN],
-        L[DPC_COL_V_BUDGET], L[DPC_COL_PCT], L[DPC_COL_BUDGET],
-    ]
-    missing = [c for c in cols if c not in table.columns]
-    if missing:
-        st.warning(
-            "APS cycle table is missing expected columns "
-            f"({', '.join(missing)}) — was the build run in APS mode?"
-        )
-        return
-
-    prior_cy, current_cy = filters.prior_cycle, filters.current_cycle
-    fwin = f"({filters.forecast_start:%b%y}-{filters.forecast_end:%b%y})"
-    awin = f"({filters.actual_start:%b%y}-{filters.actual_end:%b%y})"
-    # Plan legs anchored on the chosen cycles; budget columns given the planner's
-    # preferred "vs Budget" wording.
-    header_labels = {
-        L[DPC_COL_PRIOR_PLAN_BASE]: f"{prior_cy} IBP Base",
-        L[DPC_COL_CURRENT_PLAN_BASE]: f"{current_cy} Base",
-        L[DPC_COL_PRIOR_PLAN_RO]: f"{prior_cy} IBP R&O",
-        L[DPC_COL_CURRENT_PLAN_RO]: f"{current_cy} R&O",
-        L[DPC_COL_CURRENT_PLAN]: f"{current_cy} Plan (incl. R&O)",
-        L[DPC_COL_V_BUDGET]: "vs Budget",
-        L[DPC_COL_PCT]: "vs Budget%",
-    }
-    # 2nd header line: the window each column covers (forecast vs actual).
-    period_labels = {
-        L[DPC_COL_PRIOR_PLAN_BASE]: fwin, L[DPC_COL_CURRENT_PLAN_BASE]: fwin,
-        L[DPC_COL_BASE_PLAN]: fwin,
-        L[DPC_COL_PRIOR_PLAN_RO]: fwin, L[DPC_COL_CURRENT_PLAN_RO]: fwin,
-        L[DPC_COL_R_AND_O]: fwin,
-        L[DPC_COL_TOTAL_ACTUALS]: awin,
-    }
-
-    subtotal_flags = table["_is_subtotal"].tolist()
-    memo_flags = table["_is_memo"].tolist()
-    row_ids = table["_row_id"].tolist() if "_row_id" in table.columns else None
-    indent_flags = table["_indent"].tolist() if "_indent" in table.columns else []
-
-    base_df = table.drop(
-        columns=[c for c in ("_row_id", "_indent", "_is_subtotal", "_is_memo")
-                 if c in table.columns]).reset_index(drop=True)
-    pct_label = L[DPC_COL_PCT]
-    display_df = base_df.copy()
-    if pct_label in display_df.columns:               # % is stored as a fraction
-        display_df[pct_label] = display_df[pct_label] * 100.0
-
-    _render_comparison_tree(
-        display_df, label_col=DPC_COL_LABEL, metric_cols=cols,
-        percent_labels=[pct_label], row_ids=row_ids,
-        subtotal_flags=subtotal_flags, memo_flags=memo_flags,
-        indent_flags=indent_flags, header_labels=header_labels,
-        period_labels=period_labels)
-
-    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    st.download_button(
-        label="⬇️ Download APS / Oracle Cycle-over-Cycle (CSV)",
-        data=base_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"aps_cycle_over_cycle_{today}.csv",
-        mime="text/csv", key=_ns_key("aps_cycle_download", "aps"),
-        use_container_width=True)
-
-
 def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
     """APS mirror of Demand Plan Comparison Summary (no bias; incl. Prior Month).
 
@@ -8059,7 +7993,24 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
         # APS uses its OWN top metrics + table (prior-vs-current leg layout),
         # distinct from the IBP walk/table.
         _render_aps_cycle_kpis(kpis, filters)
-        _render_aps_cycle_table(result, filters)
+        # Same detailed table as the IBP section (dark-blue/orange, column
+        # rearrange/hide), plus two APS columns (hidden by default): "YTD
+        # Actuals" (actuals window) and "{cycle} YTG Fcst w.o. RO" (current-cycle
+        # base forecast over the forecast window).
+        _fwin = f"({filters.forecast_start:%b%y}-{filters.forecast_end:%b%y})"
+        _awin = f"({filters.actual_start:%b%y}-{filters.actual_end:%b%y})"
+        _render_demand_comparison_table(
+            result, filters, ns="aps", allow_save=False,
+            extra_cols=[DPC_DISPLAY_LABELS[DPC_COL_TOTAL_ACTUALS]],
+            header_overrides={
+                DPC_DISPLAY_LABELS[DPC_COL_TOTAL_ACTUALS]: "YTD Actuals",
+                DPC_DISPLAY_LABELS[DPC_COL_CURRENT_PLAN_BASE]:
+                    f"{filters.current_cycle} YTG Fcst w.o. RO",
+            },
+            period_overrides={
+                DPC_DISPLAY_LABELS[DPC_COL_TOTAL_ACTUALS]: _awin,
+                DPC_DISPLAY_LABELS[DPC_COL_CURRENT_PLAN_BASE]: _fwin,
+            })
         # SKU-level build-up of the APS cycle-over-cycle rows (unshifted window).
         _render_sku_cycle_drilldown(
             enriched, filters, ns="aps", shift_last_plan_window=False)

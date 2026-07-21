@@ -75,9 +75,11 @@ from data_sources.fabric_auth import (
     read_section,
 )
 from data_sources.fabric_lakehouse_io import (
+    LakehouseFile,
     LakehouseIOError,
     archive_bytes,
     get_file_properties,
+    list_files,
     read_bytes,
     read_csv,
     write_bytes,
@@ -1635,6 +1637,26 @@ def save_pipeline_review_snapshot(
             "Could not archive the RO Pipeline Review snapshot to "
             f"'Files/{_RO_PIPELINE_REVIEW_ARCHIVE_DIR}': {exc}"
         ) from exc
+
+
+def list_pipeline_review_snapshots() -> list[LakehouseFile]:
+    """List archived "RO Pipeline Review" snapshots, newest first.
+
+    Reads the archive folder in one round-trip and returns the ``.csv`` files
+    sorted by name descending (the timestamped filenames sort chronologically),
+    so the page can surface the audit trail the Refresh button writes.  Returns
+    ``[]`` when the folder doesn't exist yet.  Raises :class:`RoComparisonError`
+    on an underlying I/O failure.
+    """
+    try:
+        files = list_files(
+            _SECRETS_SECTION, _RO_PIPELINE_REVIEW_ARCHIVE_DIR, suffix=".csv")
+    except LakehouseIOError as exc:
+        raise RoComparisonError(
+            "Could not list the RO Pipeline Review archive at "
+            f"'Files/{_RO_PIPELINE_REVIEW_ARCHIVE_DIR}': {exc}"
+        ) from exc
+    return sorted(files, key=lambda f: f.name, reverse=True)
 
 
 # ── Auto-regenerate on RO_History refresh ────────────────────────────────────

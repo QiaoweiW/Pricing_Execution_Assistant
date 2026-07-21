@@ -321,6 +321,7 @@ from data_sources.ro_comparison import (
     list_months,
     regenerate_comparison_output,
     ro_item_master_blob_path,
+    list_pipeline_review_snapshots,
     save_pipeline_review_snapshot,
     save_ro_comparison_output,
 )
@@ -2576,9 +2577,9 @@ def _render_ro_pipeline_tiles(
         ("Gross Pipeline", _fmt_m_lbs(m.gross_lbs),
          "unweighted annual opportunity, all programs"),
         ("Full-Year, Risk-adjusted", _fmt_m(full_year_disp),
-         "FY28 probabilized — Total B2C"),
+         f"{rpa.FY_NEXT_LABEL} probabilized — Total B2C"),
         ("In-Year, Risk-adjusted", _fmt_m(in_year_disp),
-         "FY27 probabilized — Total B2C"),
+         f"{rpa.FY_CURRENT_LABEL} probabilized — Total B2C"),
         ("Committed", committed_val,
          "in-year probabilized at ≥95% · M lbs & % of in-year"),
     )
@@ -2607,8 +2608,10 @@ def _render_ro_pipeline_tiles(
         )
 
 
-# First-ship-date urgency-bucket colours: red = ship soon (urgent) → blue = slack.
+# First-ship-date urgency-bucket colours: dark red = overdue → red = soon →
+# amber → blue = slack.
 _RO_SHIP_BUCKET_COLORS: dict[str, str] = {
+    rpa.SHIP_BUCKET_OVERDUE: "#7b241c",
     rpa.SHIP_BUCKET_NEAR: "#c0392b",
     rpa.SHIP_BUCKET_MID:  "#e59866",
     rpa.SHIP_BUCKET_FAR:  "#5dade2",
@@ -2639,7 +2642,7 @@ def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
         barmode="stack", height=max(260, 30 * len(cats) + 100),
         margin=dict(l=10, r=10, t=40, b=10),
         font=dict(color=_RO_CHART_FONT, size=12),
-        xaxis=dict(title=dict(text="FY27 Probabilized (M lbs)"),
+        xaxis=dict(title=dict(text=f"{rpa.FY_CURRENT_LABEL} In-Year Probabilized (M lbs)"),
                    showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
         yaxis=dict(autorange="reversed", tickfont=dict(size=11)),  # largest on top
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
@@ -2725,6 +2728,11 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
             rpa.COL_PORTFOLIO:     cc.TextColumn("Portfolio", width="small"),
             rpa.COL_ANNUAL_VOLUME: cc.NumberColumn(
                 "Annual Volume (lbs)", format="accounting", width="medium"),
+            rpa.COL_IN_YEAR:       cc.NumberColumn(
+                f"In-Year ({rpa.FY_CURRENT_LABEL}, lbs)", format="accounting",
+                width="medium",
+                help=f"{rpa.FY_CURRENT_LABEL} in-year probabilized — the same "
+                     "basis the urgency chart plots."),
             rpa.COL_FIRST_SHIP:    cc.DateColumn(
                 "First Ship Date", format="YYYY-MM-DD", width="small"),
             rpa.COL_DAYS_TO_SHIP:  cc.NumberColumn(
@@ -2751,13 +2759,54 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
         f"Archives the **{len(edited)}** row(s) currently shown (after filters "
         "+ your edits).  Clear the filters above to archive the full list."
     )
-    if st.button("🔄 Refresh & archive snapshot to Fabric",
-                 key="ro_wl_archive", use_container_width=True):
+    if not fabric_signin_widget.is_fabric_signed_in():
+        # Gate on sign-in like the other RO Fabric actions — the write would
+        # otherwise only fail at click time.
+        st.caption(
+            "_Sign in via **Home & Fabric Sign-in** to archive a snapshot._"
+        )
+    elif st.button("🔄 Refresh & archive snapshot to Fabric",
+                   key="ro_wl_archive", use_container_width=True):
         try:
-            path = save_pipeline_review_snapshot(edited)
+            # UTC timestamp so filenames sort/read consistently regardless of
+            # the server's local timezone.
+            ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+            path = save_pipeline_review_snapshot(edited, timestamp=ts)
             st.success(f"✅ Archived {len(edited)} row(s) to `Files/{path}`.")
         except RoComparisonError as exc:
             st.error(f"❌ Could not archive the snapshot to Fabric.\n\n{exc}")
+
+    _render_ro_pipeline_review_archive()
+
+
+def _render_ro_pipeline_review_archive() -> None:
+    """Collapsed list of archived RO Pipeline Review snapshots (audit trail).
+
+    Read-back for the write-only archive — surfaces the timestamped CSVs the
+    Refresh button writes so the trail is reachable from the app.  Requires
+    Fabric sign-in; degrades to a hint / info banner otherwise.
+    """
+    with st.expander("🗂️ Archived review snapshots", expanded=False):
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.caption("_Sign in to list archived snapshots._")
+            return
+        try:
+            files = list_pipeline_review_snapshots()
+        except RoComparisonError as exc:
+            st.warning(f"Could not list the archive: {exc}")
+            return
+        if not files:
+            st.info("No snapshots archived yet — use **Refresh & archive** above.")
+            return
+        # Newest first (already sorted by the data source); show the recent few.
+        st.caption(f"{len(files)} snapshot(s) — most recent first.")
+        st.dataframe(
+            pd.DataFrame(
+                [{"File": f.name,
+                  "Last modified (UTC)": f.last_modified or "—",
+                  "Size (KB)": round((f.size or 0) / 1024, 1)}
+                 for f in files[:25]]),
+            use_container_width=True, hide_index=True)
 
 
 # Build-up segment styling: solid green base (expected in-year) → lighter timing
@@ -2843,16 +2892,17 @@ def _render_ro_pipeline_analytics_fragment(comp: pd.DataFrame) -> None:
     with left:
         st.markdown("#### 🔺 Urgency by Portfolio × Format & Ship Window")
         st.caption(
-            "FY27 in-year probabilized volume per Portfolio Major × Supply "
-            "Format, split by how soon each program is due to ship."
+            f"{rpa.FY_CURRENT_LABEL} in-year probabilized volume per Portfolio "
+            "Major × Supply Format, split by how soon each program is due to "
+            "ship (Overdue → > 90 days)."
         )
         _render_ro_urgency_chart(comp)
     with right:
-        st.markdown("#### 🧱 Pipeline Build-up (FY27 → Gross)")
+        st.markdown(f"#### 🧱 Pipeline Build-up ({rpa.FY_CURRENT_LABEL} → Gross)")
         st.caption(
-            "Per Portfolio Major × Supply Format: solid FY27 probabilized, plus "
-            "the Year-effect and Risk (probability-headroom) increments that "
-            "build up to the unweighted Gross Pipeline."
+            f"Per Portfolio Major × Supply Format: solid {rpa.FY_CURRENT_LABEL} "
+            "probabilized, plus the Year-effect and Risk (probability-headroom) "
+            "increments that build up to the unweighted Gross Pipeline."
         )
         _render_ro_buildup_chart(comp)
 

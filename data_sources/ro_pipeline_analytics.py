@@ -94,22 +94,34 @@ DEADLINE_DECAY_DAYS: float = 90.0
 # High-urgency watchlist = the top quartile by urgency score.
 HIGH_URGENCY_QUANTILE: float = 0.75
 
+# Fiscal-year display labels — the SINGLE source of truth for the "FY__" text
+# across the pipeline tiles / charts (page reads these).  At fiscal rollover,
+# bump these two here instead of hunting literals through the UI.  (Kept in sync
+# with the RO Summary's group labels, which carry the same convention.)
+FY_CURRENT_LABEL: str = "FY27"    # current fiscal year (in-year, "Current Fiscal")
+FY_NEXT_LABEL: str    = "FY28"    # next fiscal year (full-year, "Year1")
+
 # First-ship-date urgency buckets (days from as-of to LE First Ship Date).
+# "Overdue" (should already have shipped) is split out from "< 30 days" so a
+# past-due program doesn't hide among merely-imminent ones.
+SHIP_BUCKET_OVERDUE: str = "Overdue"
 SHIP_BUCKET_NEAR: str = "< 30 days"
 SHIP_BUCKET_MID: str  = "30–90 days"
 SHIP_BUCKET_FAR: str  = "> 90 days"
-SHIP_BUCKETS: tuple[str, ...] = (SHIP_BUCKET_NEAR, SHIP_BUCKET_MID, SHIP_BUCKET_FAR)
+SHIP_BUCKETS: tuple[str, ...] = (
+    SHIP_BUCKET_OVERDUE, SHIP_BUCKET_NEAR, SHIP_BUCKET_MID, SHIP_BUCKET_FAR,
+)
 
-# Pipeline build-up segments (per Portfolio Major): a solid FY27 base plus the
-# two increments that build it up to the unweighted Gross Pipeline —
-#   FY27 Probabilized  = Σ CUR_FISCAL_PROB_LE            (risk-adjusted in-year)
-#   Year-effect        = Σ YEAR1_PROB_LE − Σ CUR_FISCAL  (probabilized volume
-#                                                         beyond the fiscal year)
-#   Risk               = Σ ANNUAL_OPP_LE − Σ YEAR1_PROB  (probability headroom:
-#                                                         upside if prob → 100%)
+# Pipeline build-up segments (per Portfolio × Format): a solid in-year base plus
+# the two increments that build it up to the unweighted Gross Pipeline —
+#   In-Year Probabilized = Σ CUR_FISCAL_PROB_LE          (risk-adjusted in-year)
+#   Year-effect          = Σ YEAR1_PROB_LE − Σ CUR_FISCAL (probabilized volume
+#                                                          beyond the fiscal year)
+#   Risk                 = Σ ANNUAL_OPP_LE − Σ YEAR1_PROB (probability headroom:
+#                                                          upside if prob → 100%)
 # The three sum to Gross, so the reader sees how much lifting probability x→y
 # could recover.
-SEG_FY27: str        = "FY27 Probabilized"
+SEG_FY27: str        = f"{FY_CURRENT_LABEL} Probabilized"
 SEG_YEAR_EFFECT: str = "Year-effect"
 SEG_RISK: str        = "Risk (probability headroom)"
 BUILDUP_SEGMENTS: tuple[str, ...] = (SEG_FY27, SEG_YEAR_EFFECT, SEG_RISK)
@@ -124,10 +136,13 @@ ACTION_OPTIONS: tuple[str, ...] = (
     "", ACTION_PROTECT, ACTION_CHASE, ACTION_QUALIFY, ACTION_KILL,
 )
 
-# Output column identifiers for the high-urgency watchlist.
+# Output column identifiers for the high-urgency watchlist.  ``In-Year`` is the
+# same FY27 probabilized quantity the urgency chart plots — carried here so the
+# table and the chart beside it read on a common volume basis.
 COL_PROGRAM: str       = "Program"
 COL_PORTFOLIO: str     = "Portfolio Major"
 COL_ANNUAL_VOLUME: str = "Annual Volume (lbs)"
+COL_IN_YEAR: str       = "In-Year Probabilized (lbs)"
 COL_FIRST_SHIP: str    = "First Ship Date"
 COL_DAYS_TO_SHIP: str  = "Days-to-Ship"
 COL_PROBABILITY: str   = "Probability"
@@ -135,7 +150,7 @@ COL_URGENCY: str       = "Urgency"
 COL_ACTION: str        = "Action"
 
 WATCHLIST_COLUMNS: tuple[str, ...] = (
-    COL_PROGRAM, COL_PORTFOLIO, COL_ANNUAL_VOLUME, COL_FIRST_SHIP,
+    COL_PROGRAM, COL_PORTFOLIO, COL_ANNUAL_VOLUME, COL_IN_YEAR, COL_FIRST_SHIP,
     COL_DAYS_TO_SHIP, COL_PROBABILITY, COL_URGENCY, COL_ACTION,
 )
 
@@ -207,12 +222,16 @@ def _days_to_ship(comp_df: pd.DataFrame, as_of: date) -> pd.Series:
 
 
 def _ship_bucket(days: pd.Series) -> pd.Series:
-    """Map days-to-ship → urgency bucket label (NaN days → far, treated as slack)."""
-    # Overdue / very soon rows (< 30, incl. negative) are the most urgent; NaN
-    # (no date) is treated as "far" so undated rows don't inflate urgency.
+    """Map days-to-ship → urgency bucket label.
+
+    Past-due rows (days < 0) are their own ``Overdue`` bucket — the most urgent —
+    so they don't hide among merely-imminent (< 30-day) programs.  NaN (no date)
+    is treated as ``> 90 days`` so undated rows don't inflate urgency.
+    """
     out = pd.Series(SHIP_BUCKET_FAR, index=days.index, dtype=object)
-    out[days < 30] = SHIP_BUCKET_NEAR
+    out[(days >= 0) & (days < 30)] = SHIP_BUCKET_NEAR
     out[(days >= 30) & (days <= 90)] = SHIP_BUCKET_MID
+    out[days < 0] = SHIP_BUCKET_OVERDUE
     out[days.isna()] = SHIP_BUCKET_FAR
     return out
 
@@ -318,6 +337,7 @@ def build_high_urgency_programs(
         COL_PROGRAM: comp_df.apply(_compose_program, axis=1),
         COL_PORTFOLIO: _portfolio(comp_df),
         COL_ANNUAL_VOLUME: volume,
+        COL_IN_YEAR: _num(comp_df, _IN_IN_YEAR),
         COL_FIRST_SHIP: pd.to_datetime(
             comp_df.get(_IN_FIRST_SHIP), errors="coerce"),
         COL_DAYS_TO_SHIP: days,

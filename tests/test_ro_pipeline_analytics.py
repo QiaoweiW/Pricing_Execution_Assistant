@@ -61,8 +61,9 @@ def test_urgency_ranking_by_portfolio_and_format():
     # Rows are Portfolio × Format, sorted by total desc.
     assert list(wide.index) == [
         "Butter · Extended", "Butter · Cultured", "Cheese · Aseptic"]
-    # Butter · Cultured: Acme 800 + Eve 50 at <30.
-    assert wide.loc["Butter · Cultured", rpa.SHIP_BUCKET_NEAR] == pytest.approx(850.0)
+    # Butter · Cultured: Acme 800 at <30 (5d); Eve 50 Overdue (-19d, past due).
+    assert wide.loc["Butter · Cultured", rpa.SHIP_BUCKET_NEAR] == pytest.approx(800.0)
+    assert wide.loc["Butter · Cultured", rpa.SHIP_BUCKET_OVERDUE] == pytest.approx(50.0)
     # Butter · Extended: Beta 1500 at 30–90.
     assert wide.loc["Butter · Extended", rpa.SHIP_BUCKET_MID] == pytest.approx(1500.0)
     # Cheese · Aseptic: Cee 400 at >90 (Dee dropped — 0 in-year lbs).
@@ -88,6 +89,9 @@ def test_high_urgency_blank_action_days_and_ranking():
     # Days-to-Ship is whole days from as_of.
     assert int(high.iloc[0][rpa.COL_DAYS_TO_SHIP]) == 41   # Beta
     assert int(high.iloc[1][rpa.COL_DAYS_TO_SHIP]) == 5    # Acme
+    # In-Year (FY27 probabilized) column carries the chart's volume basis.
+    assert high.iloc[0][rpa.COL_IN_YEAR] == pytest.approx(1500.0)   # Beta CUR fiscal
+    assert high.iloc[1][rpa.COL_IN_YEAR] == pytest.approx(800.0)    # Acme CUR fiscal
 
 
 def test_high_urgency_empty_when_all_locked():

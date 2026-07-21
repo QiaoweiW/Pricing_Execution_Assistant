@@ -323,14 +323,6 @@ from data_sources.ro_comparison import (
     ro_item_master_blob_path,
     save_ro_comparison_output,
 )
-from data_sources.ro_early_start_programs import (
-    COL_FORMAT as ESP_COL_FORMAT,
-    COL_LE_ANNUAL_OPP as ESP_COL_LE_ANNUAL_OPP,
-    COL_PROGRAM as ESP_COL_PROGRAM,
-    COL_START_DATE as ESP_COL_START_DATE,
-    build_early_start_programs_table,
-    list_available_formats as list_esp_formats,
-)
 from data_sources.ro_summary_report import (
     COL_DELTA_CHANGE as SR_COL_DELTA_CHANGE,
     COL_DELTA_EXIT as SR_COL_DELTA_EXIT,
@@ -350,7 +342,6 @@ from data_sources.ro_summary_report import (
     clear_comparison_output_cache,
     diag_dim_summary,
     drop_all_zero_rows,
-    fetch_ro_comparison_output_df,
     recompute_subtotals,
     save_ro_summary_report,
     summary_to_csv_bytes,
@@ -554,28 +545,6 @@ _SS_SUMMARY_REPORT_RAW_DF    = "_ro_sr_raw_df"
 # widget INSIDE the report fragment reruns.
 _SS_SUMMARY_REPORT_SIG       = "_ro_sr_sig"
 _SS_SUMMARY_REPORT_TEMPLATE  = "_ro_sr_template"
-
-# Early-Start-Date Programs section.
-#
-# Sourcing model: reads ``RO_Comparison_Output.csv`` directly from
-# Fabric (via the cached :func:`fetch_ro_comparison_output_df`
-# connector) — the SAME cache slot the Summary Report uses, so the
-# "Refresh from Fabric" button at the top of the section invalidates
-# both with a single click and our fragment never pays a second
-# round-trip per render.  Keys persist the Format multiselect and
-# the cutoff-date picker selections so a fragment rerun (caused by
-# any other widget on the page) doesn't clear the planner's filters.
-_SS_ESP_FORMAT_FILTER     = "_ro_esp_format_filter"
-_SS_ESP_DATE_AFTER_FILTER = "_ro_esp_date_after_filter"
-_SS_ESP_DATE_FILTER       = "_ro_esp_date_filter"
-_SS_ESP_MIN_OPP_FILTER    = "_ro_esp_min_opp_filter"
-
-# Sentinel "no effective lower bound" for the Start-Date-After widget.
-# Predates any real Darigold program data, so by default the widget
-# is rendered but filters nothing.  Pinned at module scope so we get
-# one canonical spelling shared between the default-value, the
-# is-it-the-default test, and the help text.
-_ESP_AFTER_DATE_SENTINEL: date = date(1900, 1, 1)
 
 # Filterable columns for the field-filter row above the editable table.
 # ``Driver`` is one of {"New", "Exit", "Change", "No Change"} (see
@@ -1159,13 +1128,6 @@ def _render_ro_comparison() -> None:
             # cell edit / Save click re-runs ONLY this block — no Fabric
             # I/O, no comparison rebuild, no warnings banner re-render.
             _render_filtered_editor_fragment(prior_month, le_month)
-
-            # Early-Start-Date Programs — drilldown of the published
-            # ``RO_Comparison_Output.csv``.  Reads from Fabric directly
-            # (not from ``_SS_SUMMARY_DF``) so it reflects the last
-            # *saved* baseline.  Own fragment for widget isolation.
-            st.markdown("---")
-            _render_early_start_programs_section()
 
         # 11. Pipeline at a Glance — headline metric tiles + urgency /
         #     probability charts over the same in-memory comparison frame
@@ -2537,231 +2499,6 @@ def _bucket_display_label(customer: str, pminor: str) -> str:
     return f"{customer_disp} — {pminor_disp}"
 
 
-# ── Early-Start-Date Programs (Fabric drilldown) ────────────────────────────
-
-def _render_early_start_programs_section() -> None:
-    """Render the header + delegate to the Early-Start-Date fragment.
-
-    Header (title + caption) lives OUTSIDE the fragment because it's
-    static text — wrapping it inside would add a stack frame to every
-    widget rerun for no benefit.  Matches the
-    :func:`_render_summary_report_section` shape so the two sections
-    read identically when skimming the page.
-    """
-    st.markdown("### 🗓️ Programs with Early Start Date")
-    st.caption(
-        "Programs from the **published** RO comparison whose "
-        "**LE First Ship Date** falls before a chosen cutoff.  "
-        "Independent of the field filters and month pickers above — "
-        "reads `Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv` "
-        "from Microsoft Fabric directly, so the table reflects the last "
-        "**saved** baseline rather than any unsaved edits in the editor."
-    )
-    _render_early_start_programs_fragment()
-
-
-@st.fragment
-def _render_early_start_programs_fragment() -> None:
-    """Render the Format / cutoff-date filters and the (Format, Program,
-    Start Date) table.
-
-    Wrapped in a fragment so changing the Format multiselect or the
-    cutoff-date picker reruns ONLY this block — no Fabric round-trip
-    (the comparison-output frame is served from the shared
-    ``@st.cache_data`` slot owned by
-    :mod:`ro_summary_report`), no comparison rebuild, no warnings
-    banner re-render.
-
-    Error model
-    -----------
-    A genuine Fabric I/O failure is surfaced as an inline error and
-    the fragment returns early — the rest of the page (Summary
-    Report below, editor above) is unaffected.  An empty / missing
-    published CSV degrades to an info banner with a hint to publish
-    the comparison first.
-    """
-    try:
-        comp_df = fetch_ro_comparison_output_df()
-    except RoSummaryReportError as exc:
-        # ``fetch_ro_comparison_output_df`` lives in
-        # ``ro_summary_report`` and raises that module's error type.
-        # We share the connector deliberately (one cache slot, one
-        # Fabric round-trip per refresh window) and therefore share
-        # the error type as well — no need to introduce a parallel
-        # exception just for this section.
-        st.error(
-            "❌ Could not read RO_Comparison_Output.csv from "
-            f"Microsoft Fabric.\n\n{exc}"
-        )
-        return
-
-    if comp_df is None or comp_df.empty:
-        st.info(
-            "ℹ️ `RO_Comparison_Output.csv` is empty or has not been "
-            "published yet.  It is **auto-published** by this app the "
-            "next time `RO_History_Tracker.csv` changes in Fabric — "
-            "wait a few minutes for Fabric to ingest your upload and "
-            "reload this page."
-        )
-        return
-
-    # ── Filter widgets ────────────────────────────────────────────
-    # Four side-by-side widgets at typical browser widths; stack on
-    # mobile.  Format gets the lion's share of horizontal space
-    # because its selected-chip list grows; the date / min-opp
-    # inputs are all single-value widgets.  Reading order is the
-    # natural English phrasing of a range filter:
-    #   Format | after  | before | Min Opp
-    available_formats = list_esp_formats(comp_df)
-    fcol, acol, dcol, ocol = st.columns([3, 1.2, 1.2, 1.2])
-    with fcol:
-        selected_formats = st.multiselect(
-            "Format",
-            options=available_formats,
-            key=_SS_ESP_FORMAT_FILTER,
-            help=(
-                "Limit to programs whose Format matches one of the "
-                "selected values.  Leave empty to include every Format."
-            ),
-        )
-    with acol:
-        # Default to the 1900-01-01 sentinel: widget is always-on so
-        # the planner sees it on first render, but it filters nothing
-        # by default (no real program data predates 1900).  Picking a
-        # later date narrows the report to a range.  ``min_value``
-        # lines up with the sentinel so the widget never complains
-        # "value out of range" on initial render.
-        after_cutoff: date = st.date_input(
-            "Start date after",
-            value=st.session_state.get(
-                _SS_ESP_DATE_AFTER_FILTER, _ESP_AFTER_DATE_SENTINEL,
-            ),
-            min_value=_ESP_AFTER_DATE_SENTINEL,
-            key=_SS_ESP_DATE_AFTER_FILTER,
-            help=(
-                "Show only programs whose LE First Ship Date is "
-                "**strictly later** than this date.  Defaults to "
-                f"{_ESP_AFTER_DATE_SENTINEL:%Y-%m-%d} (no effective "
-                "lower bound).  Pair with the 'Start date before' "
-                "picker on the right to narrow to a window."
-            ),
-        )
-    with dcol:
-        # Default the cutoff to today on first render — common case
-        # is "what's supposed to be shipping by now?".  After the
-        # planner picks a value Streamlit persists it in session_state
-        # under our key, so subsequent reruns preserve their choice.
-        before_cutoff: date = st.date_input(
-            "Start date before",
-            value=st.session_state.get(_SS_ESP_DATE_FILTER, date.today()),
-            key=_SS_ESP_DATE_FILTER,
-            help=(
-                "Show programs whose LE First Ship Date is **strictly "
-                "earlier** than this date.  Defaults to today."
-            ),
-        )
-    with ocol:
-        # Step = 100,000 lbs so the +/- buttons increment in
-        # planner-meaningful chunks.  The planner can always type an
-        # exact threshold; the step only governs the up-down arrows.
-        # ``int`` everywhere so the widget renders a whole-pound input
-        # (matches the accounting format of the column itself).
-        min_le_annual_opp: int = int(st.number_input(
-            "Min LE Annual Opp (lbs)",
-            min_value=0,
-            value=int(st.session_state.get(_SS_ESP_MIN_OPP_FILTER, 0)),
-            step=100_000,
-            key=_SS_ESP_MIN_OPP_FILTER,
-            help=(
-                "Show only programs whose LE Annual Opportunity (lbs) "
-                "is ≥ this value.  0 (default) includes every program."
-            ),
-        ))
-
-    # ── Bounds sanity check ──────────────────────────────────────
-    # Strict bounds (``after < d < before``) mean ``after >= before``
-    # is *guaranteed* to produce zero rows.  Warn the planner so
-    # they don't read an empty result as "no data" when it's
-    # actually a self-inflicted impossible range.
-    after_is_active = after_cutoff > _ESP_AFTER_DATE_SENTINEL
-    if after_is_active and after_cutoff >= before_cutoff:
-        st.warning(
-            "⚠️ **Start date after** "
-            f"(`{after_cutoff:%Y-%m-%d}`) is on or after "
-            f"**Start date before** (`{before_cutoff:%Y-%m-%d}`).  "
-            "The range is empty by construction — pick an earlier "
-            "*after* date or a later *before* date."
-        )
-
-    # ── Compute + render ──────────────────────────────────────────
-    table = build_early_start_programs_table(
-        comp_df,
-        formats_filter=selected_formats or None,
-        # Pass ``None`` when the widget is at the sentinel so the
-        # function short-circuits the lower-bound check rather than
-        # comparing every row against 1900-01-01.  Saves a vectorised
-        # pass on big frames and keeps test inputs deterministic.
-        after_date=after_cutoff if after_is_active else None,
-        before_date=before_cutoff,
-        min_le_annual_opp=min_le_annual_opp if min_le_annual_opp > 0 else None,
-    )
-
-    if table.empty:
-        st.info(
-            "No programs match the current Format / date range / Min "
-            "Opp selection.  Try expanding the Format filter, "
-            "widening the date range, or lowering the Min Opp threshold."
-        )
-        return
-
-    # Caption tells the planner exactly which filters are active so
-    # they don't mistake a small list for missing data.  The Start
-    # Date bit shows the active range — single-bound when ``after``
-    # is at the sentinel, full range when both bounds are live.
-    if after_is_active:
-        date_bit = (
-            f"**{after_cutoff:%Y-%m-%d}** < Start Date < "
-            f"**{before_cutoff:%Y-%m-%d}**"
-        )
-    else:
-        date_bit = f"Start Date < **{before_cutoff:%Y-%m-%d}**"
-    filter_bits = [date_bit]
-    if min_le_annual_opp > 0:
-        filter_bits.append(f"LE Annual Opp ≥ **{min_le_annual_opp:,} lbs**")
-    st.caption(
-        f"Showing **{len(table):,}** program(s) — "
-        f"{' · '.join(filter_bits)}.  "
-        "_Programs at LE Probability = 100 % are always excluded._  "
-        "Click any column header to sort."
-    )
-
-    cc = st.column_config
-    st.dataframe(
-        table,
-        use_container_width=True,
-        hide_index=True,
-        # Header (38) + per-row (36) sized to fit a typical short
-        # list without scrolling, capped so a huge list (hundreds of
-        # programs at a far-future cutoff) doesn't dominate the page.
-        height=min(36 * (len(table) + 1) + 38, 480),
-        column_config={
-            ESP_COL_FORMAT:        cc.TextColumn("Format",  width="small"),
-            ESP_COL_PROGRAM:       cc.TextColumn("Program", width="large"),
-            # ``accounting`` format = comma thousands, no decimals,
-            # negatives in parentheses — matches every other Lbs
-            # column on this page so the planner reads them
-            # uniformly.  Numeric column → clickable header sorts
-            # numerically (not lexically).
-            ESP_COL_LE_ANNUAL_OPP: cc.NumberColumn(
-                "LE Annual Opp (lbs)", format="accounting", width="medium",
-            ),
-            ESP_COL_START_DATE:    cc.DateColumn(
-                "Start Date", format="YYYY-MM-DD", width="small",
-            ),
-        },
-    )
-
-
 # ── RO Pipeline Analytics (tiles + charts, above the RO Summary) ─────────────
 
 def _ro_pipeline_comp_df() -> Optional[pd.DataFrame]:
@@ -2820,6 +2557,123 @@ def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
     )
 
 
+# First-ship-date urgency-bucket colours: red = ship soon (urgent) → blue = slack.
+_RO_SHIP_BUCKET_COLORS: dict[str, str] = {
+    rpa.SHIP_BUCKET_NEAR: "#c0392b",
+    rpa.SHIP_BUCKET_MID:  "#e59866",
+    rpa.SHIP_BUCKET_FAR:  "#5dade2",
+}
+_RO_CHART_FONT: str = _BH_FONT_COLOR
+
+
+def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
+    """Horizontal stacked bar: FY27 in-year probabilized lbs per Portfolio Major.
+
+    Stacked by first-ship-date urgency window (< 30 / 30–90 / > 90 days),
+    sorted by total volume desc (largest on top).  Values in millions of lbs.
+    """
+    wide = rpa.build_urgency_ranking(comp_df, as_of=date.today())
+    if wide.empty:
+        st.info("No in-year probabilized volume to rank under the current filters.")
+        return
+    majors = list(wide.index)
+    fig = go.Figure()
+    for bucket in rpa.SHIP_BUCKETS:
+        fig.add_bar(
+            y=majors, x=(wide[bucket] / 1e6).tolist(), name=bucket,
+            orientation="h", marker_color=_RO_SHIP_BUCKET_COLORS[bucket],
+            hovertemplate=f"%{{y}} · {bucket}: %{{x:,.1f}}M lbs<extra></extra>",
+        )
+    fig.update_layout(
+        barmode="stack", height=max(240, 46 * len(majors) + 90),
+        margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(color=_RO_CHART_FONT, size=13),
+        xaxis=dict(title=dict(text="FY27 Probabilized (M lbs)"),
+                   showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
+        yaxis=dict(autorange="reversed"),           # largest bar on top
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="ro_urgency_chart")
+
+
+def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
+    """Top-quartile-urgency programs + a prob-tiered recommended Action.
+
+    Replaces the old "Programs with Early Start Date" watchlist.  Urgency =
+    volume × (1 − prob) × deadline-decay, so big + unlikely + soon rises to the
+    top.  Locked-in wins (prob = 100%) are excluded — there's no action to take.
+    """
+    st.markdown("#### 🚨 High-Urgency Programs")
+    st.caption(
+        "Top-quartile programs by **urgency** = annual volume × (1 − win "
+        "probability) × deadline-decay (`exp(−days-to-ship / 90)`), so large, "
+        "uncertain, soon-to-ship programs rise first.  Locked-in wins "
+        "(probability = 100%) are excluded."
+    )
+    # Action rationale, laid out explicitly so the recommendation reads clearly.
+    st.markdown(
+        "  ".join(
+            f"**{action}** — {why}" for action, why in rpa.ACTION_RATIONALE
+        )
+    )
+    tbl = rpa.build_high_urgency_programs(comp_df, as_of=date.today())
+    if tbl.empty:
+        st.info(
+            "No unlocked programs to prioritize under the current filters — "
+            "widen the field filters or check that the comparison has ROs."
+        )
+        return
+    cc = st.column_config
+    st.dataframe(
+        tbl, use_container_width=True, hide_index=True,
+        height=min(36 * (len(tbl) + 1) + 38, 480),
+        column_config={
+            rpa.COL_PROGRAM:       cc.TextColumn("Program", width="large"),
+            rpa.COL_PORTFOLIO:     cc.TextColumn("Portfolio", width="small"),
+            rpa.COL_ANNUAL_VOLUME: cc.NumberColumn(
+                "Annual Volume (lbs)", format="accounting", width="medium"),
+            rpa.COL_FIRST_SHIP:    cc.DateColumn(
+                "First Ship Date", format="YYYY-MM-DD", width="small"),
+            rpa.COL_PROBABILITY:   cc.NumberColumn(
+                "Prob", format="percent", width="small"),
+            rpa.COL_URGENCY:       cc.NumberColumn(
+                "Urgency", format="compact", width="small"),
+            rpa.COL_ACTION:        cc.TextColumn("Action", width="small"),
+        },
+    )
+
+
+def _render_ro_probability_chart(comp_df: pd.DataFrame) -> None:
+    """Stacked bar (one bar per win-probability bucket), stacked by Portfolio Major.
+
+    Uses gross (unweighted) annual-opportunity lbs so the planner sees where the
+    raw pipeline sits on the Dead → In-play → Committed spectrum.  Millions of lbs.
+    """
+    wide = rpa.build_probability_buckets(comp_df)
+    if wide.empty:
+        st.info("No gross pipeline volume to bucket under the current filters.")
+        return
+    fig = go.Figure()
+    for i, major in enumerate(wide.index):
+        color = _PLAN_LIFT_PALETTE[i % len(_PLAN_LIFT_PALETTE)]
+        fig.add_bar(
+            x=list(rpa.PROB_BUCKETS), y=(wide.loc[major] / 1e6).tolist(),
+            name=str(major), marker_color=color,
+            hovertemplate=f"{major} · %{{x}}: %{{y:,.1f}}M lbs<extra></extra>",
+        )
+    fig.update_layout(
+        barmode="stack", height=360, margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(color=_RO_CHART_FONT, size=13),
+        xaxis=dict(tickfont=dict(size=13)),
+        yaxis=dict(title=dict(text="Gross Pipeline (M lbs)"),
+                   showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="ro_probability_chart")
+
+
 def _render_ro_pipeline_analytics_section() -> None:
     """RO pipeline headline metrics + charts, rendered ABOVE the RO Summary.
 
@@ -2837,6 +2691,23 @@ def _render_ro_pipeline_analytics_section() -> None:
         "(expected value); _Gross_ = unweighted annual opportunity."
     )
     _render_ro_pipeline_tiles(comp)
+
+    # Urgency ranking + its paired watchlist.
+    st.markdown("#### 🔺 Urgency by Portfolio & Ship Window")
+    st.caption(
+        "FY27 in-year probabilized volume per Portfolio Major, split by how "
+        "soon each program is due to ship."
+    )
+    _render_ro_urgency_chart(comp)
+    _render_ro_high_urgency_table(comp)
+
+    # Where the gross pipeline sits on the win-probability spectrum.
+    st.markdown("#### 🎲 Pipeline by Win Probability")
+    st.caption(
+        "Gross (unweighted) annual opportunity per win-probability bucket, "
+        "stacked by Portfolio Major."
+    )
+    _render_ro_probability_chart(comp)
 
 
 # ── RO Summary Report (hierarchical roll-up) ────────────────────────────────

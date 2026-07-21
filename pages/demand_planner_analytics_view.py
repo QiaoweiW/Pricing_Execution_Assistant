@@ -355,6 +355,7 @@ from data_sources.ro_summary_report import (
     save_ro_summary_report,
     summary_to_csv_bytes,
 )
+from data_sources import ro_pipeline_analytics as rpa
 from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
@@ -1166,7 +1167,13 @@ def _render_ro_comparison() -> None:
             st.markdown("---")
             _render_early_start_programs_section()
 
-        # 11. RO Summary Report — hierarchical roll-up of the
+        # 11. Pipeline at a Glance — headline metric tiles + urgency /
+        #     probability charts over the same in-memory comparison frame
+        #     (``_SS_SUMMARY_DF``), rendered ABOVE the RO Summary roll-up.
+        st.markdown("---")
+        _render_ro_pipeline_analytics_section()
+
+        # 12. RO Summary Report — hierarchical roll-up of the
         #     **in-memory** comparison frame (``_SS_SUMMARY_DF``).
         #     Lives in its own ``@st.fragment`` so editing a leaf cell
         #     or hitting Save doesn't trigger any work above; on a
@@ -2753,6 +2760,83 @@ def _render_early_start_programs_fragment() -> None:
             ),
         },
     )
+
+
+# ── RO Pipeline Analytics (tiles + charts, above the RO Summary) ─────────────
+
+def _ro_pipeline_comp_df() -> Optional[pd.DataFrame]:
+    """In-memory RO Comparison per-program frame, narrowed by active filters.
+
+    Returns the same frame the RO Summary rolls up (``_SS_SUMMARY_DF``), with
+    the field filters applied so the tiles / charts react to them exactly like
+    the summary below.  ``None`` when the comparison hasn't built yet.
+    """
+    comp = st.session_state.get(_SS_SUMMARY_DF)
+    if comp is None or comp.empty:
+        return None
+    filter_state = _read_filter_state_from_session()
+    if any(sel for sel in filter_state.values()):
+        return _apply_filters(comp, filter_state)
+    return comp
+
+
+def _fmt_m_lbs(lbs: float) -> str:
+    """Raw lbs → compact millions string for a KPI tile, e.g. ``"45.2M"``."""
+    return f"{(lbs or 0.0) / 1e6:,.1f}M"
+
+
+def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
+    """Four headline pipeline metrics as KPI tiles (millions of lbs).
+
+    Gross (unweighted) · Full-Year risk-adjusted (FY28) · In-Year risk-adjusted
+    (FY27) · Committed (in-year probabilized at ≥95%, with its concentration of
+    the in-year pipeline).  Values reconcile with the RO Summary Total B2C row.
+    """
+    m = rpa.compute_pipeline_metrics(comp_df)
+    conc = (
+        f"{m.committed_concentration * 100:.0f}% of in-year"
+        if m.committed_concentration is not None else "—"
+    )
+    tiles = (
+        ("Gross Pipeline", _fmt_m_lbs(m.gross_lbs),
+         "unweighted annual opportunity, all programs"),
+        ("Full-Year, Risk-adjusted", _fmt_m_lbs(m.full_year_lbs),
+         "FY28 probabilized — Total B2C"),
+        ("In-Year, Risk-adjusted", _fmt_m_lbs(m.in_year_lbs),
+         "FY27 probabilized — Total B2C"),
+        ("Committed", _fmt_m_lbs(m.committed_lbs),
+         f"in-year probabilized at ≥95% · {conc}"),
+    )
+    cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk">'
+        f'<div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value">{_esc_html(value)}</div>'
+        f'<span class="k-sub">{_esc_html(sub)}</span></div>'
+        for label, value, sub in tiles
+    )
+    st.markdown(
+        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_ro_pipeline_analytics_section() -> None:
+    """RO pipeline headline metrics + charts, rendered ABOVE the RO Summary.
+
+    Reads the in-memory per-program comparison frame (reacts to the field
+    filters like the summary below).  Bails quietly when the comparison has
+    not built yet — the RO Summary section prints the "not built" hint.
+    """
+    comp = _ro_pipeline_comp_df()
+    if comp is None:
+        return
+    st.markdown("### 🎯 Pipeline at a Glance")
+    st.caption(
+        "Headline read on the **current in-memory** RO pipeline — reacts to "
+        "the field filters above.  _Risk-adjusted_ = probability-weighted "
+        "(expected value); _Gross_ = unweighted annual opportunity."
+    )
+    _render_ro_pipeline_tiles(comp)
 
 
 # ── RO Summary Report (hierarchical roll-up) ────────────────────────────────

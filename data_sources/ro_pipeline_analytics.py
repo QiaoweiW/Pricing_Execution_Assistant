@@ -36,9 +36,10 @@ What this module powers (all rendered ABOVE the RO Summary table)
    "Programs with Early Start Date" watchlist.
 
 4. **Pipeline build-up** (:func:`build_pipeline_buildup`)
-   Per Portfolio Major, a stacked bar from FY27 probabilized (solid) up to the
-   unweighted Gross Pipeline via a Year-effect and a Risk (probability-headroom)
-   increment — so the reader sees the upside of lifting win probability.
+   Per Portfolio Major × Supply Format, a stacked bar from FY27 probabilized
+   (solid) up to the unweighted Gross Pipeline via a Year-effect and a Risk
+   (probability-headroom) increment — so the reader sees the upside of lifting
+   win probability.
 """
 
 from __future__ import annotations
@@ -121,14 +122,6 @@ ACTION_QUALIFY: str  = "Qualify"
 ACTION_KILL: str     = "Kill"
 ACTION_OPTIONS: tuple[str, ...] = (
     "", ACTION_PROTECT, ACTION_CHASE, ACTION_QUALIFY, ACTION_KILL,
-)
-
-# Rationale copy laid out in the UI beside the watchlist.
-ACTION_RATIONALE: tuple[tuple[str, str], ...] = (
-    (ACTION_PROTECT, "≥ 80% — nearly won; protect the win, lock supply & timing."),
-    (ACTION_CHASE,   "50–80% — winnable; chase to close the remaining gap."),
-    (ACTION_QUALIFY, "20–50% — uncertain; qualify the opportunity before investing."),
-    (ACTION_KILL,    "< 20% — long shot; kill or de-prioritize to free up focus."),
 )
 
 # Output column identifiers for the high-urgency watchlist.
@@ -242,12 +235,17 @@ def _supply_format(comp_df: pd.DataFrame) -> pd.Series:
     return _clean_str(comp_df, _IN_SUPPLY_FORMAT)
 
 
+# Category label joining Portfolio Major and Supply Format — shared by the
+# urgency and build-up charts so each portfolio splits by its format mix.
+_PMAJOR_FORMAT_CAT: str = "Portfolio × Format"
+
+
+def _pmajor_format(comp_df: pd.DataFrame) -> pd.Series:
+    """Combined ``"{Portfolio Major} · {Supply Format}"`` category label."""
+    return _portfolio(comp_df).str.cat(_supply_format(comp_df), sep=" · ")
+
+
 # ── Urgency ranking (Portfolio Major × Supply Format, by ship bucket) ────────
-
-# Row label joins Portfolio Major and Supply Format so the urgency chart splits
-# each portfolio by its supply-format mix.
-_URGENCY_CAT: str = "Portfolio × Format"
-
 
 def build_urgency_ranking(comp_df: pd.DataFrame, *, as_of: date) -> pd.DataFrame:
     """FY27 in-year probabilized lbs per Portfolio Major × Supply Format.
@@ -257,13 +255,12 @@ def build_urgency_ranking(comp_df: pd.DataFrame, *, as_of: date) -> pd.DataFrame
     lbs).  Feeds a horizontal stacked bar.  Empty input → empty frame.
     """
     empty = pd.DataFrame(columns=list(SHIP_BUCKETS))
-    empty.index.name = _URGENCY_CAT
+    empty.index.name = _PMAJOR_FORMAT_CAT
     if comp_df is None or comp_df.empty:
         return empty
 
-    cat = _portfolio(comp_df).str.cat(_supply_format(comp_df), sep=" · ")
     work = pd.DataFrame({
-        _URGENCY_CAT: cat,
+        _PMAJOR_FORMAT_CAT: _pmajor_format(comp_df),
         "_bucket": _ship_bucket(_days_to_ship(comp_df, as_of)),
         "_vol": _num(comp_df, _IN_IN_YEAR),
     })
@@ -271,7 +268,7 @@ def build_urgency_ranking(comp_df: pd.DataFrame, *, as_of: date) -> pd.DataFrame
     if work.empty:
         return empty
 
-    wide = (work.pivot_table(index=_URGENCY_CAT, columns="_bucket",
+    wide = (work.pivot_table(index=_PMAJOR_FORMAT_CAT, columns="_bucket",
                              values="_vol", aggfunc="sum", fill_value=0.0)
                 .reindex(columns=list(SHIP_BUCKETS), fill_value=0.0))
     wide = wide.loc[wide.sum(axis=1).sort_values(ascending=False).index]
@@ -379,26 +376,26 @@ def apply_watchlist_filters(
 # ── Pipeline build-up (per Portfolio Major: FY27 → Gross) ────────────────────
 
 def build_pipeline_buildup(comp_df: pd.DataFrame) -> pd.DataFrame:
-    """Per-Portfolio-Major build-up of FY27 probabilized lbs up to Gross Pipeline.
+    """Build-up of FY27 probabilized lbs up to Gross, per Portfolio × Format.
 
-    Returns a wide frame indexed by Portfolio Major (sorted by Gross desc), with
-    one column per :data:`BUILDUP_SEGMENTS` label (raw lbs).  The three segments
-    sum to the unweighted Gross Pipeline; increments are clamped at 0 so a stray
-    row where probabilized exceeds unweighted can't produce a negative slice.
-    Empty input → empty frame.
+    Returns a wide frame indexed by a ``"{Portfolio} · {Supply Format}"`` label
+    (sorted by Gross desc), with one column per :data:`BUILDUP_SEGMENTS` label
+    (raw lbs).  The three segments sum to the unweighted Gross Pipeline;
+    increments are clamped at 0 so a stray row where probabilized exceeds
+    unweighted can't produce a negative slice.  Empty input → empty frame.
     """
     empty = pd.DataFrame(columns=list(BUILDUP_SEGMENTS))
-    empty.index.name = _IN_PORTFOLIO
+    empty.index.name = _PMAJOR_FORMAT_CAT
     if comp_df is None or comp_df.empty:
         return empty
 
     work = pd.DataFrame({
-        _IN_PORTFOLIO: _portfolio(comp_df),
+        _PMAJOR_FORMAT_CAT: _pmajor_format(comp_df),
         "_fy27": _num(comp_df, _IN_IN_YEAR),
         "_year1": _num(comp_df, _IN_FULL_YEAR),
         "_gross": _num(comp_df, _IN_ANNUAL_OPP),
     })
-    agg = work.groupby(_IN_PORTFOLIO).sum()
+    agg = work.groupby(_PMAJOR_FORMAT_CAT).sum()
     agg = agg[agg["_gross"] != 0.0]
     if agg.empty:
         return empty
@@ -409,5 +406,5 @@ def build_pipeline_buildup(comp_df: pd.DataFrame) -> pd.DataFrame:
         SEG_RISK: (agg["_gross"] - agg["_year1"]).clip(lower=0.0),
     })
     out = out.loc[agg["_gross"].sort_values(ascending=False).index]
-    out.index.name = _IN_PORTFOLIO
+    out.index.name = _PMAJOR_FORMAT_CAT
     return out

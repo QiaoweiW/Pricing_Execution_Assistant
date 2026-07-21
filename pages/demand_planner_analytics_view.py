@@ -2533,7 +2533,7 @@ def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
     m = rpa.compute_pipeline_metrics(comp_df)
     # Committed tile shows BOTH the volume and its share of the in-year pipeline.
     committed_val = (
-        f"{_fmt_m_lbs(m.committed_lbs)} · {m.committed_concentration * 100:.0f}%"
+        f"{_fmt_m_lbs(m.committed_lbs)}, {m.committed_concentration * 100:.0f}%"
         if m.committed_concentration is not None else _fmt_m_lbs(m.committed_lbs)
     )
     tiles = (
@@ -2615,11 +2615,8 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
         "Top-quartile programs by **urgency** = annual volume × (1 − win "
         "probability) × deadline-decay (`exp(−days-to-ship / 90)`), so large, "
         "uncertain, soon-to-ship programs rise first.  Locked-in wins "
-        "(probability = 100%) are excluded.  Edit any cell; assign an **Action** "
-        "(guide below), then **Refresh & archive** to snapshot it to Fabric."
-    )
-    st.markdown(
-        "  ".join(f"**{action}** — {why}" for action, why in rpa.ACTION_RATIONALE)
+        "(probability = 100%) are excluded.  Edit any cell; assign an **Action**, "
+        "then **Refresh & archive** to snapshot it to Fabric."
     )
     tbl = rpa.build_high_urgency_programs(comp_df, as_of=date.today())
     if tbl.empty:
@@ -2698,7 +2695,7 @@ _RO_BUILDUP_STYLE: dict[str, dict] = {
 
 
 def _render_ro_buildup_chart(comp_df: pd.DataFrame) -> None:
-    """Stacked bar per Portfolio Major: FY27 probabilized → Gross Pipeline.
+    """Stacked bar per Portfolio × Format: FY27 probabilized → Gross Pipeline.
 
     Solid FY27 Probabilized base + a Year-effect increment (probabilized volume
     beyond the fiscal year) + a Risk / probability-headroom increment (the upside
@@ -2709,18 +2706,18 @@ def _render_ro_buildup_chart(comp_df: pd.DataFrame) -> None:
     if wide.empty:
         st.info("No gross pipeline volume to build up under the current filters.")
         return
-    majors = [str(x) for x in wide.index]
+    cats = [str(x) for x in wide.index]
     fig = go.Figure()
     for seg in rpa.BUILDUP_SEGMENTS:
         style = _RO_BUILDUP_STYLE[seg]
         fig.add_bar(
-            x=majors, y=(wide[seg] / 1e6).tolist(), name=seg,
+            x=cats, y=(wide[seg] / 1e6).tolist(), name=seg,
             marker=dict(color=style["color"],
                         pattern=dict(shape=style["pattern"])),
             hovertemplate=f"%{{x}} · {seg}: %{{y:,.1f}}M lbs<extra></extra>",
         )
     fig.update_layout(
-        barmode="stack", height=max(260, 30 * len(majors) + 100),
+        barmode="stack", height=max(260, 30 * len(cats) + 100),
         margin=dict(l=10, r=10, t=40, b=10),
         font=dict(color=_RO_CHART_FONT, size=12),
         xaxis=dict(tickfont=dict(size=11)),
@@ -2762,9 +2759,9 @@ def _render_ro_pipeline_analytics_section() -> None:
     with right:
         st.markdown("#### 🧱 Pipeline Build-up (FY27 → Gross)")
         st.caption(
-            "Per Portfolio Major: solid FY27 probabilized, plus the Year-effect "
-            "and Risk (probability-headroom) increments that build up to the "
-            "unweighted Gross Pipeline."
+            "Per Portfolio Major × Supply Format: solid FY27 probabilized, plus "
+            "the Year-effect and Risk (probability-headroom) increments that "
+            "build up to the unweighted Gross Pipeline."
         )
         _render_ro_buildup_chart(comp)
 

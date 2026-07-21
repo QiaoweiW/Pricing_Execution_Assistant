@@ -118,19 +118,26 @@ def test_apply_watchlist_filters():
 def test_pipeline_buildup_segments_sum_to_gross():
     wide = rpa.build_pipeline_buildup(_sample())
     assert list(wide.columns) == list(rpa.BUILDUP_SEGMENTS)
-    # Sorted by Gross desc: Cheese (3500) then Butter (3100).
-    assert list(wide.index) == ["Cheese", "Butter"]
-    # Butter: FY27=2350, Year-effect=2560−2350=210, Risk=3100−2560=540.
-    assert wide.loc["Butter", rpa.SEG_FY27] == pytest.approx(2350.0)
-    assert wide.loc["Butter", rpa.SEG_YEAR_EFFECT] == pytest.approx(210.0)
-    assert wide.loc["Butter", rpa.SEG_RISK] == pytest.approx(540.0)
-    # Cheese: FY27=400, Year-effect=550−400=150, Risk=3500−550=2950.
-    assert wide.loc["Cheese", rpa.SEG_FY27] == pytest.approx(400.0)
-    assert wide.loc["Cheese", rpa.SEG_YEAR_EFFECT] == pytest.approx(150.0)
-    assert wide.loc["Cheese", rpa.SEG_RISK] == pytest.approx(2950.0)
-    # Each row's three segments sum to that portfolio's Gross Pipeline.
-    assert wide.loc["Butter"].sum() == pytest.approx(3100.0)
-    assert wide.loc["Cheese"].sum() == pytest.approx(3500.0)
+    # Rows are Portfolio × Format, sorted by Gross desc:
+    #   Cheese·Cultured (Dee 3000), Butter·Extended (Beta 2000),
+    #   Butter·Cultured (Acme 1000 + Eve 100 = 1100), Cheese·Aseptic (Cee 500).
+    assert list(wide.index) == [
+        "Cheese · Cultured", "Butter · Extended",
+        "Butter · Cultured", "Cheese · Aseptic"]
+    # Butter · Cultured: FY27 = Acme 800 + Eve 50 = 850; Year1 = 900 + 60 = 960;
+    # Gross = 1000 + 100 = 1100 → Year-effect 110, Risk 140.
+    bc = wide.loc["Butter · Cultured"]
+    assert bc[rpa.SEG_FY27] == pytest.approx(850.0)
+    assert bc[rpa.SEG_YEAR_EFFECT] == pytest.approx(110.0)
+    assert bc[rpa.SEG_RISK] == pytest.approx(140.0)
+    assert bc.sum() == pytest.approx(1100.0)
+    # Cheese · Cultured is Dee alone: FY27 0, Year1 100, Gross 3000.
+    cc = wide.loc["Cheese · Cultured"]
+    assert cc[rpa.SEG_FY27] == pytest.approx(0.0)
+    assert cc[rpa.SEG_YEAR_EFFECT] == pytest.approx(100.0)
+    assert cc[rpa.SEG_RISK] == pytest.approx(2900.0)
+    # Every row's three segments sum to that combo's Gross Pipeline.
+    assert cc.sum() == pytest.approx(3000.0)
 
 
 def test_isclose_guard_sanity():

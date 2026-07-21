@@ -631,22 +631,9 @@ def _bh_window_display(code: str) -> str:
 # executive legibility.
 _BH_FONT_COLOR: str = "#3a3a3a"
 # Green/red for signed YoY + Flag, layered onto the shared tree styling.
-# Scoped to ``.bh-tree`` so it can't affect the comparison / APS trees: metric
-# cells are CENTER-aligned (the label column stays left), and the YoY / Flag
-# cells get green-up / red-down / grey-flat colouring.
-_BH_EXTRA_CSS: str = """
-<style>
-.bh-tree .rw > span {text-align:center;}
-.bh-tree .rw > span.lbl {text-align:left;}
-.bh-tree .pos {color:#1b7f3a; font-weight:700;}
-.bh-tree .neg {color:#c0392b; font-weight:700;}
-.bh-tree .flag-rise {color:#1b7f3a; font-weight:700;}
-.bh-tree .flag-fall {color:#c0392b; font-weight:700;}
-.bh-tree .flag-flat {color:#5a6472; font-weight:700;}
-</style>
-"""
+# Flag → lite-table colour class: Rising green, Falling red, Flat neutral.
 _BH_FLAG_CSS: dict[str, str] = {
-    BH_FLAG_RISING: "flag-rise", BH_FLAG_FALLING: "flag-fall",
+    BH_FLAG_RISING: "pos", BH_FLAG_FALLING: "neg",
 }
 
 
@@ -828,8 +815,20 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
     tick_font = dict(size=14, color=_BH_FONT_COLOR)
     label_font = dict(size=15, color=_BH_FONT_COLOR)
 
+    # Which YoY lines to draw — lets the planner remove a line (e.g. Shipments).
+    shown = st.multiselect(
+        "Show lines", options=["Orders", "Shipments"],
+        default=["Orders", "Shipments"], key="bh_chart_lines",
+        help="Untick a source to remove its YoY line from the chart.",
+    )
+    if not shown:
+        st.info("Pick at least one line to show.")
+        return
+
     fig = go.Figure()
-    for src in ("Orders", "Shipments"):
+    for src in shown:
+        if src not in _BH_CHART_STYLE:      # guard stale/unknown selections
+            continue
         series = result.chart_series.get(src, {})
         yoys = [
             (None if series.get(w, {}).get("yoy") is None
@@ -938,23 +937,21 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
     memo_flags = tdf["_is_memo"].tolist()
     indent_flags = tdf["_indent"].tolist()
 
-    def _fmt(col: str, val: object) -> str:
+    def _cell_html(col: str, val: object) -> str:
         if col == BH_COL_FLAG:
             flag = "" if val is None else str(val)
-            cls = _BH_FLAG_CSS.get(flag, "flag-flat")
-            return f'<span class="{cls}">{_esc_html(flag or "—")}</span>'
+            cls = _BH_FLAG_CSS.get(flag, "")
+            body = _esc_html(flag or "—")
+            return f'<td class="{cls}">{body}</td>' if cls else f"<td>{body}</td>"
         if col in percent_set:
-            txt, cls = _dpc_fmt_pct(
-                None if val is None or pd.isna(val) else float(val),
-                signed=True, decimals=1)
-            return f'<span class="{cls}">{_esc_html(txt)}</span>' if cls else _esc_html(txt)
-        return _esc_html(_dpc_fmt_cell(val, is_percent=False))
+            return _summary_cell_html(
+                "pct_signed", None if val is None or pd.isna(val) else float(val))
+        return _summary_cell_html("m", val)
 
-    def _hdr_cell(c: str) -> str:
-        period = periods.get(c)
-        if period:
-            return f'<span>{_esc_html(c)}<br><span class="per">{_esc_html(period)}</span></span>'
-        return f"<span>{_esc_html(c)}</span>"
+    def _th(col: str) -> str:
+        period = periods.get(col)
+        sub = f'<br><span class="per">{_esc_html(period)}</span>' if period else ""
+        return f"<th>{_esc_html(col)}{sub}</th>"
 
     def _label_html(i: int) -> str:
         """Indented category label, applying a session rename if present."""
@@ -966,26 +963,23 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
         prefix = "  " * indent + ("• " if is_memo else "")
         return _esc_html(prefix + name)
 
-    def _make_row(i: int, foldable: bool) -> tuple[str, str]:
+    # Clean "lite" table (white, hairline rules, bold Total/section rows, green/
+    # red YoY) — the same polished look as the comparison summary table.
+    head_html = ('<th class="lbl">' + _esc_html(BH_COL_CATEGORY) + "</th>"
+                 + "".join(_th(c) for c in cols))
+    body_rows: list[str] = []
+    for i in range(len(tdf)):
         cls = _dpc_cmp_row_class(
             row_id=row_ids[i], is_subtotal=bool(subtotal_flags[i]),
             is_memo=bool(memo_flags[i]), indent=int(indent_flags[i]))
         row = tdf.iloc[i]
-        cells = (
-            f'<span class="lbl">{_tri_span(foldable)}{_label_html(i)}</span>'
-            + "".join(f"<span>{_fmt(c, row[c])}</span>" for c in cols)
-        )
-        return cls, cells
-
-    header = (
-        '<div class="rw hdr"><span class="lbl">' + _esc_html(BH_COL_CATEGORY) + "</span>"
-        + "".join(_hdr_cell(c) for c in cols) + "</div>"
-    )
-    parts = [header] + _foldable_tree_body(len(tdf), indent_flags, _make_row)
+        cells = (f'<td class="lbl">{_label_html(i)}</td>'
+                 + "".join(_cell_html(c, row[c]) for c in cols))
+        body_rows.append(f'<tr class="{cls}">{cells}</tr>')
     st.markdown(
-        _DPC_TREE_CSS + _BH_EXTRA_CSS
-        + '<div class="dpc-tree bh-tree"><div class="dpc-tree-in">'
-        + "".join(parts) + "</div></div>",
+        _DPC_LITE_CSS
+        + '<div class="dpc-lite"><table><thead><tr>' + head_html
+        + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
         unsafe_allow_html=True,
     )
     _render_column_picker(

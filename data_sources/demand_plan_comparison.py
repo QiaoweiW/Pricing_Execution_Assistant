@@ -2909,11 +2909,12 @@ BH_COL_FLAG: str = "Flag"
 BH_LEVEL_COLS: tuple[str, ...] = tuple(
     lbl for pair in BH_LEVEL_LABELS.values() for lbl in pair)
 BH_YOY_COLS: tuple[str, ...] = tuple(BH_YOY_LABELS.values())
-# Left → right metric order (the last column is the text Flag).
+# Left → right metric order: widest → narrowest window (L12M → L6M → L3M), each
+# window's Orders + YAG + Order-YoY together; the text Flag last.
 BH_DISPLAY_ORDER: tuple[str, ...] = (
-    *BH_LEVEL_COLS[:2], BH_YOY_LABELS["L3M"],      # L3M orders + YAG + YoY
+    *BH_LEVEL_COLS[4:6], BH_YOY_LABELS["L12M"],     # L12M orders + YAG + YoY
     *BH_LEVEL_COLS[2:4], BH_YOY_LABELS["L6M"],      # L6M …
-    *BH_LEVEL_COLS[4:6], BH_YOY_LABELS["L12M"],     # L12M …
+    *BH_LEVEL_COLS[:2], BH_YOY_LABELS["L3M"],       # L3M …
     BH_COL_FLAG,
 )
 BH_PERCENT_COLS: frozenset = frozenset(BH_YOY_COLS)

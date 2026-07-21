@@ -144,3 +144,34 @@ def test_isclose_guard_sanity():
     # Sanity: concentration math is a plain ratio (guards against unit drift).
     m = rpa.compute_pipeline_metrics(_sample())
     assert isclose(m.committed_concentration, m.committed_lbs / m.in_year_lbs)
+
+
+# ── Reconciliation with the RO Summary Total B2C row (item 19) ───────────────
+
+def _butter_sample() -> pd.DataFrame:
+    """All-Butter rows — every row maps into the RO Summary Total B2C subtotal
+    (Butter leaves match PMaj=Butter for any non-blank Supply Format), so the
+    per-program tile totals must equal the roll-up Total B2C exactly."""
+    return pd.DataFrame({
+        "Portfolio Major":       ["Butter", "Butter", "Butter"],
+        "Supply Format":         ["Sticks", "Bulk", "Print"],
+        "Driver":                ["New", "Change", "New"],
+        ANNUAL_OPP_LE:           [15_000_000.0, 8_000_000.0, 5_000_000.0],
+        CUR_FISCAL_PROB_LE:      [10_000_000.0, 5_000_000.0, 3_000_000.0],
+        "Change Current Fiscal Probabilized Lbs": [0.0, 0.0, 0.0],
+        "Prior Year1 Probabilized Lbs":           [0.0, 0.0, 0.0],
+        YEAR1_PROB_LE:           [12_000_000.0, 6_000_000.0, 4_000_000.0],
+    })
+
+
+def test_tiles_reconcile_with_summary_total_b2c():
+    from data_sources.ro_summary_report import (
+        build_summary_report, COL_CURRENT_PLAN, COL_Y1_LATEST, COL_ROW_ID,
+    )
+    comp = _butter_sample()
+    m = rpa.compute_pipeline_metrics(comp)
+    report, _warn, _tpl = build_summary_report(comp)
+    total = report.loc[report[COL_ROW_ID] == "total_b2c"].iloc[0]
+    # Roll-up is in millions (rounded 1dp); per-program tiles are raw lbs.
+    assert m.in_year_lbs / 1e6 == pytest.approx(total[COL_CURRENT_PLAN], abs=0.05)
+    assert m.full_year_lbs / 1e6 == pytest.approx(total[COL_Y1_LATEST], abs=0.05)

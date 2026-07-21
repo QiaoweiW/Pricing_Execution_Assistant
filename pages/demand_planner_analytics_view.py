@@ -2523,25 +2523,61 @@ def _fmt_m_lbs(lbs: float) -> str:
     return f"{(lbs or 0.0) / 1e6:,.1f}M"
 
 
-def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
+def _fmt_m(millions: float) -> str:
+    """A value already in millions → compact tile string, e.g. ``"45.2M"``."""
+    return f"{(millions or 0.0):,.1f}M"
+
+
+def _ro_total_b2c_totals(comp_df: pd.DataFrame) -> tuple[Optional[float], Optional[float]]:
+    """Canonical (In-Year FY27, Full-Year FY28) Total B2C totals, in millions.
+
+    Reads them from the SAME roll-up the RO Summary shows (``build_summary_report``
+    → Total B2C row) so the two headline tiles are identical to the summary by
+    construction — not a parallel per-program sum that can drift when a row's
+    portfolio / format falls outside the summary taxonomy.  ``(None, None)`` when
+    the roll-up can't be built or has no Total B2C row.
+    """
+    try:
+        report_df, _warn, _tpl = build_summary_report(comp_df)
+    except RoSummaryReportError:
+        return None, None
+    row = report_df.loc[report_df[SR_COL_ROW_ID] == "total_b2c"]
+    if row.empty:
+        return None, None
+    return float(row.iloc[0][SR_COL_CURRENT_PLAN]), float(row.iloc[0][SR_COL_Y1_LATEST])
+
+
+def _render_ro_pipeline_tiles(
+    comp_df: pd.DataFrame, *,
+    in_year_m: Optional[float] = None, full_year_m: Optional[float] = None,
+) -> None:
     """Four headline pipeline metrics as KPI tiles (millions of lbs).
 
     Gross (unweighted) · Full-Year risk-adjusted (FY28) · In-Year risk-adjusted
     (FY27) · Committed (in-year probabilized at ≥95%, with its concentration of
-    the in-year pipeline).  Values reconcile with the RO Summary Total B2C row.
+    the in-year pipeline).  When *in_year_m* / *full_year_m* are supplied (the
+    canonical RO Summary Total B2C totals), those two tiles use them so they
+    match the summary exactly; otherwise they fall back to the per-program sum.
+    A caption flags any gap between the per-program in-year sum and Total B2C
+    (rows outside the summary taxonomy).
     """
     m = rpa.compute_pipeline_metrics(comp_df)
-    # Committed tile shows BOTH the volume and its share of the in-year pipeline.
+    pp_in_year_m = m.in_year_lbs / 1e6                 # per-program (all rows)
+    in_year_disp = in_year_m if in_year_m is not None else pp_in_year_m
+    full_year_disp = full_year_m if full_year_m is not None else m.full_year_lbs / 1e6
+    # Committed % is the share of the (per-program) in-year pipeline that
+    # committed is a subset of — its true denominator.
+    conc = m.committed_concentration
     committed_val = (
-        f"{_fmt_m_lbs(m.committed_lbs)}, {m.committed_concentration * 100:.0f}%"
-        if m.committed_concentration is not None else _fmt_m_lbs(m.committed_lbs)
+        f"{_fmt_m_lbs(m.committed_lbs)}, {conc * 100:.0f}%"
+        if conc is not None else _fmt_m_lbs(m.committed_lbs)
     )
     tiles = (
         ("Gross Pipeline", _fmt_m_lbs(m.gross_lbs),
          "unweighted annual opportunity, all programs"),
-        ("Full-Year, Risk-adjusted", _fmt_m_lbs(m.full_year_lbs),
+        ("Full-Year, Risk-adjusted", _fmt_m(full_year_disp),
          "FY28 probabilized — Total B2C"),
-        ("In-Year, Risk-adjusted", _fmt_m_lbs(m.in_year_lbs),
+        ("In-Year, Risk-adjusted", _fmt_m(in_year_disp),
          "FY27 probabilized — Total B2C"),
         ("Committed", committed_val,
          "in-year probabilized at ≥95% · M lbs & % of in-year"),
@@ -2557,6 +2593,18 @@ def _render_ro_pipeline_tiles(comp_df: pd.DataFrame) -> None:
         f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
         unsafe_allow_html=True,
     )
+    # Reconciliation guard: surface any in-year volume that the per-program sum
+    # sees but the RO Summary Total B2C doesn't (rows whose portfolio / format
+    # fall outside the summary taxonomy), so the headline never silently
+    # under-/over-states without explanation.
+    if in_year_m is not None and abs(pp_in_year_m - in_year_m) > 0.1:
+        gap = pp_in_year_m - in_year_m
+        st.caption(
+            f"⚠️ {gap:+,.1f}M lbs of in-year pipeline is outside the RO Summary "
+            "**Total B2C** taxonomy (unmapped portfolio / supply format).  The "
+            "In-Year / Full-Year tiles use Total B2C; Gross and the charts below "
+            "include every program."
+        )
 
 
 # First-ship-date urgency-bucket colours: red = ship soon (urgent) → blue = slack.
@@ -2600,22 +2648,28 @@ def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, key="ro_urgency_chart")
 
 
+# Session store for planner Action edits, keyed by the stable Program string so
+# edits survive reruns / filter changes (the watchlist frame is rebuilt each run).
+_SS_WL_ACTIONS = "ro_wl_actions"
+
+
 def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
     """Editable high-urgency watchlist with filters + a Fabric-archive button.
 
     Top-quartile programs by urgency = volume × (1 − prob) × deadline-decay
-    (locked-in 100% wins excluded).  The table is fully editable (blank Action
-    for the planner to fill); the Urgency column is hidden (it only drives the
-    ranking).  Filters narrow by portfolio / annual volume / ship window /
-    probability.  "🔄 Refresh & archive" writes the current edited table to
-    Fabric as a timestamped CSV.
+    (locked-in 100% wins excluded).  Every cell is editable; the **Action**
+    column is a Protect/Chase/Qualify/Kill dropdown whose picks persist across
+    reruns / filter changes (keyed by Program in session_state).  The Urgency
+    column is hidden (it only drives the ranking).  Filters narrow by portfolio
+    / annual volume / ship window / probability.  "🔄 Refresh & archive" writes
+    the currently-shown (filtered + edited) rows to Fabric as a timestamped CSV.
     """
     st.markdown("#### 🚨 High-Urgency Programs")
     st.caption(
         "Top-quartile programs by **urgency** = annual volume × (1 − win "
         "probability) × deadline-decay (`exp(−days-to-ship / 90)`), so large, "
         "uncertain, soon-to-ship programs rise first.  Locked-in wins "
-        "(probability = 100%) are excluded.  Edit any cell; assign an **Action**, "
+        "(probability = 100%) are excluded.  Edit any cell; pick an **Action**, "
         "then **Refresh & archive** to snapshot it to Fabric."
     )
     tbl = rpa.build_high_urgency_programs(comp_df, as_of=date.today())
@@ -2625,6 +2679,11 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
             "widen the field filters or check that the comparison has ROs."
         )
         return
+
+    # Seed the Action column from the per-Program session store so prior picks
+    # survive reruns and filter changes (the frame itself is rebuilt each run).
+    actions: dict = st.session_state.setdefault(_SS_WL_ACTIONS, {})
+    tbl[rpa.COL_ACTION] = tbl[rpa.COL_PROGRAM].map(actions).fillna("")
 
     # ── Filters ──────────────────────────────────────────────────
     f1, f2, f3, f4 = st.columns([2, 1.3, 1.5, 1.7])
@@ -2654,11 +2713,13 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
         return
 
     # Urgency is hidden from the view (and the archive) — it only ranks the rows.
+    # No widget key on the editor: persistence is driven by the Program-keyed
+    # session store below, which is robust to the row set changing under filters.
     show = filtered.drop(columns=[rpa.COL_URGENCY])
     cc = st.column_config
     edited = st.data_editor(
         show, use_container_width=True, hide_index=True, num_rows="fixed",
-        key="ro_wl_editor", height=min(36 * (len(show) + 1) + 38, 480),
+        height=min(36 * (len(show) + 1) + 38, 480),
         column_config={
             rpa.COL_PROGRAM:       cc.TextColumn("Program", width="large"),
             rpa.COL_PORTFOLIO:     cc.TextColumn("Portfolio", width="small"),
@@ -2670,17 +2731,31 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
                 "Days-to-Ship", format="%d", width="small"),
             rpa.COL_PROBABILITY:   cc.NumberColumn(
                 "Prob", format="percent", width="small"),
-            rpa.COL_ACTION:        cc.TextColumn(
-                "Action", width="small", help="Protect / Chase / Qualify / Kill."),
+            rpa.COL_ACTION:        cc.SelectboxColumn(
+                "Action", width="small", options=list(rpa.ACTION_OPTIONS),
+                help="Protect / Chase / Qualify / Kill; blank = undecided."),
         },
     )
 
+    # Persist Action edits back to the session store (keyed by Program) so they
+    # survive the next rerun / filter change.  Only the shown rows are touched.
+    for prog, act in zip(edited[rpa.COL_PROGRAM], edited[rpa.COL_ACTION]):
+        val = "" if act is None or pd.isna(act) else str(act).strip()
+        if val:
+            actions[str(prog)] = val
+        else:
+            actions.pop(str(prog), None)
+
     # ── Refresh & archive to Fabric ──────────────────────────────
+    st.caption(
+        f"Archives the **{len(edited)}** row(s) currently shown (after filters "
+        "+ your edits).  Clear the filters above to archive the full list."
+    )
     if st.button("🔄 Refresh & archive snapshot to Fabric",
                  key="ro_wl_archive", use_container_width=True):
         try:
             path = save_pipeline_review_snapshot(edited)
-            st.success(f"✅ Archived snapshot to `Files/{path}`.")
+            st.success(f"✅ Archived {len(edited)} row(s) to `Files/{path}`.")
         except RoComparisonError as exc:
             st.error(f"❌ Could not archive the snapshot to Fabric.\n\n{exc}")
 
@@ -2734,18 +2809,34 @@ def _render_ro_pipeline_analytics_section() -> None:
 
     Reads the in-memory per-program comparison frame (reacts to the field
     filters like the summary below).  Bails quietly when the comparison has
-    not built yet — the RO Summary section prints the "not built" hint.
+    not built yet — the RO Summary section prints the "not built" hint.  The
+    body is fragment-isolated so the watchlist filters / editor rerun only this
+    block, not the whole page.
     """
     comp = _ro_pipeline_comp_df()
     if comp is None:
         return
+    _render_ro_pipeline_analytics_fragment(comp)
+
+
+@st.fragment
+def _render_ro_pipeline_analytics_fragment(comp: pd.DataFrame) -> None:
+    """Fragment body of Pipeline at a Glance (tiles + charts + watchlist).
+
+    Isolated in a fragment so a watchlist filter change / cell edit / archive
+    click reruns only this section — no full-page rerun, no re-walk of the
+    upstream Fabric reads.
+    """
     st.markdown("### 🎯 Pipeline at a Glance")
     st.caption(
         "Headline read on the **current in-memory** RO pipeline — reacts to "
         "the field filters above.  _Risk-adjusted_ = probability-weighted "
         "(expected value); _Gross_ = unweighted annual opportunity."
     )
-    _render_ro_pipeline_tiles(comp)
+    # Canonical FY27 / FY28 Total B2C from the same roll-up the summary shows,
+    # so the two headline tiles match the summary by construction.
+    in_year_m, full_year_m = _ro_total_b2c_totals(comp)
+    _render_ro_pipeline_tiles(comp, in_year_m=in_year_m, full_year_m=full_year_m)
 
     # Two charts side by side: urgency (left) + FY27→Gross build-up (right).
     left, right = st.columns(2)

@@ -453,32 +453,51 @@ def _collect_butter_supply_formats(df: pd.DataFrame) -> list[str]:
     return sorted({s for s in sfmts.tolist() if s})
 
 
+def _butter_brand_leaves(fmt_id: str, sfmt: str) -> tuple[TemplateRow, TemplateRow]:
+    """The Branded / Private Label leaf pair under one Butter Supply Format.
+
+    Branded vs Private Label is keyed on the derived Brand Category
+    (``_brand_cat`` ← the comparison ``Brand`` column, itself sourced from the
+    distribution tracker's Brand — NOT any Item-Description "DG" heuristic), so
+    it matches the same rule the ESL / Aseptic leaves already use.
+    """
+    return (
+        _leaf(f"{fmt_id}_br", "Branded", 3,
+              pmaj_disp="Butter", sfmt=sfmt, bcat="Branded",
+              pmaj_match=_BUTTER, brand_match="Branded"),
+        _leaf(f"{fmt_id}_pv", "Private Label", 3,
+              pmaj_disp="Butter", sfmt=sfmt, bcat="Private",
+              pmaj_match=_BUTTER, brand_match="Private"),
+    )
+
+
 def _build_dynamic_butter_rows(formats: list[str]) -> tuple[TemplateRow, ...]:
-    """Build Butter Supply Format leaf rows for the runtime template."""
+    """Build Butter Supply Format rows: each format is a SUBTOTAL over its
+    Branded / Private Label leaves (indent 2 subtotal → indent 3 leaves)."""
     if not formats:
         return ()
-    row_ids = _stable_unique_row_ids("but", formats)
-    return tuple(
-        _leaf(
-            row_id, sfmt, 2,
-            pmaj_disp="Butter", sfmt=sfmt,
-            pmaj_match=_BUTTER,
-        )
-        for sfmt, row_id in zip(formats, row_ids)
-    )
+    fmt_ids = _stable_unique_row_ids("but", formats)
+    rows: list[TemplateRow] = []
+    for sfmt, fmt_id in zip(formats, fmt_ids):
+        br, pv = _butter_brand_leaves(fmt_id, sfmt)
+        rows.append(_subtotal(fmt_id, sfmt, 2, (br.row_id, pv.row_id)))
+        rows.extend((br, pv))
+    return tuple(rows)
 
 
 def _build_runtime_template(source_df: pd.DataFrame) -> tuple[TemplateRow, ...]:
     """Return the report template with dynamic Butter format children."""
     butter_formats = _collect_butter_supply_formats(source_df)
-    butter_leaves = _build_dynamic_butter_rows(butter_formats)
-    butter_child_ids = tuple(leaf.row_id for leaf in butter_leaves)
+    butter_rows = _build_dynamic_butter_rows(butter_formats)
+    # Direct children of the Butter subtotal = the per-format subtotals (indent
+    # 2); their Branded / Private Label leaves (indent 3) roll up beneath them.
+    butter_child_ids = tuple(r.row_id for r in butter_rows if r.indent == 2)
 
     out: list[TemplateRow] = []
     for tpl in RO_SUMMARY_TEMPLATE:
         if tpl.row_id == "but":
             out.append(_subtotal("but", "Butter", 1, butter_child_ids))
-            out.extend(butter_leaves)
+            out.extend(butter_rows)
         else:
             out.append(tpl)
     return tuple(out)
@@ -493,39 +512,38 @@ def _template_from_report_df(df: pd.DataFrame) -> tuple[TemplateRow, ...]:
     """Reconstruct a runtime template from an existing report frame.
 
     Used by :func:`recompute_subtotals` when the caller does not pass
-    an explicit template — e.g. after a session reload.  Dynamic Butter
-    leaves are recovered from rows whose ``_row_id`` starts with
-    ``but_sfmt_``.
+    an explicit template. Dynamic Butter format subtotals are recovered
+    from rows whose ``_row_id`` starts with ``but_sfmt_`` (excluding the
+    ``_br`` / ``_pv`` Branded / Private Label leaves, which are synthesised
+    deterministically beneath each format).
     """
     if df is None or df.empty or COL_ROW_ID not in df.columns:
         return RO_SUMMARY_TEMPLATE
 
-    dynamic_ids = [
+    fmt_ids = [
         str(rid) for rid in df[COL_ROW_ID].tolist()
         if str(rid).startswith("but_sfmt_")
+        and not (str(rid).endswith("_br") or str(rid).endswith("_pv"))
     ]
-    if not dynamic_ids:
+    if not fmt_ids:
         return RO_SUMMARY_TEMPLATE
 
-    butter_leaves: list[TemplateRow] = []
-    for rid in dynamic_ids:
-        row = df.loc[df[COL_ROW_ID] == rid].iloc[0]
-        sfmt = str(row.get(COL_DIM_SFMT, "")).strip()
-        label = str(row.get(COL_LABEL, sfmt)).strip()
-        # Strip leading NBSP indent from the display label.
-        label = label.lstrip("\u00a0 ").strip() or sfmt
-        butter_leaves.append(_leaf(
-            rid, label, 2,
-            pmaj_disp="Butter", sfmt=sfmt,
-            pmaj_match=_BUTTER,
-        ))
+    butter_rows: list[TemplateRow] = []
+    for fid in fmt_ids:
+        row = df.loc[df[COL_ROW_ID] == fid].iloc[0]
+        # Format name lives in the (NBSP-indented) label; subtotal dims blank.
+        label = str(row.get(COL_LABEL, "")).lstrip("\u00a0 ").strip()
+        sfmt = label or str(row.get(COL_DIM_SFMT, "")).strip()
+        br, pv = _butter_brand_leaves(fid, sfmt)
+        butter_rows.append(_subtotal(fid, sfmt, 2, (br.row_id, pv.row_id)))
+        butter_rows.extend((br, pv))
 
-    butter_child_ids = tuple(leaf.row_id for leaf in butter_leaves)
+    butter_child_ids = tuple(r.row_id for r in butter_rows if r.indent == 2)
     out: list[TemplateRow] = []
     for tpl in RO_SUMMARY_TEMPLATE:
         if tpl.row_id == "but":
             out.append(_subtotal("but", "Butter", 1, butter_child_ids))
-            out.extend(butter_leaves)
+            out.extend(butter_rows)
         else:
             out.append(tpl)
     return tuple(out)

@@ -349,6 +349,7 @@ from data_sources.ro_summary_report import (
     summary_to_csv_bytes,
 )
 from data_sources import ro_pipeline_analytics as rpa
+from data_sources import shipments_velocity as vel
 from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
@@ -10372,19 +10373,149 @@ def _render_promotion_lift_analysis() -> None:
         st.info("ℹ️ Promotion Lift Analysis is coming soon.")
 
 
-def _render_pricing_elasticity_analysis() -> None:
-    """Foldable 'Pricing Elasticity Analysis' section.
+def _render_velocity_analysis() -> None:
+    """Foldable 'Velocity Analysis' section — weekly ordered vs shipped lbs.
 
-    A collapsed ``st.expander`` matching the other page sections, separated
-    from its neighbours by the same ``st.markdown("---")`` divider line.
+    A collapsed ``st.expander`` matching the other page sections.  Reads
+    ``dbo.Shipments`` (OneLake); the interactive body is fragment-isolated so
+    filter changes rerun only this block.
     """
-    with st.expander("📉 Pricing Elasticity Analysis", expanded=False):
+    with st.expander("🚀 Velocity Analysis", expanded=False):
         st.caption(
-            "How volume responds to price — the estimated demand elasticity "
-            "by product, so a proposed price move can be translated into an "
-            "expected volume impact."
+            "Week-over-week **ordered vs shipped lbs** from `dbo.Shipments`, "
+            "sliced by Portfolio, Product Description, Customer, Business Unit "
+            "and Product Format over a chosen order-date range."
         )
-        st.info("ℹ️ Pricing Elasticity Analysis is coming soon.")
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.info(
+                "ℹ️ Sign in via **Home & Fabric Sign-in** to load shipments."
+            )
+            return
+        _render_velocity_analysis_body()
+
+
+# Velocity chart styling: ordered = dotted red, shipped = solid teal.
+_VELOCITY_STYLE: dict[str, dict] = {
+    "Ordered": {"color": "#c0392b", "dash": "dot"},
+    "Shipped": {"color": "#137d78", "dash": "solid"},
+}
+
+
+@st.fragment
+def _render_velocity_analysis_body() -> None:
+    """Filters + KPI tiles + weekly ordered/shipped line chart (fragment)."""
+    try:
+        df = vel.fetch_shipments_df()
+    except vel.ShipmentsVelocityError as exc:
+        st.error(f"❌ Could not load `dbo.Shipments`.\n\n{exc}")
+        return
+    if df is None or df.empty or vel.COL_ORDER_DATE not in df.columns:
+        st.info("No shipment rows available.")
+        return
+
+    # ── Filters — one multiselect per dimension that resolved in the table ──
+    order_dt = pd.to_datetime(df[vel.COL_ORDER_DATE], errors="coerce")
+    min_d, max_d = order_dt.min(), order_dt.max()
+    if pd.isna(min_d) or pd.isna(max_d):
+        st.info("Shipment rows carry no parseable order dates.")
+        return
+    min_d, max_d = min_d.date(), max_d.date()
+
+    # Business Unit first so its default (B2C) is prominent; then the rest.
+    dim_specs = [
+        (vel.COL_BUSINESS_UNIT, "Business Unit"),
+        (vel.COL_PORTFOLIO,     "Portfolio"),
+        (vel.COL_PRODUCT_FORMAT, "Product Format"),
+        (vel.COL_PRODUCT_DESC,  "Product Description"),
+        (vel.COL_CUSTOMER,      "Customer"),
+    ]
+    selections: dict[str, list[str]] = {}
+    cols = st.columns(3)
+    for i, (canonical, label) in enumerate(dim_specs):
+        options = vel.distinct_values(df, canonical)
+        if not options:
+            continue                              # dimension absent in this table
+        # Business Unit defaults to B2C (when present); others default to all.
+        default = (
+            [vel.DEFAULT_BUSINESS_UNIT]
+            if canonical == vel.COL_BUSINESS_UNIT
+            and vel.DEFAULT_BUSINESS_UNIT in options
+            else []
+        )
+        with cols[i % 3]:
+            selections[canonical] = st.multiselect(
+                label, options=options, default=default,
+                key=f"velocity_{canonical}",
+                help="Leave empty to include all." if default == [] else None,
+            )
+
+    date_range = st.slider(
+        "Order date range", min_value=min_d, max_value=max_d,
+        value=(min_d, max_d), format="YYYY-MM-DD", key="velocity_date_range",
+    )
+
+    result = vel.build_weekly_velocity(
+        df,
+        portfolios=selections.get(vel.COL_PORTFOLIO) or None,
+        product_descs=selections.get(vel.COL_PRODUCT_DESC) or None,
+        customers=selections.get(vel.COL_CUSTOMER) or None,
+        business_units=selections.get(vel.COL_BUSINESS_UNIT) or None,
+        product_formats=selections.get(vel.COL_PRODUCT_FORMAT) or None,
+        date_range=date_range,
+    )
+
+    # ── Summary metric tiles (respond to every filter) ──────────────────────
+    tiles = (
+        ("Total Ordered", _fmt_m_lbs(result.total_ordered), "lbs, all filters applied"),
+        ("Total Shipped", _fmt_m_lbs(result.total_shipped), "lbs, all filters applied"),
+    )
+    cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk">'
+        f'<div class="k-label">{_esc_html(label)}</div>'
+        f'<div class="k-value">{_esc_html(value)}</div>'
+        f'<span class="k-sub">{_esc_html(sub)}</span></div>'
+        for label, value, sub in tiles
+    )
+    st.markdown(
+        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if result.weekly.empty:
+        st.info("No shipments match the current filters / date range.")
+        return
+
+    # ── Weekly line chart: ordered (dotted) vs shipped (solid) ──────────────
+    weeks = result.weekly[vel.WEEK_START]
+    fig = go.Figure()
+    for name, col in (("Ordered", vel.COL_ORDERED_LBS), ("Shipped", vel.COL_SHIPPED_LBS)):
+        style = _VELOCITY_STYLE[name]
+        fig.add_scatter(
+            x=weeks, y=result.weekly[col], name=f"{name} lbs",
+            mode="lines+markers",
+            line=dict(color=style["color"], dash=style["dash"], width=2.5),
+            marker=dict(color=style["color"], size=7),
+            hovertemplate=f"{name}: %{{y:,.0f}} lbs<br>week of %{{x|%Y-%m-%d}}<extra></extra>",
+        )
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=13),
+        xaxis=dict(title=dict(text="Week (of order date)"),
+                   showgrid=True, gridcolor="#eeeeee"),
+        yaxis=dict(title=dict(text="Lbs"), rangemode="tozero",
+                   showgrid=True, gridcolor="#eeeeee"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
+
+    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+    st.download_button(
+        "⬇️ Download weekly velocity (CSV)",
+        data=result.weekly.to_csv(index=False).encode("utf-8"),
+        file_name=f"velocity_weekly_{today}.csv", mime="text/csv",
+        key="velocity_download", use_container_width=True,
+    )
 
 
 # ── 3. Entry point ────────────────────────────────────────────────────────────
@@ -10399,7 +10530,7 @@ def render() -> None:
     2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
     3. Plan Lift Analysis           (📈, collapsible, collapsed; above RO)
     4. Promotion Lift Analysis      (🎯, collapsible, collapsed)
-    5. Pricing Elasticity Analysis  (📉, collapsible, collapsed)
+    5. Velocity Analysis           (🚀, collapsible, collapsed)
     6. RO Comparison                (collapsible, expanded by default)
     7. Demand Summary               (collapsible, collapsed by default)
     8. Product Line Review          (collapsible, collapsed by default)
@@ -10426,7 +10557,7 @@ def render() -> None:
     _render_promotion_lift_analysis()
     st.markdown("---")
 
-    _render_pricing_elasticity_analysis()
+    _render_velocity_analysis()
     st.markdown("---")
 
     # Business Health (trailing-window order momentum) sits directly ABOVE RO

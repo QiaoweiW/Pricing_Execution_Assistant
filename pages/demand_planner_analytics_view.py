@@ -2688,7 +2688,9 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
     actions: dict = st.session_state.setdefault(_SS_WL_ACTIONS, {})
     tbl[rpa.COL_ACTION] = tbl[rpa.COL_PROGRAM].map(actions).fillna("")
 
-    # ── Filters ──────────────────────────────────────────────────
+    # ── Watchlist filters (a second, local layer on top of the section's
+    #    field filters above) ───────────────────────────────────────
+    st.caption("**Watchlist filters** — further narrow the table below only:")
     f1, f2, f3, f4 = st.columns([2, 1.3, 1.5, 1.7])
     with f1:
         portfolios = st.multiselect(
@@ -2882,6 +2884,14 @@ def _render_ro_pipeline_analytics_fragment(comp: pd.DataFrame) -> None:
         "the field filters above.  _Risk-adjusted_ = probability-weighted "
         "(expected value); _Gross_ = unweighted annual opportunity."
     )
+    # Filter-layer legibility: this whole section already reflects the section's
+    # field filters; the watchlist below adds a SECOND, local filter layer.  Flag
+    # when the field filters are active so a shrunk view isn't read as "no data".
+    if any(sel for sel in _read_filter_state_from_session().values()):
+        st.caption(
+            "🔎 The **field filters above** are narrowing this section (tiles, "
+            "charts, and watchlist).  The watchlist has its own filters on top."
+        )
     # Canonical FY27 / FY28 Total B2C from the same roll-up the summary shows,
     # so the two headline tiles match the summary by construction.
     in_year_m, full_year_m = _ro_total_b2c_totals(comp)
@@ -7680,6 +7690,7 @@ def _render_demand_comparison_table(
     extra_cols: Optional[list[str]] = None,
     header_overrides: Optional[dict[str, str]] = None,
     period_overrides: Optional[dict[str, str]] = None,
+    ro_hint: bool = True,
 ) -> None:
     """Render the detailed comparison table (foldable tree) + controls + exports.
 
@@ -7696,7 +7707,10 @@ def _render_demand_comparison_table(
     ``extra_cols`` appends APS-only frame columns to the picker universe (hidden
     by default, so the default view still matches IBP); ``header_overrides`` /
     ``period_overrides`` merge into the header text / 2nd-line month ranges (used
-    by the APS view to surface "YTD Actuals" + "C5 YTG Fcst w.o. RO").
+    by the APS view to surface "YTD Actuals" + "C5 YTG Fcst w.o. RO").  Set
+    ``ro_hint=False`` to suppress the "R&O is zero — save the RO Summary" caption
+    (the APS view derives R&O from the tracker legs, not the RO Summary lookup,
+    so that hint would be stale there).
     """
     extra_cols = extra_cols or []
     table = result.table
@@ -7797,7 +7811,7 @@ def _render_demand_comparison_table(
         period_labels=period_labels,
     )
 
-    if not result.ro_summary_available:
+    if ro_hint and not result.ro_summary_available:
         st.caption(
             "_R&O is zero because the RO Summary Report could not be read. "
             "Save the RO Summary Report above to populate it._"
@@ -8165,7 +8179,10 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
             period_overrides={
                 DPC_DISPLAY_LABELS[DPC_COL_TOTAL_ACTUALS]: _awin,
                 DPC_DISPLAY_LABELS[DPC_COL_CURRENT_PLAN_BASE]: _fwin,
-            })
+            },
+            # APS derives R&O from the tracker legs (not the RO Summary lookup),
+            # so the "save the RO Summary" hint would be stale here.
+            ro_hint=False)
         # SKU-level build-up of the APS cycle-over-cycle rows (unshifted window).
         _render_sku_cycle_drilldown(
             enriched, filters, ns="aps", shift_last_plan_window=False)

@@ -5569,7 +5569,9 @@ def _cached_comparison_order_yoy(
     res = build_business_health(enriched, None, prior_month)
     yoy = {
         str(r[DPC_COL_ROW_ID]): {
-            "L3M": r[BH_YOY_LABELS["L3M"]], "L6M": r[BH_YOY_LABELS["L6M"]]}
+            "L12M": r[BH_YOY_LABELS["L12M"]],
+            "L6M": r[BH_YOY_LABELS["L6M"]],
+            "L3M": r[BH_YOY_LABELS["L3M"]]}
         for _, r in res.table.iterrows()
     }
     return yoy, res.window_labels
@@ -5594,8 +5596,9 @@ def _comparison_period_labels(
         "Base plan": f"{actual} Actual + {forecast} Fcst",
         "PY": py,
         "R&O vol": forecast,
-        "L3M Order YoY": order_labels.get("L3M", ("", ""))[0],
+        "L12M Order YoY": order_labels.get("L12M", ("", ""))[0],
         "L6M Order YoY": order_labels.get("L6M", ("", ""))[0],
+        "L3M Order YoY": order_labels.get("L3M", ("", ""))[0],
     }
 
 
@@ -6477,15 +6480,17 @@ def _render_comparison_kpis_yoy(
 ) -> None:
     """Render the YoY / share KPI row (top of the section).
 
-    L3M Order YoY · L6M Order YoY · Full-Year Base vs PY% · R&O % of Current
-    Plan · **Total B2C Plan vs Budget %**.  ``order_yoy_total`` supplies the
-    Total-B2C trailing IBP-Order YoY (same framing as Business Health);
-    ``periods`` adds the covered month range under the relevant tiles.
+    L12M Order YoY · L6M Order YoY · L3M Order YoY · Full-Year Base vs PY% ·
+    R&O % of Current Plan · **Total B2C Plan vs Budget %**.  ``order_yoy_total``
+    supplies the Total-B2C trailing IBP-Order YoY (same framing as Business
+    Health); ``periods`` adds the covered month range under the relevant tiles.
+    YoY tiles run widest → narrowest window (L12M → L6M → L3M).
     """
     order_yoy_total = order_yoy_total or {}
     per = periods or {}
-    l3m = _fmt_yoy(order_yoy_total.get("L3M"))
+    l12m = _fmt_yoy(order_yoy_total.get("L12M"))
     l6m = _fmt_yoy(order_yoy_total.get("L6M"))
+    l3m = _fmt_yoy(order_yoy_total.get("L3M"))
     fy = _fmt_yoy(kpis.full_year_base_vs_py)
     ro = _fmt_share(kpis.ro_pct)
     budget = _fmt_yoy(kpis.budget_pct)
@@ -6495,8 +6500,9 @@ def _render_comparison_kpis_yoy(
         return f"{base} · {rng}" if rng else base
 
     yoy = (
-        ("L3M Order YoY", l3m, _desc("Current reality", "L3M Order YoY")),
+        ("L12M Order YoY", l12m, _desc("Run-rate", "L12M Order YoY")),
         ("L6M Order YoY", l6m, _desc("Recent trend", "L6M Order YoY")),
+        ("L3M Order YoY", l3m, _desc("Current reality", "L3M Order YoY")),
         ("Full-Year Base vs PY%", fy, _desc("Plan assumption", "PY")),
         ("R&O % of Current Plan", ro, "Aspiration"),
         ("Total B2C Plan vs Budget %", budget, "Plan vs budget"),
@@ -6816,10 +6822,12 @@ _DPC_SUMMARY_COLS: tuple[tuple[str, str, str], ...] = (
     ("base_plan",      "Base plan",      "m"),
     ("py",             "PY",             "m"),
     ("base_vs_py",     "Base vs PY %",   "pct_signed"),
-    # L3M/L6M Order YoY (trailing IBP Orders, anchored on the Prior Month) —
+    # L12M/L6M/L3M Order YoY (trailing IBP Orders, anchored on the Prior Month) —
     # same framing as Business Health; values injected from the order lookup.
-    ("l3m_order_yoy",  "L3M Order YoY",  "pct_signed"),
+    # Widest → narrowest window, matching the Business Health table order.
+    ("l12m_order_yoy", "L12M Order YoY", "pct_signed"),
     ("l6m_order_yoy",  "L6M Order YoY",  "pct_signed"),
+    ("l3m_order_yoy",  "L3M Order YoY",  "pct_signed"),
     ("ro_vol",         "R&O vol",        "m"),
     ("ro_pct",         "RO%",            "pct_plain"),
     ("total_plan",     "Total plan",     "m"),
@@ -6892,10 +6900,11 @@ def _summary_row_values(r: pd.Series) -> dict[str, Optional[float]]:
         "base_plan": base_plan,
         "py": py,
         "base_vs_py": base_vs_py,
-        # L3M/L6M Order YoY are merged in by the renderer from the order lookup
-        # (they are NOT trailing shipments any more).
-        "l3m_order_yoy": None,
+        # L12M/L6M/L3M Order YoY are merged in by the renderer from the order
+        # lookup (they are NOT trailing shipments any more).
+        "l12m_order_yoy": None,
         "l6m_order_yoy": None,
+        "l3m_order_yoy": None,
         "ro_vol": ro_vol,
         "ro_pct": _dpc_num(r, DPC_COL_O_PCT),
         "total_plan": current_plan,
@@ -6983,6 +6992,60 @@ def _render_comparison_summary_col_picker(ns: str = "") -> None:
     )
 
 
+def _dpc_summary_label_parts(r: pd.Series) -> tuple[str, str]:
+    """``(indent_prefix, plain_name)`` for a summary row's Category label.
+
+    The prefix is the leading NBSP/space indent (preserved so a rename keeps its
+    place in the hierarchy); the plain name is the de-indented, de-bulleted text
+    used as the rename box's label + default.
+    """
+    raw = _summary_clean_label(r)                 # indent kept, bullet already gone
+    plain = _bh_plain_label(raw)                  # strip NBSP indent → clean name
+    prefix = raw[:len(raw) - len(raw.lstrip("  "))]
+    return prefix, plain
+
+
+def _dpc_summary_name_overrides(
+    rows_present: list, ns: str,
+) -> dict[str, str]:
+    """Read session-only category renames → ``{row_id: new_name}`` (read-only).
+
+    The rename boxes (rendered below the table) write ``dpc_sum_name_<rid>`` —
+    namespaced per section — which this reads on the next rerun, mirroring the
+    Business Health rename.
+    """
+    overrides: dict[str, str] = {}
+    for rid, _cls, r in rows_present:
+        _prefix, plain = _dpc_summary_label_parts(r)
+        val = str(st.session_state.get(
+            _ns_key(f"dpc_sum_name_{rid}", ns), "") or "").strip()
+        if val and val != plain:
+            overrides[rid] = val
+    return overrides
+
+
+def _render_comparison_summary_rename(rows_present: list, ns: str) -> None:
+    """Session-only per-category rename controls, BELOW the summary table.
+
+    Same design as :func:`_render_business_health_rename`: a collapsed expander
+    with one text box per category (default = its current name).  Edits live in
+    ``st.session_state`` for the session only (not saved to Fabric) and are
+    applied on the next rerun.  Namespaced by *ns* so the IBP and APS summaries
+    keep independent renames.
+    """
+    with st.expander("✏️ Rename categories (this view only)", expanded=False):
+        st.caption(
+            "Rename any category for **this view only** — applies to the summary "
+            "table above; not saved to Fabric."
+        )
+        cols = st.columns(2)
+        for i, (rid, _cls, r) in enumerate(rows_present):
+            _prefix, plain = _dpc_summary_label_parts(r)
+            with cols[i % 2]:
+                st.text_input(plain, value=plain,
+                              key=_ns_key(f"dpc_sum_name_{rid}", ns))
+
+
 def _render_comparison_summary_table(
     result, ns: str = "", *,
     order_yoy_by_row: Optional[dict] = None,
@@ -7019,16 +7082,21 @@ def _render_comparison_summary_table(
     head_html = '<th class="lbl">Category</th>' + "".join(
         _th(header) for _key, header, _kind in cols)
 
+    # Category rows present + session renames (same design as Business Health).
+    rows_present = [(rid, cls, by_id[rid]) for rid, cls in _DPC_SUMMARY_ROWS
+                    if by_id.get(rid) is not None]
+    overrides = _dpc_summary_name_overrides(rows_present, ns)
+
     body_rows: list[str] = []
-    for row_id, cls in _DPC_SUMMARY_ROWS:
-        r = by_id.get(row_id)
-        if r is None:
-            continue
+    for row_id, cls, r in rows_present:
         vals = _summary_row_values(r)
         row_orders = order_yoy.get(row_id, {})
-        vals["l3m_order_yoy"] = row_orders.get("L3M")
+        vals["l12m_order_yoy"] = row_orders.get("L12M")
         vals["l6m_order_yoy"] = row_orders.get("L6M")
-        cells = f'<td class="lbl">{_esc_html(_summary_clean_label(r))}</td>' + "".join(
+        vals["l3m_order_yoy"] = row_orders.get("L3M")
+        prefix, plain = _dpc_summary_label_parts(r)
+        label = prefix + overrides.get(row_id, plain)
+        cells = f'<td class="lbl">{_esc_html(label)}</td>' + "".join(
             _summary_cell_html(kind, vals[key]) for key, _header, kind in cols
         )
         body_rows.append(f'<tr class="{cls}">{cells}</tr>')
@@ -7039,6 +7107,8 @@ def _render_comparison_summary_table(
         + "</tr></thead><tbody>" + "".join(body_rows) + "</tbody></table></div>",
         unsafe_allow_html=True,
     )
+    # Per-category rename controls, rendered BELOW the table (like Business Health).
+    _render_comparison_summary_rename(rows_present, ns)
 
 
 # ── Current-plan volume-mix / mix-shift view (screenshot 2) ──────────────────

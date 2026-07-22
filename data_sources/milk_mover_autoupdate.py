@@ -5,20 +5,18 @@ Strategy
 --------
 When the user clicks **🔄 USDA refresh** (or a routine tick fires for
 the first time in the session), the orchestrator scrapes the headline
-values from ``dymadvancedprices.pdf`` and asks: **"do these rates
-actually differ from the latest month already in the file?"**.  Only
-when at least one of the seven canonical reconcilable cells differs do
-we ingest a new month — labelled ``max(file) + 1 calendar month`` per
-the operator contract.  Existing rows are NEVER mutated by this path
-(May-2026-late contract: "no change to existing data").
+values from ``dymadvancedprices.pdf`` and asks: **"is the PDF's page-1
+banner announcing the month that is already the latest in the file?"**.
+Only when the announced month equals ``max(file)`` do we ingest a new
+month, labelled ``max(file) + 1 calendar month`` per the operator
+contract.  Existing rows are NEVER mutated by this path (May-2026-late
+contract: "no change to existing data").
 
-The seven canonical cells live in
-:data:`_RECONCILABLE_FIELDS` and cover HTST I Skim/Bfat, HTST II
-Skim/Bfat, ESL I Skim, Culture II Protein, Culture II Other Solids.  Every other
-cell of the 5-row month group is *derived* from those seven by spec
-(ESL II / Culture II Skim+Bfat mirror HTST II, etc.), so "any of the seven
-differ" is the necessary and sufficient signal that USDA actually
-published new rates.
+Anchoring the write to the announced month IS the dedup guard: a month
+is only appended when USDA has "caught up" to the file's latest month,
+so the label counter cannot run past the real month (it will not write
+September while the PDF still announces July) and an identical month
+cannot be appended twice.
 
 Class II Butterfat is published in a separate file (page-2 history of
 ``dymclassprices.pdf``) and lags advance-prices by ~1 month at the USDA
@@ -53,16 +51,15 @@ Workflow on each invocation
     the data (bfat lag, transient error, legacy-buggy write), which
     used to leave the file stale forever even after the operator
     explicitly clicked refresh.
-5.  **Compare scraped rates vs the latest stored month.**  Identical →
-    no write, surface "rates unchanged" reason.  Differ on at least
-    one of the **six advance-prices-driven cells** (HTST I Skim/Bfat,
-    HTST II Skim, ESL I Skim, Culture II Protein, Culture II Other
-    Solids) → proceed.  The Class II Butterfat cell (HTST II Bfat /
-    ESL II Bfat / Culture II Bfat) is INTENTIONALLY EXCLUDED from the
-    gate per operator contract: "only the advance-prices PDF publish
-    should trigger a new month write — Class II Butterfat is always
-    the latest available row from page 2 of dymclassprices.pdf".  See
-    :data:`_RECONCILABLE_FIELDS`.
+5.  **New-month gate (rewired).**  Append the next calendar month
+    (``max(file) + 1``) ONLY when the advanced-prices PDF page-1
+    banner announces the month that is already the latest in the file
+    (e.g. latest = Jul 2026 AND banner = "ADVANCED PRICES FOR JULY
+    2026" -> write Aug 2026).  A different or unreadable announced
+    month writes nothing.  This is the hardened dedup guard: it stops
+    the label counter from running past the real month and cannot be
+    bypassed by a missing latest-month lookup.  Class II Butterfat
+    never gates the write (sourced as the latest page-2 row, step 6).
 6.  **Source Class II Butterfat** by taking the LATEST published row
     from :func:`pdf.parse_class_ii_butterfat_history` regardless of
     target month — the operator-facing contract is "Class II
@@ -108,7 +105,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -359,148 +356,36 @@ def _next_calendar_month(month: pd.Timestamp) -> pd.Timestamp:
     )
 
 
-# ── Compare-vs-latest gate ───────────────────────────────────────────────────
-#
-# The SIX reconcilable cells the comparator looks at — all sourced
-# directly from the advance-prices PDF.  Every other cell of a 5-row
-# month group is derived from these by spec:
-#
-#   * ESL II Skim/Bfat       = HTST II Skim/Bfat
-#   * Culture II Skim/Bfat   = ESL II Skim/Bfat (= HTST II)
-#   * ESL I  Bfat            = HTST I  Bfat
-#
-# **HTST II Butterfat is INTENTIONALLY EXCLUDED** from the gate.  Per
-# the May-2026-late operator contract: "Only the publish of
-# dymadvancedprices.pdf matters; Class II butterfat is always the last
-# row value on page 2 of dymclassprices.pdf".  In other words: the
-# class-prices PDF is treated purely as a cell-source for HTST II Bfat,
-# never as a trigger for new-month writes.  Letting Class II Butterfat
-# gate the comparator would cause spurious new-month writes any time
-# class-prices publishes ahead of advance-prices.
-#
-# So "any of the six differ" is necessary AND sufficient to conclude
-# that USDA has published new rates for the announced month.  Adding
-# the derived cells would just be redundant comparisons.
-@dataclass(frozen=True)
-class _CellSpec:
-    """Locate one reconcilable rate cell by ``(Category, Class, field)``."""
-    category: str
-    klass:    str
-    field:    str   # ``store.COL_SKIM`` / ``store.COL_BUTTERFAT`` / etc.
+def _new_month_skip_reason(
+    file_max:        Optional[pd.Timestamp],
+    announced_month: Optional[date],
+) -> Optional[str]:
+    """Return why a new month must NOT be written, or ``None`` when it should.
 
-
-_RECONCILABLE_FIELDS: tuple[_CellSpec, ...] = (
-    _CellSpec("HTST",                   "I",  store.COL_SKIM),
-    _CellSpec("HTST",                   "I",  store.COL_BUTTERFAT),
-    _CellSpec("HTST",                   "II", store.COL_SKIM),
-    _CellSpec("ESL",                    "I",  store.COL_SKIM),
-    _CellSpec(_CATEGORY_CULTURE, "II", store.COL_PROTEIN),
-    _CellSpec(_CATEGORY_CULTURE, "II", store.COL_OTHER_SOLIDS),
-)
-
-
-def _index_rows_by_key(
-    rows: Iterable[dict],
-) -> dict[tuple[str, str], dict]:
-    """Build a ``(Category, Class) → row`` lookup, casefolded keys."""
-    out: dict[tuple[str, str], dict] = {}
-    for r in rows:
-        cat = str(r.get(store.COL_CATEGORY, "")).strip().casefold()
-        cls = str(r.get(store.COL_CLASS, "")).strip().casefold()
-        if cat and cls:
-            out[(cat, cls)] = r
-    return out
-
-
-def _row_for_spec(
-    index: dict[tuple[str, str], dict],
-    spec:  _CellSpec,
-) -> Optional[dict]:
-    """Look up the row matching ``spec`` (case-insensitive Category/Class)."""
-    return index.get((spec.category.casefold(), spec.klass.casefold()))
-
-
-def _cell_value(row: Optional[dict], field: str) -> Optional[float]:
-    """Coerce ``row[field]`` to a finite float, or return ``None``."""
-    if row is None:
-        return None
-    v = row.get(field)
-    if v is None:
-        return None
-    try:
-        if pd.isna(v):
-            return None
-    except (TypeError, ValueError):
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _values_differ(
-    a: Optional[float],
-    b: Optional[float],
-    *,
-    rel_tol: float = 1e-9,
-    abs_tol: float = 1e-6,
-) -> bool:
-    """Return True when ``a`` and ``b`` represent materially different rates.
-
-    Treats ``None`` ≠ float as a difference (one side has a published
-    rate, the other doesn't), but ``None`` vs ``None`` as equal.  Float
-    comparison uses a tight ``math.isclose`` tolerance: USDA publishes
-    to 4 decimal places, so a single trailing-digit jitter wouldn't
-    survive ``round(..., 4)`` and we shouldn't trigger a new-month
-    write on representational noise.
+    Rewired new-month gate: we only append ``file_max + 1`` when the
+    advanced-prices PDF's page-1 banner is announcing the month that is already
+    the latest in the file (``announced_month == file_max``).  This ties each
+    appended month to a genuine USDA publication and is the hardened dedup guard
+    — the label counter can't run past the real month, and an unreadable /
+    mismatched banner writes nothing.  ``file_max is None`` (empty pre-seed
+    file) returns ``None`` so the bootstrap write can proceed.
     """
-    if a is None and b is None:
-        return False
-    if a is None or b is None:
-        return True
-    import math
-    return not math.isclose(a, b, rel_tol=rel_tol, abs_tol=abs_tol)
-
-
-def _scraped_rates_differ_from_latest(
-    candidate_rows:     list[dict],
-    latest_month_rows:  list[dict],
-) -> bool:
-    """Compare the seven canonical cells between candidate and stored rows.
-
-    ``candidate_rows`` and ``latest_month_rows`` must each be the
-    five-row group for a single month.  Returns ``True`` as soon as
-    any of the cells in :data:`_RECONCILABLE_FIELDS` differs.
-    Short-circuits — every other cell is bound to one of these seven
-    by spec, so a single difference is sufficient to publish.
-    """
-    cand_index = _index_rows_by_key(candidate_rows)
-    prev_index = _index_rows_by_key(latest_month_rows)
-    for spec in _RECONCILABLE_FIELDS:
-        a = _cell_value(_row_for_spec(cand_index, spec), spec.field)
-        b = _cell_value(_row_for_spec(prev_index, spec), spec.field)
-        if _values_differ(a, b):
-            return True
-    return False
-
-
-def _latest_month_row_group(latest_month: pd.Timestamp) -> list[dict]:
-    """Return every row of ``latest_month`` from the store as plain dicts.
-
-    Used by the comparator to read the seven canonical cells without
-    forcing a DataFrame round-trip.  Empty list when the store has no
-    row for ``latest_month`` (e.g. cold start before the seed lands).
-
-    Matches the store's ``M/D/YYYY`` (un-zero-padded) Month format —
-    that's the canonical shape ``read_milk_mover_df`` returns and
-    sidesteps Windows' missing ``%-m`` strftime directive.
-    """
-    df = store.read_milk_mover_df()
-    if df.empty or store.COL_MONTH not in df.columns:
-        return []
-    target_str = f"{latest_month.month}/{latest_month.day}/{latest_month.year}"
-    mask = df[store.COL_MONTH].astype(str).str.strip() == target_str
-    return df.loc[mask].to_dict(orient="records")
+    if file_max is None:
+        return None
+    if announced_month is None:
+        return (
+            "Could not read the announced month from the advanced-prices "
+            "PDF banner - no new month written."
+        )
+    if (announced_month.year, announced_month.month) != (
+        file_max.year, file_max.month
+    ):
+        return (
+            f"Advanced-prices PDF announces {announced_month:%b %Y}, but "
+            f"the latest stored month is {file_max:%b %Y} - no new month "
+            "written (only advance when the two match)."
+        )
+    return None
 
 
 def _derive_legacy_culture_rows(
@@ -749,7 +634,7 @@ def maybe_update_from_pdfs(
     # yet on the class-prices PDF, we still emit a row carrying the
     # most-recent published Bfat — which is exactly what the operator
     # wants since Class II Bfat does NOT trigger new-month writes
-    # (it's excluded from :data:`_RECONCILABLE_FIELDS`).
+    # (it never gates the new-month write - see step 5).
     #
     # Defensive fallback: if the class-prices PDF is unreachable or
     # unparseable we land here with ``class_ii_butterfat = None``.  The
@@ -778,13 +663,17 @@ def maybe_update_from_pdfs(
     if class_ii_butterfat is None:
         result.class_ii_bfat_lag_target = target_month.strftime("%b %Y")
 
-    # ── 6. Compare scraped rates vs the latest stored month ─────────────────
+    # ── 6. New-month gate ─────────────────────────────────────────────────
     #
-    # Build the candidate 5-row set first (headline-driven), then read
-    # the equivalent five rows for the latest month already on disk and
-    # ask: "do any of the seven canonical cells differ?"  Identical →
-    # we do NOT write — that's exactly the May-2026-late contract:
-    # "if rates are different, then those rates should be written".
+    # Rewired rule: append the NEXT calendar month (target_month =
+    # file_max + 1) ONLY when the advanced-prices PDF page-1 banner is
+    # announcing the month that is already the latest in the file.  Both
+    # must line up - e.g. latest stored month = Jul 2026 AND the banner
+    # says "ADVANCED PRICES FOR JULY 2026" -> write Aug 2026.  This ties
+    # every appended month to a genuine USDA publication and is the
+    # hardened dedup guard: once Aug is written, file_max = Aug while the
+    # PDF still announces Jul, so Sep is NOT written until USDA publishes
+    # August's advance prices.
     try:
         candidate_rows = _derive_rows_for_target(
             month               = target_month,
@@ -798,22 +687,12 @@ def maybe_update_from_pdfs(
         )
         return result
 
-    if file_max is not None:
-        latest_rows = _latest_month_row_group(file_max)
-        if latest_rows and not _scraped_rates_differ_from_latest(
-            candidate_rows, latest_rows,
-        ):
-            result.skipped_reason = (
-                f"USDA rates unchanged vs {file_max.strftime('%b %Y')} — "
-                "no new month written."
-            )
-            # Fall through to the legacy Culture backfill below; we still
-            # want to close gaps in the existing data even on a no-op tick.
-            target_rows_to_insert: list[dict] = []
-        else:
-            target_rows_to_insert = candidate_rows
+    announced_month = pdf.parse_advanced_prices_month(adv_bytes)
+    skip_reason = _new_month_skip_reason(file_max, announced_month)
+    if skip_reason:
+        result.skipped_reason = skip_reason
+        target_rows_to_insert: list[dict] = []
     else:
-        # Empty file (no seed) — every rate is "different from null".
         target_rows_to_insert = candidate_rows
 
     # ── 7. Append the new-month rows (existing rows untouched) ─────────────

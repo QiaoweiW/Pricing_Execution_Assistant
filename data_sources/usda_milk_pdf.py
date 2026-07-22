@@ -39,6 +39,7 @@ import hashlib
 import io
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 
 import pdfplumber
@@ -239,6 +240,38 @@ def parse_advanced_prices(pdf_bytes: bytes) -> dict[str, float]:
             + ". The USDA PDF layout may have changed."
         )
     return out
+
+
+# Page-1 headline banner, e.g. "ADVANCED PRICES FOR JULY 2026".  Read only to
+# VALIDATE which month USDA is currently announcing (a gate in the orchestrator)
+# — the mover row is still LABELLED ``store.latest_month() + 1``, never mined
+# from this text, so a USDA layout shift cannot mis-label a row.
+_ADVANCED_MONTH_RE: re.Pattern[str] = re.compile(
+    r"ADVANCED\s+PRICES\s+FOR\s+([A-Za-z]+)\s+(\d{4})", re.IGNORECASE
+)
+
+
+def parse_advanced_prices_month(pdf_bytes: bytes) -> Optional[date]:
+    """Return the month the advanced-prices PDF announces, as first-of-month.
+
+    Reads the page-1 "ADVANCED PRICES FOR <MONTH> <YYYY>" banner and maps it to
+    ``date(YYYY, MM, 1)``.  Returns ``None`` when the banner can't be located or
+    the month word isn't recognised, so the orchestrator can treat an
+    unverifiable announcement conservatively (no new-month write).
+
+    The month word is matched by its first three letters against the canonical
+    :data:`_MONTH_NAME_TO_INT` map, so full names ("JULY") and abbreviations
+    ("Jul") both resolve without a second lookup table.
+    """
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n".join((page.extract_text() or "") for page in pdf.pages)
+    m = _ADVANCED_MONTH_RE.search(text)
+    if not m:
+        return None
+    month_int = _MONTH_NAME_TO_INT.get(m.group(1)[:3].title())
+    if month_int is None:
+        return None
+    return date(int(m.group(2)), month_int, 1)
 
 
 # ── Class Prices parser (dymclassprices.pdf, page 2) ────────────────────────

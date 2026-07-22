@@ -3082,6 +3082,75 @@ def build_business_health(
         chart_series=chart_series)
 
 
+# Output dimension columns for the Business Health SKU drill-in.
+BH_SKU_DIM_COLS: tuple[str, ...] = (
+    "Portfolio Major", "Portfolio Minor", "Brand", "Supply Format",
+)
+BH_SKU_COLUMNS: tuple[str, ...] = (
+    "SKU", *BH_SKU_DIM_COLS, *BH_DISPLAY_ORDER[:-1],   # drop the text Flag
+)
+
+
+def build_business_health_sku(
+    orders_enriched: Optional[pd.DataFrame],
+    prior_month: date,
+    *,
+    dim_filter: Optional[dict[str, set]] = None,
+) -> pd.DataFrame:
+    """One-row-per-SKU build-up of the Business Health ORDER table.
+
+    Per SKU (item description): the L12M / L6M / L3M ordered lbs, their year-ago
+    (YAG) spans, and Order-YoY — in millions of lbs, over the windows ending at
+    *prior_month*.  This is the SKU-level detail behind the roll-up rows shown in
+    the Business Health table.  ``dim_filter`` narrows by pmaj / pminor / brand /
+    sfmt (empty / absent = all); columns follow the table's L12M→L6M→L3M order
+    (:data:`BH_DISPLAY_ORDER`, minus the text Flag).  Sorted by L12M Orders desc.
+    Empty / missing frame → an empty, correctly-shaped frame.
+    """
+    empty = pd.DataFrame(columns=list(BH_SKU_COLUMNS))
+    work = _apply_sku_dim_filter(orders_enriched, dim_filter)
+    if work is None or work.empty:
+        return empty
+
+    pm = prior_month.replace(day=1)
+    cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
+    yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
+    all_months = set().union(*cur_windows.values(), *yag_windows.values())
+
+    work = work[work["month"].isin(all_months)].copy()
+    if work.empty:
+        return empty
+    work["pounds"] = pd.to_numeric(work["pounds"], errors="coerce").fillna(0.0)
+
+    # Dims are constant per item_key — take the first observed value.
+    dims = work.groupby("item_key")[
+        ["item_desc", "pmaj", "pminor", "brand", "sfmt"]].first()
+
+    def _window_sum(months: set) -> pd.Series:
+        s = (work[work["month"].isin(months)]
+             .groupby("item_key")["pounds"].sum())
+        return s.reindex(dims.index).fillna(0.0) / 1e6
+
+    out = pd.DataFrame({
+        "SKU": (dims["item_desc"].astype(str).str.strip()
+                .where(lambda s: s != "", dims.index.astype(str))),
+        "Portfolio Major": dims["pmaj"].astype(str),
+        "Portfolio Minor": dims["pminor"].astype(str),
+        "Brand": dims["brand"].astype(str),
+        "Supply Format": dims["sfmt"].astype(str),
+    })
+    for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
+        cur, yag = _window_sum(cur_windows[w]), _window_sum(yag_windows[w])
+        out[cur_lbl] = cur.round(_MILLIONS_DISPLAY_DECIMALS).to_numpy()
+        out[yag_lbl] = yag.round(_MILLIONS_DISPLAY_DECIMALS).to_numpy()
+        denom = yag.where(yag.abs() > 1e-9)          # NaN YoY when no year-ago base
+        out[BH_YOY_LABELS[w]] = ((cur - yag) / denom).to_numpy()
+
+    out = (out.sort_values(BH_LEVEL_LABELS["L12M"][0], ascending=False)
+              .reset_index(drop=True))
+    return out[list(BH_SKU_COLUMNS)]
+
+
 # ── SKU-level cycle-over-cycle build-up ──────────────────────────────────────
 # The SKUs that compose the cycle-over-cycle roll-up rows, one row per item.
 # Leg build-up only (Base + R&O legs, prior vs current cycle, + actuals →

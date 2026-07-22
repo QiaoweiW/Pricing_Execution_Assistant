@@ -139,6 +139,7 @@ from data_sources.demand_plan_comparison import (
     build_prior_month_shipment_diagnostic,
     build_pm_actual_driver_table,
     build_business_health,
+    build_business_health_sku,
     build_sku_cycle_comparison,
     BusinessHealthResult,
     BH_COL_CATEGORY,
@@ -582,6 +583,13 @@ _BH_CURATED_ROWS: tuple[str, ...] = (
     "total_b2c", "esl", "esl_lc", "esl_sc", "aseptic", "cultured",
     "cult_cottage_cheese", "cult_sour_cream", "fresh_milk", "butter",
 )
+# Business-Health-only restyle: render Cultured's Cottage Cheese / Sour Cream
+# like ESL's Large / Small Carton sub-rows (indent-2 subtotal look — no memo
+# bullet, bold) instead of the template's memo styling.  Scoped to this section
+# so the shared COMPARISON_TEMPLATE (used by RO / demand summary) is untouched.
+_BH_SUBTOTAL_STYLE_ROWS: frozenset = frozenset(
+    {"cult_cottage_cheese", "cult_sour_cream"})
+_BH_MEMO_BULLET: str = "• "   # bullet prefix baked into memo labels
 _BH_TABLE_COLS_KEY: str = "business_health_table_cols"
 # Executive names for the trailing windows (chart + legend): the newest window
 # reads as near-term "Momentum", the mid window as the "Trajectory", and the
@@ -677,6 +685,7 @@ def _render_business_health() -> None:
             "(L12M), **Falling** when decelerating, else **Flat**."
         )
         _render_business_health_table(result)
+        _render_business_health_sku_drilldown(orders_enriched, prior_month)
 
 
 def _bh_order_combos(
@@ -888,6 +897,16 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
     tdf = (tdf.assign(_ord=tdf["_row_id"].map(order_ix))
               .sort_values("_ord").drop(columns="_ord").reset_index(drop=True))
 
+    # Restyle Cottage Cheese / Sour Cream to match ESL's Large / Small Carton
+    # sub-rows (indent-2 subtotal look, no memo bullet) — Business-Health only.
+    _restyle = tdf["_row_id"].isin(_BH_SUBTOTAL_STYLE_ROWS)
+    if _restyle.any():
+        tdf.loc[_restyle, "_is_memo"] = False
+        tdf.loc[_restyle, "_is_subtotal"] = True
+        tdf.loc[_restyle, BH_COL_CATEGORY] = (
+            tdf.loc[_restyle, BH_COL_CATEGORY]
+            .str.replace(_BH_MEMO_BULLET, "", regex=False))
+
     all_labels = list(BH_DISPLAY_ORDER)
     cols = _picked_columns(_BH_TABLE_COLS_KEY, all_labels)
     # Session-only category renames — read here (applied to the table), but the
@@ -965,6 +984,63 @@ def _render_business_health_table(result: "BusinessHealthResult") -> None:
         key="business_health_download", use_container_width=True)
     # Rename controls render BELOW the table (edits apply on the next rerun).
     _render_business_health_rename(tdf)
+
+
+def _render_business_health_sku_drilldown(
+    orders_enriched: Optional[pd.DataFrame], prior_month: date,
+) -> None:
+    """Foldable SKU-level build-up of the Business Health order table.
+
+    Mirrors the APS / IBP cycle drill-in design: Portfolio Major / Portfolio
+    Minor / Brand / Supply Format search filters (empty = all) over the SKUs
+    that compose the roll-up rows, in a native ``st.dataframe`` (sort / hide /
+    resize for free).  Values are the L12M / L6M / L3M **ordered lbs** (+ YAG +
+    Order-YoY) in millions, sorted by L12M orders.
+    """
+    with st.expander("🔬 SKU-level order drill-in", expanded=False):
+        st.caption(
+            "The individual **SKUs** behind the Business Health rows above — "
+            "L12M / L6M / L3M **ordered lbs** (+ year-ago and Order-YoY), in "
+            "millions.  Filter by **Portfolio Major / Portfolio Minor / Brand / "
+            "Supply Format** (empty = all); sorted by L12M orders."
+        )
+        cols = st.columns(4)
+        dim_filter: dict[str, set] = {}
+        for (key, label), slot in zip(
+            (("pmaj", "Portfolio Major"), ("pminor", "Portfolio Minor"),
+             ("brand", "Brand"), ("sfmt", "Supply Format")), cols):
+            with slot:
+                sel = st.multiselect(
+                    label, options=_sku_dim_options(orders_enriched, key),
+                    key=f"bh_sku_{key}", placeholder="All")
+            if sel:
+                dim_filter[key] = set(sel)
+
+        sku_df = build_business_health_sku(
+            orders_enriched, prior_month, dim_filter=dim_filter)
+        if sku_df.empty:
+            st.info("No SKUs match the current filters.")
+            return
+        st.caption(f"**{len(sku_df):,}** SKU(s)")
+
+        # Millions with 2dp for the level columns; the three Order-YoY columns as
+        # signed percentages (fractions → %).
+        cc = st.column_config
+        level_cols = [lbl for pair in BH_LEVEL_LABELS.values() for lbl in pair]
+        colcfg: dict[str, object] = {
+            "SKU": cc.TextColumn("SKU", width="large"),
+            **{c: cc.NumberColumn(c, format="%.2f") for c in level_cols},
+            **{c: cc.NumberColumn(c, format="percent") for c in BH_YOY_LABELS.values()},
+        }
+        st.dataframe(
+            sku_df, use_container_width=True, hide_index=True,
+            height=min(35 * (len(sku_df) + 1) + 38, 640), column_config=colcfg)
+        today = pd.Timestamp.utcnow().strftime("%Y%m%d")
+        st.download_button(
+            "⬇️ Download SKU order drill-in (CSV)",
+            data=sku_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"business_health_sku_{today}.csv", mime="text/csv",
+            key="business_health_sku_download", use_container_width=True)
 
 
 def _render_ro_comparison() -> None:

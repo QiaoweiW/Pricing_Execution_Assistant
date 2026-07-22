@@ -130,7 +130,9 @@ from data_sources.demand_plan_comparison import (
     build_comparison_not_captured,
     build_demand_plan_comparison,
     build_enriched_sources,
+    build_item_dim_frame,
     build_item_dim_frame_cascade,
+    _vectorised_item_key,
     ComparisonNotCaptured,
     DIAG_COL_LBS,
     DIAG_COL_MLBS,
@@ -5550,14 +5552,19 @@ class _ComparisonSupportingSources:
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_comparison_order_yoy(
     prior_month: date,
+    combo_exclude: frozenset = frozenset(),
 ) -> tuple[dict[str, dict[str, Optional[float]]], dict[str, tuple[str, str]]]:
-    """Per-row **L3M / L6M Order YoY** + window labels, anchored on *prior_month*.
+    """Per-row **L12M / L6M / L3M Order YoY** + window labels, anchored on
+    *prior_month* and narrowed by *combo_exclude*.
 
     Loads the 24 months of IBP Orders the L12M current + year-ago windows need,
-    enriches them, and reuses :func:`build_business_health` (orders only) so the
-    comparison's L3M/L6M Order YoY reconcile with the Business Health section by
-    construction.  Returns ``({row_id: {"L3M": frac|None, "L6M": frac|None}},
-    window_labels)``; a failed Orders read degrades to empty (blank YoY).
+    enriches them, applies the SAME Portfolio Major · Supply Format · Brand
+    exclude the comparison table uses (so the Total-B2C YoY reflects the active
+    filters — e.g. dropping Butter Private Label), and reuses
+    :func:`build_business_health` (orders only) so the YoY reconciles with the
+    filtered comparison.  ``combo_exclude`` is part of the cache key.  Returns
+    ``({row_id: {"L12M"/"L6M"/"L3M": frac|None}}, window_labels)``; a failed
+    Orders read degrades to empty (blank YoY).
     """
     cur12 = last_n_months(prior_month, 12)
     window = tuple(sorted(cur12 | {shift_year_back(m) for m in cur12}))
@@ -5566,6 +5573,7 @@ def _cached_comparison_order_yoy(
         enriched = enrich_ibp_orders_df(orders_df, _load_demand_comparison_pdh())
     except (LakehouseIOError, ValueError):
         enriched = None
+    enriched = _bh_apply_combo_exclude(enriched, combo_exclude)
     res = build_business_health(enriched, None, prior_month)
     yoy = {
         str(r[DPC_COL_ROW_ID]): {
@@ -5593,6 +5601,8 @@ def _comparison_period_labels(
     forecast = _rng(filters.forecast_start, filters.forecast_end)
     py = _rng(shift_year_back(filters.actual_start), shift_year_back(filters.forecast_end))
     return {
+        "YTD Acl": f"{actual} Actual",
+        "YTG Fcst w.o. RO": f"{forecast} Fcst",
         "Base plan": f"{actual} Actual + {forecast} Fcst",
         "PY": py,
         "R&O vol": forecast,
@@ -5967,7 +5977,8 @@ def _render_demand_plan_comparison_fragment() -> None:
     )
     # L3M/L6M **Order** YoY (trailing IBP Orders, anchored on the Prior Month) +
     # the month-range 2nd rows / tile sub-labels.
-    _order_yoy, _order_labels = _cached_comparison_order_yoy(filters.prior_month)
+    _order_yoy, _order_labels = _cached_comparison_order_yoy(
+        filters.prior_month, filters.combo_exclude)
     _periods = _comparison_period_labels(filters, _order_labels)
     _render_comparison_kpis_yoy(
         kpis, order_yoy_total=_order_yoy.get("total_b2c", {}), periods=_periods)
@@ -6819,6 +6830,10 @@ _DPC_SUMMARY_ROWS: tuple[tuple[str, str], ...] = (
 # RO% sits between R&O vol and Total plan; T3M/T6M YoY follow Base vs PY %.
 # Every column here is individually hidable via the popover; Category is fixed.
 _DPC_SUMMARY_COLS: tuple[tuple[str, str, str], ...] = (
+    # YTD Actuals + YTG Base Forecast (w/o R&O) sit in front of Base Plan and
+    # sum to it: Base Plan = YTD Acl + YTG Fcst w.o. RO (see _summary_row_values).
+    ("ytd_actl",       "YTD Acl",             "m"),
+    ("ytg_fcst",       "YTG Fcst w.o. RO",    "m"),
     ("base_plan",      "Base plan",      "m"),
     ("py",             "PY",             "m"),
     ("base_vs_py",     "Base vs PY %",   "pct_signed"),
@@ -6884,19 +6899,29 @@ def _dpc_fmt_pp(delta_frac: Optional[float], *, decimals: int = 1) -> tuple[str,
 def _summary_row_values(r: pd.Series) -> dict[str, Optional[float]]:
     """Project one comparison-table row into the summary table's value keys.
 
-    All keys map to :data:`_DPC_SUMMARY_COLS`.  The only derived values are
-    ``base_plan`` (Current Plan − R&O) and ``base_vs_py`` ((Base − PY) / PY);
-    T3M/T6M YoY are read straight off the pre-computed table columns.
+    All keys map to :data:`_DPC_SUMMARY_COLS`.  Derived values:
+    ``base_plan`` (Current Plan − R&O); its split into ``ytd_actl`` (YTD
+    Actuals) + ``ytg_fcst`` (YTG base forecast w/o R&O) — since the comparison
+    defines ``Current Plan = Total Actual + Current-Plan Base + R&O``, we have
+    ``YTD Acl = Current Plan − Current-Plan Base − R&O`` and ``YTG Fcst w.o. RO
+    = Current-Plan Base``, which sum back to Base Plan; and ``base_vs_py``
+    ((Base − PY) / PY).  T3M/T6M YoY are read straight off the table columns.
     """
     current_plan = _dpc_num(r, DPC_COL_CURRENT_PLAN)
     ro_vol = _dpc_num(r, DPC_COL_CURRENT_PLAN_RO)
     py = _dpc_num(r, DPC_COL_PY_ACTUAL)
     base_plan = None if current_plan is None else current_plan - (ro_vol or 0.0)
+    # YTG = current-plan Base leg (always present); YTD = Base Plan − YTG.
+    ytg_fcst = _dpc_num(r, DPC_COL_CURRENT_PLAN_BASE)
+    ytd_actl = (None if base_plan is None
+                else base_plan - (ytg_fcst or 0.0))
     base_vs_py = (
         (base_plan - py) / py
         if base_plan is not None and py not in (None, 0.0) else None
     )
     return {
+        "ytd_actl": ytd_actl,
+        "ytg_fcst": ytg_fcst,
         "base_plan": base_plan,
         "py": py,
         "base_vs_py": base_vs_py,
@@ -8296,7 +8321,8 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
         _render_comparison_summary_col_picker(ns="aps")
         kpis = build_comparison_kpis(
             result.table, enriched.ibp_recent, enriched.ibp_recent_py, filters)
-        _aps_order_yoy, _aps_order_labels = _cached_comparison_order_yoy(filters.prior_month)
+        _aps_order_yoy, _aps_order_labels = _cached_comparison_order_yoy(
+            filters.prior_month, filters.combo_exclude)
         _aps_periods = _comparison_period_labels(filters, _aps_order_labels)
         _render_comparison_kpis_yoy(
             kpis, order_yoy_total=_aps_order_yoy.get("total_b2c", {}), periods=_aps_periods)
@@ -10519,6 +10545,33 @@ def _render_promotion_lift_analysis() -> None:
         st.info("ℹ️ Promotion Lift Analysis is coming soon.")
 
 
+def _velocity_attach_portfolio_minor(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure a Portfolio Minor column on the shipments frame.
+
+    Uses the shipments table's own Portfolio Minor when present; otherwise falls
+    back to the **PDH reference** — joining on the item column with the
+    codebase's canonical item-key normaliser (:func:`_vectorised_item_key`) so it
+    lines up with every other PDH-dim join.  Best-effort: a missing item column
+    or any PDH load/join failure leaves the frame unchanged (the Portfolio Minor
+    filter then simply doesn't appear), so it never breaks the section.
+    """
+    if df is None or df.empty or vel.COL_PRODUCT_MINOR in df.columns:
+        return df
+    if vel.COL_ITEM not in df.columns:
+        return df
+    try:
+        dim = build_item_dim_frame(_load_demand_comparison_pdh())
+    except Exception:  # noqa: BLE001 — best-effort; keep the section alive
+        return df
+    if dim is None or dim.empty or "pminor" not in dim.columns:
+        return df
+    minor_by_key = dict(zip(dim["__item_key"], dim["pminor"].astype(str)))
+    out = df.copy()
+    out[vel.COL_PRODUCT_MINOR] = (
+        _vectorised_item_key(out[vel.COL_ITEM]).map(minor_by_key).fillna(""))
+    return out
+
+
 def _render_velocity_analysis() -> None:
     """Foldable 'Velocity Analysis' section — weekly ordered vs shipped lbs.
 
@@ -10529,8 +10582,10 @@ def _render_velocity_analysis() -> None:
     with st.expander("🚀 Velocity Analysis", expanded=False):
         st.caption(
             "Week-over-week **ordered vs shipped lbs** from `dbo.Shipments`, "
-            "sliced by Portfolio, Product Description, Customer, Business Unit "
-            "and Product Format over a chosen order-date range."
+            "sliced by Portfolio, Portfolio Minor, Product Description, Customer, "
+            "Business Unit and Product Format over a chosen order-date range.  "
+            "The right axis shows **Shipped Velocity** (shipped lbs ÷ distinct "
+            "ship-to locations) when the table carries a ship-to column."
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.info(
@@ -10559,6 +10614,11 @@ def _render_velocity_analysis_body() -> None:
         st.info("No shipment rows available.")
         return
 
+    # Portfolio Minor: use the shipments column when present, else fall back to
+    # the PDH reference (join on the item column, matched with the codebase's
+    # canonical item-key normaliser so it lines up with every other PDH join).
+    df = _velocity_attach_portfolio_minor(df)
+
     # ── Filters — one multiselect per dimension that resolved in the table ──
     order_dt = pd.to_datetime(df[vel.COL_ORDER_DATE], errors="coerce")
     min_d, max_d = order_dt.min(), order_dt.max()
@@ -10571,6 +10631,7 @@ def _render_velocity_analysis_body() -> None:
     dim_specs = [
         (vel.COL_BUSINESS_UNIT, "Business Unit"),
         (vel.COL_PORTFOLIO,     "Portfolio"),
+        (vel.COL_PRODUCT_MINOR, "Portfolio Minor"),
         (vel.COL_PRODUCT_FORMAT, "Product Format"),
         (vel.COL_PRODUCT_DESC,  "Product Description"),
         (vel.COL_CUSTOMER,      "Customer"),
@@ -10603,6 +10664,7 @@ def _render_velocity_analysis_body() -> None:
     result = vel.build_weekly_velocity(
         df,
         portfolios=selections.get(vel.COL_PORTFOLIO) or None,
+        product_minors=selections.get(vel.COL_PRODUCT_MINOR) or None,
         product_descs=selections.get(vel.COL_PRODUCT_DESC) or None,
         customers=selections.get(vel.COL_CUSTOMER) or None,
         business_units=selections.get(vel.COL_BUSINESS_UNIT) or None,
@@ -10631,8 +10693,10 @@ def _render_velocity_analysis_body() -> None:
         st.info("No shipments match the current filters / date range.")
         return
 
-    # ── Weekly line chart: ordered (dotted) vs shipped (solid) ──────────────
-    weeks = result.weekly[vel.WEEK_START]
+    # ── Weekly line chart: Ordered (dotted) + Shipped (solid) on the lbs axis,
+    #    plus Shipped Velocity (lbs / ship-to) on a right-hand axis (a per-
+    #    location rate — a different scale from the aggregate lbs lines). ──────
+    weeks = list(result.weekly[vel.WEEK_START])
     fig = go.Figure()
     for name, col in (("Ordered", vel.COL_ORDERED_LBS), ("Shipped", vel.COL_SHIPPED_LBS)):
         style = _VELOCITY_STYLE[name]
@@ -10643,16 +10707,33 @@ def _render_velocity_analysis_body() -> None:
             marker=dict(color=style["color"], size=7),
             hovertemplate=f"{name}: %{{y:,.0f}} lbs<br>week of %{{x|%Y-%m-%d}}<extra></extra>",
         )
-    fig.update_layout(
+    if result.has_velocity and vel.SHIPPED_VELOCITY in result.weekly.columns:
+        fig.add_scatter(
+            x=weeks, y=result.weekly[vel.SHIPPED_VELOCITY], name="Shipped Velocity",
+            mode="lines+markers", yaxis="y2",
+            line=dict(color="#8e44ad", dash="dash", width=2.5),
+            marker=dict(color="#8e44ad", size=7),
+            hovertemplate=("Shipped Velocity: %{y:,.0f} lbs/ship-to"
+                           "<br>week of %{x|%Y-%m-%d}<extra></extra>"),
+        )
+    layout = dict(
         height=380, margin=dict(l=10, r=10, t=40, b=10),
         font=dict(color=_BH_FONT_COLOR, size=13),
+        # Mark every data week on the x-axis (dates, angled so they don't crowd).
         xaxis=dict(title=dict(text="Week (of order date)"),
-                   showgrid=True, gridcolor="#eeeeee"),
+                   tickmode="array", tickvals=weeks, tickformat="%b %d",
+                   tickangle=-45, showgrid=True, gridcolor="#eeeeee"),
         yaxis=dict(title=dict(text="Lbs"), rangemode="tozero",
                    showgrid=True, gridcolor="#eeeeee"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
+    # Only add the right-hand axis when a Shipped Velocity line is present.
+    if result.has_velocity and vel.SHIPPED_VELOCITY in result.weekly.columns:
+        layout["yaxis2"] = dict(
+            title=dict(text="Shipped Velocity (lbs / ship-to)"),
+            overlaying="y", side="right", rangemode="tozero", showgrid=False)
+    fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
 
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")

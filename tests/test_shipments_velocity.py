@@ -89,3 +89,48 @@ def test_weekly_velocity_empty_input():
 def test_distinct_values():
     assert sv.distinct_values(_tidy(), sv.COL_PORTFOLIO) == ["Butter", "Cheese"]
     assert sv.distinct_values(_tidy(), sv.COL_PRODUCT_FORMAT) == []  # column absent
+
+
+def test_weekly_velocity_no_shipto_column():
+    # No ship-to column → no velocity series.
+    res = sv.build_weekly_velocity(_tidy(), business_units=["B2C"])
+    assert res.has_velocity is False
+    assert sv.SHIPPED_VELOCITY not in res.weekly.columns
+
+
+# ── Shipped Velocity + Portfolio Minor ───────────────────────────────────────
+
+def _tidy_shipto() -> pd.DataFrame:
+    """Two Mon-weeks with a ship-to column + Portfolio Minor (all B2C)."""
+    return pd.DataFrame({
+        sv.COL_ORDER_DATE: pd.to_datetime([
+            "2026-07-06", "2026-07-08", "2026-07-08", "2026-07-13"]),
+        sv.COL_ORDERED_LBS: [100.0, 50.0, 20.0, 220.0],
+        sv.COL_SHIPPED_LBS: [90.0, 40.0, 10.0, 200.0],
+        sv.COL_BUSINESS_UNIT: ["B2C", "B2C", "B2C", "B2C"],
+        sv.COL_PRODUCT_MINOR: ["Cottage Cheese", "Sour Cream", "Cottage Cheese",
+                               "Cottage Cheese"],
+        sv.COL_SHIP_TO: ["A", "B", "A", "C"],
+    })
+
+
+def test_shipped_velocity_per_week():
+    res = sv.build_weekly_velocity(_tidy_shipto())
+    assert res.has_velocity is True
+    wk1, wk2 = res.weekly.iloc[0], res.weekly.iloc[1]
+    # Week 1: shipped 90+40+10=140 over ship-tos {A,B}=2 → 70 lbs/ship-to.
+    assert wk1[sv.SHIP_TO_COUNT] == 2
+    assert wk1[sv.SHIPPED_VELOCITY] == pytest.approx(70.0)
+    # Week 2: shipped 200 over {C}=1 → 200.
+    assert wk2[sv.SHIP_TO_COUNT] == 1
+    assert wk2[sv.SHIPPED_VELOCITY] == pytest.approx(200.0)
+
+
+def test_product_minor_filter_reacts_in_velocity():
+    res = sv.build_weekly_velocity(
+        _tidy_shipto(), product_minors=["Cottage Cheese"])
+    # Sour Cream row dropped → week 1 shipped 90+10=100 over {A}=1 → velocity 100.
+    wk1 = res.weekly.iloc[0]
+    assert wk1[sv.COL_SHIPPED_LBS] == pytest.approx(100.0)
+    assert wk1[sv.SHIP_TO_COUNT] == 1
+    assert wk1[sv.SHIPPED_VELOCITY] == pytest.approx(100.0)

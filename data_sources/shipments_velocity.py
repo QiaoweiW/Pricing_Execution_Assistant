@@ -63,16 +63,24 @@ COL_ORDER_DATE:     str = "order_date"
 COL_ORDERED_LBS:    str = "ordered_lbs"
 COL_SHIPPED_LBS:    str = "shipped_lbs"
 COL_PORTFOLIO:      str = "portfolio"
+COL_PRODUCT_MINOR:  str = "product_minor"
 COL_PRODUCT_DESC:   str = "product_desc"
 COL_CUSTOMER:       str = "customer"
 COL_BUSINESS_UNIT:  str = "business_unit"
 COL_PRODUCT_FORMAT: str = "product_format"
+# Non-filter helper columns: item (for a PDH Portfolio-Minor fallback join when
+# the shipments table lacks Portfolio Minor) and ship-to (for Shipped Velocity).
+COL_ITEM:           str = "item"
+COL_SHIP_TO:        str = "ship_to"
 
-# Required (the chart can't be built without these) vs optional filter dims.
+# Required (the chart can't be built without these) vs optional filter dims vs
+# extra helper columns (selected when present, not offered as filters).
 REQUIRED_FIELDS: tuple[str, ...] = (COL_ORDER_DATE, COL_ORDERED_LBS, COL_SHIPPED_LBS)
 FILTER_FIELDS:   tuple[str, ...] = (
-    COL_PORTFOLIO, COL_PRODUCT_DESC, COL_CUSTOMER, COL_BUSINESS_UNIT, COL_PRODUCT_FORMAT,
+    COL_PORTFOLIO, COL_PRODUCT_MINOR, COL_PRODUCT_DESC, COL_CUSTOMER,
+    COL_BUSINESS_UNIT, COL_PRODUCT_FORMAT,
 )
+EXTRA_FIELDS:    tuple[str, ...] = (COL_ITEM, COL_SHIP_TO)
 
 # Candidate source-column spellings per logical field (probed case-insensitively,
 # first match wins).  Seeded from the conventions already used for
@@ -94,6 +102,19 @@ _CANDIDATES: dict[str, tuple[str, ...]] = {
     ),
     COL_PORTFOLIO: (
         "Portfolio", "Portfolio Major", "PortfolioMajor", "Portfolio_Major",
+    ),
+    COL_PRODUCT_MINOR: (
+        "Portfolio Minor", "PortfolioMinor", "Portfolio_Minor", "productminor",
+        "Product Minor",
+    ),
+    COL_ITEM: (
+        "Item", "Item No", "Item Number", "Item #", "ItemNo", "Item Code",
+        "ItemCode", "SKU", "productcode", "Product Code",
+    ),
+    COL_SHIP_TO: (
+        "Ship To", "ShipTo", "Ship-To", "Ship To Number", "ShipToNumber",
+        "Ship To Location", "Ship To Site", "Ship To Party", "Party Site Number",
+        "Party Site", "Location",
     ),
     COL_PRODUCT_DESC: (
         "productdesc", "Product Desc", "Product Description", "ProductDescription",
@@ -141,8 +162,9 @@ class ResolvedColumns:
         return [f for f in REQUIRED_FIELDS if not self.mapping.get(f)]
 
     def present_fields(self) -> list[str]:
-        """Logical fields (required + filter) that resolved to a real column."""
-        return [f for f in (*REQUIRED_FIELDS, *FILTER_FIELDS) if self.mapping.get(f)]
+        """Logical fields (required + filter + extra) that resolved to a column."""
+        return [f for f in (*REQUIRED_FIELDS, *FILTER_FIELDS, *EXTRA_FIELDS)
+                if self.mapping.get(f)]
 
     def select_sql(self) -> str:
         """``"Actual" AS logical`` list for the resolved fields (SQL-quoted)."""
@@ -178,16 +200,23 @@ class WeeklyVelocity:
     """Result of :func:`build_weekly_velocity`.
 
     * ``weekly`` — one row per ISO week (Mon-anchored ``week_start``) with
-      ``ordered_lbs`` and ``shipped_lbs`` sums, sorted ascending.
+      ``ordered_lbs`` and ``shipped_lbs`` sums, sorted ascending.  When the
+      shipments table carries a ship-to column it also has ``ship_to_count``
+      (distinct ship-to locations that week) and ``shipped_velocity``
+      (``shipped_lbs ÷ ship_to_count`` — average lbs per ship-to).
     * ``total_ordered`` / ``total_shipped`` — filtered grand totals (lbs).
+    * ``has_velocity`` — whether the ship-to-derived Shipped Velocity is present.
     """
 
     weekly: pd.DataFrame
     total_ordered: float
     total_shipped: float
+    has_velocity: bool = False
 
 
 WEEK_START: str = "week_start"
+SHIP_TO_COUNT: str = "ship_to_count"
+SHIPPED_VELOCITY: str = "shipped_velocity"
 
 
 def _week_start(order_dt: pd.Series) -> pd.Series:
@@ -207,6 +236,7 @@ def distinct_values(df: pd.DataFrame, logical_col: str) -> list[str]:
 def build_weekly_velocity(
     df: pd.DataFrame, *,
     portfolios:      Optional[list[str]] = None,
+    product_minors:  Optional[list[str]] = None,
     product_descs:   Optional[list[str]] = None,
     customers:       Optional[list[str]] = None,
     business_units:  Optional[list[str]] = None,
@@ -217,11 +247,14 @@ def build_weekly_velocity(
 
     Each dimension filter applies only when a value list is given AND the column
     is present.  ``date_range`` is an inclusive ``(start, end)`` bound on the
-    order date.  Empty input / no surviving rows → an empty (well-shaped) result.
+    order date.  When a ship-to column is present, each week also gets its
+    distinct ship-to count and **Shipped Velocity** (shipped lbs per ship-to) —
+    both reactive to the same filters.  Empty input / no surviving rows → an
+    empty (well-shaped) result.
     """
     empty = WeeklyVelocity(
         weekly=pd.DataFrame(columns=[WEEK_START, COL_ORDERED_LBS, COL_SHIPPED_LBS]),
-        total_ordered=0.0, total_shipped=0.0,
+        total_ordered=0.0, total_shipped=0.0, has_velocity=False,
     )
     if df is None or df.empty or COL_ORDER_DATE not in df.columns:
         return empty
@@ -230,9 +263,9 @@ def build_weekly_velocity(
     work[COL_ORDER_DATE] = pd.to_datetime(work[COL_ORDER_DATE], errors="coerce")
 
     _dim_filters = {
-        COL_PORTFOLIO: portfolios, COL_PRODUCT_DESC: product_descs,
-        COL_CUSTOMER: customers, COL_BUSINESS_UNIT: business_units,
-        COL_PRODUCT_FORMAT: product_formats,
+        COL_PORTFOLIO: portfolios, COL_PRODUCT_MINOR: product_minors,
+        COL_PRODUCT_DESC: product_descs, COL_CUSTOMER: customers,
+        COL_BUSINESS_UNIT: business_units, COL_PRODUCT_FORMAT: product_formats,
     }
     mask = work[COL_ORDER_DATE].notna()
     for col, values in _dim_filters.items():
@@ -245,21 +278,32 @@ def build_weekly_velocity(
     if work.empty:
         return empty
 
-    ordered = pd.to_numeric(work.get(COL_ORDERED_LBS), errors="coerce").fillna(0.0)
-    shipped = pd.to_numeric(work.get(COL_SHIPPED_LBS), errors="coerce").fillna(0.0)
     grouped = pd.DataFrame({
         WEEK_START: _week_start(work[COL_ORDER_DATE]),
-        COL_ORDERED_LBS: ordered.to_numpy(),
-        COL_SHIPPED_LBS: shipped.to_numpy(),
+        COL_ORDERED_LBS: pd.to_numeric(work.get(COL_ORDERED_LBS), errors="coerce").fillna(0.0).to_numpy(),
+        COL_SHIPPED_LBS: pd.to_numeric(work.get(COL_SHIPPED_LBS), errors="coerce").fillna(0.0).to_numpy(),
     })
-    weekly = (grouped.groupby(WEEK_START, as_index=False)[[COL_ORDERED_LBS, COL_SHIPPED_LBS]]
-                     .sum()
-                     .sort_values(WEEK_START)
-                     .reset_index(drop=True))
+    has_velocity = COL_SHIP_TO in work.columns
+    if has_velocity:
+        grouped[COL_SHIP_TO] = work[COL_SHIP_TO].astype(str).str.strip().to_numpy()
+
+    agg = {COL_ORDERED_LBS: "sum", COL_SHIPPED_LBS: "sum"}
+    if has_velocity:
+        agg[COL_SHIP_TO] = "nunique"
+    weekly = (grouped.groupby(WEEK_START, as_index=False).agg(agg)
+                     .sort_values(WEEK_START).reset_index(drop=True))
+    if has_velocity:
+        weekly = weekly.rename(columns={COL_SHIP_TO: SHIP_TO_COUNT})
+        # Average lbs per ship-to location; NaN (not ∞) when a week has none.
+        weekly[SHIPPED_VELOCITY] = (
+            weekly[COL_SHIPPED_LBS]
+            / weekly[SHIP_TO_COUNT].where(weekly[SHIP_TO_COUNT] > 0))
+
     return WeeklyVelocity(
         weekly=weekly,
         total_ordered=float(weekly[COL_ORDERED_LBS].sum()),
         total_shipped=float(weekly[COL_SHIPPED_LBS].sum()),
+        has_velocity=has_velocity,
     )
 
 
@@ -331,10 +375,11 @@ __all__ = [
     "ResolvedColumns",
     "WeeklyVelocity",
     "DEFAULT_BUSINESS_UNIT",
-    "WEEK_START",
+    "WEEK_START", "SHIP_TO_COUNT", "SHIPPED_VELOCITY",
     "COL_ORDER_DATE", "COL_ORDERED_LBS", "COL_SHIPPED_LBS", "COL_PORTFOLIO",
-    "COL_PRODUCT_DESC", "COL_CUSTOMER", "COL_BUSINESS_UNIT", "COL_PRODUCT_FORMAT",
-    "REQUIRED_FIELDS", "FILTER_FIELDS",
+    "COL_PRODUCT_MINOR", "COL_PRODUCT_DESC", "COL_CUSTOMER", "COL_BUSINESS_UNIT",
+    "COL_PRODUCT_FORMAT", "COL_ITEM", "COL_SHIP_TO",
+    "REQUIRED_FIELDS", "FILTER_FIELDS", "EXTRA_FIELDS",
     "resolve_columns", "build_weekly_velocity", "distinct_values",
     "fetch_shipments_df",
 ]

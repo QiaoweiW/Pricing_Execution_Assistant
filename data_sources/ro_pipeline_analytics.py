@@ -123,7 +123,7 @@ SHIP_BUCKETS: tuple[str, ...] = (
 # could recover.
 SEG_FY27: str        = f"{FY_CURRENT_LABEL} Probabilized"
 SEG_YEAR_EFFECT: str = "Year-effect"
-SEG_RISK: str        = "Risk (probability headroom)"
+SEG_RISK: str        = "Probability Headroom"
 BUILDUP_SEGMENTS: tuple[str, ...] = (SEG_FY27, SEG_YEAR_EFFECT, SEG_RISK)
 
 # Prob-tier action guidance surfaced in the UI (the planner fills Action in by

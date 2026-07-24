@@ -3016,15 +3016,26 @@ def _bh_window_measures(
     return measures
 
 
-def _bh_total_series(measures: dict[str, dict[str, float]]) -> dict[str, dict[str, Optional[float]]]:
-    """Total-B2C ``{bucket: {"vol": current, "yoy": fraction|None}}`` for the chart."""
-    tot = measures.get("total_b2c", {})
+def _bh_series_for_row(
+    measures: dict[str, dict[str, float]], row_id: str,
+) -> dict[str, dict[str, Optional[float]]]:
+    """``{bucket: {"vol": current, "yoy": fraction|None}}`` for one template row.
+
+    Works for any rolled-up row in *measures* (Total B2C or a category); ``yoy``
+    is ``None`` when there's no prior-year base to divide by.
+    """
+    row = measures.get(row_id, {})
     out: dict[str, dict[str, Optional[float]]] = {}
     for w, (cur_lbl, yag_lbl) in BH_LEVEL_LABELS.items():
-        cur, yag = tot.get(cur_lbl, 0.0), tot.get(yag_lbl, 0.0)
+        cur, yag = row.get(cur_lbl, 0.0), row.get(yag_lbl, 0.0)
         yoy = _safe_ratio(cur - yag, yag) if abs(yag) > 1e-9 else None
         out[w] = {"vol": cur, "yoy": yoy}
     return out
+
+
+def _bh_total_series(measures: dict[str, dict[str, float]]) -> dict[str, dict[str, Optional[float]]]:
+    """Total-B2C chart series (thin wrapper over :func:`_bh_series_for_row`)."""
+    return _bh_series_for_row(measures, "total_b2c")
 
 
 def build_business_health(
@@ -3080,6 +3091,160 @@ def build_business_health(
     return BusinessHealthResult(
         table=df, window_labels=window_labels, prior_month=pm,
         chart_series=chart_series)
+
+
+# ── Per-category small-multiples + Customer×SKU drivers ──────────────────────
+# The seven executive categories charted individually (Order + Shipment YoY),
+# each with the top Customer×SKU movers behind its momentum flag.
+
+# Template row-ids for the seven categories, in display order, + nice labels.
+BH_CATEGORY_ROWS: tuple[str, ...] = (
+    "esl_lc", "esl_sc", "aseptic",
+    "cult_cottage_cheese", "cult_sour_cream", "fresh_milk", "butter",
+)
+BH_CATEGORY_LABELS: dict[str, str] = {
+    "esl_lc": "ESL Large Carton",
+    "esl_sc": "ESL Small Carton",
+    "aseptic": "Aseptic",
+    "cult_cottage_cheese": "Cultured Cottage Cheese",
+    "cult_sour_cream": "Cultured Sour Cream",
+    "fresh_milk": "Fresh Milk",
+    "butter": "Butter",
+}
+BH_DRIVER_TOP_N: int = 3
+
+
+@dataclass(frozen=True)
+class BhDriver:
+    """One Customer × SKU mover behind a category's flag.
+
+    ``delta_m`` is the L3M **Order** pound swing (current window − year-ago
+    window) in millions, signed — positive = growing, negative = declining.
+    """
+    customer: str
+    sku: str
+    delta_m: float
+
+
+@dataclass(frozen=True)
+class BusinessHealthCategory:
+    """One category's small-multiple: Order + Shipment YoY series, flag, drivers.
+
+    ``order_series`` / ``ship_series`` are ``{bucket: {"vol", "yoy"}}`` (same
+    shape as the Total-B2C chart series).  ``drivers`` are the top Customer×SKU
+    movers ranked in the flag's direction (Rising → biggest growers, Falling →
+    biggest decliners, Flat → biggest absolute movers).
+    """
+    row_id: str
+    label: str
+    flag: str
+    order_series: dict[str, dict[str, Optional[float]]]
+    ship_series: dict[str, dict[str, Optional[float]]]
+    drivers: tuple[BhDriver, ...]
+
+
+def _category_leaf_rows(
+    row_id: str, template_by_id: dict[str, "TemplateRow"],
+) -> list["TemplateRow"]:
+    """Every leaf TemplateRow under *row_id* (itself if it's already a leaf)."""
+    tpl = template_by_id.get(row_id)
+    if tpl is None:
+        return []
+    if not tpl.children:
+        return [tpl]
+    leaves: list["TemplateRow"] = []
+    for child in tpl.children:
+        leaves.extend(_category_leaf_rows(child, template_by_id))
+    return leaves
+
+
+def _category_mask(
+    frame: pd.DataFrame, row_id: str, template_by_id: dict[str, "TemplateRow"],
+) -> pd.Series:
+    """Boolean mask selecting the enriched rows that roll up into *row_id*
+    (the OR of its descendant leaves' dimension matches)."""
+    if frame is None or frame.empty:
+        return pd.Series([], dtype=bool)
+    mask = pd.Series(False, index=frame.index)
+    for leaf in _category_leaf_rows(row_id, template_by_id):
+        mask |= _leaf_mask(frame, leaf)
+    return mask
+
+
+def _category_drivers(
+    orders_enriched: Optional[pd.DataFrame], row_id: str, flag: str,
+    cur_l3m: set, yag_l3m: set,
+    template_by_id: dict[str, "TemplateRow"], top_n: int,
+) -> tuple[BhDriver, ...]:
+    """Top Customer × SKU movers (L3M Order lbs Δ) behind *row_id*'s flag."""
+    if orders_enriched is None or orders_enriched.empty:
+        return ()
+    sub = orders_enriched[_category_mask(orders_enriched, row_id, template_by_id)]
+    if sub.empty:
+        return ()
+
+    def _grouped(window: set) -> pd.Series:
+        w = sub[sub["month"].isin(window)]
+        if w.empty:
+            return pd.Series(dtype=float)
+        cust = w["customer_name"].astype(str).str.strip().replace("", "(blank)")
+        sku = w["item_desc"].astype(str).str.strip().replace("", "(blank)")
+        pounds = pd.to_numeric(w["pounds"], errors="coerce").fillna(0.0)
+        return pounds.groupby([cust, sku]).sum()
+
+    cur, yag = _grouped(cur_l3m), _grouped(yag_l3m)
+    keys = cur.index.union(yag.index)
+    if len(keys) == 0:
+        return ()
+    delta = (cur.reindex(keys).fillna(0.0) - yag.reindex(keys).fillna(0.0)) / 1e6
+
+    if flag == BH_FLAG_FALLING:
+        ranked = delta.sort_values()                    # most negative first
+    elif flag == BH_FLAG_RISING:
+        ranked = delta.sort_values(ascending=False)     # most positive first
+    else:
+        ranked = delta.reindex(delta.abs().sort_values(ascending=False).index)
+
+    return tuple(
+        BhDriver(customer=str(cust), sku=str(sku), delta_m=float(d))
+        for (cust, sku), d in ranked.head(top_n).items()
+    )
+
+
+def build_business_health_categories(
+    orders_enriched: Optional[pd.DataFrame],
+    shipments_enriched: Optional[pd.DataFrame],
+    prior_month: date,
+    *,
+    top_n: int = BH_DRIVER_TOP_N,
+) -> list[BusinessHealthCategory]:
+    """Per-category (7) Order + Shipment YoY series, flag, and Customer×SKU
+    drivers — the small-multiples that sit under the Total-B2C chart.
+
+    Same windows / anchoring as :func:`build_business_health`; reads the SAME
+    (already filter-narrowed) enriched frames, so the charts + drivers react to
+    every section filter.  Degrades to empty series / no drivers when a source
+    is missing.
+    """
+    pm = prior_month.replace(day=1)
+    cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
+    yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
+    order_measures = _bh_window_measures(orders_enriched, cur_windows, yag_windows)
+    ship_measures = _bh_window_measures(shipments_enriched, cur_windows, yag_windows)
+    template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
+    cur_l3m, yag_l3m = cur_windows["L3M"], yag_windows["L3M"]
+
+    out: list[BusinessHealthCategory] = []
+    for rid in BH_CATEGORY_ROWS:
+        order_series = _bh_series_for_row(order_measures, rid)
+        ship_series = _bh_series_for_row(ship_measures, rid)
+        flag = _bh_flag(order_series["L3M"]["yoy"], order_series["L12M"]["yoy"])
+        drivers = _category_drivers(
+            orders_enriched, rid, flag, cur_l3m, yag_l3m, template_by_id, top_n)
+        out.append(BusinessHealthCategory(
+            row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,
+            order_series=order_series, ship_series=ship_series, drivers=drivers))
+    return out
 
 
 # Output dimension columns for the Business Health SKU drill-in.

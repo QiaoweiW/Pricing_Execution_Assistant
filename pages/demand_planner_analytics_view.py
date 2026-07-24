@@ -141,6 +141,7 @@ from data_sources.demand_plan_comparison import (
     build_prior_month_shipment_diagnostic,
     build_pm_actual_driver_table,
     build_business_health,
+    build_business_health_categories,
     build_business_health_sku,
     build_sku_cycle_comparison,
     BusinessHealthResult,
@@ -152,6 +153,7 @@ from data_sources.demand_plan_comparison import (
     BH_YOY_LABELS,
     BH_FLAG_RISING,
     BH_FLAG_FALLING,
+    BH_FLAG_FLAT,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
@@ -686,8 +688,86 @@ def _render_business_health() -> None:
             "**Rising** when recent (L3M) YoY is accelerating vs the trailing year "
             "(L12M), **Falling** when decelerating, else **Flat**."
         )
+        # Per-category small-multiples + Customer×SKU drivers, governed by the
+        # SAME "Show lines" selection the B2C chart above wrote.
+        shown_lines = st.session_state.get("bh_chart_lines", ["Orders", "Shipments"])
+        categories = build_business_health_categories(
+            orders_enriched, shipments_enriched, prior_month)
+        _render_business_health_category_charts(categories, shown_lines)
+
         _render_business_health_table(result)
         _render_business_health_sku_drilldown(orders_enriched, prior_month)
+
+
+# Flag → chip for the per-category cards (green rising / red falling / neutral).
+_BH_FLAG_CHIP: dict[str, str] = {
+    BH_FLAG_RISING: "🟢 Rising", BH_FLAG_FALLING: "🔴 Falling", BH_FLAG_FLAT: "⚪ Flat",
+}
+
+
+def _render_business_health_category_charts(
+    categories: list, shown_lines: list[str],
+) -> None:
+    """Seven per-category YoY small-multiples (2 per row), each with a flag chip
+    and its top Customer×SKU movers — laid out above the table.
+
+    Reuses the B2C chart's Order/Shipment colors and honours the same
+    ``shown_lines`` selection, so a line toggled off up top disappears here too.
+    """
+    if not categories:
+        return
+    st.markdown("#### 📊 Category momentum — Order vs Shipment YoY, by category")
+    st.caption(
+        "Small-multiples of the seven executive categories (same windows / "
+        "filters / **Show lines** control as the chart above).  Each card flags "
+        "momentum and lists the top **Customer × SKU** movers behind it "
+        "(L3M Order-YoY pound swing, in the flag's direction)."
+    )
+    order = ["L12M", "L6M", "L3M"]
+    labels = [_bh_window_display(w) for w in order]
+    for i in range(0, len(categories), 2):        # two cards per row
+        for col, cat in zip(st.columns(2), categories[i:i + 2]):
+            with col:
+                _render_bh_category_card(cat, labels, order, shown_lines)
+
+
+def _render_bh_category_card(
+    cat, labels: list[str], order: list[str], shown_lines: list[str],
+) -> None:
+    """One category card: title + flag chip + mini dual-line YoY chart + drivers."""
+    st.markdown(f"**{_esc_html(cat.label)}**  {_BH_FLAG_CHIP.get(cat.flag, '—')}")
+    fig = go.Figure()
+    for src, series in (("Orders", cat.order_series), ("Shipments", cat.ship_series)):
+        if src not in shown_lines or src not in _BH_CHART_STYLE:
+            continue
+        color = _BH_CHART_STYLE[src]["line"]
+        yoys = [None if series[w]["yoy"] is None else series[w]["yoy"] * 100.0
+                for w in order]
+        fig.add_scatter(
+            x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers",
+            line=dict(color=color, dash="dot", width=2),
+            marker=dict(color=color, size=8, line=dict(color="white", width=1)),
+            hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
+        )
+    fig.update_layout(
+        height=220, margin=dict(l=8, r=8, t=8, b=8),
+        font=dict(color=_BH_FONT_COLOR, size=11),
+        xaxis=dict(tickfont=dict(size=10)),
+        yaxis=dict(ticksuffix="%", rangemode="tozero", zeroline=True,
+                   zerolinecolor="#9ca3af", showgrid=True, gridcolor="#eeeeee",
+                   tickfont=dict(size=10)),
+        showlegend=False, plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"bh_cat_{cat.row_id}")
+    if cat.drivers:
+        direction = {BH_FLAG_RISING: "growers", BH_FLAG_FALLING: "decliners"}.get(
+            cat.flag, "movers")
+        st.caption(f"Top {direction} — Customer × SKU (L3M Order-YoY Δ):")
+        st.markdown("  \n".join(
+            f"- {_esc_html(d.customer)} × {_esc_html(d.sku)}: **{d.delta_m:+.1f}M**"
+            for d in cat.drivers))
+    else:
+        st.caption("_No driver rows under the current filters._")
 
 
 def _bh_order_combos(

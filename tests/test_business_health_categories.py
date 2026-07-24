@@ -51,12 +51,14 @@ def _shipments() -> pd.DataFrame:
 
 
 def _finance_enriched() -> pd.DataFrame:
-    """Enriched Finance frame (net_sales) for Butter — L3M $3.0M vs YAG $2.4M."""
+    """Enriched Finance frame for Butter — Net Sales L3M $3.0M vs YAG $2.4M
+    (+25%); Gross Profit L3M $1.0M vs YAG $1.25M (−20%)."""
     rows = [
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2026-06-01", 3_000_000.0),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2025-06-01", 2_400_000.0),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2026-06-01", 3_000_000.0, 1_000_000.0),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2025-06-01", 2_400_000.0, 1_250_000.0),
     ]
-    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "net_sales"]
+    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc",
+            "month", "net_sales", "gross_profit"]
     df = pd.DataFrame(rows, columns=cols)
     df["month"] = pd.to_datetime(df["month"]).dt.date
     df["item_key"] = df["item_desc"]
@@ -70,7 +72,7 @@ def test_categories_shape_and_order():
     for c in cats:
         assert set(c.order_series) == {"L3M", "L6M", "L12M"}
         assert set(c.ship_series) == {"L3M", "L6M", "L12M"}
-        assert c.net_series == {}          # no finance frame supplied → empty
+        assert c.finance_series == {}      # no finance frame supplied → empty
 
 
 def test_butter_flag_and_grower_decliner_drivers():
@@ -92,23 +94,28 @@ def test_butter_flag_and_grower_decliner_drivers():
     assert dec.yoy_pct == pytest.approx((1.0 - 1.5) / 1.5)    # −33.3%
 
 
-def test_net_sales_series_per_category_and_total():
+def test_finance_series_per_category_and_total():
     fin = _finance_enriched()
     cats = {c.row_id: c
             for c in build_business_health_categories(
                 _orders(), _shipments(), PRIOR, finance_enriched=fin)}
     butter = cats["butter"]
-    # L3M net sales $3.0M vs YAG $2.4M → +25%.
-    assert butter.net_series["L3M"]["yoy"] == pytest.approx((3.0 - 2.4) / 2.4, rel=1e-3)
-    # Total-B2C chart also carries the Net Sales series when finance supplied.
+    # Both finance lines present per category, keyed by line name.
+    assert set(butter.finance_series) == {"Net Sales", "Gross Profit"}
+    # Net Sales L3M $3.0M vs YAG $2.4M → +25%.
+    assert butter.finance_series["Net Sales"]["L3M"]["yoy"] == pytest.approx((3.0 - 2.4) / 2.4, rel=1e-3)
+    # Gross Profit L3M $1.0M vs YAG $1.25M → −20%.
+    assert butter.finance_series["Gross Profit"]["L3M"]["yoy"] == pytest.approx((1.0 - 1.25) / 1.25, rel=1e-3)
+    # Total-B2C chart also carries BOTH finance series when finance supplied.
     result = build_business_health(_orders(), _shipments(), PRIOR, finance_enriched=fin)
-    assert "Net Sales" in result.chart_series
-    assert result.chart_series["Net Sales"]["L3M"]["yoy"] == pytest.approx((3.0 - 2.4) / 2.4, rel=1e-3)
+    assert "Net Sales" in result.chart_series and "Gross Profit" in result.chart_series
+    assert result.chart_series["Gross Profit"]["L3M"]["yoy"] == pytest.approx((1.0 - 1.25) / 1.25, rel=1e-3)
 
 
-def test_build_business_health_without_finance_has_no_net_line():
+def test_build_business_health_without_finance_has_no_finance_lines():
     result = build_business_health(_orders(), _shipments(), PRIOR)
     assert "Net Sales" not in result.chart_series
+    assert "Gross Profit" not in result.chart_series
 
 
 def test_enrich_finance_df_actual_only_and_pdh_dims():
@@ -128,16 +135,33 @@ def test_enrich_finance_df_actual_only_and_pdh_dims():
         "Customer": ["Costco", "Costco", "Kroger"],
         "GLMonth": [45778, 45778, 45778],   # 2025-05-01 (excel serial)
         "Net Sales": ["1,000.50", "9999", "500"],
+        "Gross Profit": ["400.25", "8888", "100"],
     })
     out = enrich_finance_df(finance, pdh)
     assert list(out.columns) == [
-        "item_key", "item_desc", "customer_name", "month", "net_sales",
-        "pmaj", "sfmt", "pminor", "brand",
+        "item_key", "item_desc", "customer_name", "month",
+        "net_sales", "gross_profit", "pmaj", "sfmt", "pminor", "brand",
     ]
     assert len(out) == 2                       # Budget row dropped
     assert out["net_sales"].sum() == pytest.approx(1500.50)   # comma parsed
+    assert out["gross_profit"].sum() == pytest.approx(500.25)
     assert set(out["pmaj"]) == {"Butter"}      # PDH dims attached via Item No.
     assert out["month"].iloc[0] == date(2025, 5, 1)
+
+
+def test_enrich_finance_df_missing_metric_column_degrades_to_zero():
+    """A finance metric whose source column is absent → all-zeros, not a crash."""
+    finance = pd.DataFrame({
+        "Budget/Actual": ["Actual"],
+        "Item No.": ["310180"],
+        "Customer": ["Costco"],
+        "GLMonth": [45778],
+        "Net Sales": ["1000"],
+        # No "Gross Profit" column present.
+    })
+    out = enrich_finance_df(finance, None)
+    assert (out["gross_profit"] == 0.0).all()
+    assert out["net_sales"].sum() == pytest.approx(1000.0)
 
 
 def test_empty_inputs_degrade():
@@ -149,6 +173,6 @@ def test_empty_inputs_degrade():
 def test_enrich_finance_df_empty():
     assert enrich_finance_df(None, None).empty
     assert list(enrich_finance_df(None, None).columns) == [
-        "item_key", "item_desc", "customer_name", "month", "net_sales",
-        "pmaj", "sfmt", "pminor", "brand",
+        "item_key", "item_desc", "customer_name", "month",
+        "net_sales", "gross_profit", "pmaj", "sfmt", "pminor", "brand",
     ]

@@ -158,6 +158,7 @@ from data_sources.demand_plan_comparison import (
     BH_FLAG_RISING,
     BH_FLAG_FALLING,
     BH_FLAG_FLAT,
+    BH_FINANCE_METRICS,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
@@ -706,8 +707,8 @@ def _render_business_health() -> None:
         _render_business_health_legend(result)
         if finance_file:
             st.caption(
-                f"💰 **Net Sales** (third line) from Finance actuals — "
-                f"source `Files/Finance/{finance_file}`."
+                "💰 **Net Sales** and **Gross Profit** YoY lines from Finance "
+                f"actuals — source `Files/Finance/{finance_file}`."
             )
         _render_business_health_chart(result)
         st.caption(
@@ -749,7 +750,8 @@ def _render_business_health_category_charts(
     if not categories:
         return
     st.markdown(
-        "#### 📊 Category momentum — Order / Shipment / Net-Sales YoY, by category")
+        "#### 📊 Category momentum — Order / Shipment / Net-Sales / Gross-Profit "
+        "YoY, by category")
     st.caption(
         "Small-multiples of the seven executive categories (same windows / "
         "filters / **Show lines** control as the chart above).  Each card flags "
@@ -764,24 +766,29 @@ def _render_business_health_category_charts(
                 _render_bh_category_card(cat, labels, order, shown_lines)
 
 
-# Per-line label placement so the (up to) three data-label rows don't collide.
-_BH_CAT_LINE_SPECS: tuple[tuple[str, str, str], ...] = (
-    # (source, category-series attribute, data-label position)
-    ("Orders",    "order_series", "top center"),
-    ("Shipments", "ship_series",  "bottom center"),
-    ("Net Sales", "net_series",   "top center"),
-)
+def _bh_category_lines(cat):
+    """Yield ``(line_name, series, data-label position)`` for one category, in
+    draw order — the two volume lines then each finance line.
+
+    Label positions alternate top / bottom so the (up to four) data-label rows
+    don't collide.  Finance lines with no series (extract absent) are skipped.
+    """
+    yield "Orders", cat.order_series, "top center"
+    yield "Shipments", cat.ship_series, "bottom center"
+    for i, name in enumerate(_BH_FINANCE_LINE_NAMES):
+        series = cat.finance_series.get(name)
+        if series:
+            yield name, series, ("top center" if i % 2 == 0 else "bottom center")
 
 
 def _render_bh_category_card(
     cat, labels: list[str], order: list[str], shown_lines: list[str],
 ) -> None:
     """One category card: title + flag chip + mini YoY chart (Order / Shipment /
-    Net Sales) + top-5 Customer×SKU growers and decliners."""
+    finance lines) + top-5 Customer×SKU growers and decliners."""
     st.markdown(f"**{_esc_html(cat.label)}**  {_BH_FLAG_CHIP.get(cat.flag, '—')}")
     fig = go.Figure()
-    for src, attr, textpos in _BH_CAT_LINE_SPECS:
-        series = getattr(cat, attr, None)
+    for src, series, textpos in _bh_category_lines(cat):
         if src not in shown_lines or src not in _BH_CHART_STYLE or not series:
             continue
         color = _BH_CHART_STYLE[src]["line"]
@@ -932,19 +939,27 @@ def _render_business_health_legend(result: "BusinessHealthResult") -> None:
 
 
 # Business Health chart palette — YoY lines kept visually distinct: a red dotted
-# Order line, a teal dotted Shipment line, and an amber dotted Net-Sales ($) line.
+# Order line, a teal dotted Shipment line, and the finance ($) lines in amber
+# (Net Sales) and violet (Gross Profit).
 _BH_CHART_STYLE: dict[str, dict] = {
-    "Orders":    {"line": "#c0392b"},
-    "Shipments": {"line": "#137d78"},
-    "Net Sales": {"line": "#b7791f"},
+    "Orders":       {"line": "#c0392b"},
+    "Shipments":    {"line": "#137d78"},
+    "Net Sales":    {"line": "#b7791f"},
+    "Gross Profit": {"line": "#6b46c1"},
 }
+
+# The two volume lines are always available; finance lines come from the shared
+# BH_FINANCE_METRICS registry and appear only when the extract loaded.
+_BH_VOLUME_LINES: tuple[str, ...] = ("Orders", "Shipments")
+_BH_FINANCE_LINE_NAMES: tuple[str, ...] = tuple(n for n, _c, _cd in BH_FINANCE_METRICS)
 
 
 def _bh_line_options(result: "BusinessHealthResult") -> tuple[str, ...]:
-    """The YoY lines available to chart, in draw order — Net Sales only when the
-    Finance extract loaded (i.e. its series is present in ``chart_series``)."""
+    """The YoY lines available to chart, in draw order — a finance line (Net
+    Sales, Gross Profit, …) only when its series is present in ``chart_series``
+    (i.e. the Finance extract loaded)."""
     return tuple(
-        src for src in ("Orders", "Shipments", "Net Sales")
+        src for src in (*_BH_VOLUME_LINES, *_BH_FINANCE_LINE_NAMES)
         if src in result.chart_series
     )
 
@@ -960,12 +975,13 @@ def _bh_yoy_label(yoy_pct: Optional[float]) -> str:
 
 
 def _render_business_health_chart(result: "BusinessHealthResult") -> None:
-    """YoY-focused chart: dotted Order / Shipment / Net-Sales YoY lines.
+    """YoY-focused chart: dotted Order / Shipment / Net-Sales / Gross-Profit lines.
 
     Single axis (YoY %, zero-based).  X axis = L12M → L6M → L3M (widest →
     narrowest).  Values are the Total B2C row for each source, so the chart ties
-    to the table's top row.  Net Sales appears only when the Finance extract
-    loaded, and (like every line) can be removed from the "Show lines" control.
+    to the table's top row.  The finance lines (Net Sales, Gross Profit) appear
+    only when the Finance extract loaded, and (like every line) can be removed
+    from the "Show lines" control.
     """
     order = ["L12M", "L6M", "L3M"]                    # widest → narrowest
     labels = [_bh_window_display(w) for w in order]   # Run-Rate (L12M) …
@@ -979,7 +995,7 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
         "Show lines", options=options,
         default=options, key="bh_chart_lines",
         help="Untick a source to remove its YoY line from the chart "
-             "(Net Sales is the Finance $-based line).",
+             "(Net Sales and Gross Profit are the Finance $-based lines).",
     )
     if not shown:
         st.info("Pick at least one line to show.")

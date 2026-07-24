@@ -174,6 +174,31 @@ _IBP_CUSTOMER_NAME_CANDIDATES: tuple[str, ...] = (
     "Customer Name", "CustomerName", "Customer_Name",
 )
 
+# Finance extract (Files/Finance/finance_data_*.csv).  Wide GL table at
+# Item × Customer × month; Business Health reads Net Sales for its YoY line.
+# Item No. joins to PDH so Net Sales is categorised by the SAME rules as volume.
+_FIN_ITEM_CANDIDATES: tuple[str, ...] = (
+    "Item No.", "Item No", "Item Number", "Item #", "ItemNo", "Item",
+)
+_FIN_MONTH_CANDIDATES: tuple[str, ...] = (
+    "GLMonth", "GL Month", "Month Start", "Start of Month",
+)
+_FIN_NET_SALES_CANDIDATES: tuple[str, ...] = (
+    "Net Sales", "NetSales", "Net_Sales",
+)
+_FIN_CUSTOMER_CANDIDATES: tuple[str, ...] = (
+    "Customer", "Customer Name", "CustomerName",
+)
+_FIN_DESC_CANDIDATES: tuple[str, ...] = (
+    "Item Description", "Item Desc", "Description",
+)
+_FIN_BUDGET_ACTUAL_CANDIDATES: tuple[str, ...] = (
+    "Budget/Actual", "Budget/Actuals", "Budget Actual", "Actual/Budget",
+)
+# Only "Actual" rows drive the momentum line (a "how are we actually doing"
+# read); Budget / R&O rows for future months are excluded.
+_FIN_ACTUAL_TOKEN: str = "actual"
+
 # Tracker (qry_mgmt_plan_history_tracker.csv) — Item Description column.
 # Used as a fallback only; driver tables prefer the PDH description so
 # item naming is consistent across plan + actuals.
@@ -1443,11 +1468,17 @@ def _last_n_months(end: date, n: int) -> set[date]:
     return months
 
 
-def _sum_millions(df: pd.DataFrame, mask: pd.Series) -> float:
-    """Return Σ pounds (in millions) over *df* rows where *mask* is True."""
-    if df.empty or not mask.any():
+def _sum_millions(
+    df: pd.DataFrame, mask: pd.Series, value_col: str = "pounds",
+) -> float:
+    """Return Σ *value_col* (in millions) over *df* rows where *mask* is True.
+
+    Defaults to summing pounds; Business Health passes ``value_col="net_sales"``
+    to reuse the same windowing machinery for the Finance Net-Sales line.
+    """
+    if df.empty or not mask.any() or value_col not in df.columns:
         return 0.0
-    return float(df.loc[mask, "pounds"].sum()) / _LBS_PER_MILLION
+    return float(df.loc[mask, value_col].sum()) / _LBS_PER_MILLION
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1548,6 +1579,78 @@ def enrich_ibp_shipments_df(
     if ibp_df is None or ibp_df.empty:
         return _empty_enriched(actuals=True)
     return _enrich_ibp(ibp_df, dim_frame)   # default qty candidates = shipments
+
+
+# Column order of the enriched Finance frame (mirrors _enrich_ibp's shape so it
+# flows through _bh_window_measures / _category_drivers / _bh_apply_combo_exclude
+# unchanged; ``net_sales`` replaces ``pounds`` as the additive value).
+_FINANCE_ENRICHED_COLS: tuple[str, ...] = (
+    "item_key", "item_desc", "customer_name", "month", "net_sales",
+    "pmaj", "sfmt", "pminor", "brand",
+)
+
+
+def _empty_finance_enriched() -> pd.DataFrame:
+    """Empty, correctly-shaped enriched Finance frame."""
+    return pd.DataFrame(columns=list(_FINANCE_ENRICHED_COLS))
+
+
+def enrich_finance_df(
+    finance_df: Optional[pd.DataFrame],
+    pdh_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Return a tidy Finance frame (**Actual** Net Sales) with PDH dims attached.
+
+    Output columns: ``item_key, item_desc, customer_name, month (first-of-month
+    date), net_sales (float, $), pmaj, sfmt, pminor, brand``.  Net Sales is
+    classified by joining ``Item No.`` to PDH — the SAME dimensions the volume
+    lines use — so a category's Net-Sales-YoY covers exactly the same items as
+    its Order/Shipment YoY.  Only ``Budget/Actual == "Actual"`` rows are kept
+    (both Actual scenarios partition the products, so summing across them does
+    not double-count).  Missing / empty input → an empty, correctly-shaped frame.
+    """
+    if finance_df is None or finance_df.empty:
+        return _empty_finance_enriched()
+
+    item_col = _resolve_column(finance_df, _FIN_ITEM_CANDIDATES)
+    month_col = _resolve_column(finance_df, _FIN_MONTH_CANDIDATES)
+    ns_col = _resolve_column(finance_df, _FIN_NET_SALES_CANDIDATES)
+    if not (item_col and month_col and ns_col):
+        logger.warning(
+            "Finance extract missing a required column "
+            "(item=%r, month=%r, net_sales=%r); Net Sales line will be empty.",
+            item_col, month_col, ns_col,
+        )
+        return _empty_finance_enriched()
+
+    work = finance_df
+    ba_col = _resolve_column(finance_df, _FIN_BUDGET_ACTUAL_CANDIDATES)
+    if ba_col:
+        keep = work[ba_col].astype(str).str.strip().str.casefold() == _FIN_ACTUAL_TOKEN
+        work = work[keep]
+    if work.empty:
+        return _empty_finance_enriched()
+
+    cust_col = _resolve_column(work, _FIN_CUSTOMER_CANDIDATES)
+    net_sales = pd.to_numeric(
+        work[ns_col].astype("string").str.replace(",", "", regex=False),
+        errors="coerce",
+    ).fillna(0.0)
+    cust_name = (
+        _vectorised_clean_str(work[cust_col])
+        if cust_col else pd.Series([""] * len(work), index=work.index, dtype="object")
+    )
+
+    base = pd.DataFrame({
+        "item_key": _vectorised_item_key(work[item_col]).values,
+        "customer_name": cust_name.values,
+        "month": _vectorised_start_of_month(work[month_col]).values,
+        "net_sales": net_sales.values,
+    })
+    enriched = _attach_dims(base, base["item_key"], build_item_dim_frame(pdh_df))
+    enriched["item_desc"] = enriched["desc"]
+    out = enriched[list(_FINANCE_ENRICHED_COLS)]
+    return out.dropna(subset=["month"]).reset_index(drop=True)
 
 
 def resolve_ro_summary_path(
@@ -2988,11 +3091,13 @@ def _bh_rollup(
 def _bh_window_measures(
     enriched: Optional[pd.DataFrame],
     cur_windows: dict[str, set], yag_windows: dict[str, set],
+    value_col: str = "pounds",
 ) -> dict[str, dict[str, float]]:
-    """Per-template-row six-window pound sums (millions) with subtotal roll-up.
+    """Per-template-row six-window value sums (millions) with subtotal roll-up.
 
-    Works on ANY enriched frame (orders or shipments) — both carry the same
-    ``pmaj/sfmt/pminor/brand/month/pounds``.  Empty frame → all zeros.
+    Works on ANY enriched frame carrying ``pmaj/sfmt/pminor/brand/month`` plus
+    *value_col*: orders / shipments (``"pounds"``) or the Finance extract
+    (``"net_sales"``, in $M).  Empty / column-less frame → all zeros.
     """
     frame = enriched if enriched is not None else _empty_enriched(actuals=True)
     month_ser = frame["month"] if not frame.empty else pd.Series([], dtype=object)
@@ -3007,8 +3112,10 @@ def _bh_window_measures(
             if frame.empty:
                 vals[cur_lbl] = vals[yag_lbl] = 0.0
             else:
-                vals[cur_lbl] = _sum_millions(frame, leaf & month_ser.isin(cur_windows[w]))
-                vals[yag_lbl] = _sum_millions(frame, leaf & month_ser.isin(yag_windows[w]))
+                vals[cur_lbl] = _sum_millions(
+                    frame, leaf & month_ser.isin(cur_windows[w]), value_col)
+                vals[yag_lbl] = _sum_millions(
+                    frame, leaf & month_ser.isin(yag_windows[w]), value_col)
         measures[tpl.row_id] = vals
     for tpl in COMPARISON_TEMPLATE:
         if tpl.is_subtotal:
@@ -3042,14 +3149,17 @@ def build_business_health(
     orders_enriched: Optional[pd.DataFrame],
     shipments_enriched: Optional[pd.DataFrame],
     prior_month: date,
+    *,
+    finance_enriched: Optional[pd.DataFrame] = None,
 ) -> BusinessHealthResult:
     """Trailing-window momentum from enriched IBP **Orders** (+ Shipments chart).
 
     For *prior_month* (first-of-month), the L3M / L6M / L12M windows END at that
     month (inclusive) and each YAG window is the same span one year earlier.
     The per-category **table** is ORDER-based (pound sums, YoY, momentum Flag);
-    the **chart** series carry Total-B2C volume + YoY for BOTH Orders and
-    Shipments.  Degrades to zeros (blank Flags) when a source is missing.
+    the **chart** series carry Total-B2C volume + YoY for Orders, Shipments and
+    — when ``finance_enriched`` is supplied — Net Sales.  Degrades to zeros
+    (blank Flags) when a source is missing.
     """
     pm = prior_month.replace(day=1)
     cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
@@ -3088,6 +3198,10 @@ def build_business_health(
         "Orders": _bh_total_series(order_measures),
         "Shipments": _bh_total_series(ship_measures),
     }
+    if finance_enriched is not None:
+        net_measures = _bh_window_measures(
+            finance_enriched, cur_windows, yag_windows, "net_sales")
+        chart_series["Net Sales"] = _bh_total_series(net_measures)
     return BusinessHealthResult(
         table=df, window_labels=window_labels, prior_month=pm,
         chart_series=chart_series)
@@ -3111,36 +3225,44 @@ BH_CATEGORY_LABELS: dict[str, str] = {
     "fresh_milk": "Fresh Milk",
     "butter": "Butter",
 }
-BH_DRIVER_TOP_N: int = 3
+BH_DRIVER_TOP_N: int = 5
 
 
 @dataclass(frozen=True)
 class BhDriver:
-    """One Customer × SKU mover behind a category's flag.
+    """One Customer × SKU mover behind a category's momentum.
 
     ``delta_m`` is the L3M **Order** pound swing (current window − year-ago
-    window) in millions, signed — positive = growing, negative = declining.
+    window) in **millions of lbs**, signed — positive = growing, negative =
+    declining.  ``yoy_pct`` is that same L3M Order-lbs YoY as a fraction
+    (current ÷ year-ago − 1), or ``None`` when there's no year-ago base.
     """
     customer: str
     sku: str
     delta_m: float
+    yoy_pct: Optional[float]
 
 
 @dataclass(frozen=True)
 class BusinessHealthCategory:
-    """One category's small-multiple: Order + Shipment YoY series, flag, drivers.
+    """One category's small-multiple: Order + Shipment (+ Net Sales) YoY, flag,
+    and its top Customer×SKU growers AND decliners.
 
-    ``order_series`` / ``ship_series`` are ``{bucket: {"vol", "yoy"}}`` (same
-    shape as the Total-B2C chart series).  ``drivers`` are the top Customer×SKU
-    movers ranked in the flag's direction (Rising → biggest growers, Falling →
-    biggest decliners, Flat → biggest absolute movers).
+    ``order_series`` / ``ship_series`` / ``net_series`` are
+    ``{bucket: {"vol", "yoy"}}`` (same shape as the Total-B2C chart series);
+    ``net_series`` is empty when the Finance extract is unavailable.
+    ``growers`` / ``decliners`` are the top-N Customer×SKU pairs by L3M Order-lbs
+    swing — biggest gainers and biggest losers respectively — shown regardless
+    of the flag so both sides of the story are always visible.
     """
     row_id: str
     label: str
     flag: str
     order_series: dict[str, dict[str, Optional[float]]]
     ship_series: dict[str, dict[str, Optional[float]]]
-    drivers: tuple[BhDriver, ...]
+    net_series: dict[str, dict[str, Optional[float]]]
+    growers: tuple[BhDriver, ...]
+    decliners: tuple[BhDriver, ...]
 
 
 def _category_leaf_rows(
@@ -3172,16 +3294,23 @@ def _category_mask(
 
 
 def _category_drivers(
-    orders_enriched: Optional[pd.DataFrame], row_id: str, flag: str,
+    orders_enriched: Optional[pd.DataFrame], row_id: str,
     cur_l3m: set, yag_l3m: set,
     template_by_id: dict[str, "TemplateRow"], top_n: int,
-) -> tuple[BhDriver, ...]:
-    """Top Customer × SKU movers (L3M Order lbs Δ) behind *row_id*'s flag."""
+) -> tuple[tuple[BhDriver, ...], tuple[BhDriver, ...]]:
+    """``(growers, decliners)`` — top-N Customer × SKU movers under *row_id*.
+
+    Each driver carries both the L3M Order-lbs Δ (millions, signed) and the L3M
+    Order-lbs YoY %.  ``growers`` = the top-N biggest gainers (Δ > 0, largest
+    first); ``decliners`` = the top-N biggest losers (Δ < 0, most negative
+    first).  Both are returned regardless of the category's flag, so the card
+    always shows who's up and who's down.  Empty tuples when nothing qualifies.
+    """
     if orders_enriched is None or orders_enriched.empty:
-        return ()
+        return (), ()
     sub = orders_enriched[_category_mask(orders_enriched, row_id, template_by_id)]
     if sub.empty:
-        return ()
+        return (), ()
 
     def _grouped(window: set) -> pd.Series:
         w = sub[sub["month"].isin(window)]
@@ -3195,20 +3324,26 @@ def _category_drivers(
     cur, yag = _grouped(cur_l3m), _grouped(yag_l3m)
     keys = cur.index.union(yag.index)
     if len(keys) == 0:
-        return ()
-    delta = (cur.reindex(keys).fillna(0.0) - yag.reindex(keys).fillna(0.0)) / 1e6
+        return (), ()
+    cur = cur.reindex(keys).fillna(0.0)
+    yag = yag.reindex(keys).fillna(0.0)
+    delta_m = (cur - yag) / 1e6
 
-    if flag == BH_FLAG_FALLING:
-        ranked = delta.sort_values()                    # most negative first
-    elif flag == BH_FLAG_RISING:
-        ranked = delta.sort_values(ascending=False)     # most positive first
-    else:
-        ranked = delta.reindex(delta.abs().sort_values(ascending=False).index)
+    def _driver(key) -> BhDriver:
+        cust, sku = key
+        c, y = float(cur.loc[key]), float(yag.loc[key])
+        yoy = _safe_ratio(c - y, y) if abs(y) > 1e-9 else None
+        return BhDriver(
+            customer=str(cust), sku=str(sku),
+            delta_m=float(delta_m.loc[key]), yoy_pct=yoy)
 
-    return tuple(
-        BhDriver(customer=str(cust), sku=str(sku), delta_m=float(d))
-        for (cust, sku), d in ranked.head(top_n).items()
-    )
+    growers = tuple(
+        _driver(k) for k, d in delta_m.sort_values(ascending=False).items()
+        if d > 0)[:top_n]
+    decliners = tuple(
+        _driver(k) for k, d in delta_m.sort_values().items()
+        if d < 0)[:top_n]
+    return growers, decliners
 
 
 def build_business_health_categories(
@@ -3216,21 +3351,27 @@ def build_business_health_categories(
     shipments_enriched: Optional[pd.DataFrame],
     prior_month: date,
     *,
+    finance_enriched: Optional[pd.DataFrame] = None,
     top_n: int = BH_DRIVER_TOP_N,
 ) -> list[BusinessHealthCategory]:
-    """Per-category (7) Order + Shipment YoY series, flag, and Customer×SKU
-    drivers — the small-multiples that sit under the Total-B2C chart.
+    """Per-category (7) Order + Shipment (+ Net Sales) YoY series, flag, and the
+    top Customer×SKU growers + decliners — the small-multiples under the chart.
 
     Same windows / anchoring as :func:`build_business_health`; reads the SAME
     (already filter-narrowed) enriched frames, so the charts + drivers react to
-    every section filter.  Degrades to empty series / no drivers when a source
-    is missing.
+    every section filter.  ``finance_enriched`` (from :func:`enrich_finance_df`)
+    adds a Net-Sales-YoY series per category; omit it and ``net_series`` is
+    empty.  Degrades to empty series / no drivers when a source is missing.
     """
     pm = prior_month.replace(day=1)
     cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
     yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
     order_measures = _bh_window_measures(orders_enriched, cur_windows, yag_windows)
     ship_measures = _bh_window_measures(shipments_enriched, cur_windows, yag_windows)
+    net_measures = (
+        _bh_window_measures(finance_enriched, cur_windows, yag_windows, "net_sales")
+        if finance_enriched is not None else None
+    )
     template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
     cur_l3m, yag_l3m = cur_windows["L3M"], yag_windows["L3M"]
 
@@ -3238,12 +3379,14 @@ def build_business_health_categories(
     for rid in BH_CATEGORY_ROWS:
         order_series = _bh_series_for_row(order_measures, rid)
         ship_series = _bh_series_for_row(ship_measures, rid)
+        net_series = _bh_series_for_row(net_measures, rid) if net_measures else {}
         flag = _bh_flag(order_series["L3M"]["yoy"], order_series["L12M"]["yoy"])
-        drivers = _category_drivers(
-            orders_enriched, rid, flag, cur_l3m, yag_l3m, template_by_id, top_n)
+        growers, decliners = _category_drivers(
+            orders_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
         out.append(BusinessHealthCategory(
             row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,
-            order_series=order_series, ship_series=ship_series, drivers=drivers))
+            order_series=order_series, ship_series=ship_series,
+            net_series=net_series, growers=growers, decliners=decliners))
     return out
 
 

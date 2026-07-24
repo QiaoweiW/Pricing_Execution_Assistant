@@ -80,6 +80,10 @@ from data_sources.demand_summary import (
     pivot_for_download,
     total_item_level_demand_blob_path,
 )
+from data_sources.finance_data import (
+    FinanceDataError,
+    fetch_finance_data,
+)
 from data_sources.demand_plan_comparison import (
     ComparisonFilters,
     ComparisonResult,
@@ -159,6 +163,7 @@ from data_sources.demand_plan_comparison import (
     driver_table_to_csv_bytes,
     enrich_ibp_orders_df,
     enrich_ibp_shipments_df,
+    enrich_finance_df,
     list_driver_buckets_for_group,
     fetch_ro_summary_total_delta_by_path,
     list_tracker_cycles,
@@ -680,14 +685,30 @@ def _render_business_health() -> None:
             if warn:
                 st.caption(f"⚠️ {warn}")
 
-        # "Hide combinations" filter — applied to BOTH orders + shipments before
-        # rolling up, so chart + table exclude the same combos.
+        # Finance extract → Net Sales YoY line (non-fatal; volume lines don't
+        # depend on it).  Enriched with the SAME PDH dims as the volume frames so
+        # Net Sales is categorised by identical rules and reacts to the filters.
+        finance_df, finance_file = _load_business_health_finance()
+        finance_enriched = (
+            enrich_finance_df(finance_df, pdh_df) if finance_df is not None else None
+        )
+
+        # "Hide combinations" filter — applied to orders, shipments AND finance
+        # before rolling up, so chart + table exclude the same combos.
         combo_exclude = _render_business_health_dim_filters(orders_enriched)
         orders_enriched = _bh_apply_combo_exclude(orders_enriched, combo_exclude)
         shipments_enriched = _bh_apply_combo_exclude(shipments_enriched, combo_exclude)
-        result = build_business_health(orders_enriched, shipments_enriched, prior_month)
+        finance_enriched = _bh_apply_combo_exclude(finance_enriched, combo_exclude)
+        result = build_business_health(
+            orders_enriched, shipments_enriched, prior_month,
+            finance_enriched=finance_enriched)
 
         _render_business_health_legend(result)
+        if finance_file:
+            st.caption(
+                f"💰 **Net Sales** (third line) from Finance actuals — "
+                f"source `Files/Finance/{finance_file}`."
+            )
         _render_business_health_chart(result)
         st.caption(
             "**YoY %** = (orders in the window ÷ orders in the **same window one "
@@ -699,9 +720,11 @@ def _render_business_health() -> None:
         )
         # Per-category small-multiples + Customer×SKU drivers, governed by the
         # SAME "Show lines" selection the B2C chart above wrote.
-        shown_lines = st.session_state.get("bh_chart_lines", ["Orders", "Shipments"])
+        shown_lines = st.session_state.get(
+            "bh_chart_lines", list(_bh_line_options(result)))
         categories = build_business_health_categories(
-            orders_enriched, shipments_enriched, prior_month)
+            orders_enriched, shipments_enriched, prior_month,
+            finance_enriched=finance_enriched)
         _render_business_health_category_charts(categories, shown_lines)
 
         _render_business_health_table(result)
@@ -725,12 +748,13 @@ def _render_business_health_category_charts(
     """
     if not categories:
         return
-    st.markdown("#### 📊 Category momentum — Order vs Shipment YoY, by category")
+    st.markdown(
+        "#### 📊 Category momentum — Order / Shipment / Net-Sales YoY, by category")
     st.caption(
         "Small-multiples of the seven executive categories (same windows / "
         "filters / **Show lines** control as the chart above).  Each card flags "
-        "momentum and lists the top **Customer × SKU** movers behind it "
-        "(L3M Order-YoY pound swing, in the flag's direction)."
+        "momentum and lists the top-5 **Customer × SKU** growers **and** "
+        "decliners behind it — the L3M Order swing in **lbs** with its YoY %."
     )
     order = ["L12M", "L6M", "L3M"]
     labels = [_bh_window_display(w) for w in order]
@@ -740,26 +764,37 @@ def _render_business_health_category_charts(
                 _render_bh_category_card(cat, labels, order, shown_lines)
 
 
+# Per-line label placement so the (up to) three data-label rows don't collide.
+_BH_CAT_LINE_SPECS: tuple[tuple[str, str, str], ...] = (
+    # (source, category-series attribute, data-label position)
+    ("Orders",    "order_series", "top center"),
+    ("Shipments", "ship_series",  "bottom center"),
+    ("Net Sales", "net_series",   "top center"),
+)
+
+
 def _render_bh_category_card(
     cat, labels: list[str], order: list[str], shown_lines: list[str],
 ) -> None:
-    """One category card: title + flag chip + mini dual-line YoY chart + drivers."""
+    """One category card: title + flag chip + mini YoY chart (Order / Shipment /
+    Net Sales) + top-5 Customer×SKU growers and decliners."""
     st.markdown(f"**{_esc_html(cat.label)}**  {_BH_FLAG_CHIP.get(cat.flag, '—')}")
     fig = go.Figure()
-    for src, series in (("Orders", cat.order_series), ("Shipments", cat.ship_series)):
-        if src not in shown_lines or src not in _BH_CHART_STYLE:
+    for src, attr, textpos in _BH_CAT_LINE_SPECS:
+        series = getattr(cat, attr, None)
+        if src not in shown_lines or src not in _BH_CHART_STYLE or not series:
             continue
         color = _BH_CHART_STYLE[src]["line"]
         yoys = [None if series[w]["yoy"] is None else series[w]["yoy"] * 100.0
                 for w in order]
-        # Visible 1-decimal data label on every point; Orders above the point,
-        # Shipments below, so the two lines' labels don't overlap.
+        # Visible 1-decimal data label on every point; stagger positions so the
+        # three lines' labels don't overlap.
         fig.add_scatter(
             x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers+text",
             line=dict(color=color, dash="dot", width=2),
             marker=dict(color=color, size=8, line=dict(color="white", width=1)),
             text=[_bh_yoy_label(y) for y in yoys],
-            textposition="top center" if src == "Orders" else "bottom center",
+            textposition=textpos,
             textfont=dict(size=10, color=color),
             hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
         )
@@ -773,15 +808,42 @@ def _render_bh_category_card(
         showlegend=False, plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_cat_{cat.row_id}")
-    if cat.drivers:
-        direction = {BH_FLAG_RISING: "growers", BH_FLAG_FALLING: "decliners"}.get(
-            cat.flag, "movers")
-        st.caption(f"Top {direction} — Customer × SKU (L3M Order-YoY Δ):")
-        st.markdown("  \n".join(
-            f"- {_esc_html(d.customer)} × {_esc_html(d.sku)}: **{d.delta_m:+.1f}M**"
-            for d in cat.drivers))
-    else:
+    _render_bh_category_drivers(cat)
+
+
+def _bh_driver_line(d) -> str:
+    """One Customer × SKU driver bullet: signed L3M Order Δ **lbs** + YoY %."""
+    yoy = "" if d.yoy_pct is None else f" ({d.yoy_pct * 100.0:+.1f}%)"
+    return (f"- {_esc_html(d.customer)} × {_esc_html(d.sku)}: "
+            f"**{d.delta_m:+.2f}M lbs**{yoy}")
+
+
+def _render_bh_category_drivers(cat) -> None:
+    """Top-5 growers and top-5 decliners (Customer × SKU) for one category.
+
+    Always shows BOTH sides (independent of the flag): the biggest L3M
+    Order-lbs gainers and the biggest losers, each with the signed Δ in **lbs**
+    (millions) and its YoY %.  Units are stated once in the header so every
+    bullet reads unambiguously.
+    """
+    if not cat.growers and not cat.decliners:
         st.caption("_No driver rows under the current filters._")
+        return
+    st.caption(
+        "Top Customer × SKU movers — **L3M Order Δ (millions of lbs)**, YoY % "
+        "in parentheses:"
+    )
+    up, down = st.columns(2)
+    with up:
+        st.markdown("📈 **Top 5 growers**")
+        st.markdown(
+            "  \n".join(_bh_driver_line(d) for d in cat.growers)
+            if cat.growers else "_None growing._")
+    with down:
+        st.markdown("📉 **Top 5 decliners**")
+        st.markdown(
+            "  \n".join(_bh_driver_line(d) for d in cat.decliners)
+            if cat.decliners else "_None declining._")
 
 
 def _bh_order_combos(
@@ -869,12 +931,22 @@ def _render_business_health_legend(result: "BusinessHealthResult") -> None:
         f"📅 **Windows** ending **{result.prior_month:%b %Y}** — {parts}")
 
 
-# Business Health chart palette — Orders vs Shipments YoY lines kept visually
-# distinct: a red dotted line for Order YoY, a teal dotted line for Shipment YoY.
+# Business Health chart palette — YoY lines kept visually distinct: a red dotted
+# Order line, a teal dotted Shipment line, and an amber dotted Net-Sales ($) line.
 _BH_CHART_STYLE: dict[str, dict] = {
     "Orders":    {"line": "#c0392b"},
     "Shipments": {"line": "#137d78"},
+    "Net Sales": {"line": "#b7791f"},
 }
+
+
+def _bh_line_options(result: "BusinessHealthResult") -> tuple[str, ...]:
+    """The YoY lines available to chart, in draw order — Net Sales only when the
+    Finance extract loaded (i.e. its series is present in ``chart_series``)."""
+    return tuple(
+        src for src in ("Orders", "Shipments", "Net Sales")
+        if src in result.chart_series
+    )
 
 
 def _bh_yoy_label(yoy_pct: Optional[float]) -> str:
@@ -888,11 +960,12 @@ def _bh_yoy_label(yoy_pct: Optional[float]) -> str:
 
 
 def _render_business_health_chart(result: "BusinessHealthResult") -> None:
-    """YoY-focused chart: dotted Order-YoY + Shipment-YoY lines (no volume bars).
+    """YoY-focused chart: dotted Order / Shipment / Net-Sales YoY lines.
 
     Single axis (YoY %, zero-based).  X axis = L12M → L6M → L3M (widest →
     narrowest).  Values are the Total B2C row for each source, so the chart ties
-    to the table's top row.
+    to the table's top row.  Net Sales appears only when the Finance extract
+    loaded, and (like every line) can be removed from the "Show lines" control.
     """
     order = ["L12M", "L6M", "L3M"]                    # widest → narrowest
     labels = [_bh_window_display(w) for w in order]   # Run-Rate (L12M) …
@@ -900,11 +973,13 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
     tick_font = dict(size=14, color=_BH_FONT_COLOR)
     label_font = dict(size=15, color=_BH_FONT_COLOR)
 
-    # Which YoY lines to draw — lets the planner remove a line (e.g. Shipments).
+    # Which YoY lines to draw — lets the planner remove any line (incl. Net Sales).
+    options = list(_bh_line_options(result))
     shown = st.multiselect(
-        "Show lines", options=["Orders", "Shipments"],
-        default=["Orders", "Shipments"], key="bh_chart_lines",
-        help="Untick a source to remove its YoY line from the chart.",
+        "Show lines", options=options,
+        default=options, key="bh_chart_lines",
+        help="Untick a source to remove its YoY line from the chart "
+             "(Net Sales is the Finance $-based line).",
     )
     if not shown:
         st.info("Pick at least one line to show.")
@@ -6426,6 +6501,21 @@ def _load_demand_comparison_pdh() -> Optional[pd.DataFrame]:
     except DemandSummaryError as exc:
         logger.info("qry_pdh.csv unavailable for Demand Plan Comparison: %s", exc)
         return None
+
+
+def _load_business_health_finance() -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Return ``(finance extract df, source file name)`` for the Net Sales line.
+
+    Non-fatal: on any read failure the Business Health Net-Sales line simply
+    doesn't appear (the volume lines are unaffected), so we swallow the error
+    and log it rather than breaking the whole section.
+    """
+    try:
+        snap = fetch_finance_data()
+        return snap.df, snap.file_name
+    except FinanceDataError as exc:
+        logger.info("Finance extract unavailable for Business Health: %s", exc)
+        return None, None
 
 
 def _load_mom_item_master() -> Optional[pd.DataFrame]:

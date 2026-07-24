@@ -1,4 +1,5 @@
-"""Unit tests for build_business_health_categories (per-category YoY + drivers)."""
+"""Unit tests for build_business_health_categories — per-category YoY (Order /
+Shipment / Net Sales), top-5 growers + decliners, and the finance enrichment."""
 
 from datetime import date
 
@@ -9,7 +10,9 @@ from data_sources.demand_plan_comparison import (
     BH_CATEGORY_ROWS,
     BH_CATEGORY_LABELS,
     BH_FLAG_RISING,
+    build_business_health,
     build_business_health_categories,
+    enrich_finance_df,
 )
 
 
@@ -47,6 +50,19 @@ def _shipments() -> pd.DataFrame:
     return df
 
 
+def _finance_enriched() -> pd.DataFrame:
+    """Enriched Finance frame (net_sales) for Butter — L3M $3.0M vs YAG $2.4M."""
+    rows = [
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2026-06-01", 3_000_000.0),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2025-06-01", 2_400_000.0),
+    ]
+    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "net_sales"]
+    df = pd.DataFrame(rows, columns=cols)
+    df["month"] = pd.to_datetime(df["month"]).dt.date
+    df["item_key"] = df["item_desc"]
+    return df
+
+
 def test_categories_shape_and_order():
     cats = build_business_health_categories(_orders(), _shipments(), PRIOR)
     assert [c.row_id for c in cats] == list(BH_CATEGORY_ROWS)
@@ -54,31 +70,85 @@ def test_categories_shape_and_order():
     for c in cats:
         assert set(c.order_series) == {"L3M", "L6M", "L12M"}
         assert set(c.ship_series) == {"L3M", "L6M", "L12M"}
+        assert c.net_series == {}          # no finance frame supplied → empty
 
 
-def test_butter_flag_and_customer_sku_drivers():
+def test_butter_flag_and_grower_decliner_drivers():
     cats = {c.row_id: c for c in build_business_health_categories(_orders(), _shipments(), PRIOR)}
     butter = cats["butter"]
     # L3M orders 4.0M vs YAG 3.5M (+14%), L12M dragged down by the 2024-08 base
     # → recent momentum accelerating → Rising.
     assert butter.flag == BH_FLAG_RISING
     assert butter.order_series["L3M"]["yoy"] == pytest.approx((4.0 - 3.5) / 3.5, rel=1e-3)
-    # Drivers are Customer × SKU pairs, ranked by L3M lbs Δ (Rising → top grower).
-    assert len(butter.drivers) == 2
-    top = butter.drivers[0]
-    assert (top.customer, top.sku) == ("Costco", "Butter Stick")
-    assert top.delta_m == pytest.approx(1.0)          # 3.0M − 2.0M
-    assert butter.drivers[1].delta_m == pytest.approx(-0.5)   # WinCo Bulk 1.0 − 1.5
+    # Growers = biggest positive Δ; decliners = biggest negative Δ — BOTH shown.
+    assert len(butter.growers) == 1 and len(butter.decliners) == 1
+    grow = butter.growers[0]
+    assert (grow.customer, grow.sku) == ("Costco", "Butter Stick")
+    assert grow.delta_m == pytest.approx(1.0)                 # 3.0M − 2.0M
+    assert grow.yoy_pct == pytest.approx((3.0 - 2.0) / 2.0)   # +50%
+    dec = butter.decliners[0]
+    assert (dec.customer, dec.sku) == ("WinCo", "Butter Bulk")
+    assert dec.delta_m == pytest.approx(-0.5)                 # 1.0M − 1.5M
+    assert dec.yoy_pct == pytest.approx((1.0 - 1.5) / 1.5)    # −33.3%
 
 
-def test_shipments_series_present_for_butter():
-    cats = {c.row_id: c for c in build_business_health_categories(_orders(), _shipments(), PRIOR)}
-    # Butter shipped only in the L3M current window (2.8M), no year-ago → YoY None.
-    assert cats["butter"].ship_series["L3M"]["vol"] == pytest.approx(2.8)
-    assert cats["butter"].ship_series["L3M"]["yoy"] is None
+def test_net_sales_series_per_category_and_total():
+    fin = _finance_enriched()
+    cats = {c.row_id: c
+            for c in build_business_health_categories(
+                _orders(), _shipments(), PRIOR, finance_enriched=fin)}
+    butter = cats["butter"]
+    # L3M net sales $3.0M vs YAG $2.4M → +25%.
+    assert butter.net_series["L3M"]["yoy"] == pytest.approx((3.0 - 2.4) / 2.4, rel=1e-3)
+    # Total-B2C chart also carries the Net Sales series when finance supplied.
+    result = build_business_health(_orders(), _shipments(), PRIOR, finance_enriched=fin)
+    assert "Net Sales" in result.chart_series
+    assert result.chart_series["Net Sales"]["L3M"]["yoy"] == pytest.approx((3.0 - 2.4) / 2.4, rel=1e-3)
+
+
+def test_build_business_health_without_finance_has_no_net_line():
+    result = build_business_health(_orders(), _shipments(), PRIOR)
+    assert "Net Sales" not in result.chart_series
+
+
+def test_enrich_finance_df_actual_only_and_pdh_dims():
+    """enrich_finance_df keeps only Actual rows and attaches PDH dims by Item No."""
+    pdh = pd.DataFrame({
+        "Item No": ["310180"],
+        "Item Description": ["DG Btr Qtr 1Lb 30cs"],
+        "Portfolio Major": ["Butter"],
+        "Supply Format": ["Sticks"],
+        "Portfolio Minor": ["Packaged Butter"],
+        "Brand": ["Branded"],
+    })
+    finance = pd.DataFrame({
+        "Budget/Actual": ["Actual", "Budget", "Actual"],
+        "Item No.": ["310180", "310180", "310180"],
+        "Item Description": ["DG Btr Qtr 1Lb 30cs"] * 3,
+        "Customer": ["Costco", "Costco", "Kroger"],
+        "GLMonth": [45778, 45778, 45778],   # 2025-05-01 (excel serial)
+        "Net Sales": ["1,000.50", "9999", "500"],
+    })
+    out = enrich_finance_df(finance, pdh)
+    assert list(out.columns) == [
+        "item_key", "item_desc", "customer_name", "month", "net_sales",
+        "pmaj", "sfmt", "pminor", "brand",
+    ]
+    assert len(out) == 2                       # Budget row dropped
+    assert out["net_sales"].sum() == pytest.approx(1500.50)   # comma parsed
+    assert set(out["pmaj"]) == {"Butter"}      # PDH dims attached via Item No.
+    assert out["month"].iloc[0] == date(2025, 5, 1)
 
 
 def test_empty_inputs_degrade():
     cats = build_business_health_categories(None, None, PRIOR)
     assert [c.row_id for c in cats] == list(BH_CATEGORY_ROWS)
-    assert all(c.drivers == () for c in cats)
+    assert all(c.growers == () and c.decliners == () for c in cats)
+
+
+def test_enrich_finance_df_empty():
+    assert enrich_finance_df(None, None).empty
+    assert list(enrich_finance_df(None, None).columns) == [
+        "item_key", "item_desc", "customer_name", "month", "net_sales",
+        "pmaj", "sfmt", "pminor", "brand",
+    ]

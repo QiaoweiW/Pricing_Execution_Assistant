@@ -152,11 +152,41 @@ def test_lever_b_without_finance_is_blank():
     assert butter.decomp_sowhat == ""
 
 
-def test_lever_c_margin_and_reading():
+def test_lever_c_margin_table_and_reading():
     butter = _butter(finance_enriched=_finance_enriched())
+    # GP% = Gross Profit ÷ Net Sales.
     assert butter.margin_pct["L3M"] == pytest.approx(0.20, rel=1e-3)   # 0.6 / 3.0
+    # Dollar totals behind the margin come from the finance series ($M).
+    assert butter.finance_series["Gross Profit"]["L3M"]["vol"] == pytest.approx(0.6, rel=1e-3)
+    assert butter.finance_series["Net Sales"]["L3M"]["vol"] == pytest.approx(3.0, rel=1e-3)
+    # GL-month header comes from the single Actual month (Jun 2026) in every window.
+    for p in ("L12M", "L6M", "L3M"):
+        assert butter.margin_gl_months[p] == "Jun 2026 · 1 mo"
     # Vol ▲ (+20%) and margin flat/▲ across periods → healthy growth.
     assert butter.vol_margin_reading == BH_VM_HEALTHY
+
+
+def test_margin_gl_months_actual_only():
+    """GL months reflect ONLY Actual finance rows (Budget dropped by enrichment)."""
+    pdh = pd.DataFrame({
+        "Item No": ["310180"], "Item Description": ["DG Btr"],
+        "Portfolio Major": ["Butter"], "Supply Format": ["Sticks"],
+        "Portfolio Minor": ["Packaged Butter"], "Brand": ["Branded"],
+    })
+    # Actual for Apr+May+Jun 2026 (in L3M); a Budget row for Jul 2026 must NOT
+    # extend the range.
+    finance = pd.DataFrame({
+        "Budget/Actual": ["Actual", "Actual", "Actual", "Budget"],
+        "Item No.": ["310180"] * 4,
+        "Customer": ["Costco"] * 4,
+        "GLMonth": [46113, 46143, 46174, 46204],   # Apr, May, Jun, Jul 2026
+        "Net Sales": ["100", "100", "100", "999"],
+        "Gross Profit": ["20", "20", "20", "200"],
+    })
+    fin = enrich_finance_df(finance, pdh)
+    butter = _butter(finance_enriched=fin)
+    # L3M window = Apr–Jun 2026 → three Actual months; Jul (Budget) excluded.
+    assert butter.margin_gl_months["L3M"] == "Apr 2026 – Jun 2026 · 3 mo"
 
 
 def test_lever_d_concentration_order_based_captures_mt_food_bank():
@@ -202,6 +232,7 @@ def test_empty_inputs_degrade():
     for c in cats:
         assert c.gap_flag == "" and c.decomp_sowhat == "" and c.vol_margin_reading == ""
         assert c.concentration.growers == () and c.concentration.decliners == ()
+        assert all(v == "—" for v in c.margin_gl_months.values())   # no finance
 
 
 # ── Finance enrichment (feeds Levers B & C) ──────────────────────────────────

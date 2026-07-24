@@ -3089,6 +3089,14 @@ def _month_range_label(months: set[date]) -> str:
     return f"{lo:%b %Y}" if lo == hi else f"{lo:%b %Y} – {hi:%b %Y}"
 
 
+def _gl_months_label(months: set[date]) -> str:
+    """GL-month range + count for a Lever-C column header, e.g.
+    ``"Apr 2026 – Jun 2026 · 3 mo"`` (``"—"`` when the set is empty)."""
+    if not months:
+        return "—"
+    return f"{_month_range_label(months)} · {len(months)} mo"
+
+
 def _bh_flag(l3m_yoy: Optional[float], l12m_yoy: Optional[float]) -> str:
     """Classify momentum from newest-window (L3M) vs trailing-year (L12M) YoY.
 
@@ -3387,7 +3395,10 @@ class BusinessHealthCategory:
       fractions (price_mix = net_sales − volume residual); ``decomp_sowhat`` —
       earned vs bought/lost read on the L3M move.
     * **C** ``margin_pct`` — ``{period: Gross Profit ÷ Net Sales}``;
-      ``vol_margin_reading`` — the Vol×Margin quadrant reading.
+      ``margin_gl_months`` — ``{period: GL-month range label}`` from **Actual**
+      finance rows only; ``vol_margin_reading`` — the Vol×Margin quadrant reading.
+      (The Gross-Profit / Net-Sales dollar totals behind the margin come from
+      ``finance_series[...]["vol"]``.)
     * **D** ``concentration`` — the L3M shipped-lbs move split across
       Customer×SKU lines (:class:`BhConcentration`).
     """
@@ -3401,6 +3412,7 @@ class BusinessHealthCategory:
     decomp: dict[str, dict[str, Optional[float]]]
     decomp_sowhat: str
     margin_pct: dict[str, Optional[float]]
+    margin_gl_months: dict[str, str]
     vol_margin_reading: str
     concentration: BhConcentration
 
@@ -3552,6 +3564,18 @@ def build_business_health_categories(
     template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
     cur_l3m, yag_l3m = cur_windows["L3M"], yag_windows["L3M"]
 
+    # GL-month range per period from ACTUAL finance rows only (enrich_finance_df
+    # already dropped Budget rows), so Lever C's column headers show exactly
+    # which actual months rolled into each L12M/L6M/L3M total.  Window-level
+    # (identical across categories), computed once.
+    fin_months = (
+        set(finance_enriched["month"])
+        if finance_enriched is not None and not finance_enriched.empty else set()
+    )
+    margin_gl_months = {
+        p: _gl_months_label(fin_months & cur_windows[p]) for p in BH_PERIOD_ORDER
+    }
+
     out: list[BusinessHealthCategory] = []
     for rid in BH_CATEGORY_ROWS:
         order_series = _bh_series_for_row(order_measures, rid)
@@ -3592,7 +3616,8 @@ def build_business_health_categories(
             order_series=order_series, ship_series=ship_series,
             finance_series=finance_series, gap_flag=gap_flag,
             decomp=decomp, decomp_sowhat=decomp_sowhat,
-            margin_pct=margin_pct, vol_margin_reading=vol_margin_reading,
+            margin_pct=margin_pct, margin_gl_months=margin_gl_months,
+            vol_margin_reading=vol_margin_reading,
             concentration=concentration))
     return out
 

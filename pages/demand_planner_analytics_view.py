@@ -816,14 +816,16 @@ def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
         color = _BH_CHART_STYLE[src]["line"]
         yoys = [None if series[w]["yoy"] is None else series[w]["yoy"] * 100.0
                 for w in order]
+        labels_1dp = [_bh_yoy_label(y) for y in yoys]   # "+14.3%" — 1-dp string
         fig.add_scatter(
             x=labels, y=yoys, name=src, mode="lines+markers+text",
             line=dict(color=color, dash="dot", width=2),
             marker=dict(color=color, size=8, line=dict(color="white", width=1)),
-            text=[_bh_yoy_label(y) for y in yoys],
+            text=labels_1dp, customdata=labels_1dp,
             textposition="top center" if src == "Orders" else "bottom center",
             textfont=dict(size=10, color=color),
-            hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
+            # Hover reuses the pre-rounded 1-dp string (no raw floats on hover).
+            hovertemplate=f"{src} %{{x}} YoY: %{{customdata}}<extra></extra>",
         )
     fig.update_layout(
         height=200, margin=dict(l=8, r=8, t=8, b=8),
@@ -880,9 +882,17 @@ def _render_bh_lever_b(cat) -> None:
         st.caption("_Net-Sales decomposition needs the Finance extract._")
 
 
+def _bh_money_m(value) -> str:
+    """Format a $-millions value as e.g. ``"$12.3M"`` / ``"-$1.2M"`` (— if None)."""
+    if value is None:
+        return "—"
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.1f}M"
+
+
 def _render_bh_lever_c(cat) -> None:
-    """Lever C — Vol×Margin reading as the header so-what, then Gross Profit %
-    L12M→L3M."""
+    """Lever C — Vol×Margin reading (header so-what) + an auditable margin table:
+    per period its GL months, total Gross Profit, total Net Sales, and GP%."""
     if cat.vol_margin_reading:
         icon, color = _BH_VM_STYLE.get(cat.vol_margin_reading, ("", _BH_FONT_COLOR))
         st.markdown(
@@ -893,12 +903,39 @@ def _render_bh_lever_c(cat) -> None:
     else:
         st.markdown("**C · Margin** — Gross Profit %")
     periods = list(BH_PERIOD_ORDER)
-    vals = [cat.margin_pct[p] for p in periods]
-    if all(v is None for v in vals):
+    if all(cat.margin_pct[p] is None for p in periods):
         st.caption("_Margin needs the Finance extract._")
         return
-    trail = " → ".join("—" if v is None else f"{v * 100:.1f}%" for v in vals)
-    st.markdown(f"GP% {' → '.join(periods)}:  **{trail}**")
+    gp = cat.finance_series.get("Gross Profit", {})
+    ns = cat.finance_series.get("Net Sales", {})
+    # Two-line header: period name + its actual GL-month range (Actual rows only).
+    head = (
+        "<tr><th style='text-align:left'></th>"
+        + "".join(f"<th style='text-align:right;padding-left:12px'>{p}</th>"
+                  for p in periods)
+        + "</tr><tr><td></td>"
+        + "".join(
+            "<td style='text-align:right;padding-left:12px;font-weight:normal;"
+            f"font-size:0.7rem;color:#6b7280'>{_esc_html(cat.margin_gl_months[p])}</td>"
+            for p in periods)
+        + "</tr>"
+    )
+    rows = (
+        ("Gross Profit", [_bh_money_m(gp.get(p, {}).get("vol")) for p in periods]),
+        ("Net Sales", [_bh_money_m(ns.get(p, {}).get("vol")) for p in periods]),
+        ("GP%", ["—" if cat.margin_pct[p] is None else f"{cat.margin_pct[p] * 100:.1f}%"
+                 for p in periods]),
+    )
+    body = "".join(
+        f"<tr><td style='text-align:left'><b>{name}</b></td>"
+        + "".join(f"<td style='text-align:right;padding-left:12px'>{v}</td>" for v in vals)
+        + "</tr>"
+        for name, vals in rows
+    )
+    st.markdown(
+        f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
+        unsafe_allow_html=True,
+    )
 
 
 def _render_bh_lever_d(cat) -> None:
@@ -1101,13 +1138,15 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
             for w in order
         ]
         color = _BH_CHART_STYLE[src]["line"]
+        labels_1dp = [_bh_yoy_label(y) for y in yoys]   # "+14.3%" — 1-dp string
         fig.add_scatter(
             x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers+text",
             line=dict(color=color, dash="dot", width=3),
             marker=dict(color=color, size=11, line=dict(color="white", width=1.5)),
-            text=[_bh_yoy_label(y) for y in yoys],
+            text=labels_1dp, customdata=labels_1dp,
             textposition="top center", textfont=dict(size=14, color=color),
-            hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
+            # Hover reuses the pre-rounded 1-dp string (no raw floats on hover).
+            hovertemplate=f"{src} %{{x}} YoY: %{{customdata}}<extra></extra>",
         )
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=44, b=10),

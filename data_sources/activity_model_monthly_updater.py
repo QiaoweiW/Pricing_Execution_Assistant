@@ -112,6 +112,58 @@ _NA_TIER_RE: re.Pattern[str] = re.compile(
 )
 
 
+# ── Currency parsing / formatting ────────────────────────────────────────────
+#
+# The Activity_Model money columns (" Delivery Charge ($/Gal) ",
+# "Packaging ($/Gal)", …) are stored as DOLLAR-FORMATTED STRINGS, e.g.
+# "$0.82".  A plain ``pd.to_numeric`` on those yields NaN — which, when
+# ``.fillna(0.0)``-ed, silently turns "base + mover" into "0 + mover" and so
+# OVERWRITES the base with the delta.  These helpers mirror
+# ``processing/new_pricing_processor.parse_dollar`` so the base is parsed
+# correctly, and re-emit the "$X.XX" format the file (and its downstream
+# consumers) expect.
+
+# Delivery charges / packaging are cents-denominated $/Gal — 2 dp matches the
+# file's existing "$0.82" convention.  Kept as a constant so the precision is
+# easy to revisit in one place.
+_CURRENCY_DECIMALS: int = 2
+
+
+def _parse_currency(value: object) -> float:
+    """Parse a possibly ``$``/comma-formatted money cell → float (0.0 on blank).
+
+    Accepts ``"$0.82"``, ``"1,234.5"``, ``0.82`` (already numeric), ``""`` /
+    ``NaN`` (→ 0.0).  Returns 0.0 for anything unparseable so a stray cell can
+    never crash the monthly run (it just contributes nothing).
+    """
+    if value is None:
+        return 0.0
+    try:
+        if pd.isna(value):
+            return 0.0
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)):
+        return float(value)
+    cleaned = str(value).replace("$", "").replace(",", "").strip()
+    if not cleaned:
+        return 0.0
+    try:
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_currency_series(series: pd.Series) -> pd.Series:
+    """Vectorised :func:`_parse_currency` over a column → float Series."""
+    return series.map(_parse_currency).astype(float)
+
+
+def _format_currency(value: float) -> str:
+    """Render a float back as the file's ``"$X.XX"`` string convention."""
+    return f"${value:,.{_CURRENCY_DECIMALS}f}"
+
+
 # ── Exceptions ───────────────────────────────────────────────────────────────
 
 class ActivityModelMonthlyUpdaterError(RuntimeError):
@@ -364,7 +416,16 @@ def _lookup_rest_freight_mover(target_month: pd.Timestamp) -> Optional[float]:
     mask = months.dt.normalize().dt.to_period("M") == target_month.to_period("M")
     if not mask.any():
         return None
-    val = pd.to_numeric(df.loc[mask, _NMT_COL_REST_FREIGHT], errors="coerce").dropna()
+    # Currency-aware (defensive): strip $/commas then to_numeric so a
+    # "$0.05"-style mover cell resolves instead of coercing to NaN (which would
+    # make the whole monthly run no-op with "no Rest HTST Freight Mover row").
+    val = pd.to_numeric(
+        df.loc[mask, _NMT_COL_REST_FREIGHT].astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    ).dropna()
     if val.empty:
         return None
     return float(val.iloc[-1])
@@ -442,14 +503,19 @@ def _apply_delivery_rule(
     )
 
     out = df.copy()
-    existing = pd.to_numeric(out[_DELIVERY_COL_CHARGE], errors="coerce").fillna(0.0)
+    # Parse the existing "$X.XX" base with the currency-aware parser (a plain
+    # to_numeric would read "$0.82" as NaN→0 and OVERWRITE the base with the
+    # delta — the bug this fixes).
+    existing = _parse_currency_series(out[_DELIVERY_COL_CHARGE])
     is_na_tier = out[_DELIVERY_COL_MILEAGE_TIER].astype(str).apply(_is_na_tier)
 
-    # N/A row: 0 forever. All other rows: existing + rest_freight.
+    # N/A row: 0 forever. All other rows: existing + rest_freight (incorporate
+    # the delta on top of the base — NOT overwrite it).
     new_charge = existing + rest_freight
     new_charge = new_charge.where(~is_na_tier, 0.0)
     rows_changed = int((new_charge != existing).sum())
-    out[_DELIVERY_COL_CHARGE] = new_charge
+    # Re-emit in the file's "$X.XX" string convention.
+    out[_DELIVERY_COL_CHARGE] = new_charge.map(_format_currency)
 
     try:
         _io.write_csv(
@@ -529,7 +595,16 @@ def _apply_pppi_rule(
     # exist, the LAST row wins (preserves the FG's intended ordering).
     fg_clean = fg_df[[_FG_COL_PRODUCT_ID, _FG_COL_MOVER]].copy()
     fg_clean[_FG_COL_PRODUCT_ID] = fg_clean[_FG_COL_PRODUCT_ID].astype(str).str.strip()
-    fg_clean[_FG_COL_MOVER] = pd.to_numeric(fg_clean[_FG_COL_MOVER], errors="coerce")
+    # Currency-aware parse of the mover, but keep the drop-invalid behaviour:
+    # strip $/commas then to_numeric so blank / unparseable cells become NaN and
+    # are dropped from the lookup (rather than silently added as 0).
+    fg_clean[_FG_COL_MOVER] = pd.to_numeric(
+        fg_clean[_FG_COL_MOVER].astype(str)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
     fg_clean = fg_clean.dropna(subset=[_FG_COL_MOVER])
     lookup: dict[str, float] = dict(zip(
         fg_clean[_FG_COL_PRODUCT_ID],
@@ -545,14 +620,18 @@ def _apply_pppi_rule(
     keys = out[_PPPI_COL_ITEM].astype(str).str.strip()
     movers = keys.map(lookup)  # NaN where unmatched
     matched_mask = movers.notna()
-    existing_packaging = pd.to_numeric(out[_PPPI_COL_PACKAGING], errors="coerce").fillna(0.0)
+    # Parse the existing "$X.XX" packaging base with the currency-aware parser
+    # (a plain to_numeric would read "$1.23" as NaN→0 and OVERWRITE the base
+    # with the mover — the same bug fixed in the Delivery rule).
+    existing_packaging = _parse_currency_series(out[_PPPI_COL_PACKAGING])
     addition = movers.fillna(0.0)
     new_packaging = existing_packaging + addition
 
-    # Only matched rows actually changed; unmatched rows retain their
-    # original (string-or-numeric) packaging cell, untouched.
+    # Only matched rows change (base + mover), re-emitted in the "$X.XX"
+    # convention; unmatched rows keep their original packaging cell untouched.
     rows_changed = int(matched_mask.sum())
-    out.loc[matched_mask, _PPPI_COL_PACKAGING] = new_packaging.loc[matched_mask].values
+    out.loc[matched_mask, _PPPI_COL_PACKAGING] = (
+        new_packaging.loc[matched_mask].map(_format_currency).values)
 
     try:
         _io.write_csv(

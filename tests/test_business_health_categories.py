@@ -62,10 +62,20 @@ def test_vol_margin_reading_quadrants():
 # ── Fixtures: a Butter deep-dive with clean, single-month numbers ────────────
 
 def _orders() -> pd.DataFrame:
-    """Butter orders — L3M +30% (June 3.9M vs 2.5... 3.0M)."""
+    """Butter orders — several Customer×SKU lines for Lever D, incl. an
+    order-only account (MT Food Bank) that has NO shipment (the RCA case)."""
     rows = [
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2026-06-01", 3_900_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2025-06-01", 3_000_000),
+        # Growers.
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco",  "KS Btr Qtr", "2026-06-01", 2_000_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco",  "KS Btr Qtr", "2025-06-01", 1_000_000),  # +1.0
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Kroger",  "KRO Salted", "2026-06-01",   800_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Kroger",  "KRO Salted", "2025-06-01",   300_000),  # +0.5
+        # Decliners.
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "MT Food Bank", "DG Btr", "2025-06-01", 1_400_000),  # -1.4 (order-only)
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Baugh",   "WhF Btr",  "2026-06-01",   100_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Baugh",   "WhF Btr",  "2025-06-01",   900_000),  # -0.8
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Golden State (McD)", "DG Btr", "2026-06-01", 200_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Golden State (McD)", "DG Btr", "2025-06-01", 800_000),  # -0.6
     ]
     cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
     df = pd.DataFrame(rows, columns=cols)
@@ -75,16 +85,11 @@ def _orders() -> pd.DataFrame:
 
 
 def _shipments() -> pd.DataFrame:
-    """Butter shipments — total L3M 3.0M vs YAG 2.5M (+20%); four Customer×SKU
-    lines so Lever D has top-3 + an 'All others' segment."""
+    """Butter shipments — total L3M 3.0M vs YAG 2.5M (+20%).  Note MT Food Bank
+    has NO shipment row, so a shipment-based Lever D would miss it."""
     rows = [
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2026-06-01", 2_000_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2025-06-01", 1_000_000),
-        ("Butter", "Bulk",   "Branded", "Packaged Butter", "WinCo",  "Butter Bulk",  "2026-06-01",   200_000),
-        ("Butter", "Bulk",   "Branded", "Packaged Butter", "WinCo",  "Butter Bulk",  "2025-06-01", 1_000_000),
-        ("Butter", "Tub",    "Branded", "Packaged Butter", "Kroger", "Butter Tub",   "2026-06-01",   600_000),
-        ("Butter", "WhF",    "Branded", "Packaged Butter", "Baugh",  "Butter WhF",   "2026-06-01",   200_000),
-        ("Butter", "WhF",    "Branded", "Packaged Butter", "Baugh",  "Butter WhF",   "2025-06-01",   500_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "KS Btr Qtr", "2026-06-01", 3_000_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "KS Btr Qtr", "2025-06-01", 2_500_000),
     ]
     cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
     df = pd.DataFrame(rows, columns=cols)
@@ -123,8 +128,8 @@ def test_categories_shape_and_order():
 
 
 def test_lever_a_gap_read():
-    # Orders +30% vs Shipments +20% → gap +10pt → channel building.
-    assert _butter().gap_flag == BH_GAP_BUILDING
+    # Orders −29.5% vs Shipments +20% → shipments outpacing orders → draining.
+    assert _butter().gap_flag == BH_GAP_DRAINING
 
 
 def test_lever_b_decomposition_and_sowhat():
@@ -154,22 +159,41 @@ def test_lever_c_margin_and_reading():
     assert butter.vol_margin_reading == BH_VM_HEALTHY
 
 
-def test_lever_d_concentration():
-    butter = _butter()
-    conc = butter.concentration
-    # Deltas: Costco +1.0, WinCo −0.8, Kroger +0.6, Baugh −0.3 → Σ|Δ| = 2.7M.
-    assert conc.total_abs_m == pytest.approx(2.7, rel=1e-3)
-    assert len(conc.segments) == 4                       # top-3 + "All others"
-    top = conc.segments[0]
-    assert top.label == "Costco × Butter Stick" and top.kind == "grower"
-    assert top.delta_m == pytest.approx(1.0, rel=1e-3)
-    assert top.share == pytest.approx(1.0 / 2.7, rel=1e-3)
-    assert top.yoy_pct == pytest.approx(1.0, rel=1e-3)   # (2.0−1.0)/1.0
-    assert conc.segments[1].kind == "decliner"           # WinCo −0.8
-    last = conc.segments[-1]
-    assert last.label.startswith("All others") and last.kind == "other"
-    # Shares partition the whole move.
-    assert sum(s.share for s in conc.segments) == pytest.approx(1.0, rel=1e-6)
+def test_lever_d_concentration_order_based_captures_mt_food_bank():
+    """Lever D ranks by ORDER-lbs Δ, so MT Food Bank (order-only, no shipment)
+    is captured — the RCA fix — as the #1 decliner."""
+    conc = _butter().concentration
+    # Order deltas: Costco +1.0, Kroger +0.5, MT Food Bank −1.4, Baugh −0.8,
+    # Golden State −0.6 → Σ|Δ| = 4.3M.
+    assert conc.total_abs_m == pytest.approx(4.3, rel=1e-3)
+    # Two growers (only two positive), three decliners.
+    assert [g.label for g in conc.growers] == ["Costco × KS Btr Qtr", "Kroger × KRO Salted"]
+    assert conc.growers[0].delta_m == pytest.approx(1.0, rel=1e-3)
+    assert conc.growers[0].share == pytest.approx(1.0 / 4.3, rel=1e-3)
+    top_decliner = conc.decliners[0]
+    assert top_decliner.label == "MT Food Bank × DG Btr"      # captured, ranked #1
+    assert top_decliner.kind == "decliner"
+    assert top_decliner.delta_m == pytest.approx(-1.4, rel=1e-3)
+    assert top_decliner.yoy_pct == pytest.approx(-1.0, rel=1e-3)   # 0 vs 1.4M → −100%
+    assert [d.label for d in conc.decliners] == [
+        "MT Food Bank × DG Btr", "Baugh × WhF Btr", "Golden State (McD) × DG Btr"]
+    # Ranking is by absolute pounds — never YoY% (MT Food Bank's −100% doesn't
+    # jump it above a bigger-pound line; it wins here on 1.4M lbs, not the %).
+    assert all(g.kind == "grower" for g in conc.growers)
+
+
+def test_lever_d_ships_only_would_miss_mt_food_bank():
+    """Regression guard: a shipment-based rank misses the order-only account
+    (there is no MT Food Bank shipment row) — hence Lever D uses orders."""
+    from data_sources.demand_plan_comparison import (
+        _category_concentration, COMPARISON_TEMPLATE, _last_n_months, _shift_year_back,
+    )
+    tby = {r.row_id: r for r in COMPARISON_TEMPLATE}
+    cur = _last_n_months(PRIOR, 3)
+    yag = {_shift_year_back(m) for m in cur}
+    ship_conc = _category_concentration(_shipments(), "butter", cur, yag, tby)
+    labels = [s.label for s in (*ship_conc.growers, *ship_conc.decliners)]
+    assert not any("MT Food Bank" in lbl for lbl in labels)
 
 
 def test_empty_inputs_degrade():
@@ -177,7 +201,7 @@ def test_empty_inputs_degrade():
     assert [c.row_id for c in cats] == list(BH_CATEGORY_ROWS)
     for c in cats:
         assert c.gap_flag == "" and c.decomp_sowhat == "" and c.vol_margin_reading == ""
-        assert c.concentration.segments == ()
+        assert c.concentration.growers == () and c.concentration.decliners == ()
 
 
 # ── Finance enrichment (feeds Levers B & C) ──────────────────────────────────

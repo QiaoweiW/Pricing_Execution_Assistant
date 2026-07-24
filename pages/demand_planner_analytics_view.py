@@ -746,7 +746,12 @@ _BH_FLAG_CHIP: dict[str, str] = {
 
 # ── Per-category four-lever deep-dive (one expandable row per category) ───────
 
-# Lever A gap read → human words for the caption.
+# Lever A gap read → header chip + longer caption words.
+_BH_GAP_HEADER: dict[str, str] = {
+    BH_GAP_BUILDING: "📦▲ channel building",
+    BH_GAP_DRAINING: "📦▼ channel draining",
+    BH_GAP_BALANCED: "📦= channel balanced",
+}
 _BH_GAP_WORDS: dict[str, str] = {
     BH_GAP_BUILDING: "building (orders outpacing shipments)",
     BH_GAP_DRAINING: "draining (shipments outpacing orders)",
@@ -759,13 +764,8 @@ _BH_VM_STYLE: dict[str, tuple[str, str]] = {
     BH_VM_RENTING:  ("🟠", "#c05621"),   # scary disguised as good
     BH_VM_BLEED:    ("🔴", "#c0392b"),   # true bleed
 }
-# Lever D segment colours / chips by mover kind.
-_BH_SEG_COLOR: dict[str, str] = {
-    "grower": "#137d78", "decliner": "#c0392b", "other": "#9ca3af",
-}
-_BH_SEG_CHIP: dict[str, str] = {
-    "grower": "🟩", "decliner": "🟥", "other": "⬜",
-}
+# Lever D diverging-bar colours by mover kind (green growers / red decliners).
+_BH_SEG_COLOR: dict[str, str] = {"grower": "#137d78", "decliner": "#c0392b"}
 # Signed-value colours for the Lever B decomposition table.
 _BH_POS_COLOR: str = "#137d78"
 _BH_NEG_COLOR: str = "#c0392b"
@@ -784,9 +784,9 @@ def _render_business_health_category_levers(categories: list) -> None:
     st.caption(
         "Each category is one expandable row.  Open it for the four levers — "
         "**A** Orders vs Shipments YoY (+ channel gap read), **B** Net-Sales "
-        "decomposition (Volume + Price/mix, all three periods), **C** "
-        "Gross-Profit-% margin trend (+ Vol×Margin reading), **D** concentration "
-        "of the L3M pound move across Customer×SKU lines."
+        "decomposition (Units + Price/mix, all three periods), **C** "
+        "Gross-Profit-% margin trend (+ Vol×Margin reading), **D** top "
+        "Customer×SKU movers by the L3M order swing."
     )
     order = list(BH_PERIOD_ORDER)
     labels = [_bh_window_display(w) for w in order]
@@ -806,8 +806,11 @@ def _render_business_health_category_levers(categories: list) -> None:
 
 
 def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
-    """Lever A — Orders vs Shipments YoY (L12M→L3M) + the channel gap read."""
-    st.markdown("**A · Orders vs Shipments YoY**")
+    """Lever A — Orders vs Shipments YoY (L12M→L3M); gap read as the header so-what."""
+    gap = _BH_GAP_HEADER.get(cat.gap_flag, "")
+    st.markdown(
+        f"**A · Orders vs Shipments YoY**  —  {gap}" if gap
+        else "**A · Orders vs Shipments YoY**")
     fig = go.Figure()
     for src, series in (("Orders", cat.order_series), ("Shipments", cat.ship_series)):
         color = _BH_CHART_STYLE[src]["line"]
@@ -837,32 +840,34 @@ def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
     st.caption(f"gap read → channel inventory **{_BH_GAP_WORDS.get(cat.gap_flag, 'n/a')}**")
 
 
-def _bh_signed_html(value, *, pts: bool = False) -> str:
-    """Coloured signed percentage/points cell for the Lever B table (— if None)."""
+def _bh_signed_html(value) -> str:
+    """Coloured signed YoY% cell for the Lever B table (— when None)."""
     if value is None:
         return "<span style='color:#9ca3af'>—</span>"
     color = _BH_POS_COLOR if value >= 0 else _BH_NEG_COLOR
-    unit = "pt" if pts else "%"
-    return f"<span style='color:{color}'>{value * 100:+.1f}{unit}</span>"
+    return f"<span style='color:{color}'>{value * 100:+.1f}%</span>"
 
 
 def _render_bh_lever_b(cat) -> None:
-    """Lever B — Net Sales YoY ≈ Volume YoY + Price/mix (residual), all periods."""
-    st.markdown("**B · Decomposition** — Net Sales ≈ Volume + Price/mix")
+    """Lever B — Net Sales YoY% ≈ Units YoY% + Price/mix YoY% (residual), all
+    periods; so-what (earned vs bought/lost) as the header."""
+    sowhat = f"  —  {cat.decomp_sowhat}" if cat.decomp_sowhat else ""
+    st.markdown(f"**B · Decomposition**{sowhat}")
+    st.caption("Net Sales YoY% ≈ Units YoY% + Price/mix YoY%")
     periods = list(BH_PERIOD_ORDER)
     rows = (
-        ("Volume YoY", "volume", False),
-        ("Price/mix", "price_mix", True),
-        ("Net Sales YoY", "net_sales", False),
+        ("Units YoY%", "volume"),
+        ("Price/mix YoY%", "price_mix"),
+        ("Net Sales YoY%", "net_sales"),
     )
     head = "<tr><th style='text-align:left'></th>" + "".join(
         f"<th style='text-align:right;padding-left:10px'>{p}</th>" for p in periods
     ) + "</tr>"
     body = ""
-    for name, key, pts in rows:
+    for name, key in rows:
         cells = "".join(
             f"<td style='text-align:right;padding-left:10px'>"
-            f"{_bh_signed_html(cat.decomp[p][key], pts=pts)}</td>"
+            f"{_bh_signed_html(cat.decomp[p][key])}</td>"
             for p in periods
         )
         body += f"<tr><td style='text-align:left'><b>{name}</b></td>{cells}</tr>"
@@ -871,15 +876,22 @@ def _render_bh_lever_b(cat) -> None:
         f"{head}{body}</table>",
         unsafe_allow_html=True,
     )
-    if cat.decomp_sowhat:
-        st.caption(f"so-what → the Net-Sales move was **{cat.decomp_sowhat}**")
-    else:
+    if not cat.decomp_sowhat:
         st.caption("_Net-Sales decomposition needs the Finance extract._")
 
 
 def _render_bh_lever_c(cat) -> None:
-    """Lever C — Gross Profit % L12M→L3M + the Vol×Margin quadrant reading."""
-    st.markdown("**C · Margin** — Gross Profit %")
+    """Lever C — Vol×Margin reading as the header so-what, then Gross Profit %
+    L12M→L3M."""
+    if cat.vol_margin_reading:
+        icon, color = _BH_VM_STYLE.get(cat.vol_margin_reading, ("", _BH_FONT_COLOR))
+        st.markdown(
+            f"**C · Margin**  —  <span style='color:{color}'>{icon} "
+            f"{_esc_html(cat.vol_margin_reading)}</span>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("**C · Margin** — Gross Profit %")
     periods = list(BH_PERIOD_ORDER)
     vals = [cat.margin_pct[p] for p in periods]
     if all(v is None for v in vals):
@@ -887,53 +899,52 @@ def _render_bh_lever_c(cat) -> None:
         return
     trail = " → ".join("—" if v is None else f"{v * 100:.1f}%" for v in vals)
     st.markdown(f"GP% {' → '.join(periods)}:  **{trail}**")
-    if cat.vol_margin_reading:
-        icon, color = _BH_VM_STYLE.get(cat.vol_margin_reading, ("", _BH_FONT_COLOR))
-        st.markdown(
-            f"<div style='color:{color};font-size:0.9rem'>{icon} "
-            f"{_esc_html(cat.vol_margin_reading)}</div>",
-            unsafe_allow_html=True,
-        )
 
 
 def _render_bh_lever_d(cat) -> None:
-    """Lever D — 100%-stacked concentration bar of the L3M shipped-lbs move.
+    """Lever D — diverging bar of the top-3 growers (green) and top-3 decliners
+    (red) by L3M **order**-lbs Δ; each bar's data label is its % of impact.
 
-    Segments (top movers + "All others") are ranked/sized by ABSOLUTE pound
-    impact; the YoY % rides along only as a hover/label so tiny-base outliers
-    can't hijack the ranking.
+    Bar length = absolute pound impact (what ranks); the % share label answers
+    "how much of the move is this line".  YoY% is hover-only so a tiny-base
+    outlier can't hijack the ranking.
     """
-    st.markdown("**D · Concentration** — L3M lbs move (ranked by |Δ|)")
+    st.markdown("**D · Top movers** — L3M order Δ (ranked by |Δ| lbs)")
     conc = cat.concentration
-    if not conc.segments:
-        st.caption("_No shipment movement under the current filters._")
+    # Biggest decliners on top, growers below (matches the diverging mockup).
+    movers = list(conc.decliners) + list(conc.growers)
+    if not movers:
+        st.caption("_No order movement under the current filters._")
         return
-    fig = go.Figure()
-    for seg in conc.segments:
-        yoy = "" if seg.yoy_pct is None else f" ({seg.yoy_pct * 100:+.1f}%)"
-        fig.add_bar(
-            y=["move"], x=[seg.share * 100.0], orientation="h",
-            marker=dict(color=_BH_SEG_COLOR.get(seg.kind, "#9ca3af")),
-            text=[f"{seg.share * 100:.0f}%"], textposition="inside",
-            insidetextanchor="middle", textfont=dict(color="white", size=11),
-            hovertemplate=(
-                f"{_esc_html(seg.label)}<br>share %{{x:.0f}}%"
-                f"<br>Δ {seg.delta_m:+.2f}M lbs{yoy}<extra></extra>"),
-        )
+    fig = go.Figure(go.Bar(
+        y=[seg.label for seg in movers],
+        x=[seg.delta_m for seg in movers],
+        orientation="h",
+        marker=dict(color=[_BH_SEG_COLOR[seg.kind] for seg in movers]),
+        text=[f"{seg.share * 100:.0f}%" for seg in movers],
+        textposition="outside", textfont=dict(size=11, color=_BH_FONT_COLOR),
+        customdata=[
+            "—" if seg.yoy_pct is None else f"{seg.yoy_pct * 100:+.1f}%"
+            for seg in movers],
+        hovertemplate=(
+            "%{y}<br>Δ %{x:+.2f}M lbs · YoY %{customdata}"
+            "<br>%{text} of total move<extra></extra>"),
+    ))
     fig.update_layout(
-        barmode="stack", height=90, margin=dict(l=6, r=6, t=6, b=6),
+        height=max(150, 34 * len(movers) + 60),
+        margin=dict(l=6, r=6, t=6, b=8),
         showlegend=False, plot_bgcolor="white",
-        xaxis=dict(range=[0, 100], visible=False),
-        yaxis=dict(visible=False),
+        font=dict(color=_BH_FONT_COLOR, size=11),
+        xaxis=dict(title=dict(text="L3M order Δ (M lbs)", font=dict(size=11)),
+                   ticksuffix="M", zeroline=True, zerolinecolor="#9ca3af",
+                   zerolinewidth=1, showgrid=True, gridcolor="#eeeeee"),
+        yaxis=dict(automargin=True, autorange="reversed"),
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_ld_{cat.row_id}")
-    st.caption(f"Total gross move: **{conc.total_abs_m:.2f}M lbs** (100% of bar)")
-    st.markdown("  \n".join(
-        f"- {_BH_SEG_CHIP.get(seg.kind, '⬜')} {_esc_html(seg.label)} — "
-        f"**{seg.share * 100:.0f}%** · {seg.delta_m:+.2f}M lbs"
-        + ("" if seg.yoy_pct is None else f" ({seg.yoy_pct * 100:+.1f}%)")
-        for seg in conc.segments
-    ))
+    st.caption(
+        f"Data labels = **% of total gross move** "
+        f"({conc.total_abs_m:.2f}M lbs).  Ranked by absolute lbs, not YoY%."
+    )
 
 
 def _bh_order_combos(

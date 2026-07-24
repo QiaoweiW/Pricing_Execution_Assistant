@@ -3246,11 +3246,12 @@ def build_business_health(
 # ── Per-category four-lever deep-dive ────────────────────────────────────────
 # Each of the seven executive categories is analysed through four "levers":
 #   A  Orders vs Shipments YoY (L12M→L6M→L3M) + a channel gap read
-#   B  Net-Sales decomposition:  Net Sales YoY ≈ Volume YoY + Price/mix (residual)
+#   B  Net-Sales decomposition:  Net Sales YoY% ≈ Units YoY% + Price/mix YoY% (residual)
 #   C  Margin:  Gross Profit % over L12M→L6M→L3M + a Vol×Margin quadrant reading
-#   D  Concentration of the L3M pound move across Customer×SKU lines
-# Volume throughout B/C/D is IBP **Shipped** lbs (the shipment line in Lever A);
-# Net Sales and Gross Profit come from the Finance extract.
+#   D  Top Customer×SKU movers by the L3M order-lbs swing
+# Volume for B/C is IBP **Shipped** lbs (the shipment line in Lever A); Lever D
+# ranks by IBP **Order** lbs (the demand signal); Net Sales and Gross Profit
+# come from the Finance extract.
 
 # Template row-ids for the seven categories, in display order, + nice labels.
 BH_CATEGORY_ROWS: tuple[str, ...] = (
@@ -3341,13 +3342,12 @@ def _bh_vol_margin_reading(
 
 @dataclass(frozen=True)
 class BhMoverSegment:
-    """One segment of a category's Lever-D concentration bar.
+    """One Customer × SKU mover on a category's Lever-D diverging bar.
 
-    A top mover is a single Customer × SKU line; the tail collapses into an
-    "All others" segment.  ``delta_m`` is the signed L3M shipped-lbs swing
-    (millions); ``share`` is |Δ| ÷ the category's total gross movement (0–1) —
-    i.e. this line's slice of the 100% bar; ``yoy_pct`` is context only (never
-    used to rank); ``kind`` is ``"grower" | "decliner" | "other"``.
+    ``delta_m`` is the signed L3M **order**-lbs swing (millions); ``share`` is
+    |Δ| ÷ the category's total gross movement (0–1) — this line's **percentage
+    of impact**, used as the bar's data label; ``yoy_pct`` is context only
+    (never used to rank); ``kind`` is ``"grower"`` or ``"decliner"``.
     """
     label: str
     delta_m: float
@@ -3358,15 +3358,18 @@ class BhMoverSegment:
 
 @dataclass(frozen=True)
 class BhConcentration:
-    """Lever D: the L3M pound move split across a category's Customer×SKU lines.
+    """Lever D: the L3M order-lbs move across a category's Customer×SKU lines.
 
-    ``total_abs_m`` is Σ|Δ shipped lbs| (millions) — the 100% of the stacked
-    bar; ``segments`` are the top-N movers (by absolute impact) followed by an
-    "All others" segment, whose ``share`` values sum to 1.  Empty when the
-    category had no movement.
+    ``total_abs_m`` is Σ|Δ order lbs| (millions) — the denominator behind each
+    mover's percentage of impact.  ``growers`` / ``decliners`` are the top-N
+    biggest gainers (Δ>0, largest first) and losers (Δ<0, most-negative first),
+    for the diverging bar (green right / red left).  Ranking is by ABSOLUTE
+    pound impact — never by YoY % — so a tiny-base line can't hijack the chart.
+    Empty tuples when the category had no movement.
     """
     total_abs_m: float
-    segments: tuple[BhMoverSegment, ...]
+    growers: tuple[BhMoverSegment, ...]
+    decliners: tuple[BhMoverSegment, ...]
 
 
 @dataclass(frozen=True)
@@ -3471,41 +3474,37 @@ def _category_concentration(
     cur_l3m: set, yag_l3m: set,
     template_by_id: dict[str, "TemplateRow"], top_n: int = BH_MOVER_TOP_N,
 ) -> BhConcentration:
-    """Lever D: split the category's L3M shipped-lbs move into top-N movers +
-    "All others", each sized by its share of the total **gross** movement.
+    """Lever D: the category's top-N Customer×SKU growers and decliners by L3M
+    **order**-lbs swing, each carrying its percentage of the total gross move.
 
-    Ranking is by absolute pound impact (never by YoY %), so a tiny-base line
-    doubling can't dominate the bar.  The shares (|Δ| ÷ Σ|Δ|) sum to 1, so the
-    stacked bar reads directly as "what % of the move is a few lines".
+    Uses ORDER lbs (the demand signal) so order-side accounts that don't
+    generate a matching shipment line — e.g. food-bank / donation orders like
+    MT Food Bank — are captured (a shipment-based rank missed them).  Ranking is
+    by absolute pound impact; ``share`` (|Δ| ÷ Σ|Δ| over all movers) is the data
+    label — the % of business impact each line represents.
     """
     cur, yag, delta_m = _category_pair_deltas(
         frame, row_id, cur_l3m, yag_l3m, template_by_id)
     if len(delta_m) == 0:
-        return BhConcentration(0.0, ())
-    abs_delta = delta_m.abs()
-    total_abs = float(abs_delta.sum())
+        return BhConcentration(0.0, (), ())
+    total_abs = float(delta_m.abs().sum())
     if total_abs <= 1e-9:
-        return BhConcentration(0.0, ())
+        return BhConcentration(0.0, (), ())
 
-    ranked_keys = list(abs_delta.sort_values(ascending=False).index)
-    segments: list[BhMoverSegment] = []
-    for key in ranked_keys[:top_n]:
+    def _seg(key) -> BhMoverSegment:
         cust, sku = key
         d, c, y = float(delta_m.loc[key]), float(cur.loc[key]), float(yag.loc[key])
         yoy = _safe_ratio(c - y, y) if abs(y) > 1e-9 else None
-        segments.append(BhMoverSegment(
+        return BhMoverSegment(
             label=f"{cust} × {sku}", delta_m=d, yoy_pct=yoy,
-            share=abs(d) / total_abs,
-            kind="grower" if d > 0 else "decliner" if d < 0 else "other"))
+            share=abs(d) / total_abs, kind="grower" if d > 0 else "decliner")
 
-    rest_keys = ranked_keys[top_n:]
-    rest_abs = float(abs_delta.loc[rest_keys].sum()) if rest_keys else 0.0
-    if rest_abs > 1e-9:
-        segments.append(BhMoverSegment(
-            label=f"All others ({len(rest_keys)} lines)",
-            delta_m=float(delta_m.loc[rest_keys].sum()), yoy_pct=None,
-            share=rest_abs / total_abs, kind="other"))
-    return BhConcentration(total_abs_m=total_abs, segments=tuple(segments))
+    pos = delta_m[delta_m > 0].sort_values(ascending=False)   # biggest gainers
+    neg = delta_m[delta_m < 0].sort_values()                  # biggest losers
+    growers = tuple(_seg(k) for k in pos.index[:top_n])
+    decliners = tuple(_seg(k) for k in neg.index[:top_n])
+    return BhConcentration(
+        total_abs_m=total_abs, growers=growers, decliners=decliners)
 
 
 def _bh_margin_pct(
@@ -3532,8 +3531,9 @@ def build_business_health_categories(
 
     Same windows / anchoring as :func:`build_business_health`; reads the SAME
     (already filter-narrowed) enriched frames, so every lever reacts to every
-    section filter.  Volume throughout is IBP **Shipped** lbs; Net Sales and
-    Gross Profit come from ``finance_enriched`` (:func:`enrich_finance_df`) — the
+    section filter.  Volume for B/C is IBP **Shipped** lbs; Lever D ranks by IBP
+    **Order** lbs (so order-only accounts are captured).  Net Sales and Gross
+    Profit come from ``finance_enriched`` (:func:`enrich_finance_df`) — the
     decomposition (B) and margin (C) degrade to blanks when finance is absent,
     while the Orders/Shipments levers (A) and concentration (D) still populate.
     """
@@ -3582,9 +3582,10 @@ def build_business_health_categories(
         vol_margin_reading = _bh_vol_margin_reading(
             ship_series["L3M"]["yoy"], margin_pct["L3M"], margin_pct["L12M"])
 
-        # Lever D — concentration of the L3M shipped-lbs move (volume basis).
+        # Lever D — top movers by the L3M ORDER-lbs swing (demand signal), so
+        # order-only accounts (e.g. MT Food Bank) are captured.
         concentration = _category_concentration(
-            shipments_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
+            orders_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
 
         out.append(BusinessHealthCategory(
             row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,

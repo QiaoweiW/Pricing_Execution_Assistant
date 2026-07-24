@@ -1600,8 +1600,8 @@ def enrich_ibp_shipments_df(
 _FINANCE_VALUE_COLS: tuple[str, ...] = tuple(
     col for _name, col, _cands in BH_FINANCE_METRICS)
 # Column order of the enriched Finance frame (mirrors _enrich_ibp's shape so it
-# flows through _bh_window_measures / _category_drivers / _bh_apply_combo_exclude
-# unchanged; the finance value columns replace ``pounds`` as the additive values).
+# flows through _bh_window_measures / _bh_apply_combo_exclude unchanged; the
+# finance value columns replace ``pounds`` as the additive values).
 _FINANCE_ENRICHED_COLS: tuple[str, ...] = (
     "item_key", "item_desc", "customer_name", "month", *_FINANCE_VALUE_COLS,
     "pmaj", "sfmt", "pminor", "brand",
@@ -3243,9 +3243,14 @@ def build_business_health(
         chart_series=chart_series)
 
 
-# ── Per-category small-multiples + Customer×SKU drivers ──────────────────────
-# The seven executive categories charted individually (Order + Shipment YoY),
-# each with the top Customer×SKU movers behind its momentum flag.
+# ── Per-category four-lever deep-dive ────────────────────────────────────────
+# Each of the seven executive categories is analysed through four "levers":
+#   A  Orders vs Shipments YoY (L12M→L6M→L3M) + a channel gap read
+#   B  Net-Sales decomposition:  Net Sales YoY ≈ Volume YoY + Price/mix (residual)
+#   C  Margin:  Gross Profit % over L12M→L6M→L3M + a Vol×Margin quadrant reading
+#   D  Concentration of the L3M pound move across Customer×SKU lines
+# Volume throughout B/C/D is IBP **Shipped** lbs (the shipment line in Lever A);
+# Net Sales and Gross Profit come from the Finance extract.
 
 # Template row-ids for the seven categories, in display order, + nice labels.
 BH_CATEGORY_ROWS: tuple[str, ...] = (
@@ -3261,36 +3266,127 @@ BH_CATEGORY_LABELS: dict[str, str] = {
     "fresh_milk": "Fresh Milk",
     "butter": "Butter",
 }
-BH_DRIVER_TOP_N: int = 5
+# Periods shown left→right in the Lever B / C tables (widest → narrowest).
+BH_PERIOD_ORDER: tuple[str, ...] = ("L12M", "L6M", "L3M")
+# Lever D ranks the top-N individual movers; the rest collapse to "All others".
+BH_MOVER_TOP_N: int = 3
+
+# Lever A — channel gap read (Orders YoY vs Shipments YoY at L3M).  Orders ABOVE
+# shipments ⇒ sell-in outpacing sell-through ⇒ channel building inventory.
+BH_GAP_BUILDING: str = "Building"
+BH_GAP_DRAINING: str = "Draining"
+BH_GAP_BALANCED: str = "Balanced"
+
+# Lever B — so-what on the L3M Net-Sales move: earned via price/realization, or
+# bought/lost via volume (which term dominates the Net Sales YoY).
+BH_MOVE_EARNED: str = "Earned — price/realization"
+BH_MOVE_GIVEN_BACK: str = "Given back — price/realization"
+BH_MOVE_BOUGHT: str = "Bought — volume"
+BH_MOVE_LOST: str = "Lost — volume"
+
+# Lever C — Vol × Margin quadrant readings (direction of L3M volume YoY × the
+# L3M-vs-L12M change in Gross Profit %).
+BH_VM_HEALTHY: str = "Vol ▲ / Margin ▲ — real, healthy growth. Protect and forecast up."
+BH_VM_RENTING: str = "Vol ▲ / Margin ▼ — renting volume with price/promo; growth destroying value."
+BH_VM_SHEDDING: str = "Vol ▼ / Margin ▲ — shedding low-margin volume; usually fine, sometimes desirable."
+BH_VM_BLEED: str = "Vol ▼ / Margin ▼ — true bleed; unambiguously top-priority."
+
+
+def _bh_gap_flag(order_yoy: Optional[float], ship_yoy: Optional[float]) -> str:
+    """Lever A: classify the Orders−Shipments YoY gap into building/draining/flat."""
+    if (order_yoy is None or ship_yoy is None
+            or pd.isna(order_yoy) or pd.isna(ship_yoy)):
+        return ""
+    gap = order_yoy - ship_yoy
+    if gap > _BH_FLAG_DEADBAND:
+        return BH_GAP_BUILDING
+    if gap < -_BH_FLAG_DEADBAND:
+        return BH_GAP_DRAINING
+    return BH_GAP_BALANCED
+
+
+def _bh_decomp_sowhat(
+    net_yoy: Optional[float], vol_yoy: Optional[float],
+) -> str:
+    """Lever B: was the Net-Sales YoY move earned (price) or bought/lost (volume)?
+
+    Price/mix is the residual ``net_yoy − vol_yoy``.  Whichever of price/mix or
+    volume has the larger magnitude is deemed the driver; the sign of the net
+    move picks earned/given-back (price-driven) vs bought/lost (volume-driven).
+    """
+    if net_yoy is None or vol_yoy is None or pd.isna(net_yoy) or pd.isna(vol_yoy):
+        return ""
+    price_mix = net_yoy - vol_yoy
+    price_driven = abs(price_mix) >= abs(vol_yoy)
+    if net_yoy >= 0:
+        return BH_MOVE_EARNED if price_driven else BH_MOVE_BOUGHT
+    return BH_MOVE_GIVEN_BACK if price_driven else BH_MOVE_LOST
+
+
+def _bh_vol_margin_reading(
+    vol_yoy_l3m: Optional[float],
+    gp_pct_l3m: Optional[float], gp_pct_l12m: Optional[float],
+) -> str:
+    """Lever C: map (L3M volume direction) × (L3M-vs-L12M margin direction) to a
+    Vol×Margin quadrant reading."""
+    if (vol_yoy_l3m is None or gp_pct_l3m is None or gp_pct_l12m is None
+            or any(pd.isna(x) for x in (vol_yoy_l3m, gp_pct_l3m, gp_pct_l12m))):
+        return ""
+    vol_up = vol_yoy_l3m >= 0
+    margin_up = (gp_pct_l3m - gp_pct_l12m) >= 0
+    if vol_up:
+        return BH_VM_HEALTHY if margin_up else BH_VM_RENTING
+    return BH_VM_SHEDDING if margin_up else BH_VM_BLEED
 
 
 @dataclass(frozen=True)
-class BhDriver:
-    """One Customer × SKU mover behind a category's momentum.
+class BhMoverSegment:
+    """One segment of a category's Lever-D concentration bar.
 
-    ``delta_m`` is the L3M **Order** pound swing (current window − year-ago
-    window) in **millions of lbs**, signed — positive = growing, negative =
-    declining.  ``yoy_pct`` is that same L3M Order-lbs YoY as a fraction
-    (current ÷ year-ago − 1), or ``None`` when there's no year-ago base.
+    A top mover is a single Customer × SKU line; the tail collapses into an
+    "All others" segment.  ``delta_m`` is the signed L3M shipped-lbs swing
+    (millions); ``share`` is |Δ| ÷ the category's total gross movement (0–1) —
+    i.e. this line's slice of the 100% bar; ``yoy_pct`` is context only (never
+    used to rank); ``kind`` is ``"grower" | "decliner" | "other"``.
     """
-    customer: str
-    sku: str
+    label: str
     delta_m: float
     yoy_pct: Optional[float]
+    share: float
+    kind: str
+
+
+@dataclass(frozen=True)
+class BhConcentration:
+    """Lever D: the L3M pound move split across a category's Customer×SKU lines.
+
+    ``total_abs_m`` is Σ|Δ shipped lbs| (millions) — the 100% of the stacked
+    bar; ``segments`` are the top-N movers (by absolute impact) followed by an
+    "All others" segment, whose ``share`` values sum to 1.  Empty when the
+    category had no movement.
+    """
+    total_abs_m: float
+    segments: tuple[BhMoverSegment, ...]
 
 
 @dataclass(frozen=True)
 class BusinessHealthCategory:
-    """One category's small-multiple: Order + Shipment (+ finance) YoY, flag,
-    and its top Customer×SKU growers AND decliners.
+    """One category's four-lever deep-dive.
 
-    ``order_series`` / ``ship_series`` are ``{bucket: {"vol", "yoy"}}`` (same
-    shape as the Total-B2C chart series).  ``finance_series`` maps each finance
-    line name (:data:`BH_FINANCE_METRICS` — ``"Net Sales"``, ``"Gross Profit"``,
-    …) to the same series shape; it's empty when the Finance extract is
-    unavailable.  ``growers`` / ``decliners`` are the top-N Customer×SKU pairs by
-    L3M Order-lbs swing — biggest gainers and biggest losers respectively —
-    shown regardless of the flag so both sides of the story are always visible.
+    Raw series (shared by the levers) — ``order_series`` / ``ship_series`` are
+    ``{bucket: {"vol", "yoy"}}``; ``finance_series`` maps each finance line
+    (:data:`BH_FINANCE_METRICS`) to the same shape (empty when the extract is
+    absent).  Derived levers:
+
+    * **A** ``gap_flag`` — channel building/draining from the L3M Orders vs
+      Shipments YoY gap.
+    * **B** ``decomp`` — ``{period: {"volume", "price_mix", "net_sales"}}`` YoY
+      fractions (price_mix = net_sales − volume residual); ``decomp_sowhat`` —
+      earned vs bought/lost read on the L3M move.
+    * **C** ``margin_pct`` — ``{period: Gross Profit ÷ Net Sales}``;
+      ``vol_margin_reading`` — the Vol×Margin quadrant reading.
+    * **D** ``concentration`` — the L3M shipped-lbs move split across
+      Customer×SKU lines (:class:`BhConcentration`).
     """
     row_id: str
     label: str
@@ -3298,8 +3394,12 @@ class BusinessHealthCategory:
     order_series: dict[str, dict[str, Optional[float]]]
     ship_series: dict[str, dict[str, Optional[float]]]
     finance_series: dict[str, dict[str, dict[str, Optional[float]]]]
-    growers: tuple[BhDriver, ...]
-    decliners: tuple[BhDriver, ...]
+    gap_flag: str
+    decomp: dict[str, dict[str, Optional[float]]]
+    decomp_sowhat: str
+    margin_pct: dict[str, Optional[float]]
+    vol_margin_reading: str
+    concentration: BhConcentration
 
 
 def _category_leaf_rows(
@@ -3330,24 +3430,23 @@ def _category_mask(
     return mask
 
 
-def _category_drivers(
-    orders_enriched: Optional[pd.DataFrame], row_id: str,
-    cur_l3m: set, yag_l3m: set,
-    template_by_id: dict[str, "TemplateRow"], top_n: int,
-) -> tuple[tuple[BhDriver, ...], tuple[BhDriver, ...]]:
-    """``(growers, decliners)`` — top-N Customer × SKU movers under *row_id*.
+def _category_pair_deltas(
+    frame: Optional[pd.DataFrame], row_id: str,
+    cur_l3m: set, yag_l3m: set, template_by_id: dict[str, "TemplateRow"],
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """``(cur, yag, delta_m)`` L3M pound Series indexed by ``(customer, sku)``.
 
-    Each driver carries both the L3M Order-lbs Δ (millions, signed) and the L3M
-    Order-lbs YoY %.  ``growers`` = the top-N biggest gainers (Δ > 0, largest
-    first); ``decliners`` = the top-N biggest losers (Δ < 0, most negative
-    first).  Both are returned regardless of the category's flag, so the card
-    always shows who's up and who's down.  Empty tuples when nothing qualifies.
+    Sums the category's rows in the current L3M window and its year-ago span,
+    aligns them on the full key union, and returns the signed swing in millions
+    of lbs.  Works on any enriched frame with ``pounds`` (orders or shipments);
+    Lever D uses **shipments**.  Empty Series when the category has no rows.
     """
-    if orders_enriched is None or orders_enriched.empty:
-        return (), ()
-    sub = orders_enriched[_category_mask(orders_enriched, row_id, template_by_id)]
+    empty = pd.Series(dtype=float)
+    if frame is None or frame.empty:
+        return empty, empty, empty
+    sub = frame[_category_mask(frame, row_id, template_by_id)]
     if sub.empty:
-        return (), ()
+        return empty, empty, empty
 
     def _grouped(window: set) -> pd.Series:
         w = sub[sub["month"].isin(window)]
@@ -3361,26 +3460,64 @@ def _category_drivers(
     cur, yag = _grouped(cur_l3m), _grouped(yag_l3m)
     keys = cur.index.union(yag.index)
     if len(keys) == 0:
-        return (), ()
+        return empty, empty, empty
     cur = cur.reindex(keys).fillna(0.0)
     yag = yag.reindex(keys).fillna(0.0)
-    delta_m = (cur - yag) / 1e6
+    return cur, yag, (cur - yag) / 1e6
 
-    def _driver(key) -> BhDriver:
+
+def _category_concentration(
+    frame: Optional[pd.DataFrame], row_id: str,
+    cur_l3m: set, yag_l3m: set,
+    template_by_id: dict[str, "TemplateRow"], top_n: int = BH_MOVER_TOP_N,
+) -> BhConcentration:
+    """Lever D: split the category's L3M shipped-lbs move into top-N movers +
+    "All others", each sized by its share of the total **gross** movement.
+
+    Ranking is by absolute pound impact (never by YoY %), so a tiny-base line
+    doubling can't dominate the bar.  The shares (|Δ| ÷ Σ|Δ|) sum to 1, so the
+    stacked bar reads directly as "what % of the move is a few lines".
+    """
+    cur, yag, delta_m = _category_pair_deltas(
+        frame, row_id, cur_l3m, yag_l3m, template_by_id)
+    if len(delta_m) == 0:
+        return BhConcentration(0.0, ())
+    abs_delta = delta_m.abs()
+    total_abs = float(abs_delta.sum())
+    if total_abs <= 1e-9:
+        return BhConcentration(0.0, ())
+
+    ranked_keys = list(abs_delta.sort_values(ascending=False).index)
+    segments: list[BhMoverSegment] = []
+    for key in ranked_keys[:top_n]:
         cust, sku = key
-        c, y = float(cur.loc[key]), float(yag.loc[key])
+        d, c, y = float(delta_m.loc[key]), float(cur.loc[key]), float(yag.loc[key])
         yoy = _safe_ratio(c - y, y) if abs(y) > 1e-9 else None
-        return BhDriver(
-            customer=str(cust), sku=str(sku),
-            delta_m=float(delta_m.loc[key]), yoy_pct=yoy)
+        segments.append(BhMoverSegment(
+            label=f"{cust} × {sku}", delta_m=d, yoy_pct=yoy,
+            share=abs(d) / total_abs,
+            kind="grower" if d > 0 else "decliner" if d < 0 else "other"))
 
-    growers = tuple(
-        _driver(k) for k, d in delta_m.sort_values(ascending=False).items()
-        if d > 0)[:top_n]
-    decliners = tuple(
-        _driver(k) for k, d in delta_m.sort_values().items()
-        if d < 0)[:top_n]
-    return growers, decliners
+    rest_keys = ranked_keys[top_n:]
+    rest_abs = float(abs_delta.loc[rest_keys].sum()) if rest_keys else 0.0
+    if rest_abs > 1e-9:
+        segments.append(BhMoverSegment(
+            label=f"All others ({len(rest_keys)} lines)",
+            delta_m=float(delta_m.loc[rest_keys].sum()), yoy_pct=None,
+            share=rest_abs / total_abs, kind="other"))
+    return BhConcentration(total_abs_m=total_abs, segments=tuple(segments))
+
+
+def _bh_margin_pct(
+    finance_series: dict[str, dict[str, dict[str, Optional[float]]]], period: str,
+) -> Optional[float]:
+    """Gross Profit ÷ Net Sales for *period* from the category's finance series
+    (``None`` when finance is absent or Net Sales ~ 0)."""
+    ns = finance_series.get("Net Sales", {}).get(period, {}).get("vol")
+    gp = finance_series.get("Gross Profit", {}).get(period, {}).get("vol")
+    if ns is None or gp is None or abs(ns) < 1e-9:
+        return None
+    return gp / ns
 
 
 def build_business_health_categories(
@@ -3389,18 +3526,16 @@ def build_business_health_categories(
     prior_month: date,
     *,
     finance_enriched: Optional[pd.DataFrame] = None,
-    top_n: int = BH_DRIVER_TOP_N,
+    top_n: int = BH_MOVER_TOP_N,
 ) -> list[BusinessHealthCategory]:
-    """Per-category (7) Order + Shipment (+ finance) YoY series, flag, and the
-    top Customer×SKU growers + decliners — the small-multiples under the chart.
+    """Per-category (7) four-lever deep-dive (see :class:`BusinessHealthCategory`).
 
     Same windows / anchoring as :func:`build_business_health`; reads the SAME
-    (already filter-narrowed) enriched frames, so the charts + drivers react to
-    every section filter.  ``finance_enriched`` (from :func:`enrich_finance_df`)
-    adds one YoY series per :data:`BH_FINANCE_METRICS` line (Net Sales, Gross
-    Profit, …) under each category's ``finance_series``; omit it and
-    ``finance_series`` is empty.  Degrades to empty series / no drivers when a
-    source is missing.
+    (already filter-narrowed) enriched frames, so every lever reacts to every
+    section filter.  Volume throughout is IBP **Shipped** lbs; Net Sales and
+    Gross Profit come from ``finance_enriched`` (:func:`enrich_finance_df`) — the
+    decomposition (B) and margin (C) degrade to blanks when finance is absent,
+    while the Orders/Shipments levers (A) and concentration (D) still populate.
     """
     pm = prior_month.replace(day=1)
     cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
@@ -3424,13 +3559,40 @@ def build_business_health_categories(
         finance_series = {
             name: _bh_series_for_row(m, rid) for name, m in fin_measures.items()
         }
+        net_ser = finance_series.get("Net Sales", {})
         flag = _bh_flag(order_series["L3M"]["yoy"], order_series["L12M"]["yoy"])
-        growers, decliners = _category_drivers(
-            orders_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
+
+        # Lever A — channel gap read (L3M Orders vs Shipments YoY).
+        gap_flag = _bh_gap_flag(
+            order_series["L3M"]["yoy"], ship_series["L3M"]["yoy"])
+
+        # Lever B — Net Sales ≈ Volume (IBP shipped) + Price/mix (residual),
+        # per period so the reader sees how price/mix evolves L12M→L3M.
+        decomp: dict[str, dict[str, Optional[float]]] = {}
+        for period in BH_PERIOD_ORDER:
+            vol = ship_series[period]["yoy"]
+            net = net_ser.get(period, {}).get("yoy") if net_ser else None
+            price_mix = (net - vol) if (net is not None and vol is not None) else None
+            decomp[period] = {"volume": vol, "price_mix": price_mix, "net_sales": net}
+        decomp_sowhat = _bh_decomp_sowhat(
+            decomp["L3M"]["net_sales"], decomp["L3M"]["volume"])
+
+        # Lever C — Gross Profit % per period + Vol×Margin quadrant reading.
+        margin_pct = {p: _bh_margin_pct(finance_series, p) for p in BH_PERIOD_ORDER}
+        vol_margin_reading = _bh_vol_margin_reading(
+            ship_series["L3M"]["yoy"], margin_pct["L3M"], margin_pct["L12M"])
+
+        # Lever D — concentration of the L3M shipped-lbs move (volume basis).
+        concentration = _category_concentration(
+            shipments_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
+
         out.append(BusinessHealthCategory(
             row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,
             order_series=order_series, ship_series=ship_series,
-            finance_series=finance_series, growers=growers, decliners=decliners))
+            finance_series=finance_series, gap_flag=gap_flag,
+            decomp=decomp, decomp_sowhat=decomp_sowhat,
+            margin_pct=margin_pct, vol_margin_reading=vol_margin_reading,
+            concentration=concentration))
     return out
 
 

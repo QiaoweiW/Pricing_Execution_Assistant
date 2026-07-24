@@ -158,7 +158,14 @@ from data_sources.demand_plan_comparison import (
     BH_FLAG_RISING,
     BH_FLAG_FALLING,
     BH_FLAG_FLAT,
-    BH_FINANCE_METRICS,
+    BH_PERIOD_ORDER,
+    BH_GAP_BUILDING,
+    BH_GAP_DRAINING,
+    BH_GAP_BALANCED,
+    BH_VM_HEALTHY,
+    BH_VM_RENTING,
+    BH_VM_SHEDDING,
+    BH_VM_BLEED,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
@@ -707,8 +714,9 @@ def _render_business_health() -> None:
         _render_business_health_legend(result)
         if finance_file:
             st.caption(
-                "💰 **Net Sales** and **Gross Profit** YoY lines from Finance "
-                f"actuals — source `Files/Finance/{finance_file}`."
+                "💰 **Net Sales** YoY line (headline) + **Gross Profit** margin "
+                "(category Lever C) from Finance actuals — source "
+                f"`Files/Finance/{finance_file}`."
             )
         _render_business_health_chart(result)
         st.caption(
@@ -719,14 +727,12 @@ def _render_business_health() -> None:
             "**Rising** when recent (L3M) YoY is accelerating vs the trailing year "
             "(L12M), **Falling** when decelerating, else **Flat**."
         )
-        # Per-category small-multiples + Customer×SKU drivers, governed by the
-        # SAME "Show lines" selection the B2C chart above wrote.
-        shown_lines = st.session_state.get(
-            "bh_chart_lines", list(_bh_line_options(result)))
+        # Per-category four-lever deep-dive (one expandable row each), reacting to
+        # the SAME filters / windows as the headline chart above.
         categories = build_business_health_categories(
             orders_enriched, shipments_enriched, prior_month,
             finance_enriched=finance_enriched)
-        _render_business_health_category_charts(categories, shown_lines)
+        _render_business_health_category_levers(categories)
 
         _render_business_health_table(result)
         _render_business_health_sku_drilldown(orders_enriched, prior_month)
@@ -738,119 +744,196 @@ _BH_FLAG_CHIP: dict[str, str] = {
 }
 
 
-def _render_business_health_category_charts(
-    categories: list, shown_lines: list[str],
-) -> None:
-    """Seven per-category YoY small-multiples (2 per row), each with a flag chip
-    and its top Customer×SKU movers — laid out above the table.
+# ── Per-category four-lever deep-dive (one expandable row per category) ───────
 
-    Reuses the B2C chart's Order/Shipment colors and honours the same
-    ``shown_lines`` selection, so a line toggled off up top disappears here too.
+# Lever A gap read → human words for the caption.
+_BH_GAP_WORDS: dict[str, str] = {
+    BH_GAP_BUILDING: "building (orders outpacing shipments)",
+    BH_GAP_DRAINING: "draining (shipments outpacing orders)",
+    BH_GAP_BALANCED: "balanced (orders and shipments in line)",
+}
+# Lever C Vol×Margin reading → (icon, callout colour) by severity.
+_BH_VM_STYLE: dict[str, tuple[str, str]] = {
+    BH_VM_HEALTHY:  ("🟢", "#137d78"),   # real growth
+    BH_VM_SHEDDING: ("🟡", "#b7791f"),   # good news disguised as bad
+    BH_VM_RENTING:  ("🟠", "#c05621"),   # scary disguised as good
+    BH_VM_BLEED:    ("🔴", "#c0392b"),   # true bleed
+}
+# Lever D segment colours / chips by mover kind.
+_BH_SEG_COLOR: dict[str, str] = {
+    "grower": "#137d78", "decliner": "#c0392b", "other": "#9ca3af",
+}
+_BH_SEG_CHIP: dict[str, str] = {
+    "grower": "🟩", "decliner": "🟥", "other": "⬜",
+}
+# Signed-value colours for the Lever B decomposition table.
+_BH_POS_COLOR: str = "#137d78"
+_BH_NEG_COLOR: str = "#c0392b"
+
+
+def _render_business_health_category_levers(categories: list) -> None:
+    """Seven per-category deep-dives, each an expandable row of four levers.
+
+    A row opens (like the mockup's "click one tile") to a 2×2 grid: **A**
+    Orders-vs-Shipments YoY + gap read, **B** Net-Sales decomposition table,
+    **C** Gross-Profit-% margin + Vol×Margin reading, **D** concentration bar.
     """
     if not categories:
         return
-    st.markdown(
-        "#### 📊 Category momentum — Order / Shipment / Net-Sales / Gross-Profit "
-        "YoY, by category")
+    st.markdown("#### 🔬 Category deep-dive — four levers per category")
     st.caption(
-        "Small-multiples of the seven executive categories (same windows / "
-        "filters / **Show lines** control as the chart above).  Each card flags "
-        "momentum and lists the top-5 **Customer × SKU** growers **and** "
-        "decliners behind it — the L3M Order swing in **lbs** with its YoY %."
+        "Each category is one expandable row.  Open it for the four levers — "
+        "**A** Orders vs Shipments YoY (+ channel gap read), **B** Net-Sales "
+        "decomposition (Volume + Price/mix, all three periods), **C** "
+        "Gross-Profit-% margin trend (+ Vol×Margin reading), **D** concentration "
+        "of the L3M pound move across Customer×SKU lines."
     )
-    order = ["L12M", "L6M", "L3M"]
+    order = list(BH_PERIOD_ORDER)
     labels = [_bh_window_display(w) for w in order]
-    for i in range(0, len(categories), 2):        # two cards per row
-        for col, cat in zip(st.columns(2), categories[i:i + 2]):
-            with col:
-                _render_bh_category_card(cat, labels, order, shown_lines)
+    for cat in categories:
+        title = f"{cat.label}  ·  {_BH_FLAG_CHIP.get(cat.flag, '—')}"
+        with st.expander(title, expanded=False):
+            a_col, b_col = st.columns(2)
+            with a_col:
+                _render_bh_lever_a(cat, labels, order)
+            with b_col:
+                _render_bh_lever_b(cat)
+            c_col, d_col = st.columns(2)
+            with c_col:
+                _render_bh_lever_c(cat)
+            with d_col:
+                _render_bh_lever_d(cat)
 
 
-def _bh_category_lines(cat):
-    """Yield ``(line_name, series, data-label position)`` for one category, in
-    draw order — the two volume lines then each finance line.
-
-    Label positions alternate top / bottom so the (up to four) data-label rows
-    don't collide.  Finance lines with no series (extract absent) are skipped.
-    """
-    yield "Orders", cat.order_series, "top center"
-    yield "Shipments", cat.ship_series, "bottom center"
-    for i, name in enumerate(_BH_FINANCE_LINE_NAMES):
-        series = cat.finance_series.get(name)
-        if series:
-            yield name, series, ("top center" if i % 2 == 0 else "bottom center")
-
-
-def _render_bh_category_card(
-    cat, labels: list[str], order: list[str], shown_lines: list[str],
-) -> None:
-    """One category card: title + flag chip + mini YoY chart (Order / Shipment /
-    finance lines) + top-5 Customer×SKU growers and decliners."""
-    st.markdown(f"**{_esc_html(cat.label)}**  {_BH_FLAG_CHIP.get(cat.flag, '—')}")
+def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
+    """Lever A — Orders vs Shipments YoY (L12M→L3M) + the channel gap read."""
+    st.markdown("**A · Orders vs Shipments YoY**")
     fig = go.Figure()
-    for src, series, textpos in _bh_category_lines(cat):
-        if src not in shown_lines or src not in _BH_CHART_STYLE or not series:
-            continue
+    for src, series in (("Orders", cat.order_series), ("Shipments", cat.ship_series)):
         color = _BH_CHART_STYLE[src]["line"]
         yoys = [None if series[w]["yoy"] is None else series[w]["yoy"] * 100.0
                 for w in order]
-        # Visible 1-decimal data label on every point; stagger positions so the
-        # three lines' labels don't overlap.
         fig.add_scatter(
-            x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers+text",
+            x=labels, y=yoys, name=src, mode="lines+markers+text",
             line=dict(color=color, dash="dot", width=2),
             marker=dict(color=color, size=8, line=dict(color="white", width=1)),
             text=[_bh_yoy_label(y) for y in yoys],
-            textposition=textpos,
+            textposition="top center" if src == "Orders" else "bottom center",
             textfont=dict(size=10, color=color),
             hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
         )
     fig.update_layout(
-        height=220, margin=dict(l=8, r=8, t=8, b=8),
+        height=200, margin=dict(l=8, r=8, t=8, b=8),
         font=dict(color=_BH_FONT_COLOR, size=11),
         xaxis=dict(tickfont=dict(size=10)),
         yaxis=dict(ticksuffix="%", rangemode="tozero", zeroline=True,
                    zerolinecolor="#9ca3af", showgrid=True, gridcolor="#eeeeee",
                    tickfont=dict(size=10)),
-        showlegend=False, plot_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0,
+                    font=dict(size=10)),
+        showlegend=True, plot_bgcolor="white",
     )
-    st.plotly_chart(fig, use_container_width=True, key=f"bh_cat_{cat.row_id}")
-    _render_bh_category_drivers(cat)
+    st.plotly_chart(fig, use_container_width=True, key=f"bh_la_{cat.row_id}")
+    st.caption(f"gap read → channel inventory **{_BH_GAP_WORDS.get(cat.gap_flag, 'n/a')}**")
 
 
-def _bh_driver_line(d) -> str:
-    """One Customer × SKU driver bullet: signed L3M Order Δ **lbs** + YoY %."""
-    yoy = "" if d.yoy_pct is None else f" ({d.yoy_pct * 100.0:+.1f}%)"
-    return (f"- {_esc_html(d.customer)} × {_esc_html(d.sku)}: "
-            f"**{d.delta_m:+.2f}M lbs**{yoy}")
+def _bh_signed_html(value, *, pts: bool = False) -> str:
+    """Coloured signed percentage/points cell for the Lever B table (— if None)."""
+    if value is None:
+        return "<span style='color:#9ca3af'>—</span>"
+    color = _BH_POS_COLOR if value >= 0 else _BH_NEG_COLOR
+    unit = "pt" if pts else "%"
+    return f"<span style='color:{color}'>{value * 100:+.1f}{unit}</span>"
 
 
-def _render_bh_category_drivers(cat) -> None:
-    """Top-5 growers and top-5 decliners (Customer × SKU) for one category.
+def _render_bh_lever_b(cat) -> None:
+    """Lever B — Net Sales YoY ≈ Volume YoY + Price/mix (residual), all periods."""
+    st.markdown("**B · Decomposition** — Net Sales ≈ Volume + Price/mix")
+    periods = list(BH_PERIOD_ORDER)
+    rows = (
+        ("Volume YoY", "volume", False),
+        ("Price/mix", "price_mix", True),
+        ("Net Sales YoY", "net_sales", False),
+    )
+    head = "<tr><th style='text-align:left'></th>" + "".join(
+        f"<th style='text-align:right;padding-left:10px'>{p}</th>" for p in periods
+    ) + "</tr>"
+    body = ""
+    for name, key, pts in rows:
+        cells = "".join(
+            f"<td style='text-align:right;padding-left:10px'>"
+            f"{_bh_signed_html(cat.decomp[p][key], pts=pts)}</td>"
+            for p in periods
+        )
+        body += f"<tr><td style='text-align:left'><b>{name}</b></td>{cells}</tr>"
+    st.markdown(
+        f"<table style='font-size:0.85rem;border-collapse:collapse'>"
+        f"{head}{body}</table>",
+        unsafe_allow_html=True,
+    )
+    if cat.decomp_sowhat:
+        st.caption(f"so-what → the Net-Sales move was **{cat.decomp_sowhat}**")
+    else:
+        st.caption("_Net-Sales decomposition needs the Finance extract._")
 
-    Always shows BOTH sides (independent of the flag): the biggest L3M
-    Order-lbs gainers and the biggest losers, each with the signed Δ in **lbs**
-    (millions) and its YoY %.  Units are stated once in the header so every
-    bullet reads unambiguously.
-    """
-    if not cat.growers and not cat.decliners:
-        st.caption("_No driver rows under the current filters._")
+
+def _render_bh_lever_c(cat) -> None:
+    """Lever C — Gross Profit % L12M→L3M + the Vol×Margin quadrant reading."""
+    st.markdown("**C · Margin** — Gross Profit %")
+    periods = list(BH_PERIOD_ORDER)
+    vals = [cat.margin_pct[p] for p in periods]
+    if all(v is None for v in vals):
+        st.caption("_Margin needs the Finance extract._")
         return
-    st.caption(
-        "Top Customer × SKU movers — **L3M Order Δ (millions of lbs)**, YoY % "
-        "in parentheses:"
+    trail = " → ".join("—" if v is None else f"{v * 100:.1f}%" for v in vals)
+    st.markdown(f"GP% {' → '.join(periods)}:  **{trail}**")
+    if cat.vol_margin_reading:
+        icon, color = _BH_VM_STYLE.get(cat.vol_margin_reading, ("", _BH_FONT_COLOR))
+        st.markdown(
+            f"<div style='color:{color};font-size:0.9rem'>{icon} "
+            f"{_esc_html(cat.vol_margin_reading)}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _render_bh_lever_d(cat) -> None:
+    """Lever D — 100%-stacked concentration bar of the L3M shipped-lbs move.
+
+    Segments (top movers + "All others") are ranked/sized by ABSOLUTE pound
+    impact; the YoY % rides along only as a hover/label so tiny-base outliers
+    can't hijack the ranking.
+    """
+    st.markdown("**D · Concentration** — L3M lbs move (ranked by |Δ|)")
+    conc = cat.concentration
+    if not conc.segments:
+        st.caption("_No shipment movement under the current filters._")
+        return
+    fig = go.Figure()
+    for seg in conc.segments:
+        yoy = "" if seg.yoy_pct is None else f" ({seg.yoy_pct * 100:+.1f}%)"
+        fig.add_bar(
+            y=["move"], x=[seg.share * 100.0], orientation="h",
+            marker=dict(color=_BH_SEG_COLOR.get(seg.kind, "#9ca3af")),
+            text=[f"{seg.share * 100:.0f}%"], textposition="inside",
+            insidetextanchor="middle", textfont=dict(color="white", size=11),
+            hovertemplate=(
+                f"{_esc_html(seg.label)}<br>share %{{x:.0f}}%"
+                f"<br>Δ {seg.delta_m:+.2f}M lbs{yoy}<extra></extra>"),
+        )
+    fig.update_layout(
+        barmode="stack", height=90, margin=dict(l=6, r=6, t=6, b=6),
+        showlegend=False, plot_bgcolor="white",
+        xaxis=dict(range=[0, 100], visible=False),
+        yaxis=dict(visible=False),
     )
-    up, down = st.columns(2)
-    with up:
-        st.markdown("📈 **Top 5 growers**")
-        st.markdown(
-            "  \n".join(_bh_driver_line(d) for d in cat.growers)
-            if cat.growers else "_None growing._")
-    with down:
-        st.markdown("📉 **Top 5 decliners**")
-        st.markdown(
-            "  \n".join(_bh_driver_line(d) for d in cat.decliners)
-            if cat.decliners else "_None declining._")
+    st.plotly_chart(fig, use_container_width=True, key=f"bh_ld_{cat.row_id}")
+    st.caption(f"Total gross move: **{conc.total_abs_m:.2f}M lbs** (100% of bar)")
+    st.markdown("  \n".join(
+        f"- {_BH_SEG_CHIP.get(seg.kind, '⬜')} {_esc_html(seg.label)} — "
+        f"**{seg.share * 100:.0f}%** · {seg.delta_m:+.2f}M lbs"
+        + ("" if seg.yoy_pct is None else f" ({seg.yoy_pct * 100:+.1f}%)")
+        for seg in conc.segments
+    ))
 
 
 def _bh_order_combos(
@@ -939,29 +1022,23 @@ def _render_business_health_legend(result: "BusinessHealthResult") -> None:
 
 
 # Business Health chart palette — YoY lines kept visually distinct: a red dotted
-# Order line, a teal dotted Shipment line, and the finance ($) lines in amber
-# (Net Sales) and violet (Gross Profit).
+# Order line, a teal dotted Shipment line, an amber dotted Net-Sales ($) line.
+# (Gross Profit is no longer a line — it feeds the Lever C margin read.)
 _BH_CHART_STYLE: dict[str, dict] = {
-    "Orders":       {"line": "#c0392b"},
-    "Shipments":    {"line": "#137d78"},
-    "Net Sales":    {"line": "#b7791f"},
-    "Gross Profit": {"line": "#6b46c1"},
+    "Orders":    {"line": "#c0392b"},
+    "Shipments": {"line": "#137d78"},
+    "Net Sales": {"line": "#b7791f"},
 }
 
-# The two volume lines are always available; finance lines come from the shared
-# BH_FINANCE_METRICS registry and appear only when the extract loaded.
-_BH_VOLUME_LINES: tuple[str, ...] = ("Orders", "Shipments")
-_BH_FINANCE_LINE_NAMES: tuple[str, ...] = tuple(n for n, _c, _cd in BH_FINANCE_METRICS)
+# Total-B2C headline chart lines, in draw order.  Net Sales appears only when the
+# Finance extract loaded; Gross Profit is intentionally NOT a headline line.
+_BH_HEADLINE_LINES: tuple[str, ...] = ("Orders", "Shipments", "Net Sales")
 
 
 def _bh_line_options(result: "BusinessHealthResult") -> tuple[str, ...]:
-    """The YoY lines available to chart, in draw order — a finance line (Net
-    Sales, Gross Profit, …) only when its series is present in ``chart_series``
-    (i.e. the Finance extract loaded)."""
-    return tuple(
-        src for src in (*_BH_VOLUME_LINES, *_BH_FINANCE_LINE_NAMES)
-        if src in result.chart_series
-    )
+    """Headline-chart lines available to draw, in order — Net Sales only when its
+    series is present in ``chart_series`` (i.e. the Finance extract loaded)."""
+    return tuple(s for s in _BH_HEADLINE_LINES if s in result.chart_series)
 
 
 def _bh_yoy_label(yoy_pct: Optional[float]) -> str:
@@ -975,13 +1052,14 @@ def _bh_yoy_label(yoy_pct: Optional[float]) -> str:
 
 
 def _render_business_health_chart(result: "BusinessHealthResult") -> None:
-    """YoY-focused chart: dotted Order / Shipment / Net-Sales / Gross-Profit lines.
+    """YoY-focused headline chart: dotted Order / Shipment / Net-Sales lines.
 
     Single axis (YoY %, zero-based).  X axis = L12M → L6M → L3M (widest →
     narrowest).  Values are the Total B2C row for each source, so the chart ties
-    to the table's top row.  The finance lines (Net Sales, Gross Profit) appear
-    only when the Finance extract loaded, and (like every line) can be removed
-    from the "Show lines" control.
+    to the table's top row.  The Net Sales line appears only when the Finance
+    extract loaded, and (like every line) can be removed from the "Show lines"
+    control.  Gross Profit is not a line here — it drives the per-category
+    Lever C margin read.
     """
     order = ["L12M", "L6M", "L3M"]                    # widest → narrowest
     labels = [_bh_window_display(w) for w in order]   # Run-Rate (L12M) …
@@ -995,7 +1073,7 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
         "Show lines", options=options,
         default=options, key="bh_chart_lines",
         help="Untick a source to remove its YoY line from the chart "
-             "(Net Sales and Gross Profit are the Finance $-based lines).",
+             "(Net Sales is the Finance $-based line).",
     )
     if not shown:
         st.info("Pick at least one line to show.")

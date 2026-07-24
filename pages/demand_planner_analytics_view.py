@@ -10595,13 +10595,6 @@ def _render_velocity_analysis() -> None:
         _render_velocity_analysis_body()
 
 
-# Velocity chart styling: ordered = dotted red, shipped = solid teal.
-_VELOCITY_STYLE: dict[str, dict] = {
-    "Ordered": {"color": "#c0392b", "dash": "dot"},
-    "Shipped": {"color": "#137d78", "dash": "solid"},
-}
-
-
 @st.fragment
 def _render_velocity_analysis_body() -> None:
     """Filters + KPI tiles + weekly ordered/shipped line chart (fragment)."""
@@ -10656,6 +10649,20 @@ def _render_velocity_analysis_body() -> None:
                 help="Leave empty to include all." if default == [] else None,
             )
 
+    # Portfolio Minor diagnostic: if it resolved neither in dbo.Shipments nor
+    # via the PDH fallback, surface the real source columns so the item/SKU
+    # column can be identified and wired in.
+    if vel.COL_PRODUCT_MINOR not in df.columns:
+        with st.expander("🔎 Portfolio Minor unavailable — dbo.Shipments columns",
+                         expanded=False):
+            st.caption(
+                "Portfolio Minor isn't a column in `dbo.Shipments`, and the PDH "
+                "fallback couldn't attach it (no recognizable **item** column to "
+                "join on, or no PDH match).  The table's actual columns are below "
+                "— tell me which one is the item / SKU code and I'll wire the join."
+            )
+            st.write(vel.fetch_source_columns() or "Could not read source columns.")
+
     date_range = st.slider(
         "Order date range", min_value=min_d, max_value=max_d,
         value=(min_d, max_d), format="YYYY-MM-DD", key="velocity_date_range",
@@ -10693,27 +10700,43 @@ def _render_velocity_analysis_body() -> None:
         st.info("No shipments match the current filters / date range.")
         return
 
-    # ── Weekly line chart: Ordered (dotted) + Shipped (solid) on the lbs axis,
-    #    plus Shipped Velocity (lbs / ship-to) on a right-hand axis (a per-
-    #    location rate — a different scale from the aggregate lbs lines). ──────
+    # ── Weekly line chart ────────────────────────────────────────────────────
+    # Aggregate lbs on the left axis; per-ship-to velocity RATES on the right
+    # axis (a much smaller scale).  A "Show lines" picker lets the planner remove
+    # any line — it's also how to isolate Ordered lbs, which otherwise sits
+    # invisibly under the near-identical Shipped lbs line.
     weeks = list(result.weekly[vel.WEEK_START])
+    # (name, column, y-axis, line style, hover unit)
+    _line_specs = [
+        ("Ordered lbs",      vel.COL_ORDERED_LBS,  "y",  dict(color="#c0392b", dash="dot"),   "lbs"),
+        ("Shipped lbs",      vel.COL_SHIPPED_LBS,  "y",  dict(color="#137d78", dash="solid"), "lbs"),
+        ("Order Velocity",   vel.ORDER_VELOCITY,   "y2", dict(color="#e67e22", dash="dot"),   "lbs/ship-to"),
+        ("Shipped Velocity", vel.SHIPPED_VELOCITY, "y2", dict(color="#8e44ad", dash="dash"),  "lbs/ship-to"),
+    ]
+    present = [s for s in _line_specs if s[1] in result.weekly.columns]
+    present_names = [s[0] for s in present]
+    shown = st.multiselect(
+        "Show lines", options=present_names, default=present_names,
+        key="velocity_show_lines",
+        help="Untick a line to remove it — e.g. hide Shipped lbs to see the "
+             "near-identical Ordered lbs line.",
+    )
+    if not shown:
+        st.info("Pick at least one line to show.")
+        return
+
     fig = go.Figure()
-    for name, col in (("Ordered", vel.COL_ORDERED_LBS), ("Shipped", vel.COL_SHIPPED_LBS)):
-        style = _VELOCITY_STYLE[name]
+    uses_y2 = False
+    for name, col, axis, style, unit in present:
+        if name not in shown:
+            continue
+        uses_y2 = uses_y2 or (axis == "y2")
         fig.add_scatter(
-            x=weeks, y=result.weekly[col], name=f"{name} lbs",
-            mode="lines+markers",
+            x=weeks, y=result.weekly[col], name=name, mode="lines+markers",
+            yaxis=axis,
             line=dict(color=style["color"], dash=style["dash"], width=2.5),
             marker=dict(color=style["color"], size=7),
-            hovertemplate=f"{name}: %{{y:,.0f}} lbs<br>week of %{{x|%Y-%m-%d}}<extra></extra>",
-        )
-    if result.has_velocity and vel.SHIPPED_VELOCITY in result.weekly.columns:
-        fig.add_scatter(
-            x=weeks, y=result.weekly[vel.SHIPPED_VELOCITY], name="Shipped Velocity",
-            mode="lines+markers", yaxis="y2",
-            line=dict(color="#8e44ad", dash="dash", width=2.5),
-            marker=dict(color="#8e44ad", size=7),
-            hovertemplate=("Shipped Velocity: %{y:,.0f} lbs/ship-to"
+            hovertemplate=(f"{name}: %{{y:,.0f}} {unit}"
                            "<br>week of %{x|%Y-%m-%d}<extra></extra>"),
         )
     layout = dict(
@@ -10728,10 +10751,10 @@ def _render_velocity_analysis_body() -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
-    # Only add the right-hand axis when a Shipped Velocity line is present.
-    if result.has_velocity and vel.SHIPPED_VELOCITY in result.weekly.columns:
+    # Right-hand axis only when a velocity (rate) line is actually shown.
+    if uses_y2:
         layout["yaxis2"] = dict(
-            title=dict(text="Shipped Velocity (lbs / ship-to)"),
+            title=dict(text="Velocity (lbs / ship-to)"),
             overlaying="y", side="right", rangemode="tozero", showgrid=False)
     fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True, key="velocity_chart")

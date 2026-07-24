@@ -108,8 +108,10 @@ _CANDIDATES: dict[str, tuple[str, ...]] = {
         "Product Minor",
     ),
     COL_ITEM: (
-        "Item", "Item No", "Item Number", "Item #", "ItemNo", "Item Code",
-        "ItemCode", "SKU", "productcode", "Product Code",
+        "Item", "Item No", "Item Number", "Item #", "ItemNo", "Item Num",
+        "ItemNum", "Item Code", "ItemCode", "Item ID", "ItemID", "SKU",
+        "productcode", "Product Code", "Product ID", "ProductID", "Product",
+        "Material", "Material Number", "itemnumber", "item_no", "item",
     ),
     COL_SHIP_TO: (
         "Ship To", "ShipTo", "Ship-To", "Ship To Number", "ShipToNumber",
@@ -202,10 +204,11 @@ class WeeklyVelocity:
     * ``weekly`` — one row per ISO week (Mon-anchored ``week_start``) with
       ``ordered_lbs`` and ``shipped_lbs`` sums, sorted ascending.  When the
       shipments table carries a ship-to column it also has ``ship_to_count``
-      (distinct ship-to locations that week) and ``shipped_velocity``
-      (``shipped_lbs ÷ ship_to_count`` — average lbs per ship-to).
+      (distinct ship-to locations that week), ``shipped_velocity``
+      (``shipped_lbs ÷ ship_to_count``) and ``order_velocity``
+      (``ordered_lbs ÷ ship_to_count``) — average lbs per ship-to.
     * ``total_ordered`` / ``total_shipped`` — filtered grand totals (lbs).
-    * ``has_velocity`` — whether the ship-to-derived Shipped Velocity is present.
+    * ``has_velocity`` — whether the ship-to-derived velocity lines are present.
     """
 
     weekly: pd.DataFrame
@@ -217,6 +220,7 @@ class WeeklyVelocity:
 WEEK_START: str = "week_start"
 SHIP_TO_COUNT: str = "ship_to_count"
 SHIPPED_VELOCITY: str = "shipped_velocity"
+ORDER_VELOCITY: str = "order_velocity"
 
 
 def _week_start(order_dt: pd.Series) -> pd.Series:
@@ -295,9 +299,9 @@ def build_weekly_velocity(
     if has_velocity:
         weekly = weekly.rename(columns={COL_SHIP_TO: SHIP_TO_COUNT})
         # Average lbs per ship-to location; NaN (not ∞) when a week has none.
-        weekly[SHIPPED_VELOCITY] = (
-            weekly[COL_SHIPPED_LBS]
-            / weekly[SHIP_TO_COUNT].where(weekly[SHIP_TO_COUNT] > 0))
+        _denom = weekly[SHIP_TO_COUNT].where(weekly[SHIP_TO_COUNT] > 0)
+        weekly[SHIPPED_VELOCITY] = weekly[COL_SHIPPED_LBS] / _denom
+        weekly[ORDER_VELOCITY] = weekly[COL_ORDERED_LBS] / _denom
 
     return WeeklyVelocity(
         weekly=weekly,
@@ -370,16 +374,45 @@ def fetch_shipments_df(*, force_refresh: bool = False) -> pd.DataFrame:
     return _cached_shipments_fetch("default")
 
 
+@st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
+def _cached_source_columns(_cache_token: str) -> list[str]:
+    """Raw ``dbo.Shipments`` column names — a cheap LIMIT-0 header read."""
+    uri = _table_uri()
+    try:
+        token = acquire_storage_token()
+    except FabricAuthError as exc:
+        raise ShipmentsVelocityError(str(exc)) from exc
+    ssl_verify = prepare_duckdb_tls()
+    try:
+        con = get_duckdb_connection()
+        with duckdb_lock():
+            bind_storage_token(con, token, ssl_verify=ssl_verify)
+            header = con.execute(
+                f"SELECT * FROM delta_scan('{uri}') LIMIT 0").df()
+    except Exception as exc:  # noqa: BLE001
+        raise ShipmentsVelocityError(str(exc)) from exc
+    return list(header.columns)
+
+
+def fetch_source_columns() -> list[str]:
+    """Raw ``dbo.Shipments`` column names for the UI diagnostic; ``[]`` on any
+    read failure (a diagnostic must never break the section)."""
+    try:
+        return _cached_source_columns("default")
+    except ShipmentsVelocityError:
+        return []
+
+
 __all__ = [
     "ShipmentsVelocityError",
     "ResolvedColumns",
     "WeeklyVelocity",
     "DEFAULT_BUSINESS_UNIT",
-    "WEEK_START", "SHIP_TO_COUNT", "SHIPPED_VELOCITY",
+    "WEEK_START", "SHIP_TO_COUNT", "SHIPPED_VELOCITY", "ORDER_VELOCITY",
     "COL_ORDER_DATE", "COL_ORDERED_LBS", "COL_SHIPPED_LBS", "COL_PORTFOLIO",
     "COL_PRODUCT_MINOR", "COL_PRODUCT_DESC", "COL_CUSTOMER", "COL_BUSINESS_UNIT",
     "COL_PRODUCT_FORMAT", "COL_ITEM", "COL_SHIP_TO",
     "REQUIRED_FIELDS", "FILTER_FIELDS", "EXTRA_FIELDS",
     "resolve_columns", "build_weekly_velocity", "distinct_values",
-    "fetch_shipments_df",
+    "fetch_shipments_df", "fetch_source_columns",
 ]

@@ -124,6 +124,10 @@ def test_shipped_velocity_per_week():
     # Week 2: shipped 200 over {C}=1 → 200.
     assert wk2[sv.SHIP_TO_COUNT] == 1
     assert wk2[sv.SHIPPED_VELOCITY] == pytest.approx(200.0)
+    # Order Velocity = ordered lbs / ship-to count.
+    # Week 1: ordered 100+50+20=170 over {A,B}=2 → 85.
+    assert wk1[sv.ORDER_VELOCITY] == pytest.approx(85.0)
+    assert wk2[sv.ORDER_VELOCITY] == pytest.approx(220.0)
 
 
 def test_product_minor_filter_reacts_in_velocity():

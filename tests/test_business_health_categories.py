@@ -283,6 +283,41 @@ def test_enrich_finance_df_missing_metric_column_degrades_to_zero():
     assert out["net_sales"].sum() == pytest.approx(1000.0)
 
 
+def test_enrich_finance_df_format_overrides_sfmt_for_esl_split():
+    """Finance 'Format' drives the ESL carton/aseptic split so Net Sales/GP
+    reconcile to the P&L: an item PDH calls Small Carton but Finance books as
+    Large Carton (e.g. OV Organic Hvy Whip Pt) lands in Large Carton; a format
+    with no template mapping (milk 'Gallon') keeps PDH's Supply Format."""
+    pdh = pd.DataFrame({
+        "Item No": ["1", "2"],
+        "Item Description": ["OV Organic Hvy Whip Pt UP", "DG Milk Gallon"],
+        "Portfolio Major": ["ESL", "HTST"],
+        "Supply Format": ["Small Carton", "Gallon Jug"],
+        "Portfolio Minor": ["", ""],
+        "Brand": ["Branded", "Branded"],
+    })
+    finance = pd.DataFrame({
+        "Budget/Actual": ["Actual", "Actual"],
+        "Item No.": ["1", "2"],
+        "Customer": ["Kroger", "Kroger"],
+        "GLMonth": [46174, 46174],                 # 2026-06-01
+        "Net Sales": ["100", "100"],
+        "Format": ["Large Carton", "Gallon"],      # #1 remaps; #2 has no mapping
+    })
+    out = enrich_finance_df(finance, pdh).set_index("item_desc")
+    assert out.loc["OV Organic Hvy Whip Pt UP", "sfmt"] == "Large Carton"  # finance wins
+    assert out.loc["DG Milk Gallon", "sfmt"] == "Gallon Jug"               # PDH kept
+
+
+def test_packaged_butter_label_is_consistent():
+    """Butter is labelled 'Packaged Butter' (its pminor scope) in the template
+    (drives APS/IBP/BH tables) and the BH category cards."""
+    from data_sources.demand_plan_comparison import COMPARISON_TEMPLATE
+    assert BH_CATEGORY_LABELS["butter"] == "Packaged Butter"
+    leaf = {r.row_id: r for r in COMPARISON_TEMPLATE}["butter"]
+    assert leaf.label == "Packaged Butter"
+
+
 def test_enrich_finance_df_empty():
     assert enrich_finance_df(None, None).empty
     assert list(enrich_finance_df(None, None).columns) == [

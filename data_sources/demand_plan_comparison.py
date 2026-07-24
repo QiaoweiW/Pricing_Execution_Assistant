@@ -195,6 +195,25 @@ _FIN_CUSTOMER_CANDIDATES: tuple[str, ...] = (
 _FIN_DESC_CANDIDATES: tuple[str, ...] = (
     "Item Description", "Item Desc", "Description",
 )
+# Finance's own granular supply-format column.  The finance P&L (and the B2C
+# Actuals PowerBI) split ESL by this "Format" column, whereas PDH's "Supply
+# Format" aligns with the coarser "Format 2" rollup.  They agree except for a
+# few items (e.g. OV Organic Hvy Whip Pt UP, which Finance books as Large Carton
+# but PDH/Format-2 call Small Carton).  For finance metrics to reconcile to the
+# P&L, we let this column drive the ESL carton / aseptic split (see the map
+# below); every other format keeps its PDH Supply Format.
+_FIN_FORMAT_CANDIDATES: tuple[str, ...] = (
+    "Format", "Supply Format", "Format 1",
+)
+# Only the formats where finance's granular column is authoritative for a
+# Business Health category discriminator AND shares the template's vocabulary.
+# Milk (Gallon/Quart/…) and tub (16 & 24 oz/…) formats are intentionally absent
+# so those categories keep their PDH Supply Format.
+_FIN_FORMAT_TO_SFMT: dict[str, str] = {
+    "large carton": "Large Carton",
+    "small carton": "Small Carton",
+    "aseptic": "Aseptic",
+}
 _FIN_BUDGET_ACTUAL_CANDIDATES: tuple[str, ...] = (
     "Budget/Actual", "Budget/Actuals", "Budget Actual", "Actual/Budget",
 )
@@ -485,7 +504,10 @@ COMPARISON_TEMPLATE: tuple[TemplateRow, ...] = (
     # Portfolio Major = Butter AND Portfolio Minor = "Packaged Butter"
     # (e.g. excludes bulk/ingredient butter that shares the Butter PMaj).
     # Both values come from PDH; the mask ANDs them in _leaf_mask.
-    _leaf("butter", "Butter", 1,
+    # Display label is "Packaged Butter" (the pminor scope) — distinguishing it
+    # from bulk/ingredient butter, consistent across Business Health, APS & IBP.
+    # (The RO-summary path key stays "Butter" — it matches the RO report file.)
+    _leaf("butter", "Packaged Butter", 1,
           pmaj_match=_BUTTER, pminor_match=_BUTTER_PMINOR,
           ro_summary_path=(_RO_TOTAL, "Butter")),
 )
@@ -1683,6 +1705,21 @@ def enrich_finance_df(
 
     enriched = _attach_dims(base, base["item_key"], build_item_dim_frame(pdh_df))
     enriched["item_desc"] = enriched["desc"]
+
+    # Reconcile the ESL carton / aseptic split to the finance P&L: where the
+    # finance "Format" column maps to a template supply-format, it wins over the
+    # PDH Supply Format (e.g. OV Organic Hvy Whip Pt → Large Carton).  `enriched`
+    # is positional to `work` (base built via .values, left-merge preserves
+    # order), so the finance-format array aligns row-for-row.
+    fmt_col = _resolve_column(work, _FIN_FORMAT_CANDIDATES)
+    if fmt_col:
+        override = pd.Series(
+            [_FIN_FORMAT_TO_SFMT.get(f)
+             for f in work[fmt_col].astype(str).str.strip().str.casefold().to_numpy()],
+            index=enriched.index,
+        )
+        enriched["sfmt"] = override.where(override.notna(), enriched["sfmt"])
+
     out = enriched[list(_FINANCE_ENRICHED_COLS)]
     return out.dropna(subset=["month"]).reset_index(drop=True)
 
@@ -3273,7 +3310,7 @@ BH_CATEGORY_LABELS: dict[str, str] = {
     "cult_cottage_cheese": "Cultured Cottage Cheese",
     "cult_sour_cream": "Cultured Sour Cream",
     "fresh_milk": "Fresh Milk",
-    "butter": "Butter",
+    "butter": "Packaged Butter",
 }
 # Periods shown left→right in the Lever B / C tables (widest → narrowest).
 BH_PERIOD_ORDER: tuple[str, ...] = ("L12M", "L6M", "L3M")

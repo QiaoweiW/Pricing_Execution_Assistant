@@ -441,6 +441,15 @@ _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
         "Baseline%20Plan%20Change%20Journal.xlsx?web=1",
     ),
     (
+        "Finance Data",
+        "https://darigold1com.sharepoint.com/:x:/r/sites/B2CFinanceTeam/"
+        "_layouts/15/Doc.aspx?sourcedoc=%7B1297df84-f3f0-4ea5-b9dd-"
+        "26f93e27f392%7D&action=edit&wdinitialsession=fbc9e93e-dea1-9be0-"
+        "1005-0341dfea319c&wdrldsc=6&wdrldc=1&wdrldr=ContinueInExcel&"
+        "wdenableroaming=1&wdlcid=en-US&wdorigin=Other&"
+        "wdredirectionreason=Force_SingleStepBoot",
+    ),
+    (
         "Tiger Report",
         "https://app.fabric.microsoft.com/groups/"
         "2a12208d-127f-4f59-b062-3f44876388dc/reports/"

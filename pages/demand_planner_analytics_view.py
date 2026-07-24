@@ -743,10 +743,15 @@ def _render_bh_category_card(
         color = _BH_CHART_STYLE[src]["line"]
         yoys = [None if series[w]["yoy"] is None else series[w]["yoy"] * 100.0
                 for w in order]
+        # Visible 1-decimal data label on every point; Orders above the point,
+        # Shipments below, so the two lines' labels don't overlap.
         fig.add_scatter(
-            x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers",
+            x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers+text",
             line=dict(color=color, dash="dot", width=2),
             marker=dict(color=color, size=8, line=dict(color="white", width=1)),
+            text=[_bh_yoy_label(y) for y in yoys],
+            textposition="top center" if src == "Orders" else "bottom center",
+            textfont=dict(size=10, color=color),
             hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
         )
     fig.update_layout(
@@ -863,6 +868,16 @@ _BH_CHART_STYLE: dict[str, dict] = {
 }
 
 
+def _bh_yoy_label(yoy_pct: Optional[float]) -> str:
+    """Signed 1-decimal YoY data label, e.g. ``"+1.4%"`` (``"—"`` when None).
+
+    Shared by the Total-B2C chart and the per-category small-multiples so the
+    on-point data labels read identically everywhere.  Input is already in
+    whole-percent units (i.e. a YoY fraction × 100).
+    """
+    return "—" if yoy_pct is None else f"{yoy_pct:+.1f}%"
+
+
 def _render_business_health_chart(result: "BusinessHealthResult") -> None:
     """YoY-focused chart: dotted Order-YoY + Shipment-YoY lines (no volume bars).
 
@@ -901,7 +916,7 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
             x=labels, y=yoys, name=f"{src} YoY %", mode="lines+markers+text",
             line=dict(color=color, dash="dot", width=3),
             marker=dict(color=color, size=11, line=dict(color="white", width=1.5)),
-            text=[("—" if y is None else f"{y:+.1f}%") for y in yoys],
+            text=[_bh_yoy_label(y) for y in yoys],
             textposition="top center", textfont=dict(size=14, color=color),
             hovertemplate=f"{src} %{{x}} YoY: %{{y:+.1f}}%<extra></extra>",
         )

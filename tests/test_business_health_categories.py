@@ -260,6 +260,7 @@ def test_enrich_finance_df_actual_only_and_pdh_dims():
     assert list(out.columns) == [
         "item_key", "item_desc", "customer_name", "month",
         "net_sales", "gross_profit", "pmaj", "sfmt", "pminor", "brand",
+        "fin_category",
     ]
     assert len(out) == 2                       # Budget row dropped
     assert out["net_sales"].sum() == pytest.approx(1500.50)   # comma parsed
@@ -283,32 +284,6 @@ def test_enrich_finance_df_missing_metric_column_degrades_to_zero():
     assert out["net_sales"].sum() == pytest.approx(1000.0)
 
 
-def test_enrich_finance_df_format_overrides_sfmt_for_esl_split():
-    """Finance 'Format' drives the ESL carton/aseptic split so Net Sales/GP
-    reconcile to the P&L: an item PDH calls Small Carton but Finance books as
-    Large Carton (e.g. OV Organic Hvy Whip Pt) lands in Large Carton; a format
-    with no template mapping (milk 'Gallon') keeps PDH's Supply Format."""
-    pdh = pd.DataFrame({
-        "Item No": ["1", "2"],
-        "Item Description": ["OV Organic Hvy Whip Pt UP", "DG Milk Gallon"],
-        "Portfolio Major": ["ESL", "HTST"],
-        "Supply Format": ["Small Carton", "Gallon Jug"],
-        "Portfolio Minor": ["", ""],
-        "Brand": ["Branded", "Branded"],
-    })
-    finance = pd.DataFrame({
-        "Budget/Actual": ["Actual", "Actual"],
-        "Item No.": ["1", "2"],
-        "Customer": ["Kroger", "Kroger"],
-        "GLMonth": [46174, 46174],                 # 2026-06-01
-        "Net Sales": ["100", "100"],
-        "Format": ["Large Carton", "Gallon"],      # #1 remaps; #2 has no mapping
-    })
-    out = enrich_finance_df(finance, pdh).set_index("item_desc")
-    assert out.loc["OV Organic Hvy Whip Pt UP", "sfmt"] == "Large Carton"  # finance wins
-    assert out.loc["DG Milk Gallon", "sfmt"] == "Gallon Jug"               # PDH kept
-
-
 def test_packaged_butter_label_is_consistent():
     """Butter is labelled 'Packaged Butter' (its pminor scope) in the template
     (drives APS/IBP/BH tables) and the BH category cards."""
@@ -323,4 +298,61 @@ def test_enrich_finance_df_empty():
     assert list(enrich_finance_df(None, None).columns) == [
         "item_key", "item_desc", "customer_name", "month",
         "net_sales", "gross_profit", "pmaj", "sfmt", "pminor", "brand",
+        "fin_category",
     ]
+
+
+def test_enrich_finance_df_fin_category_from_finance_taxonomy():
+    """fin_category is derived from Finance's own Product Group + Format."""
+    pdh = pd.DataFrame({
+        "Item No": ["1", "2", "3"],
+        "Item Description": ["a", "b", "c"],
+        "Portfolio Major": ["Butter", "ESL", "Cultured"],
+        "Supply Format": ["Sticks", "Small Carton", "Large Tub"],
+        "Portfolio Minor": ["Packaged Butter", "", "Cottage Cheese"],
+        "Brand": ["Branded", "Branded", "Branded"],
+    })
+    finance = pd.DataFrame({
+        "Budget/Actual": ["Actual"] * 3,
+        "Item No.": ["1", "2", "3"],
+        "GLMonth": [46174] * 3,
+        "Net Sales": ["1", "1", "1"],
+        "Product Group Name": ["BUTTER", "UP CLASS II MILK", "COTTAGE CHEESE"],
+        "Format": ["Butter", "Large Carton", "3 & 5 lb."],
+    })
+    out = enrich_finance_df(finance, pdh).set_index("item_key")
+    assert out.loc["1", "fin_category"] == "butter"
+    assert out.loc["2", "fin_category"] == "esl_lc"   # UP + Format Large Carton
+    assert out.loc["3", "fin_category"] == "cult_cottage_cheese"
+
+
+def test_lever_c_reconciliation_pdh_vs_finance():
+    """Reconciliation: Packaged-Butter card (PDH) vs Finance's full BUTTER group.
+    Bulk Butter is in Finance's group but not the PDH card → shows as a gap."""
+    pdh = pd.DataFrame({
+        "Item No": ["1", "2"],
+        "Item Description": ["DG Packaged Btr", "DG Bulk Btr"],
+        "Portfolio Major": ["Butter", "Butter"],
+        "Supply Format": ["Sticks", "Bulk"],
+        "Portfolio Minor": ["Packaged Butter", "Bulk Butter"],
+        "Brand": ["Branded", "Branded"],
+    })
+    finance = pd.DataFrame({
+        "Budget/Actual": ["Actual", "Actual"],
+        "Item No.": ["1", "2"],
+        "Customer": ["Costco", "WinCo"],
+        "GLMonth": [46174, 46174],                 # 2026-06
+        "Net Sales": ["3000000", "1000000"],
+        "Gross Profit": ["600000", "100000"],
+        "Product Group Name": ["BUTTER", "BUTTER"],
+        "Format": ["Butter", "Butter"],
+    })
+    enr = enrich_finance_df(finance, pdh)
+    cats = {c.row_id: c for c in build_business_health_categories(
+        None, None, PRIOR, finance_enriched=enr)}
+    r = cats["butter"].reconciliation
+    assert r.available
+    assert r.net_pdh["L3M"] == pytest.approx(3.0)          # Packaged only
+    assert r.net_fin["L3M"] == pytest.approx(4.0)          # Packaged + Bulk
+    assert (r.net_pdh["L3M"] - r.net_fin["L3M"]) == pytest.approx(-1.0)
+    assert any("Bulk Btr" in d for d in r.drivers)

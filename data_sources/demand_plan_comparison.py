@@ -195,25 +195,47 @@ _FIN_CUSTOMER_CANDIDATES: tuple[str, ...] = (
 _FIN_DESC_CANDIDATES: tuple[str, ...] = (
     "Item Description", "Item Desc", "Description",
 )
-# Finance's own granular supply-format column.  The finance P&L (and the B2C
-# Actuals PowerBI) split ESL by this "Format" column, whereas PDH's "Supply
-# Format" aligns with the coarser "Format 2" rollup.  They agree except for a
-# few items (e.g. OV Organic Hvy Whip Pt UP, which Finance books as Large Carton
-# but PDH/Format-2 call Small Carton).  For finance metrics to reconcile to the
-# P&L, we let this column drive the ESL carton / aseptic split (see the map
-# below); every other format keeps its PDH Supply Format.
-_FIN_FORMAT_CANDIDATES: tuple[str, ...] = (
-    "Format", "Supply Format", "Format 1",
+# Finance's own taxonomy columns — used ONLY to derive a "finance-report"
+# category per row (``fin_category``) for the Business Health reconciliation
+# panel.  Category rollups themselves are driven by PDH (see enrich_finance_df),
+# so volume and net sales share one classification; this is the reference the
+# reconciliation compares against so a planner can see (and RCA) any gap.
+_FIN_FORMAT_CANDIDATES: tuple[str, ...] = ("Format", "Format 1")
+_FIN_PRODUCT_GROUP_CANDIDATES: tuple[str, ...] = (
+    "Product Group Name", "Product Group", "ProductGroupName",
 )
-# Only the formats where finance's granular column is authoritative for a
-# Business Health category discriminator AND shares the template's vocabulary.
-# Milk (Gallon/Quart/…) and tub (16 & 24 oz/…) formats are intentionally absent
-# so those categories keep their PDH Supply Format.
-_FIN_FORMAT_TO_SFMT: dict[str, str] = {
-    "large carton": "Large Carton",
-    "small carton": "Small Carton",
-    "aseptic": "Aseptic",
+# Product Group → category (Finance's native rollup).  Butter is the FULL
+# product group here (Packaged + Bulk) — that's how the finance P&L reports it —
+# so the reconciliation surfaces the Bulk-Butter gap vs our Packaged-only card.
+_FIN_PG_TO_CATEGORY: dict[str, str] = {
+    "BUTTER": "butter",
+    "COTTAGE CHEESE": "cult_cottage_cheese",
+    "SOUR CREAM": "cult_sour_cream",
+    "HTST MILK": "fresh_milk", "HTST CASELESS": "fresh_milk",
+    "HTST CLASS II MILK": "fresh_milk",
 }
+# ESL (ultra-pasteurised) product groups, split into carton categories by the
+# granular finance "Format" column.
+_FIN_ESL_PRODUCT_GROUPS: frozenset = frozenset({
+    "UP MILK", "UP CLASS II MILK", "UP MIX", "ASEPTIC", "ASEPTIC CLASS II",
+})
+_FIN_ESL_FORMAT_TO_CATEGORY: dict[str, str] = {
+    "large carton": "esl_lc", "small carton": "esl_sc", "aseptic": "aseptic",
+}
+
+
+def _finance_native_category(product_group: object, fmt: object) -> Optional[str]:
+    """Map a finance row to a Business Health category via Finance's OWN taxonomy
+    (Product Group + granular Format) — the reconciliation reference, computed
+    independently of PDH.  Returns ``None`` for rows outside the seven categories.
+    """
+    pg = str(product_group).strip().upper()
+    direct = _FIN_PG_TO_CATEGORY.get(pg)
+    if direct is not None:
+        return direct
+    if pg in _FIN_ESL_PRODUCT_GROUPS:
+        return _FIN_ESL_FORMAT_TO_CATEGORY.get(str(fmt).strip().casefold())
+    return None
 _FIN_BUDGET_ACTUAL_CANDIDATES: tuple[str, ...] = (
     "Budget/Actual", "Budget/Actuals", "Budget Actual", "Actual/Budget",
 )
@@ -1626,7 +1648,7 @@ _FINANCE_VALUE_COLS: tuple[str, ...] = tuple(
 # finance value columns replace ``pounds`` as the additive values).
 _FINANCE_ENRICHED_COLS: tuple[str, ...] = (
     "item_key", "item_desc", "customer_name", "month", *_FINANCE_VALUE_COLS,
-    "pmaj", "sfmt", "pminor", "brand",
+    "pmaj", "sfmt", "pminor", "brand", "fin_category",
 )
 
 
@@ -1694,10 +1716,24 @@ def enrich_finance_df(
         if cust_col else pd.Series([""] * len(work), index=work.index, dtype="object")
     )
 
+    # Finance-report category per row from Finance's OWN taxonomy (Product Group
+    # + Format) — used only by the reconciliation panel; the category ROLLUP is
+    # PDH-driven (below), so volume and net sales share one classification.
+    pg_col = _resolve_column(work, _FIN_PRODUCT_GROUP_CANDIDATES)
+    fmt_col = _resolve_column(work, _FIN_FORMAT_CANDIDATES)
+    if pg_col:
+        pgs = work[pg_col].astype(str).to_numpy()
+        fmts = (work[fmt_col].astype(str).to_numpy()
+                if fmt_col else [""] * len(work))
+        fin_category = [_finance_native_category(pg, fm) for pg, fm in zip(pgs, fmts)]
+    else:
+        fin_category = [None] * len(work)
+
     cols: dict[str, object] = {
         "item_key": _vectorised_item_key(work[item_col]).values,
         "customer_name": cust_name.values,
         "month": _vectorised_start_of_month(work[month_col]).values,
+        "fin_category": fin_category,
     }
     for col, src in metric_cols.items():      # net_sales, gross_profit, …
         cols[col] = _fin_numeric(work[src] if src else None, work.index).values
@@ -1705,21 +1741,6 @@ def enrich_finance_df(
 
     enriched = _attach_dims(base, base["item_key"], build_item_dim_frame(pdh_df))
     enriched["item_desc"] = enriched["desc"]
-
-    # Reconcile the ESL carton / aseptic split to the finance P&L: where the
-    # finance "Format" column maps to a template supply-format, it wins over the
-    # PDH Supply Format (e.g. OV Organic Hvy Whip Pt → Large Carton).  `enriched`
-    # is positional to `work` (base built via .values, left-merge preserves
-    # order), so the finance-format array aligns row-for-row.
-    fmt_col = _resolve_column(work, _FIN_FORMAT_CANDIDATES)
-    if fmt_col:
-        override = pd.Series(
-            [_FIN_FORMAT_TO_SFMT.get(f)
-             for f in work[fmt_col].astype(str).str.strip().str.casefold().to_numpy()],
-            index=enriched.index,
-        )
-        enriched["sfmt"] = override.where(override.notna(), enriched["sfmt"])
-
     out = enriched[list(_FINANCE_ENRICHED_COLS)]
     return out.dropna(subset=["month"]).reset_index(drop=True)
 
@@ -3418,6 +3439,25 @@ class BhConcentration:
 
 
 @dataclass(frozen=True)
+class BhReconciliation:
+    """Lever-C reconciliation: our PDH-driven rollup vs Finance's own report.
+
+    Both sides read the SAME finance dollars; only the *classification* differs
+    — our card rolls up by PDH (so volume and net sales agree), while Finance's
+    report groups by its own Product Group / Format taxonomy.  ``net_pdh`` /
+    ``net_fin`` / ``gp_pdh`` / ``gp_fin`` are ``{period: $M}``.  ``drivers`` are
+    concise, human notes naming the items behind any gap (empty when they tie).
+    ``available`` is False when the Finance extract wasn't loaded.
+    """
+    available: bool
+    net_pdh: dict[str, float]
+    net_fin: dict[str, float]
+    gp_pdh: dict[str, float]
+    gp_fin: dict[str, float]
+    drivers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class BusinessHealthCategory:
     """One category's four-lever deep-dive.
 
@@ -3438,6 +3478,9 @@ class BusinessHealthCategory:
       ``finance_series[...]["vol"]``.)
     * **D** ``concentration`` — the L3M shipped-lbs move split across
       Customer×SKU lines (:class:`BhConcentration`).
+
+    ``reconciliation`` — PDH-rollup vs Finance-report cross-check
+    (:class:`BhReconciliation`), shown in a foldable panel under Lever C.
     """
     row_id: str
     label: str
@@ -3452,6 +3495,7 @@ class BusinessHealthCategory:
     margin_gl_months: dict[str, str]
     vol_margin_reading: str
     concentration: BhConcentration
+    reconciliation: BhReconciliation
 
 
 def _category_leaf_rows(
@@ -3568,6 +3612,60 @@ def _bh_margin_pct(
     return gp / ns
 
 
+# Max reclassification drivers to name in a reconciliation note (per direction).
+_BH_RECON_DRIVER_TOP_N: int = 2
+
+
+def _bh_reconciliation(
+    finance_enriched: Optional[pd.DataFrame], row_id: str,
+    template_by_id: dict[str, "TemplateRow"],
+    cur_windows: dict[str, set],
+) -> BhReconciliation:
+    """PDH-rollup vs Finance-report reconciliation for one category.
+
+    Both sides sum the SAME finance dollars; the only difference is *which rows*
+    land in the category — our card uses the PDH rollup (:func:`_category_mask`),
+    Finance's report uses its own ``fin_category``.  Returns per-period Net Sales
+    & Gross Profit for each side plus concise driver notes naming the items that
+    each side files here but the other files elsewhere (ranked by L12M net sales).
+    """
+    empty = {p: 0.0 for p in cur_windows}
+    if (finance_enriched is None or finance_enriched.empty
+            or "fin_category" not in finance_enriched.columns):
+        return BhReconciliation(False, dict(empty), dict(empty),
+                                dict(empty), dict(empty), ())
+
+    fin = finance_enriched
+    pdh_mask = _category_mask(fin, row_id, template_by_id)
+    fin_mask = fin["fin_category"] == row_id
+    month = fin["month"]
+
+    def _sums(mask, col):
+        return {p: float(fin.loc[mask & month.isin(w), col].sum()) / _LBS_PER_MILLION
+                for p, w in cur_windows.items()}
+
+    net_pdh, net_fin = _sums(pdh_mask, "net_sales"), _sums(fin_mask, "net_sales")
+    gp_pdh, gp_fin = _sums(pdh_mask, "gross_profit"), _sums(fin_mask, "gross_profit")
+
+    # Driver notes over L12M: items only one side files into this category.
+    l12 = month.isin(cur_windows.get("L12M", set()))
+    drivers: list[str] = []
+    for mask, other, verb in (
+        (fin_mask & ~pdh_mask, "PDH files it elsewhere", "Finance adds"),
+        (pdh_mask & ~fin_mask, "Finance files it elsewhere", "this card adds"),
+    ):
+        sub = fin[l12 & mask]
+        if sub.empty:
+            continue
+        by_item = sub.groupby(sub["item_desc"].astype(str).str.strip().replace("", "(no PDH item)"))
+        top = by_item["net_sales"].sum().abs().sort_values(ascending=False).head(_BH_RECON_DRIVER_TOP_N)
+        for desc in top.index:
+            amt = sub.loc[sub["item_desc"].astype(str).str.strip().replace("", "(no PDH item)") == desc,
+                          "net_sales"].sum() / _LBS_PER_MILLION
+            drivers.append(f"{desc}: {verb} ${abs(amt):.1f}M (L12M); {other}.")
+    return BhReconciliation(True, net_pdh, net_fin, gp_pdh, gp_fin, tuple(drivers))
+
+
 def build_business_health_categories(
     orders_enriched: Optional[pd.DataFrame],
     shipments_enriched: Optional[pd.DataFrame],
@@ -3648,6 +3746,10 @@ def build_business_health_categories(
         concentration = _category_concentration(
             orders_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
 
+        # Lever C reconciliation — PDH rollup (this card) vs Finance's report.
+        reconciliation = _bh_reconciliation(
+            finance_enriched, rid, template_by_id, cur_windows)
+
         out.append(BusinessHealthCategory(
             row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,
             order_series=order_series, ship_series=ship_series,
@@ -3655,7 +3757,7 @@ def build_business_health_categories(
             decomp=decomp, decomp_sowhat=decomp_sowhat,
             margin_pct=margin_pct, margin_gl_months=margin_gl_months,
             vol_margin_reading=vol_margin_reading,
-            concentration=concentration))
+            concentration=concentration, reconciliation=reconciliation))
     return out
 
 

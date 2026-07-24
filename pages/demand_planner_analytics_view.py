@@ -905,37 +905,118 @@ def _render_bh_lever_c(cat) -> None:
     periods = list(BH_PERIOD_ORDER)
     if all(cat.margin_pct[p] is None for p in periods):
         st.caption("_Margin needs the Finance extract._")
-        return
-    gp = cat.finance_series.get("Gross Profit", {})
-    ns = cat.finance_series.get("Net Sales", {})
-    # Two-line header: period name + its actual GL-month range (Actual rows only).
-    head = (
-        "<tr><th style='text-align:left'></th>"
-        + "".join(f"<th style='text-align:right;padding-left:12px'>{p}</th>"
-                  for p in periods)
-        + "</tr><tr><td></td>"
-        + "".join(
-            "<td style='text-align:right;padding-left:12px;font-weight:normal;"
-            f"font-size:0.7rem;color:#6b7280'>{_esc_html(cat.margin_gl_months[p])}</td>"
-            for p in periods)
-        + "</tr>"
-    )
-    rows = (
-        ("Gross Profit", [_bh_money_m(gp.get(p, {}).get("vol")) for p in periods]),
-        ("Net Sales", [_bh_money_m(ns.get(p, {}).get("vol")) for p in periods]),
-        ("GP%", ["—" if cat.margin_pct[p] is None else f"{cat.margin_pct[p] * 100:.1f}%"
-                 for p in periods]),
-    )
-    body = "".join(
-        f"<tr><td style='text-align:left'><b>{name}</b></td>"
-        + "".join(f"<td style='text-align:right;padding-left:12px'>{v}</td>" for v in vals)
-        + "</tr>"
-        for name, vals in rows
-    )
-    st.markdown(
-        f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
-        unsafe_allow_html=True,
-    )
+    else:
+        gp = cat.finance_series.get("Gross Profit", {})
+        ns = cat.finance_series.get("Net Sales", {})
+        # Two-line header: period name + its actual GL-month range (Actual only).
+        head = (
+            "<tr><th style='text-align:left'></th>"
+            + "".join(f"<th style='text-align:right;padding-left:12px'>{p}</th>"
+                      for p in periods)
+            + "</tr><tr><td></td>"
+            + "".join(
+                "<td style='text-align:right;padding-left:12px;font-weight:normal;"
+                f"font-size:0.7rem;color:#6b7280'>{_esc_html(cat.margin_gl_months[p])}</td>"
+                for p in periods)
+            + "</tr>"
+        )
+        rows = (
+            ("Gross Profit", [_bh_money_m(gp.get(p, {}).get("vol")) for p in periods]),
+            ("Net Sales", [_bh_money_m(ns.get(p, {}).get("vol")) for p in periods]),
+            ("GP%", ["—" if cat.margin_pct[p] is None else f"{cat.margin_pct[p] * 100:.1f}%"
+                     for p in periods]),
+        )
+        body = "".join(
+            f"<tr><td style='text-align:left'><b>{name}</b></td>"
+            + "".join(f"<td style='text-align:right;padding-left:12px'>{v}</td>" for v in vals)
+            + "</tr>"
+            for name, vals in rows
+        )
+        st.markdown(
+            f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
+            unsafe_allow_html=True,
+        )
+    # Foldable RCA aid — kept collapsed so it never crowds the executive glance.
+    _render_bh_lever_c_recon(cat)
+
+
+# ── Fabric data-source deep-links (HTST lakehouse) ───────────────────────────
+# Workspace / lakehouse GUIDs of the B2C Actuals lakehouse (same one the app
+# reads Finance, PDH and IBP from).  Deep-links let a planner jump straight to
+# the source to RCA a reconciliation gap.
+_FABRIC_LAKEHOUSE_BASE: str = (
+    "https://app.fabric.microsoft.com/groups/"
+    "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
+    "a01f513d-eee7-41eb-8c15-670bc40e7fc8?experience=fabric-developer"
+)
+_FABRIC_FINANCE_URL: str = _FABRIC_LAKEHOUSE_BASE + "&selectedPath=Files%2FFinance"
+_FABRIC_PDH_URL: str = (
+    _FABRIC_LAKEHOUSE_BASE
+    + "&selectedPath=Files%2FRO%20Tracking%2FDemand%20Plan%2Fqry_pdh.csv"
+)
+_FABRIC_IBP_URL: str = _FABRIC_LAKEHOUSE_BASE + "&selectedPath=Tables"
+
+
+def _bh_money_delta(value: float) -> str:
+    """Signed $-millions delta, e.g. ``"+$2.9M"`` / ``"-$12.3M"``."""
+    return f"{'+' if value >= 0 else '-'}${abs(value):,.1f}M"
+
+
+def _render_bh_lever_c_recon(cat) -> None:
+    """Foldable reconciliation + data-source panel under Lever C.
+
+    Collapsed by default (executives glance the levers; analysts open this to
+    RCA).  Shows where the finance data comes from, that the rollup is PDH-
+    driven, and a PDH-rollup vs Finance-report cross-check with concise drivers.
+    """
+    recon = cat.reconciliation
+    with st.expander("🔎 Reconciliation & data sources", expanded=False):
+        st.markdown(
+            f"**Data sources** — Net Sales & Gross Profit are **SKU-level "
+            f"[Finance actuals]({_FABRIC_FINANCE_URL})**; every category rollup "
+            f"(volume **and** net sales) is driven by **[PDH classification]"
+            f"({_FABRIC_PDH_URL})**; volume (orders **and** shipments) is the "
+            f"**[IBP shipment tables]({_FABRIC_IBP_URL})**."
+        )
+        if not recon.available:
+            st.caption("_Finance extract not loaded — nothing to reconcile._")
+            return
+        periods = list(BH_PERIOD_ORDER)
+        recon_rows = (
+            ("Net Sales — PDH rollup (this card)", recon.net_pdh, False),
+            ("Net Sales — Finance report", recon.net_fin, False),
+            ("Δ Net Sales", None, True),
+            ("Gross Profit — PDH rollup (this card)", recon.gp_pdh, False),
+            ("Gross Profit — Finance report", recon.gp_fin, False),
+            ("Δ Gross Profit", None, True),
+        )
+        head = ("<tr><th style='text-align:left'></th>"
+                + "".join(f"<th style='text-align:right;padding-left:12px'>{p}</th>"
+                          for p in periods) + "</tr>")
+        body = ""
+        for label, series, is_delta in recon_rows:
+            if is_delta:
+                base_pdh = recon.net_pdh if "Net Sales" in label else recon.gp_pdh
+                base_fin = recon.net_fin if "Net Sales" in label else recon.gp_fin
+                cells = "".join(
+                    "<td style='text-align:right;padding-left:12px'>"
+                    f"{_bh_money_delta(base_pdh[p] - base_fin[p])}</td>" for p in periods)
+                body += (f"<tr style='color:#6b7280'><td style='text-align:left'>"
+                         f"<i>{label}</i></td>{cells}</tr>")
+            else:
+                cells = "".join(
+                    f"<td style='text-align:right;padding-left:12px'>{_bh_money_m(series[p])}</td>"
+                    for p in periods)
+                body += f"<tr><td style='text-align:left'>{label}</td>{cells}</tr>"
+        st.markdown(
+            f"<table style='font-size:0.8rem;border-collapse:collapse'>{head}{body}</table>",
+            unsafe_allow_html=True,
+        )
+        if recon.drivers:
+            st.markdown("**Difference drivers** _(classification, not dollars)_")
+            st.markdown("  \n".join(f"- {_esc_html(d)}" for d in recon.drivers))
+        else:
+            st.caption("Rollup ties to Finance's report for this category.")
 
 
 def _render_bh_lever_d(cat) -> None:

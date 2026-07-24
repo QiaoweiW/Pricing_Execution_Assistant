@@ -582,6 +582,20 @@ def _build_credential_cached(cache_name: str):
             "Run: pip install -r requirements.txt"
         ) from exc
 
+    # Promote a configured service principal ([fabric_htst]) to the AZURE_*
+    # env vars BEFORE constructing EnvironmentCredential — which reads them at
+    # __init__.  Without this, the SP is invisible on every path that hasn't
+    # first gone through a lakehouse-IO read (the sign-in status check and the
+    # Demand Planner Analytics Delta scans), so on a headless Cloud deployment
+    # — where the SP is the ONLY usable credential — auth fails even though the
+    # secret is set.  Best-effort: no [fabric_htst] SP → the paths below handle
+    # it; ``setdefault`` inside the promote never clobbers an operator's own
+    # AZURE_* / az-login environment.
+    try:
+        promote_sp_secrets_to_env(read_section("fabric_htst"))
+    except Exception:  # noqa: BLE001 — never block credential build on secrets
+        pass
+
     credentials = [EnvironmentCredential()]
 
     if not _is_headless_runtime():

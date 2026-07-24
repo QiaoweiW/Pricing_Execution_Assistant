@@ -653,6 +653,63 @@ def reset_auth_failure_cache(cache_name: Optional[str] = None) -> None:
             _AUTH_FAILURES.pop(cache_name, None)
 
 
+def _delete_msal_cache_files(cache_name: str) -> int:
+    """Best-effort delete the on-disk MSAL token cache for *cache_name*.
+
+    ``TokenCachePersistenceOptions(name=…)`` stores the cache under
+    ``%LOCALAPPDATA%\\.IdentityService\\<name>`` on Windows (plus a sibling
+    lock file).  Returns the number of files removed; never raises — a locked
+    or absent file just contributes 0.  A no-op on platforms without
+    ``LOCALAPPDATA`` (the interactive cache path is Windows-workstation only).
+    """
+    import glob
+    import os
+
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return 0
+    pattern = os.path.join(base, ".IdentityService", f"{cache_name}*")
+    removed = 0
+    for path in glob.glob(pattern):
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass  # locked / vanished — best-effort
+    return removed
+
+
+def reset_credential_cache(cache_name: str = DEFAULT_CACHE_NAME) -> str:
+    """Full credential reset for the "Reset Fabric credential cache" button.
+
+    Clears everything a stuck sign-in can get wedged on, so the next attempt
+    starts from a clean slate:
+
+    1. the process-wide ``@st.cache_resource`` credential chain (so it is
+       rebuilt and re-reads the on-disk MSAL cache on the next acquire) —
+       this is what a browser reload alone can NOT clear;
+    2. the auth-failure short-circuit + the device-code sign-in state;
+    3. the on-disk MSAL token cache file(s) (best-effort), which fixes the
+       "could not reuse the new token" case where that file is stale / locked.
+
+    Returns a short human-readable summary of what was cleared (for the UI).
+    Never raises — every step degrades gracefully.
+    """
+    cleared: list[str] = []
+    try:
+        _build_credential_cached.clear()   # st.cache_resource → .clear()
+        cleared.append("in-process credential")
+    except Exception:  # noqa: BLE001 — reset must never raise
+        pass
+    reset_auth_failure_cache()
+    reset_device_code_signin()
+    cleared.append("sign-in state")
+    removed = _delete_msal_cache_files(cache_name)
+    if removed:
+        cleared.append(f"{removed} on-disk token file(s)")
+    return "Cleared " + ", ".join(cleared) + "."
+
+
 def _peek_auth_failure(cache_name: str) -> Optional["FabricAuthError"]:
     """Return the cached failure if it's still within the TTL, else ``None``."""
     with _AUTH_FAILURE_LOCK:
@@ -929,6 +986,7 @@ __all__ = [
     "acquire_storage_token",
     "cached_auth_error",
     "reset_auth_failure_cache",
+    "reset_credential_cache",
     "get_device_code_prompt",
     "clear_device_code_prompt",
     "start_device_code_signin",

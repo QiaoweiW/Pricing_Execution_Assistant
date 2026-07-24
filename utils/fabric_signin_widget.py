@@ -180,18 +180,37 @@ def render_fabric_signin_section() -> None:
         "🔒 **Microsoft Fabric is not connected.**\n\n"
         f"{error_text}"
     )
-    if st.button(
-        "🔁 Try sign-in again",
-        key="_fab_signin_retry",
-        type="primary",
-        help="Clear the cached failure and start a fresh device-code sign-in flow.",
-    ):
-        _fabric_auth.reset_auth_failure_cache()
-        _fabric_auth.reset_device_code_signin()
-        # Re-arm the auto-start gate so the next render fires a fresh flow.
-        st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
-        st.session_state.pop(_SS_SIGNIN_RECOVERY_DONE, None)
-        st.rerun()
+    retry_col, reset_col = st.columns(2)
+    with retry_col:
+        if st.button(
+            "🔁 Try sign-in again",
+            key="_fab_signin_retry",
+            type="primary",
+            help="Clear the cached failure and start a fresh device-code sign-in flow.",
+        ):
+            _fabric_auth.reset_auth_failure_cache()
+            _fabric_auth.reset_device_code_signin()
+            # Re-arm the auto-start gate so the next render fires a fresh flow.
+            st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
+            st.session_state.pop(_SS_SIGNIN_RECOVERY_DONE, None)
+            st.rerun()
+    with reset_col:
+        # Deeper reset for the "signed in but the chain can't reuse the token"
+        # case: also drops the process-wide cached credential + the on-disk MSAL
+        # token cache (which a page reload alone cannot clear), then re-arms a
+        # fresh device-code flow.  Use this when "Try sign-in again" keeps failing.
+        if st.button(
+            "🧹 Reset Fabric credential cache",
+            key="_fab_signin_reset_cache",
+            help="Clear the cached credential + on-disk token cache, then start a "
+                 "fresh sign-in.  Use this if 'Try sign-in again' keeps failing "
+                 "with a token-cache error.",
+        ):
+            summary = _fabric_auth.reset_credential_cache()
+            st.session_state.pop(_SS_DEVCODE_AUTOSTARTED, None)
+            st.session_state.pop(_SS_SIGNIN_RECOVERY_DONE, None)
+            st.toast(f"🧹 {summary}")
+            st.rerun()
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────

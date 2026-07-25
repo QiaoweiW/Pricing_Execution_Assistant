@@ -355,4 +355,7 @@ def test_lever_c_reconciliation_pdh_vs_finance():
     assert r.net_pdh["L3M"] == pytest.approx(3.0)          # Packaged only
     assert r.net_fin["L3M"] == pytest.approx(4.0)          # Packaged + Bulk
     assert (r.net_pdh["L3M"] - r.net_fin["L3M"]) == pytest.approx(-1.0)
-    assert any("Bulk Btr" in d for d in r.drivers)
+    # Driver names the item AND exactly where PDH files it (Bulk Butter, which
+    # maps to none of the seven cards) so a planner can catch the difference.
+    driver = next(d for d in r.drivers if "Bulk Btr" in d)
+    assert "Bulk Butter" in driver and "excludes it" in driver

@@ -3647,22 +3647,55 @@ def _bh_reconciliation(
     net_pdh, net_fin = _sums(pdh_mask, "net_sales"), _sums(fin_mask, "net_sales")
     gp_pdh, gp_fin = _sums(pdh_mask, "gross_profit"), _sums(fin_mask, "gross_profit")
 
-    # Driver notes over L12M: items only one side files into this category.
+    # Per-row PDH category (which of the seven cards, if any) so a driver note
+    # can name EXACTLY where PDH files a disputed item — the point being that a
+    # planner can see the reclassification and catch it at a glance.
+    pdh_cat = pd.Series(pd.NA, index=fin.index, dtype=object)
+    for cid in BH_CATEGORY_ROWS:
+        pdh_cat = pdh_cat.mask(_category_mask(fin, cid, template_by_id), cid)
+
+    desc_key = fin["item_desc"].astype(str).str.strip().replace("", "(no PDH item)")
     l12 = month.isin(cur_windows.get("L12M", set()))
+
+    def _pdh_where(idx) -> str:
+        """Human label for where PDH files an item (a category card, or its raw
+        pmaj · pminor when it maps to none of the seven B2C cards)."""
+        cats = pdh_cat.loc[idx].dropna()
+        if len(cats):
+            return BH_CATEGORY_LABELS.get(cats.iloc[0], str(cats.iloc[0]))
+        r = fin.loc[idx[0]]
+        parts = [str(r.get("pmaj", "")).strip(),
+                 str(r.get("pminor", "") or r.get("sfmt", "")).strip()]
+        raw = " · ".join(p for p in parts if p) or "an unclassified item"
+        return f"{raw} (outside the seven B2C cards)"
+
+    def _fin_where(idx) -> str:
+        """Human label for where Finance files an item (its fin_category)."""
+        cats = fin.loc[idx, "fin_category"].dropna()
+        if not len(cats):
+            return "outside the seven B2C categories"
+        cid = cats.iloc[0]
+        return BH_CATEGORY_LABELS.get(cid, str(cid))
+
     drivers: list[str] = []
-    for mask, other, verb in (
-        (fin_mask & ~pdh_mask, "PDH files it elsewhere", "Finance adds"),
-        (pdh_mask & ~fin_mask, "Finance files it elsewhere", "this card adds"),
-    ):
-        sub = fin[l12 & mask]
-        if sub.empty:
+    # (mask of items only this side files here, template for the note, where-fn)
+    for mask, is_finance_only in ((fin_mask & ~pdh_mask, True), (pdh_mask & ~fin_mask, False)):
+        sub_all = fin[l12 & mask]
+        if sub_all.empty:
             continue
-        by_item = sub.groupby(sub["item_desc"].astype(str).str.strip().replace("", "(no PDH item)"))
-        top = by_item["net_sales"].sum().abs().sort_values(ascending=False).head(_BH_RECON_DRIVER_TOP_N)
-        for desc in top.index:
-            amt = sub.loc[sub["item_desc"].astype(str).str.strip().replace("", "(no PDH item)") == desc,
-                          "net_sales"].sum() / _LBS_PER_MILLION
-            drivers.append(f"{desc}: {verb} ${abs(amt):.1f}M (L12M); {other}.")
+        keys = desc_key[l12 & mask]
+        totals = sub_all["net_sales"].groupby(keys).sum()
+        for desc in totals.abs().sort_values(ascending=False).head(_BH_RECON_DRIVER_TOP_N).index:
+            idx = sub_all.index[keys == desc]
+            amt = abs(float(sub_all.loc[idx, "net_sales"].sum())) / _LBS_PER_MILLION
+            if is_finance_only:      # Finance counts it here; PDH put it elsewhere
+                drivers.append(
+                    f"{desc} (${amt:.1f}M, L12M): PDH classifies it as "
+                    f"**{_pdh_where(idx)}**, so this card excludes it — Finance counts it here.")
+            else:                    # this card counts it; Finance put it elsewhere
+                drivers.append(
+                    f"{desc} (${amt:.1f}M, L12M): Finance classifies it as "
+                    f"**{_fin_where(idx)}**, so Finance excludes it — this card counts it here.")
     return BhReconciliation(True, net_pdh, net_fin, gp_pdh, gp_fin, tuple(drivers))
 
 

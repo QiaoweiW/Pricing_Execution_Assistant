@@ -105,7 +105,7 @@ Design notes
 from __future__ import annotations
 
 import hashlib
-from datetime import date, datetime
+from datetime import datetime
 from typing import NamedTuple, Optional
 
 import pandas as pd
@@ -115,6 +115,12 @@ from data_sources.htst_shipment import (
     HTSTShipmentSourceError,
     SnapshotMeta,
     fetch_htst_shipment_df,
+)
+from data_sources.htst_shipment_lookups import (
+    FABRIC_SHIPMENT_REPORT_URL,
+    HTSTLookupBundle,
+    HTSTLookupError,
+    fetch_htst_lookups,
 )
 from utils.ui_helpers import apply_custom_css
 
@@ -481,17 +487,15 @@ def _drop_blank_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def _process_shipment_data(
     shipment_df: pd.DataFrame,
-    plant_tracker_file,
-    mileage_tracker_file,
-    demantra_file,
-    pricing_tracker_file,
+    lookups: dict[str, pd.DataFrame],
 ) -> Optional[pd.DataFrame]:
     """Enrich the HTST Shipment Report in a sequential pipeline.
 
     The shipment DataFrame is supplied directly by the caller — sourced from
-    either the Fabric dataflow connector (preferred) or the manual-upload
-    fallback (CSV → DataFrame conversion happens in _render_shipment_source).
-    The four lookup tables remain CSVs uploaded by the user.
+    either the Fabric Delta table (preferred) or the manual-upload fallback.
+    ``lookups`` holds the four enrichment tables as DataFrames, keyed
+    ``plant_tracker`` / ``mileage_tracker`` / ``demantra`` / ``pricing_tracker``
+    — read from the lakehouse (``htst_shipment_lookups``) or uploaded CSVs.
 
     Enrichment steps
     ----------------
@@ -507,7 +511,9 @@ def _process_shipment_data(
     2.  Left-join Mileage Tracker on ('Sourcing Plant', 'SHIPTONAME')
         → 'Mileage' inserted after 'Sourcing Plant'; missing rows → 'n/a'.
     3.  Left-join Demantra on PRODUCTDESC = 'Item Description'
-        → 'Total Each Per Pallet' and 'Unit Net Weight' after 'Ordered LBS'.
+        → 'Total Each Per Pallet' and 'Unit Net Weight' after 'Ordered LBS';
+        also derive 'Format' = "{Product Size} {Unit Pkg Type}" (e.g. "Gallon
+        Plastic Jug"), inserted after 'PRODUCTDESC' — the dashboard's Format filter.
     3b. Row-level pallet metrics (depends on step 3 columns):
         → 'Pallet%'       = Ordered LBS / (Total Each Per Pallet × Unit Net Weight),
                             inserted after 'Unit Net Weight'.
@@ -554,7 +560,7 @@ def _process_shipment_data(
 
     # ── Step 1: Sourcing Plant ────────────────────────────────────────────────
     try:
-        plant_df = pd.read_csv(plant_tracker_file)
+        plant_df = lookups["plant_tracker"].copy()
         plant_df.columns = plant_df.columns.str.strip()
         plant_lookup = (
             plant_df[["Shipping Warehouse", "Plant"]]
@@ -569,7 +575,7 @@ def _process_shipment_data(
 
     # ── Step 2: Mileage ───────────────────────────────────────────────────────
     try:
-        mile_df = pd.read_csv(mileage_tracker_file)
+        mile_df = lookups["mileage_tracker"].copy()
         mile_df.columns = mile_df.columns.str.strip()
         mile_lookup = (
             mile_df[["Sourcing Plant", "SHIPTONAME", "Mileage"]]
@@ -582,12 +588,17 @@ def _process_shipment_data(
         st.error(f"Could not apply Mileage Tracker lookup: {exc}")
         return None
 
-    # ── Step 3: Pallet & weight data from Demantra ───────────────────────────
+    # ── Step 3: Pallet & weight data + Format from Demantra ──────────────────
     try:
-        dem_df = pd.read_csv(demantra_file, low_memory=False)
+        dem_df = lookups["demantra"].copy()
         dem_df.columns = dem_df.columns.str.strip()
+        # Format = "Product Size + Unit Pkg Type" (e.g. "Gallon Plastic Jug"),
+        # the operational pack the dashboard filters by; blanks collapse cleanly.
+        size = dem_df.get("Product Size", "").astype(str).str.strip().replace("nan", "")
+        pkg = dem_df.get("Unit Pkg Type", "").astype(str).str.strip().replace("nan", "")
+        dem_df["Format"] = (size + " " + pkg).str.strip().replace("", "(unmapped)")
         dem_lookup = (
-            dem_df[["Item Description", "Total Each Per Pallet", "Unit Net Weight"]]
+            dem_df[["Item Description", "Total Each Per Pallet", "Unit Net Weight", "Format"]]
             .drop_duplicates(subset=["Item Description"])
         )
         df = df.merge(
@@ -597,6 +608,8 @@ def _process_shipment_data(
             how="left",
         )
         df = df.drop(columns=["Item Description"], errors="ignore")
+        df["Format"] = df["Format"].fillna("(unmapped)")
+        df = _insert_col_after(df, "PRODUCTDESC", "Format")
         df = _insert_col_after(df, "Ordered LBS", "Total Each Per Pallet")
         df = _insert_col_after(df, "Total Each Per Pallet", "Unit Net Weight")
     except Exception as exc:
@@ -616,7 +629,7 @@ def _process_shipment_data(
 
     # ── Step 4: Pricing Method from Delivered vs FOB Tracker ─────────────────
     try:
-        price_df = pd.read_csv(pricing_tracker_file)
+        price_df = lookups["pricing_tracker"].copy()
         price_df.columns = price_df.columns.str.strip()
         # Cast Party Site Number to str in both tables to prevent silent type
         # mismatches that would drop rows during the join.
@@ -727,12 +740,39 @@ def _bracket_drop_size(drop_size: pd.Series) -> pd.Series:
 
 
 
+def _delivery_fee_map(delivery_df: Optional[pd.DataFrame]) -> dict[tuple[str, str], float]:
+    """Build the (Mileage Tier, Drop Tier) → $/Gal delivery-charge map.
+
+    Reads the authoritative lakehouse table when available; falls back to the
+    hard-coded :data:`_DELIVERY_FEES` otherwise.  The charge column is parsed
+    currency-tolerantly (strips ``$``, spaces, commas)."""
+    if delivery_df is None or delivery_df.empty:
+        return dict(_DELIVERY_FEES)
+    cols = {c.strip(): c for c in delivery_df.columns}
+    mile_c = cols.get("Mileage Fee Tier (Mi)")
+    drop_c = cols.get("Drop Fee Tier (lbs/Drop Size)")
+    fee_c = cols.get("Delivery Charge ($/Gal)")
+    if not (mile_c and drop_c and fee_c):
+        return dict(_DELIVERY_FEES)
+    fees = pd.to_numeric(
+        delivery_df[fee_c].astype(str).str.replace(r"[$,\s]", "", regex=True),
+        errors="coerce",
+    )
+    out: dict[tuple[str, str], float] = {}
+    for m, d, f in zip(delivery_df[mile_c].astype(str).str.strip(),
+                       delivery_df[drop_c].astype(str).str.strip(), fees):
+        if pd.notna(f):
+            out[(m, d)] = float(f)
+    return out or dict(_DELIVERY_FEES)
+
+
 def _build_customer_site_summary(
     filtered_df: pd.DataFrame,
     duration_days: int,
     pallet_fee_df: Optional[pd.DataFrame] = None,
     sell_to_df: Optional[pd.DataFrame] = None,
     custom_label_df: Optional[pd.DataFrame] = None,
+    delivery_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Aggregate the filtered enriched DataFrame into the Customer-Site Details table.
 
@@ -775,6 +815,17 @@ def _build_customer_site_summary(
     if filtered_df.empty:
         return pd.DataFrame()
 
+    # The lakehouse shipment frame stores identity columns as `category` dtype;
+    # grouping on categoricals (observed=False) explodes to the Cartesian product
+    # of every level.  Cast the group keys to plain strings once (cheap — only
+    # these columns are copied) so every groupby here and in _site_fee_stack
+    # stays on the observed combinations.
+    _cast = {c: filtered_df[c].astype(str)
+             for c in ("Customer", "SHIPTONAME", "PRODUCTDESC", "PRODUCTGROUP", "Format")
+             if c in filtered_df.columns and str(filtered_df[c].dtype) == "category"}
+    if _cast:
+        filtered_df = filtered_df.assign(**_cast)
+
     site_keys    = ["Customer", "SHIPTONAME"]
     product_keys = ["Customer", "SHIPTONAME", "PRODUCTDESC", "PRODUCTGROUP"]
 
@@ -788,6 +839,7 @@ def _build_customer_site_summary(
                 "Ordered LBS":           ("Ordered LBS",           "sum"),
                 "Pricing Method":        ("Pricing Method",         "first"),
                 "Mileage":               ("Mileage",                "first"),
+                **({"Format": ("Format", "first")} if "Format" in filtered_df.columns else {}),
             }
         )
     )
@@ -861,8 +913,9 @@ def _build_customer_site_summary(
     agg["Mileage Fee Tier (Mi)"] = _bracket_mileage(agg["Mileage"])
     agg["Drop Fee Tier (lbs/Drop Size)"] = _bracket_drop_size(agg["Drop Size (lbs per drop)"])
 
+    fee_map = _delivery_fee_map(delivery_df)
     fee_keys = list(zip(agg["Mileage Fee Tier (Mi)"], agg["Drop Fee Tier (lbs/Drop Size)"]))
-    agg["Delivery Charge ($/Gal)"] = [_DELIVERY_FEES.get(k, 0.0) for k in fee_keys]
+    agg["Delivery Charge ($/Gal)"] = [fee_map.get(k, 0.0) for k in fee_keys]
 
     # FOB override: Pricing Method 0 means the seller, not the buyer, covers freight.
     is_fob = agg["Pricing Method"].astype(str).eq("0")
@@ -946,7 +999,7 @@ def _build_customer_site_summary(
     agg = agg.rename(columns={"PRODUCTGROUP": "Product Group"})
 
     ordered_cols = [
-        "Customer", "SHIPTONAME", "PRODUCTDESC", "Product Group",
+        "Customer", "SHIPTONAME", "PRODUCTDESC", "Format", "Product Group",
         "Ordered Secondary QTY", "Ordered LBS",
         "Count of Unique Orders", "Duration", "Annualized Gallons",
         "Site-level Sell-to Volume (Gallons)",
@@ -964,6 +1017,217 @@ def _build_customer_site_summary(
         .sort_values(["Customer", "SHIPTONAME", "PRODUCTDESC"])
         .reset_index(drop=True)
     )
+
+
+# ── 5b. Trailing-window momentum + requote analytics ──────────────────────────
+# The dashboard replaces a free date slicer with fixed trailing windows ending
+# at the latest Order month, so a planner sees how activity metrics MOVE and
+# where behaviour has drifted across a fee bracket (a requote trigger).
+
+# Operating days per year — the same annualisation constant the single-window
+# summary uses (Ordered Secondary QTY / window-days × _ANNUALIZE_DAYS).
+_ANNUALIZE_DAYS: int = 350
+# Trailing windows, widest → narrowest (label, months back from the latest month).
+_TRAILING_WINDOWS: tuple[tuple[str, int], ...] = (("L12M", 12), ("L6M", 6), ("L3M", 3))
+
+
+def _trailing_windows(order_dt: pd.Series) -> dict[str, tuple[pd.Timestamp, pd.Timestamp, int]]:
+    """``{label: (start, end, days)}`` for L12M/L6M/L3M ending at the latest
+    order date.  Empty when no parseable dates.  ``days`` is the inclusive span,
+    used as the annualisation denominator so windows are comparable."""
+    valid = pd.to_datetime(order_dt, errors="coerce").dropna()
+    if valid.empty:
+        return {}
+    latest = valid.max().normalize()
+    out: dict[str, tuple[pd.Timestamp, pd.Timestamp, int]] = {}
+    for label, n in _TRAILING_WINDOWS:
+        start = (latest - pd.DateOffset(months=n) + pd.Timedelta(days=1)).normalize()
+        out[label] = (start, latest, max((latest - start).days + 1, 1))
+    return out
+
+
+def _window_slice(df: pd.DataFrame, window: tuple[pd.Timestamp, pd.Timestamp, int]) -> pd.DataFrame:
+    """Rows of *df* whose Order Date falls in *window* (start, end, _)."""
+    if "Order Date" not in df.columns:
+        return df.iloc[0:0]
+    dt = pd.to_datetime(df["Order Date"], errors="coerce")
+    start, end, _ = window
+    return df[((dt >= start) & (dt <= end)).fillna(False)]
+
+
+# Momentum metric rows: (display label, unit, key).  Order = top → bottom.
+_MOMENTUM_METRICS: tuple[tuple[str, str, str], ...] = (
+    ("Mixed-pallet share", "%", "mixed_pct"),
+    ("Full-pallet share", "%", "full_pct"),
+    ("Annualized sell-to volume", "gal", "sellto_vol"),
+    ("Annualized custom-label volume", "gal", "customlabel_vol"),
+    ("Drop size", "lbs/drop", "drop_size"),
+    ("Travel distance", "mi", "mileage"),
+)
+
+
+def _window_metrics(df: pd.DataFrame, days: int) -> dict[str, Optional[float]]:
+    """The six momentum metrics for one window slice (None when undefined).
+
+    Volumes annualise the window rate (× _ANNUALIZE_DAYS ÷ window-days); pallet
+    share and travel distance are pound-weighted so a few big drops dominate."""
+    keys = ("mixed_pct", "full_pct", "sellto_vol", "customlabel_vol", "drop_size", "mileage")
+    if df.empty:
+        return {k: None for k in keys}
+    qty = pd.to_numeric(df["Ordered Secondary QTY"], errors="coerce").fillna(0.0)
+    lbs = pd.to_numeric(df["Ordered LBS"], errors="coerce").fillna(0.0)
+    total_lbs = float(lbs.sum())
+    non_dg = ~df["PRODUCTDESC"].astype(str).str.startswith("DG")
+    n_orders = int(df["Order Number"].nunique()) if "Order Number" in df.columns else 0
+    mnum = pd.to_numeric(df["Mileage"], errors="coerce") if "Mileage" in df.columns else pd.Series(dtype=float)
+    mweight = lbs.where(mnum.notna(), 0.0)
+    if "Pallet Status" in df.columns and total_lbs > 0:
+        mixed_pct = float(lbs.where(df["Pallet Status"].eq("Mixed"), 0.0).sum()) / total_lbs
+    else:
+        mixed_pct = None
+    return {
+        "mixed_pct": mixed_pct,
+        "full_pct": (1.0 - mixed_pct) if mixed_pct is not None else None,
+        "sellto_vol": float(qty.sum()) / days * _ANNUALIZE_DAYS,
+        "customlabel_vol": float(qty[non_dg].sum()) / days * _ANNUALIZE_DAYS,
+        "drop_size": (total_lbs / n_orders) if n_orders else None,
+        "mileage": (float((mnum.fillna(0.0) * mweight).sum()) / float(mweight.sum()))
+                   if float(mweight.sum()) > 0 else None,
+    }
+
+
+def _build_momentum(filtered_df: pd.DataFrame, windows: dict) -> pd.DataFrame:
+    """Momentum table: one row per metric, columns L12M / L6M / L3M (raw values).
+
+    Reactive to the caller's Customer / Format / Product filters; the windows
+    are computed once from the full dataset so the anchor is filter-independent.
+    """
+    if not windows or filtered_df.empty:
+        return pd.DataFrame()
+    per_window = {
+        label: _window_metrics(_window_slice(filtered_df, w), w[2])
+        for label, w in windows.items()
+    }
+    labels = [lbl for lbl, _ in _TRAILING_WINDOWS if lbl in windows]
+    rows = []
+    for name, unit, key in _MOMENTUM_METRICS:
+        row = {"Metric": name, "Unit": unit}
+        for lbl in labels:
+            row[lbl] = per_window[lbl][key]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _site_fee_stack(summary: pd.DataFrame) -> pd.DataFrame:
+    """Reduce the product-grain summary to one row per Customer × Ship-To with
+    the activity fee stack ($/gal) and the tiers/brackets that set it.
+
+    Sell-to / Custom-label / Delivery fees are site-level (constant across the
+    site's products); Mixed-pallet fee is pound-weighted across products.
+    """
+    if summary.empty:
+        return pd.DataFrame()
+    site = ["Customer", "SHIPTONAME"]
+    first_cols = {
+        "Sell-to Fee": "Sell-to Volume Fee ($/Gal)",
+        "Custom-label Fee": "Custom Label Fee ($/Gal)",
+        "Delivery Fee": "Delivery Charge ($/Gal)",
+        "Sell-to Volume (Gal)": "Site-level Sell-to Volume (Gallons)",
+        "Mileage Tier": "Mileage Fee Tier (Mi)",
+        "Drop Tier": "Drop Fee Tier (lbs/Drop Size)",
+        "Sell-to Bracket": "Sell-to Volume Bracket",
+        "Custom-label Bracket": "Custom Label Bracket (Gal/Yr)",
+    }
+    spec = {out: (src, "first") for out, src in first_cols.items() if src in summary.columns}
+    out = summary.groupby(site, as_index=False).agg(**spec)
+
+    if "Mixed Pallet Fee" in summary.columns and "Annualized Gallons" in summary.columns:
+        tmp = summary[[*site, "Mixed Pallet Fee", "Annualized Gallons"]].copy()
+        tmp["_w"] = pd.to_numeric(tmp["Mixed Pallet Fee"], errors="coerce").fillna(0.0) \
+            * pd.to_numeric(tmp["Annualized Gallons"], errors="coerce").fillna(0.0)
+        w = tmp.groupby(site, as_index=False).agg(
+            _w=("_w", "sum"), _g=("Annualized Gallons", "sum"))
+        w["Mixed-pallet Fee"] = (w["_w"] / w["_g"]).where(w["_g"] > 0, 0.0)
+        out = out.merge(w[[*site, "Mixed-pallet Fee"]], on=site, how="left")
+    else:
+        out["Mixed-pallet Fee"] = 0.0
+
+    for c in ("Sell-to Fee", "Custom-label Fee", "Delivery Fee", "Mixed-pallet Fee"):
+        out[c] = pd.to_numeric(out.get(c), errors="coerce").fillna(0.0)
+    out["Total Activity Fee"] = out[
+        ["Sell-to Fee", "Custom-label Fee", "Delivery Fee", "Mixed-pallet Fee"]].sum(axis=1)
+    return out
+
+
+def _requote_drivers(r: pd.Series) -> str:
+    """Concise, human list of which fee components worsened L12M → L3M."""
+    parts: list[str] = []
+    if r.get("Δ Mixed-pallet Fee", 0) > 1e-9:
+        parts.append(f"pallet → more Mixed (+${r['Δ Mixed-pallet Fee']:.3f}/gal)")
+    if r.get("Δ Delivery Fee", 0) > 1e-9:
+        parts.append(
+            f"delivery tier worse (drop {r.get('Drop Tier (L12M)')}→{r.get('Drop Tier (L3M)')})")
+    if r.get("Δ Sell-to Fee", 0) > 1e-9:
+        parts.append(
+            f"sell-to volume fell ({r.get('Sell-to Bracket (L12M)')}→{r.get('Sell-to Bracket (L3M)')})")
+    if r.get("Δ Custom-label Fee", 0) > 1e-9:
+        parts.append(
+            f"custom-label volume rose ({r.get('Custom-label Bracket (L12M)')}→{r.get('Custom-label Bracket (L3M)')})")
+    return "; ".join(parts) or "—"
+
+
+def _build_requote(
+    filtered_df: pd.DataFrame,
+    windows: dict,
+    pallet_fee_df: Optional[pd.DataFrame],
+    sell_to_df: Optional[pd.DataFrame],
+    custom_label_df: Optional[pd.DataFrame],
+    delivery_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Requote candidates: sites whose activity fee stack ROSE from L12M to L3M.
+
+    Builds the site fee stack for each window (reusing _build_customer_site_summary
+    → _site_fee_stack), diffs L3M vs L12M, and ranks by ``$ Impact`` =
+    Δ total fee × L3M annualized volume.  Only worsened sites are returned, so
+    the top of the table is where a requote recovers the most margin.
+    """
+    if not windows or filtered_df.empty or {"L12M", "L3M"} - set(windows):
+        return pd.DataFrame()
+    kw = dict(pallet_fee_df=pallet_fee_df, sell_to_df=sell_to_df,
+              custom_label_df=custom_label_df, delivery_df=delivery_df)
+    s12 = _site_fee_stack(_build_customer_site_summary(
+        _window_slice(filtered_df, windows["L12M"]), windows["L12M"][2], **kw))
+    s3 = _site_fee_stack(_build_customer_site_summary(
+        _window_slice(filtered_df, windows["L3M"]), windows["L3M"][2], **kw))
+    if s3.empty or s12.empty:
+        return pd.DataFrame()
+
+    site = ["Customer", "SHIPTONAME"]
+    m = s3.merge(s12, on=site, how="inner", suffixes=(" (L3M)", " (L12M)"))
+    fee_cols = ["Sell-to Fee", "Custom-label Fee", "Delivery Fee",
+                "Mixed-pallet Fee", "Total Activity Fee"]
+    for c in fee_cols:
+        m[f"Δ {c}"] = m[f"{c} (L3M)"] - m[f"{c} (L12M)"]
+    m["Annualized Volume (Gal, L3M)"] = pd.to_numeric(
+        m["Sell-to Volume (Gal) (L3M)"], errors="coerce").fillna(0.0)
+    m["$ Impact (Δfee × L3M vol)"] = (
+        m["Δ Total Activity Fee"] * m["Annualized Volume (Gal, L3M)"]).round(0)
+    m["Requote Drivers (L12M→L3M)"] = m.apply(_requote_drivers, axis=1)
+
+    m = m[m["Δ Total Activity Fee"] > 1e-9].copy()
+    if m.empty:
+        return pd.DataFrame()
+    cols = [
+        "Customer", "SHIPTONAME",
+        "Total Activity Fee (L12M)", "Total Activity Fee (L3M)", "Δ Total Activity Fee",
+        "Annualized Volume (Gal, L3M)", "$ Impact (Δfee × L3M vol)",
+        "Requote Drivers (L12M→L3M)",
+        "Δ Sell-to Fee", "Δ Custom-label Fee", "Δ Delivery Fee", "Δ Mixed-pallet Fee",
+    ]
+    cols = [c for c in cols if c in m.columns]
+    return (m[cols]
+            .sort_values("$ Impact (Δfee × L3M vol)", ascending=False)
+            .reset_index(drop=True))
 
 
 # ── 6. UI rendering ───────────────────────────────────────────────────────────
@@ -1137,270 +1401,329 @@ def _render_upload_section(*, include_shipment: bool) -> dict[str, object]:
     return _detect_files(uploaded_files or [], patterns=patterns)
 
 
-def _render_filters(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Render date range slicer, Customer multiselect, and SHIPTONAME multiselect.
+def _multiselect_filter(
+    df: pd.DataFrame, col: str, label: str, key_salt: str, help_text: str,
+) -> pd.DataFrame:
+    """Apply one search-friendly multiselect over *col* (empty pick → no rows).
 
-    Returns (filtered_df, duration_days) where:
-    - filtered_df   — subset of *df* matching all current widget selections.
-    - duration_days — calendar-day span of the selected Order Date range (≥ 1),
-                      used as the annualisation denominator in Customer-Site Details
-                      so that all volume metrics reflect the chosen period.
+    The widget key embeds *key_salt* (a hash of upstream selections) so Streamlit
+    auto-resets it to the full default whenever an upstream filter changes."""
+    if col not in df.columns:
+        return df
+    opts = sorted(df[col].dropna().astype(str).unique().tolist())
+    sel = st.multiselect(
+        label, options=opts, default=opts,
+        key=f"htst_filter_{col}_{_widget_key(key_salt)}", help=help_text,
+    )
+    return df[df[col].astype(str).isin(sel)] if sel else df.iloc[0:0]
 
-    Filter application order (each stage feeds the next):
-      1. Order Date range  → date_df       (bounds Customer/Ship-To options)
-      2. Customer          → customer_df
-      3. Ship-To Name      → filtered_df   (returned)
 
-    Widget auto-reset strategy
-    --------------------------
-    All three widget keys embed hashes of upstream selections so that Streamlit
-    treats them as brand-new whenever an upstream filter changes, resetting them
-    to their full defaults without manual session_state manipulation:
-    - Customer key   embeds the date range hash.
-    - Ship-To key    embeds both date range and customer selection hashes.
+def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
+    """Render the Customer · Format · Product Description filters (no date slicer).
+
+    Time is handled by the fixed L12M/L6M/L3M trailing windows downstream, so
+    this function only narrows *which* shipments the dashboard covers.  Each
+    filter cascades into the next (options narrow to the prior selection) and
+    auto-resets when an upstream pick changes.
     """
     st.markdown("### 🔍 Filter")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        d1 = _multiselect_filter(
+            df, "Customer", "Customer", "",
+            "Select one or more customers. Format & Product options narrow automatically.")
+    with c2:
+        d2 = _multiselect_filter(
+            d1, "Format", "Format", str(sorted(d1["Customer"].dropna().astype(str).unique())),
+            "Pack format from Demantra (Product Size + Unit Pkg Type).")
+    with c3:
+        salt = str(sorted(d2.get("Format", pd.Series(dtype=str)).dropna().astype(str).unique()))
+        d3 = _multiselect_filter(
+            d2, "PRODUCTDESC", "Product Description", salt,
+            "Narrows to the selected Customer × Format.")
+    st.caption(f"**{len(d3):,}** shipment rows match the current filter.")
+    return d3
 
-    # ── 1. Order Date range ───────────────────────────────────────────────────
-    # 'Order Date' is pre-parsed to datetime64 by _process_shipment_data, so
-    # this is just an idempotent dtype check (microseconds).  Strings still
-    # work because pd.to_datetime is a no-op on already-datetime Series.
-    date_col = "Order Date"
-    if date_col in df.columns:
-        date_series: Optional[pd.Series] = pd.to_datetime(df[date_col], errors="coerce")
-        valid_dates = date_series.dropna()
-        min_dt: Optional[date] = valid_dates.min().date() if not valid_dates.empty else None
-        max_dt: Optional[date] = valid_dates.max().date() if not valid_dates.empty else None
-    else:
-        date_series = None
-        min_dt = max_dt = None
 
-    if min_dt is not None and min_dt != max_dt:
-        date_range = st.date_input(
-            "Order Date Range",
-            value=(min_dt, max_dt),
-            min_value=min_dt,
-            max_value=max_dt,
-            key="htst_filter_date_range",
-            help=(
-                "Select the order date window.  All downstream metrics — "
-                "Annualized Gallons, volume brackets, and fees — "
-                "recalculate automatically based on this period."
-            ),
+def _render_sop_panel(bundle: Optional[HTSTLookupBundle], from_lakehouse: bool) -> None:
+    """Pinned Standard-Operating-Procedure panel: what the source files are, where
+    they live in Fabric, and the download → refresh → re-upload loop."""
+    with st.expander("📋 Source Data & Refresh SOP", expanded=False):
+        st.markdown(
+            "This dashboard reads **everything from the Pricing Lakehouse** — no "
+            "uploads once Microsoft Fabric is connected.\n\n"
+            "**Enrichment lookups** (Plant Tracker · Ship-Route Mileage · Demantra "
+            "Item Master · Delivered-vs-FOB Pricing) live in "
+            f"[`Files/Activity_Model/Shipment Report`]({FABRIC_SHIPMENT_REPORT_URL}). "
+            "To refresh them each cycle:\n"
+            "1. **Download** the current file from its source system.\n"
+            "2. **Refresh** the data (add the latest month).\n"
+            "3. **Re-upload** to the **same folder**, keeping the naming convention "
+            "(e.g. `Demantra_MMDDYYYY.csv`) — the app auto-selects the newest by date "
+            "stamp, so no code change is needed.\n\n"
+            "**Fee / bracket tables** (Sell-to, Custom-label, Pallet, Delivery) live in "
+            "`Files/Activity_Model/` and are read the same way."
         )
-        # Guard: during user interaction st.date_input may return a 1-element
-        # tuple (start only, end not yet clicked).  Fall back to the full range.
-        if isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-            sel_start, sel_end = date_range[0], date_range[1]
+        if from_lakehouse and bundle is not None and bundle.files:
+            st.markdown("**Files currently in use:**")
+            st.dataframe(
+                pd.DataFrame([
+                    {"Lookup": m.label, "File": m.name,
+                     "Folder": f"Files/{m.folder}",
+                     "Last modified": (m.last_modified or "")[:19]}
+                    for m in bundle.files
+                ]),
+                use_container_width=True, hide_index=True,
+            )
         else:
-            sel_start, sel_end = min_dt, max_dt
+            st.warning(
+                "Lakehouse lookups are unavailable in this session — use the manual "
+                "upload panel below (typical on a headless Streamlit Cloud server)."
+            )
 
-        # Normalise to midnight before comparison so rows whose Order Date
-        # parsed with a time component are not unintentionally excluded.
-        norm  = date_series.dt.normalize()
-        mask  = (norm >= pd.Timestamp(sel_start)) & (norm <= pd.Timestamp(sel_end))
-        date_df      = df[mask.fillna(False)]
-        duration_days = max((sel_end - sel_start).days, 1)
-    else:
-        # No parseable dates — skip the date filter entirely.
-        if min_dt is None:
-            st.caption("ℹ️ 'Order Date' column could not be parsed — date filter unavailable.")
-        sel_start = sel_end = None
-        date_df       = df
-        duration_days = 1
 
-    # Fragment embedded in Customer and Ship-To keys; changes when the date
-    # range changes, causing both downstream widgets to auto-reset.
-    date_key = f"{sel_start}:{sel_end}" if sel_start is not None else "nodate"
-
-    # ── 2. Customer & Ship-To filters ─────────────────────────────────────────
-    f1, f2 = st.columns(2)
-
-    with f1:
-        all_customers = sorted(date_df["Customer"].dropna().astype(str).unique().tolist())
-        sel_customers = st.multiselect(
-            "Customer",
-            options=all_customers,
-            default=all_customers,
-            # Key changes with the date range so the widget resets when the
-            # date window changes (customers in range may differ).
-            key=f"htst_filter_customer_{_widget_key(date_key)}",
-            help="Select one or more customers.  Ship-To options narrow automatically.",
+def _render_formula_panel() -> None:
+    """Explicit formula/fee reference, pinned above the dashboard for auditability."""
+    with st.expander("🧮 How the metrics & fees are computed", expanded=False):
+        st.markdown(
+            f"- **Pallet%** = Ordered LBS ÷ (Total Each per Pallet × Unit Net Weight); "
+            f"a row is **Full** at ≥ {_PALLET_FULL_ROW_MIN:.0%} of a pallet, else **Mixed** "
+            f"→ Mixed pallets should incur the **Mixed Pallet Fee ($/gal)**.\n"
+            f"- **Annualized volume** = Ordered Secondary QTY ÷ window-days × "
+            f"{_ANNUALIZE_DAYS} (sell-to = all products; **custom-label** = non-DG only).\n"
+            f"- **Drop size** = Σ Ordered LBS ÷ count of unique orders → **Drop tier**.\n"
+            f"- **Travel distance** = route mileage (Sourcing Plant → Ship-To) → "
+            f"**Mileage tier**.\n"
+            f"- **Delivery charge ($/gal)** = table[(Mileage tier, Drop tier)]; forced to "
+            f"**$0 when FOB** (Pricing Method 0).\n"
+            f"- **Sell-to / Custom-label fee ($/gal)** = bracket of the annualized volume.\n"
+            f"- **Total activity fee ($/gal)** = Sell-to + Custom-label + Delivery + "
+            f"Mixed-pallet — what a customer *should* be charged for how they order."
         )
 
-    df_by_customer = (
-        date_df[date_df["Customer"].astype(str).isin(sel_customers)]
-        if sel_customers else date_df.iloc[0:0]
+
+def _fmt_metric(v: Optional[float], unit: str) -> str:
+    """Format one momentum/KPI value by unit (— when None)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    if unit == "%":
+        return f"{v * 100:.1f}%"
+    if unit == "gal":
+        return f"{v / 1e6:.2f}M gal" if abs(v) >= 1e6 else f"{v:,.0f} gal"
+    if unit == "lbs":
+        return f"{v:,.0f} lbs"
+    if unit == "mi":
+        return f"{v:,.0f} mi"
+    return f"{v:,.2f}"
+
+
+def _trend_str(first: Optional[float], last: Optional[float], unit: str) -> str:
+    """Arrow + change from L12M (first) to L3M (last); pp for %, else % change."""
+    if first is None or last is None or pd.isna(first) or pd.isna(last):
+        return "—"
+    delta = last - first
+    arrow = "▲" if delta > 1e-9 else "▼" if delta < -1e-9 else "▬"
+    if unit == "%":
+        return f"{arrow} {delta * 100:+.1f}pp"
+    if abs(first) < 1e-9:
+        return f"{arrow} n/a"
+    return f"{arrow} {delta / abs(first) * 100:+.0f}%"
+
+
+def _render_kpis(filtered_df: pd.DataFrame, windows: dict) -> None:
+    """Latest-quarter (L3M) KPI tiles for the current filter."""
+    if not windows or "L3M" not in windows:
+        return
+    l3 = _window_slice(filtered_df, windows["L3M"])
+    m = _window_metrics(l3, windows["L3M"][2])
+    start, end, _ = windows["L3M"]
+    st.markdown(f"### 📌 Latest quarter at a glance — L3M ({start:%b %Y}–{end:%b %Y})")
+    sites = int(l3[["Customer", "SHIPTONAME"]].drop_duplicates().shape[0]) if not l3.empty else 0
+    cols = st.columns(5)
+    cols[0].metric("Ship-To sites", f"{sites:,}")
+    cols[1].metric("Mixed-pallet share", _fmt_metric(m["mixed_pct"], "%"))
+    cols[2].metric("Annualized sell-to vol", _fmt_metric(m["sellto_vol"], "gal"))
+    cols[3].metric("Avg drop size", _fmt_metric(m["drop_size"], "lbs"))
+    cols[4].metric("Avg travel distance", _fmt_metric(m["mileage"], "mi"))
+
+
+def _render_momentum(momentum_df: pd.DataFrame, windows: dict) -> None:
+    """Trailing-window momentum table (metric × L12M/L6M/L3M) + trend + CSV."""
+    st.markdown("### 📈 Metric momentum — L12M → L6M → L3M")
+    st.caption(
+        "How the activity metrics move as the window narrows to the most recent "
+        "quarter.  Rising Mixed-pallet share, falling drop size, or rising travel "
+        "distance all push the fee a customer should be charged **up**."
+    )
+    if momentum_df.empty:
+        st.info("Not enough order history for the trailing-window view.")
+        return
+    labels = [lbl for lbl, _ in _TRAILING_WINDOWS if lbl in windows]
+    rows = []
+    for _, r in momentum_df.iterrows():
+        unit = r["Unit"]
+        cell = {"Metric": r["Metric"]}
+        for lbl in labels:
+            cell[lbl] = _fmt_metric(r.get(lbl), unit)
+        cell["Trend (L3M vs L12M)"] = _trend_str(r.get("L12M"), r.get("L3M"), unit)
+        rows.append(cell)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    today = datetime.now().strftime("%Y%m%d")
+    st.download_button(
+        "⬇️ Download Momentum (CSV)", data=_to_csv_bytes(momentum_df),
+        file_name=f"HTST_Momentum_{today}.csv", mime="text/csv", key="htst_dl_momentum",
     )
 
-    with f2:
-        shiptoname_opts = sorted(
-            df_by_customer["SHIPTONAME"].dropna().astype(str).unique().tolist()
-        )
-        sel_shiptonames = st.multiselect(
-            "Ship-To Name",
-            options=shiptoname_opts,
-            default=shiptoname_opts,
-            # Key embeds both date and customer so this widget resets whenever
-            # either upstream selection changes.
-            key=f"htst_filter_shiptoname_{_widget_key(date_key + str(sorted(sel_customers)))}",
-            help="Options narrow automatically based on the Customer selection above.",
-        )
 
-    filtered = (
-        df_by_customer[df_by_customer["SHIPTONAME"].astype(str).isin(sel_shiptonames)]
-        if sel_shiptonames else df_by_customer.iloc[0:0]
+def _render_requote(requote_df: pd.DataFrame) -> None:
+    """Requote-candidate table — sites whose activity fee rose L12M → L3M."""
+    st.markdown("### 🎯 Requote candidates — activity fee rose L12M → L3M")
+    st.caption(
+        "Sites whose activity-based **$/gal** increased as behaviour drifted across "
+        "a fee bracket (pallet → Mixed, smaller drops, lower volume, longer haul).  "
+        "Ranked by **$ Impact = Δ fee × L3M annualized volume** — the top rows "
+        "recover the most margin if repriced."
     )
-    st.caption(f"**{len(filtered):,}** rows match the current filter criteria.")
-    return filtered, duration_days
+    if requote_df.empty:
+        st.success("✅ No sites crossed into a higher activity-fee bracket this quarter.")
+        return
+    show = requote_df.copy()
+    money_cols = [c for c in show.columns if c.startswith("Δ ") or "Total Activity Fee" in c]
+    for c in money_cols:
+        show[c] = pd.to_numeric(show[c], errors="coerce").map(lambda v: f"${v:,.3f}" if pd.notna(v) else "—")
+    if "Annualized Volume (Gal, L3M)" in show:
+        show["Annualized Volume (Gal, L3M)"] = pd.to_numeric(
+            show["Annualized Volume (Gal, L3M)"], errors="coerce").map(lambda v: f"{v:,.0f}")
+    if "$ Impact (Δfee × L3M vol)" in show:
+        show["$ Impact (Δfee × L3M vol)"] = pd.to_numeric(
+            show["$ Impact (Δfee × L3M vol)"], errors="coerce").map(lambda v: f"${v:,.0f}")
+    st.dataframe(show, use_container_width=True, hide_index=True)
+    today = datetime.now().strftime("%Y%m%d")
+    st.download_button(
+        "⬇️ Download Requote Candidates (CSV)", data=_to_csv_bytes(requote_df),
+        file_name=f"HTST_Requote_Candidates_{today}.csv", mime="text/csv",
+        key="htst_dl_requote",
+    )
 
 
 def _render_customer_site_details(
     filtered_df: pd.DataFrame,
-    duration_days: int,
+    windows: dict,
     pallet_fee_df: Optional[pd.DataFrame],
     sell_to_df: Optional[pd.DataFrame],
     custom_label_df: Optional[pd.DataFrame],
+    delivery_df: Optional[pd.DataFrame],
 ) -> None:
-    """Render the Customer-Site Details aggregated summary table.
-
-    All optional lookup DataFrames (*pallet_fee_df*, *sell_to_df*,
-    *custom_label_df*) are pre-loaded by render() from the respective
-    uploaded files (None when not uploaded).  Passing them as DataFrames
-    keeps this function — and _build_customer_site_summary — free of file I/O.
-    """
-    st.markdown("### 📊 Customer-Site Details")
-
-    summary = _build_customer_site_summary(
-        filtered_df, duration_days, pallet_fee_df, sell_to_df, custom_label_df
-    )
-
-    if summary.empty:
-        st.info("No data matches the current filters.")
-        return
-
-    st.caption(
-        f"Aggregated by Customer × Ship-To × Product. "
-        f"Duration: **{duration_days:,} days** (selected date range). "
-        f"Annualized Gallons reflect the activity rate for this period."
-    )
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    today = datetime.now().strftime("%Y%m%d")
-    st.download_button(
-        label="⬇️ Download Customer-Site Summary (CSV)",
-        data=_to_csv_bytes(summary),
-        file_name=f"HTST_CustomerSite_Summary_{today}.csv",
-        mime="text/csv",
-        key="htst_download_summary",
-    )
+    """Full L3M activity detail (Customer × Ship-To × Product) — foldable + CSV."""
+    with st.expander("📊 Customer-Site Details (L3M) — full activity & fee table", expanded=False):
+        if not windows or "L3M" not in windows:
+            st.info("No trailing windows available.")
+            return
+        l3 = _window_slice(filtered_df, windows["L3M"])
+        summary = _build_customer_site_summary(
+            l3, windows["L3M"][2], pallet_fee_df, sell_to_df, custom_label_df, delivery_df)
+        if summary.empty:
+            st.info("No data matches the current filters.")
+            return
+        st.caption(
+            "Grain: Customer × Ship-To × Product (L3M window).  Annualized Gallons "
+            f"= QTY ÷ {windows['L3M'][2]} days × {_ANNUALIZE_DAYS}."
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        today = datetime.now().strftime("%Y%m%d")
+        st.download_button(
+            "⬇️ Download Customer-Site Summary (CSV)", data=_to_csv_bytes(summary),
+            file_name=f"HTST_CustomerSite_Summary_{today}.csv", mime="text/csv",
+            key="htst_download_summary",
+        )
 
 
 def _render_output_section(filtered_df: pd.DataFrame) -> None:
-    """Render the Enriched Shipment Report section.
-
-    Shows summary metrics, a download button (HTTP stream), and a row-capped
-    browser preview.  Only _PREVIEW_ROWS rows go through st.dataframe() to
-    stay within Streamlit's WebSocket message-size limit.
-    """
-    st.markdown("### 📋 Enriched Shipment Report")
-
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("Filtered Rows", f"{len(filtered_df):,}")
-    with m2:
-        st.metric("Total Columns", f"{len(filtered_df.columns)}")
-    with m3:
+    """Enriched Shipment Report — demoted to a foldable panel + CSV (HTTP stream)."""
+    with st.expander("📋 Enriched Shipment Report (row-level) — download / preview", expanded=False):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Filtered Rows", f"{len(filtered_df):,}")
+        m2.metric("Total Columns", f"{len(filtered_df.columns)}")
         n_no_mileage = int((filtered_df["Mileage"] == "n/a").sum()) if "Mileage" in filtered_df.columns else 0
-        st.metric("Rows with n/a Mileage", f"{n_no_mileage:,}")
-    with m4:
+        m3.metric("Rows with n/a Mileage", f"{n_no_mileage:,}")
         n_no_plant = int(filtered_df["Sourcing Plant"].isna().sum()) if "Sourcing Plant" in filtered_df.columns else 0
-        st.metric("Rows with Unmatched Plant", f"{n_no_plant:,}")
-
-    st.markdown("")
-
-    today = datetime.now().strftime("%Y%m%d")
-    st.download_button(
-        label="⬇️ Download Full Enriched Report (CSV)",
-        data=_to_csv_bytes(filtered_df),
-        file_name=f"HTST_Shipment_Enriched_{today}.csv",
-        mime="text/csv",
-        key="htst_download_output",
-    )
-    st.caption(
-        f"Preview: first {min(_PREVIEW_ROWS, len(filtered_df)):,} of "
-        f"{len(filtered_df):,} rows. Use the download button above for the full dataset."
-    )
-    st.dataframe(filtered_df.head(_PREVIEW_ROWS), use_container_width=True, hide_index=True)
+        m4.metric("Rows with Unmatched Plant", f"{n_no_plant:,}")
+        today = datetime.now().strftime("%Y%m%d")
+        st.download_button(
+            "⬇️ Download Full Enriched Report (CSV)", data=_to_csv_bytes(filtered_df),
+            file_name=f"HTST_Shipment_Enriched_{today}.csv", mime="text/csv",
+            key="htst_download_output",
+        )
+        st.caption(
+            f"Preview: first {min(_PREVIEW_ROWS, len(filtered_df)):,} of "
+            f"{len(filtered_df):,} rows. Use the download button for the full dataset."
+        )
+        st.dataframe(filtered_df.head(_PREVIEW_ROWS), use_container_width=True, hide_index=True)
 
 
 # ── 7. Entry point ────────────────────────────────────────────────────────────
 
+_REQUIRED_LOOKUP_KEYS: tuple[str, ...] = (
+    "plant_tracker", "mileage_tracker", "demantra", "pricing_tracker",
+)
+
+
 def render() -> None:
-    """Render the HTST Activity Monitor page.
+    """Render the Shipment Monitor & HTST Requote dashboard.
 
-    Flow: lakehouse pull (auto) → on success, lookup-only uploads;
-          on failure, full upload (shipment + lookups) → validate →
-          process (cached) → load optional lookups → filter →
-          Customer-Site Details → Enriched Report.
-
-    Business logic is fully delegated to section-specific functions.
-    The enrichment pipeline is cached in st.session_state so it only re-runs
-    when the shipment snapshot OR the lookup file set changes — not on every
-    widget interaction.  duration_days is derived from the Order Date range
-    slicer inside _render_filters and is NOT cached — it updates instantly
-    with the slicer.  Optional lookup DataFrames (pallet_fee_df, sell_to_df,
-    custom_label_df) are loaded here from uploaded file objects and passed as
-    arguments — no function downstream opens a file directly.
+    Once Microsoft Fabric is connected, both the shipment Delta table and every
+    lookup are read straight from the lakehouse — **no uploads, no second
+    refresh**.  Only a headless Streamlit Cloud session (no interactive Azure
+    sign-in) falls back to the manual upload panel.  The enrichment pipeline is
+    cached in session_state keyed by the shipment snapshot + lookup file
+    identities, so it re-runs only when a source actually changes.  Time is
+    handled by fixed L12M/L6M/L3M trailing windows, not a date slicer.
     """
     apply_custom_css()
-
     st.markdown(
         '<h1 class="main-header">Shipment Monitor &amp; HTST Requote</h1>',
         unsafe_allow_html=True,
     )
 
-    # ── Welcome ───────────────────────────────────────────────────────────────
-    st.markdown("### Welcome")
-    st.info(
-        "Shipment data is pulled automatically from the Pricing Lakehouse. "
-        "Upload the lookup CSVs below to refresh the HTST activity-level "
-        "report.  If the lakehouse pull fails (typically when running on "
-        "Streamlit Cloud), the full multi-file upload panel will appear "
-        "automatically as a fallback."
-    )
-    st.markdown("---")
-
-    # ── Shipment input — lakehouse first, upload fallback on failure ─────────
-    # No user-facing toggle: the page always tries the Pricing Lakehouse
-    # pull first.  If the pull fails (typical on a headless Streamlit Cloud
-    # session that cannot complete an interactive Azure sign-in), the page
-    # automatically reveals the full upload panel below — the user never
-    # has to click a checkbox to switch modes.
+    # ── Sources: shipment (Delta) + lookups (Files), both auto from Fabric ───
     source_result = _render_shipment_source()
-    use_upload_fallback = source_result.df is None
     shipment_df = source_result.df
     shipment_sig = source_result.signature
+    use_upload_fallback = shipment_df is None
 
+    lookup_bundle: Optional[HTSTLookupBundle] = None
+    lookup_error: Optional[str] = None
+    if not use_upload_fallback:
+        try:
+            lookup_bundle = fetch_htst_lookups()
+        except HTSTLookupError as exc:
+            lookup_error = str(exc)
+    need_lookup_upload = lookup_bundle is None
+
+    _render_sop_panel(lookup_bundle, from_lakehouse=not need_lookup_upload)
+    _render_formula_panel()
+    st.markdown("---")
+
+    # ── Upload fallback (headless Cloud) ─────────────────────────────────────
     if use_upload_fallback:
         st.warning(
-            "⚠️ Could not pull the HTST Shipment Report from the Pricing "
-            "Lakehouse — falling back to manual upload.  Upload the HTST "
-            "Shipment Report alongside the lookup CSVs in the panel below.\n\n"
-            "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
-            "in the sidebar to sign in, then return to this page."
+            "⚠️ Could not read the HTST Shipment Report from the Pricing Lakehouse "
+            "— falling back to manual upload.  If Microsoft Fabric is not signed "
+            "in, visit **Home & Fabric Sign-in** in the sidebar, then return."
         )
         with st.expander("Why did the lakehouse pull fail?", expanded=False):
             st.code(source_result.error or "Unknown error.", language="text")
-    st.markdown("---")
+    elif need_lookup_upload:
+        st.warning(
+            "⚠️ Shipment loaded, but the lakehouse **lookup** tables could not be "
+            f"read — upload them below.\n\n{lookup_error or ''}"
+        )
 
-    # ── Lookup uploads (and the shipment file when in fallback mode) ─────────
-    detected = _render_upload_section(include_shipment=use_upload_fallback)
-    st.markdown("---")
+    detected: dict[str, object] = {}
+    if use_upload_fallback or need_lookup_upload:
+        detected = _render_upload_section(include_shipment=use_upload_fallback)
+        st.markdown("---")
 
-    # In fallback mode, materialise the uploaded shipment CSV before the
-    # required-missing gate so its presence/absence is reflected in the
-    # waiting message alongside the lookup files.
     if use_upload_fallback:
         shipment_file = detected.get("shipment")
         if shipment_file is not None:
@@ -1411,93 +1734,76 @@ def render() -> None:
                 return
             shipment_sig = f"upload:{shipment_file.name}:{shipment_file.size}"
 
-    # Required-files gate.  In fallback mode we additionally check the
-    # shipment file via shipment_df, since _SHIPMENT_PATTERN is not part of
-    # _FILE_PATTERNS.
-    required_missing = [
-        p.label for p in _FILE_PATTERNS
-        if p.required and detected.get(p.key) is None
-    ]
-    if use_upload_fallback and shipment_df is None:
-        required_missing.append(_SHIPMENT_PATTERN.label)
-    if required_missing:
-        # Surface the explicit list of files we're still waiting on so the
-        # user knows exactly what to upload — much clearer than the prior
-        # "calculation in progress" wording, which made the static
-        # waiting-state look like a hung pipeline.
-        missing_md = "\n".join(f"  • {label}" for label in required_missing)
-        st.info(
-            "⏳ Waiting for the following required report(s) before "
-            f"processing can begin:\n{missing_md}"
-        )
+    # ── Assemble the lookup DataFrames + fee tables + a cache signature ──────
+    if not need_lookup_upload and lookup_bundle is not None:
+        enrich_lookups: Optional[dict[str, pd.DataFrame]] = {
+            k: lookup_bundle.frames[k] for k in _REQUIRED_LOOKUP_KEYS
+        }
+        pallet_fee_df = lookup_bundle.get("pallet_fee")
+        sell_to_df = lookup_bundle.get("sell_to")
+        custom_label_df = lookup_bundle.get("custom_label")
+        delivery_df = lookup_bundle.get("delivery")
+        lookup_sig = "||".join(f"{m.name}:{m.last_modified}" for m in lookup_bundle.files)
+    else:
+        missing = [p.label for p in _FILE_PATTERNS if p.required and detected.get(p.key) is None]
+        if use_upload_fallback and shipment_df is None:
+            missing.append(_SHIPMENT_PATTERN.label)
+        if missing:
+            st.info("⏳ Waiting for the following required file(s):\n"
+                    + "\n".join(f"  • {label}" for label in missing))
+            return
+        enrich_lookups = None  # read lazily on cache miss (below)
+        pallet_fee_df = _load_optional_lookup(detected.get("pallet_fee"), "Pallet Fee file")
+        sell_to_df = _load_optional_lookup(detected.get("sell_to"), "Sell-To Volume Bracket file")
+        custom_label_df = _load_optional_lookup(detected.get("custom_label"), "Custom Label Volume Bracket file")
+        delivery_df = None
+        lookup_sig = "".join(
+            f"{detected[k].name}:{detected[k].size}" for k in _REQUIRED_LOOKUP_KEYS)
+
+    if shipment_df is None:
+        st.info("⏳ Waiting for the HTST Shipment Report.")
         return
 
-    # ── Process main enrichment pipeline (session-state cached) ───────────────
-    # _process_shipment_data joins the in-memory shipment DataFrame against
-    # four uploaded lookup CSVs — an expensive operation on a 400 K-row table.
-    # Streamlit re-executes render() on every widget interaction, so without
-    # caching this pipeline would re-run on every click.
-    #
-    # Strategy: build a composite signature from the shipment snapshot identity
-    # AND the four lookup files' name+size.  If the signature matches what is
-    # stored in session_state, the enriched DataFrame is read from cache;
-    # otherwise the pipeline runs and the results are stored.
-    _REQUIRED_LOOKUP_KEYS = [
-        "plant_tracker", "mileage_tracker", "demantra", "pricing_tracker"
-    ]
-    lookup_sig_input = "".join(
-        f"{detected[k].name}:{detected[k].size}" for k in _REQUIRED_LOOKUP_KEYS
-    )
-    file_sig = hashlib.md5(
-        f"{shipment_sig}||{lookup_sig_input}".encode()
-    ).hexdigest()
-
+    # ── Enrichment pipeline (session-state cached by source identities) ──────
+    file_sig = hashlib.md5(f"{shipment_sig}||{lookup_sig}".encode()).hexdigest()
     if st.session_state.get("_htst_file_sig") != file_sig:
+        if enrich_lookups is None:      # upload mode — materialise the 4 CSVs now
+            try:
+                enrich_lookups = {
+                    k: pd.read_csv(detected[k], low_memory=False) for k in _REQUIRED_LOOKUP_KEYS}
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not read an uploaded lookup CSV: {exc}")
+                return
         with st.spinner("Processing — enriching shipment data…"):
-            enriched_df = _process_shipment_data(
-                shipment_df=shipment_df,
-                plant_tracker_file=detected["plant_tracker"],
-                mileage_tracker_file=detected["mileage_tracker"],
-                demantra_file=detected["demantra"],
-                pricing_tracker_file=detected["pricing_tracker"],
-            )
+            enriched_df = _process_shipment_data(shipment_df, enrich_lookups)
         if enriched_df is None:
             return  # st.error already raised inside _process_shipment_data
         st.session_state["_htst_enriched_df"] = enriched_df
-        st.session_state["_htst_file_sig"]    = file_sig
+        st.session_state["_htst_file_sig"] = file_sig
 
     enriched_df = st.session_state.get("_htst_enriched_df")
-
     if enriched_df is None:
-        # Defensive guard: cache entry missing (e.g. session was reset).
-        st.error("Processed data unavailable — please refresh the lakehouse pull and re-upload the lookup files.")
+        st.error("Processed data unavailable — refresh the lakehouse pull and retry.")
         return
 
-    # ── Load optional lookup tables from uploaded files ───────────────────────
-    # All three are loaded here so _build_customer_site_summary stays a pure
-    # analytics function with no file I/O.  None is passed when not uploaded;
-    # _build_customer_site_summary then substitutes hardcoded fallback fees.
-    pallet_fee_df   = _load_optional_lookup(detected.get("pallet_fee"),   "Pallet Fee file")
-    sell_to_df      = _load_optional_lookup(detected.get("sell_to"),      "Sell-To Volume Bracket file")
-    custom_label_df = _load_optional_lookup(detected.get("custom_label"), "Custom Label Volume Bracket file")
-
     st.success(
-        f"✅ Processing complete — **{len(enriched_df):,} rows**, "
-        f"**{len(enriched_df.columns)} columns**"
+        f"✅ Ready — **{len(enriched_df):,} rows** enriched.  Trailing-window "
+        "metrics update instantly with the filters below."
     )
     st.markdown("---")
 
-    # ── Filters (drive both downstream sections) ──────────────────────────────
-    # _render_filters returns the date-filtered + customer/ship-to filtered df
-    # together with duration_days derived from the selected date range.
-    filtered_df, duration_days = _render_filters(enriched_df)
+    # ── Filters → trailing windows → dashboard ───────────────────────────────
+    filtered_df = _render_filters(enriched_df)
+    windows = _trailing_windows(enriched_df["Order Date"]) if "Order Date" in enriched_df.columns else {}
     st.markdown("---")
 
-    # ── Customer-Site Details ─────────────────────────────────────────────────
+    _render_kpis(filtered_df, windows)
+    st.markdown("---")
+    _render_momentum(_build_momentum(filtered_df, windows), windows)
+    st.markdown("---")
+    _render_requote(_build_requote(
+        filtered_df, windows, pallet_fee_df, sell_to_df, custom_label_df, delivery_df))
+    st.markdown("---")
     _render_customer_site_details(
-        filtered_df, duration_days, pallet_fee_df, sell_to_df, custom_label_df
-    )
-    st.markdown("---")
-
-    # ── Enriched Shipment Report (filtered, downloadable) ─────────────────────
+        filtered_df, windows, pallet_fee_df, sell_to_df, custom_label_df, delivery_df)
     _render_output_section(filtered_df)

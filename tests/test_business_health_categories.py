@@ -13,17 +13,17 @@ from data_sources.demand_plan_comparison import (
     BH_GAP_BUILDING,
     BH_GAP_DRAINING,
     BH_GAP_BALANCED,
-    BH_MOVE_EARNED,
-    BH_MOVE_GIVEN_BACK,
-    BH_MOVE_BOUGHT,
-    BH_MOVE_LOST,
-    BH_VM_HEALTHY,
-    BH_VM_RENTING,
-    BH_VM_SHEDDING,
-    BH_VM_BLEED,
+    BH_MOVE_PRICE_UP,
+    BH_MOVE_VOLUME_UP,
+    BH_MOVE_VOLUME_DOWN,
+    BH_MOVE_PRICE_DOWN,
+    BH_VM_UP_UP,
+    BH_VM_UP_DOWN,
+    BH_VM_DOWN_UP,
+    BH_VM_DOWN_DOWN,
     _bh_gap_flag,
     _bh_decomp_sowhat,
-    _bh_vol_margin_reading,
+    _bh_vol_margin_quadrant,
     build_business_health_categories,
     enrich_finance_df,
 )
@@ -42,21 +42,29 @@ def test_gap_flag_branches():
 
 
 def test_decomp_sowhat_branches():
-    # Positive move, price/mix dominates → earned; volume dominates → bought.
-    assert _bh_decomp_sowhat(0.25, 0.05) == BH_MOVE_EARNED     # price_mix +20 vs vol +5
-    assert _bh_decomp_sowhat(0.25, 0.20) == BH_MOVE_BOUGHT     # price_mix +5 vs vol +20
-    # Negative move, price/mix dominates → given back; volume dominates → lost.
-    assert _bh_decomp_sowhat(-0.25, -0.05) == BH_MOVE_GIVEN_BACK
-    assert _bh_decomp_sowhat(-0.25, -0.20) == BH_MOVE_LOST
+    # Positive move: price/mix dominates → price-led; volume dominates → volume-led.
+    assert _bh_decomp_sowhat(0.25, 0.05) == BH_MOVE_PRICE_UP    # price_mix +20 vs vol +5
+    assert _bh_decomp_sowhat(0.25, 0.20) == BH_MOVE_VOLUME_UP   # price_mix +5 vs vol +20
+    # Negative move: price/mix dominates → price-led ▼; volume dominates → volume-led ▼.
+    assert _bh_decomp_sowhat(-0.25, -0.05) == BH_MOVE_PRICE_DOWN
+    assert _bh_decomp_sowhat(-0.25, -0.20) == BH_MOVE_VOLUME_DOWN
     assert _bh_decomp_sowhat(None, 0.1) == ""
 
 
-def test_vol_margin_reading_quadrants():
-    assert _bh_vol_margin_reading(0.10, 0.20, 0.18) == BH_VM_HEALTHY    # vol↑ margin↑
-    assert _bh_vol_margin_reading(0.10, 0.16, 0.18) == BH_VM_RENTING    # vol↑ margin↓
-    assert _bh_vol_margin_reading(-0.08, 0.19, 0.18) == BH_VM_SHEDDING  # vol↓ margin↑
-    assert _bh_vol_margin_reading(-0.08, 0.16, 0.18) == BH_VM_BLEED     # vol↓ margin↓
-    assert _bh_vol_margin_reading(None, 0.2, 0.2) == ""
+def test_vol_margin_quadrants():
+    assert _bh_vol_margin_quadrant(0.10, 0.20, 0.18) == BH_VM_UP_UP      # vol↑ margin↑
+    assert _bh_vol_margin_quadrant(0.10, 0.16, 0.18) == BH_VM_UP_DOWN    # vol↑ margin↓
+    assert _bh_vol_margin_quadrant(-0.08, 0.19, 0.18) == BH_VM_DOWN_UP   # vol↓ margin↑
+    assert _bh_vol_margin_quadrant(-0.08, 0.16, 0.18) == BH_VM_DOWN_DOWN  # vol↓ margin↓
+    assert _bh_vol_margin_quadrant(None, 0.2, 0.2) == ""
+
+
+def test_no_promo_categories_rule():
+    """Fresh Milk is the only B2C category sold without trade/promo — the Lever C
+    assumption wording keys off this."""
+    from data_sources.demand_plan_comparison import BH_NO_PROMO_CATEGORIES
+    assert BH_NO_PROMO_CATEGORIES == frozenset({"fresh_milk"})
+    assert BH_NO_PROMO_CATEGORIES <= set(BH_CATEGORY_ROWS)
 
 
 # ── Fixtures: a Butter deep-dive with clean, single-month numbers ────────────
@@ -139,7 +147,7 @@ def test_lever_b_decomposition_and_sowhat():
     assert d["net_sales"] == pytest.approx(0.25, rel=1e-3)   # finance net sales YoY
     assert d["price_mix"] == pytest.approx(0.05, rel=1e-3)   # residual 25 − 20
     # Volume (+20) dominates the +25 net move → bought (volume).
-    assert butter.decomp_sowhat == BH_MOVE_BOUGHT
+    assert butter.decomp_sowhat == BH_MOVE_VOLUME_UP
     # All three periods carry the decomposition keys.
     for p in ("L12M", "L6M", "L3M"):
         assert set(butter.decomp[p]) == {"volume", "price_mix", "net_sales"}
@@ -163,7 +171,7 @@ def test_lever_c_margin_table_and_reading():
     for p in ("L12M", "L6M", "L3M"):
         assert butter.margin_gl_months[p] == "Jun 2026 · 1 mo"
     # Vol ▲ (+20%) and margin flat/▲ across periods → healthy growth.
-    assert butter.vol_margin_reading == BH_VM_HEALTHY
+    assert butter.vol_margin_quadrant == BH_VM_UP_UP
 
 
 def test_margin_gl_months_actual_only():
@@ -230,7 +238,7 @@ def test_empty_inputs_degrade():
     cats = build_business_health_categories(None, None, PRIOR)
     assert [c.row_id for c in cats] == list(BH_CATEGORY_ROWS)
     for c in cats:
-        assert c.gap_flag == "" and c.decomp_sowhat == "" and c.vol_margin_reading == ""
+        assert c.gap_flag == "" and c.decomp_sowhat == "" and c.vol_margin_quadrant == ""
         assert c.concentration.growers == () and c.concentration.decliners == ()
         assert all(v == "—" for v in c.margin_gl_months.values())   # no finance
 

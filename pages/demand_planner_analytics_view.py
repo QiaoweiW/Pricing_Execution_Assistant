@@ -162,10 +162,15 @@ from data_sources.demand_plan_comparison import (
     BH_GAP_BUILDING,
     BH_GAP_DRAINING,
     BH_GAP_BALANCED,
-    BH_VM_HEALTHY,
-    BH_VM_RENTING,
-    BH_VM_SHEDDING,
-    BH_VM_BLEED,
+    BH_MOVE_PRICE_UP,
+    BH_MOVE_VOLUME_UP,
+    BH_MOVE_VOLUME_DOWN,
+    BH_MOVE_PRICE_DOWN,
+    BH_VM_UP_UP,
+    BH_VM_UP_DOWN,
+    BH_VM_DOWN_UP,
+    BH_VM_DOWN_DOWN,
+    BH_NO_PROMO_CATEGORIES,
     comparison_to_csv_bytes,
     compute_demand_driver_items,
     driver_table_to_csv_bytes,
@@ -757,12 +762,59 @@ _BH_GAP_WORDS: dict[str, str] = {
     BH_GAP_DRAINING: "draining (shipments outpacing orders)",
     BH_GAP_BALANCED: "balanced (orders and shipments in line)",
 }
-# Lever C Vol×Margin reading → (icon, callout colour) by severity.
-_BH_VM_STYLE: dict[str, tuple[str, str]] = {
-    BH_VM_HEALTHY:  ("🟢", "#137d78"),   # real growth
-    BH_VM_SHEDDING: ("🟡", "#b7791f"),   # good news disguised as bad
-    BH_VM_RENTING:  ("🟠", "#c05621"),   # scary disguised as good
-    BH_VM_BLEED:    ("🔴", "#c0392b"),   # true bleed
+# Lever B — Price-Volume-Mix token → (short header tag, plain-English so-what).
+# Industry-standard PVM read: a revenue move is either price/mix-led (better
+# realization) or volume-led (more/fewer units).
+_BH_MOVE_READING: dict[str, tuple[str, str]] = {
+    BH_MOVE_PRICE_UP: (
+        "Price/mix-led ▲",
+        "Net sales rose mainly on **price & mix** (realization) — units contributed little."),
+    BH_MOVE_VOLUME_UP: (
+        "Volume-led ▲",
+        "Net sales rose mainly on **more units sold** — price & mix contributed little."),
+    BH_MOVE_VOLUME_DOWN: (
+        "Volume-led ▼",
+        "Net sales fell mainly on **fewer units** — price & mix held."),
+    BH_MOVE_PRICE_DOWN: (
+        "Price/mix-led ▼",
+        "Net sales fell mainly on **lower price / weaker mix** — units held."),
+}
+
+# Lever C — Vol×Margin quadrant token → neutral, assumption-framed reading.
+# Each entry: (icon, colour, header statement, {key assumption to confirm}).  The
+# vol-up/margin-down case has a promo variant and a no-promo variant (Fresh Milk).
+_BH_VM_READING: dict[str, dict[str, str]] = {
+    BH_VM_UP_UP: {
+        "icon": "🟢", "color": "#137d78",
+        "head": "Vol ▲ / Margin ▲ — volume and margin both rising",
+        "assume": "Likely genuine demand strength and/or a favourable price–cost "
+                  "position.  Confirm the gain is structural (not a comp/timing "
+                  "effect) before carrying it forward in the plan.",
+    },
+    BH_VM_UP_DOWN: {
+        "icon": "🟠", "color": "#c05621",
+        "head": "Vol ▲ / Margin ▲→▼ — volume up, margin softening",
+        "assume": "Likely volume supported by **trade/promo investment**, or by "
+                  "absorbing higher input cost, faster than price recovers it.  "
+                  "Confirm promo/trade depth and cost pass-through.",
+        "assume_nopromo": "No trade/promo in this category, so the margin dip is "
+                  "**price realization, mix, or input cost** (milk/freight), not "
+                  "promo.  Confirm list-price realization and cost pass-through.",
+    },
+    BH_VM_DOWN_UP: {
+        "icon": "🟡", "color": "#b7791f",
+        "head": "Vol ▼ / Margin ▲ — volume down, margin up",
+        "assume": "Likely mix/price improvement or an exit of low-margin business.  "
+                  "Confirm the volume loss is deliberate mix management rather than "
+                  "lost demand.",
+    },
+    BH_VM_DOWN_DOWN: {
+        "icon": "🔴", "color": "#c0392b",
+        "head": "Vol ▼ / Margin ▼ — volume and margin both down",
+        "assume": "Likely soft demand alongside price/cost pressure.  Confirm "
+                  "whether it is competitive, cost-, or mix-driven before any "
+                  "pricing or promo action.",
+    },
 }
 # Lever D diverging-bar colours by mover kind (green growers / red decliners).
 _BH_SEG_COLOR: dict[str, str] = {"grower": "#137d78", "decliner": "#c0392b"}
@@ -852,10 +904,12 @@ def _bh_signed_html(value) -> str:
 
 def _render_bh_lever_b(cat) -> None:
     """Lever B — Net Sales YoY% ≈ Units YoY% + Price/mix YoY% (residual), all
-    periods; so-what (earned vs bought/lost) as the header."""
-    sowhat = f"  —  {cat.decomp_sowhat}" if cat.decomp_sowhat else ""
-    st.markdown(f"**B · Decomposition**{sowhat}")
+    periods; a short Price-Volume-Mix tag in the header + a plain so-what line."""
+    tag, explain = _BH_MOVE_READING.get(cat.decomp_sowhat, ("", ""))
+    st.markdown(f"**B · Decomposition**  —  {tag}" if tag else "**B · Decomposition**")
     st.caption("Net Sales YoY% ≈ Units YoY% + Price/mix YoY%")
+    if explain:
+        st.caption(f"**So-what:** {explain}")
     periods = list(BH_PERIOD_ORDER)
     rows = (
         ("Units YoY%", "volume"),
@@ -891,13 +945,17 @@ def _bh_money_m(value) -> str:
 
 
 def _render_bh_lever_c(cat) -> None:
-    """Lever C — Vol×Margin reading (header so-what) + an auditable margin table:
-    per period its GL months, total Gross Profit, total Net Sales, and GP%."""
-    if cat.vol_margin_reading:
-        icon, color = _BH_VM_STYLE.get(cat.vol_margin_reading, ("", _BH_FONT_COLOR))
+    """Lever C — Vol×Margin quadrant (neutral header statement) + an auditable
+    margin table + a **key assumption** to confirm (category-aware for promo).
+
+    The reading is framed as an assumption to validate, not a verdict — and the
+    vol-up/margin-down wording drops the promo clause for no-promo categories
+    (Fresh Milk)."""
+    spec = _BH_VM_READING.get(cat.vol_margin_quadrant)
+    if spec:
         st.markdown(
-            f"**C · Margin**  —  <span style='color:{color}'>{icon} "
-            f"{_esc_html(cat.vol_margin_reading)}</span>",
+            f"**C · Margin**  —  <span style='color:{spec['color']}'>"
+            f"{spec['icon']} {spec['head']}</span>",
             unsafe_allow_html=True,
         )
     else:
@@ -936,6 +994,13 @@ def _render_bh_lever_c(cat) -> None:
             f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
             unsafe_allow_html=True,
         )
+    # Key assumption — framed as a hypothesis to confirm, not a verdict; the
+    # promo clause is dropped for categories sold without trade/promo.
+    if spec:
+        assume = spec.get("assume", "")
+        if cat.vol_margin_quadrant == BH_VM_UP_DOWN and cat.row_id in BH_NO_PROMO_CATEGORIES:
+            assume = spec.get("assume_nopromo", assume)
+        st.caption(f"**Key assumption:** {assume}")
     # Foldable RCA aid — kept collapsed so it never crowds the executive glance.
     _render_bh_lever_c_recon(cat)
 

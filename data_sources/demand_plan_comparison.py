@@ -3344,19 +3344,26 @@ BH_GAP_BUILDING: str = "Building"
 BH_GAP_DRAINING: str = "Draining"
 BH_GAP_BALANCED: str = "Balanced"
 
-# Lever B — so-what on the L3M Net-Sales move: earned via price/realization, or
-# bought/lost via volume (which term dominates the Net Sales YoY).
-BH_MOVE_EARNED: str = "Earned — price/realization"
-BH_MOVE_GIVEN_BACK: str = "Given back — price/realization"
-BH_MOVE_BOUGHT: str = "Bought — volume"
-BH_MOVE_LOST: str = "Lost — volume"
+# Lever B — Price-Volume-Mix (PVM) read on the L3M Net-Sales move: which term
+# (units, or price & mix) drove the Net Sales YoY, and which way.  Tokens; the
+# page turns each into a short tag + a plain-English explanation.
+BH_MOVE_PRICE_UP: str = "price_up"        # net sales up, price/mix dominated
+BH_MOVE_VOLUME_UP: str = "volume_up"      # net sales up, units dominated
+BH_MOVE_VOLUME_DOWN: str = "volume_down"  # net sales down, units dominated
+BH_MOVE_PRICE_DOWN: str = "price_down"    # net sales down, price/mix dominated
 
-# Lever C — Vol × Margin quadrant readings (direction of L3M volume YoY × the
-# L3M-vs-L12M change in Gross Profit %).
-BH_VM_HEALTHY: str = "Vol ▲ / Margin ▲ — real, healthy growth. Protect and forecast up."
-BH_VM_RENTING: str = "Vol ▲ / Margin ▼ — renting volume with price/promo; growth destroying value."
-BH_VM_SHEDDING: str = "Vol ▼ / Margin ▲ — shedding low-margin volume; usually fine, sometimes desirable."
-BH_VM_BLEED: str = "Vol ▼ / Margin ▼ — true bleed; unambiguously top-priority."
+# Lever C — Vol × Margin quadrant TOKEN (direction of L3M volume YoY × the
+# L3M-vs-L12M change in Gross Profit %).  The page turns the token into a
+# neutral, assumption-framed reading; the wording is category-aware because some
+# categories have trade/promo and some don't (see BH_NO_PROMO_CATEGORIES).
+BH_VM_UP_UP: str = "up_up"
+BH_VM_UP_DOWN: str = "up_down"
+BH_VM_DOWN_UP: str = "down_up"
+BH_VM_DOWN_DOWN: str = "down_down"
+
+# Categories sold WITHOUT trade/promo — a margin move here is price / cost / mix,
+# never promo depth, so the Lever C assumption is phrased accordingly.
+BH_NO_PROMO_CATEGORIES: frozenset = frozenset({"fresh_milk"})
 
 
 def _bh_gap_flag(order_yoy: Optional[float], ship_yoy: Optional[float]) -> str:
@@ -3375,35 +3382,36 @@ def _bh_gap_flag(order_yoy: Optional[float], ship_yoy: Optional[float]) -> str:
 def _bh_decomp_sowhat(
     net_yoy: Optional[float], vol_yoy: Optional[float],
 ) -> str:
-    """Lever B: was the Net-Sales YoY move earned (price) or bought/lost (volume)?
+    """Lever B: Price-Volume-Mix read on the L3M Net-Sales move (token).
 
     Price/mix is the residual ``net_yoy − vol_yoy``.  Whichever of price/mix or
-    volume has the larger magnitude is deemed the driver; the sign of the net
-    move picks earned/given-back (price-driven) vs bought/lost (volume-driven).
+    volume has the larger magnitude is the driver; the sign of the net move sets
+    the direction.  Returns a BH_MOVE_* token (page renders the wording); ""
+    when undefined.
     """
     if net_yoy is None or vol_yoy is None or pd.isna(net_yoy) or pd.isna(vol_yoy):
         return ""
     price_mix = net_yoy - vol_yoy
     price_driven = abs(price_mix) >= abs(vol_yoy)
     if net_yoy >= 0:
-        return BH_MOVE_EARNED if price_driven else BH_MOVE_BOUGHT
-    return BH_MOVE_GIVEN_BACK if price_driven else BH_MOVE_LOST
+        return BH_MOVE_PRICE_UP if price_driven else BH_MOVE_VOLUME_UP
+    return BH_MOVE_PRICE_DOWN if price_driven else BH_MOVE_VOLUME_DOWN
 
 
-def _bh_vol_margin_reading(
+def _bh_vol_margin_quadrant(
     vol_yoy_l3m: Optional[float],
     gp_pct_l3m: Optional[float], gp_pct_l12m: Optional[float],
 ) -> str:
-    """Lever C: map (L3M volume direction) × (L3M-vs-L12M margin direction) to a
-    Vol×Margin quadrant reading."""
+    """Lever C: (L3M volume direction) × (L3M-vs-L12M margin direction) → a
+    BH_VM_* quadrant token (page composes the assumption text); "" when undefined."""
     if (vol_yoy_l3m is None or gp_pct_l3m is None or gp_pct_l12m is None
             or any(pd.isna(x) for x in (vol_yoy_l3m, gp_pct_l3m, gp_pct_l12m))):
         return ""
     vol_up = vol_yoy_l3m >= 0
     margin_up = (gp_pct_l3m - gp_pct_l12m) >= 0
     if vol_up:
-        return BH_VM_HEALTHY if margin_up else BH_VM_RENTING
-    return BH_VM_SHEDDING if margin_up else BH_VM_BLEED
+        return BH_VM_UP_UP if margin_up else BH_VM_UP_DOWN
+    return BH_VM_DOWN_UP if margin_up else BH_VM_DOWN_DOWN
 
 
 @dataclass(frozen=True)
@@ -3473,7 +3481,7 @@ class BusinessHealthCategory:
       earned vs bought/lost read on the L3M move.
     * **C** ``margin_pct`` — ``{period: Gross Profit ÷ Net Sales}``;
       ``margin_gl_months`` — ``{period: GL-month range label}`` from **Actual**
-      finance rows only; ``vol_margin_reading`` — the Vol×Margin quadrant reading.
+      finance rows only; ``vol_margin_quadrant`` — the Vol×Margin quadrant token.
       (The Gross-Profit / Net-Sales dollar totals behind the margin come from
       ``finance_series[...]["vol"]``.)
     * **D** ``concentration`` — the L3M shipped-lbs move split across
@@ -3493,7 +3501,7 @@ class BusinessHealthCategory:
     decomp_sowhat: str
     margin_pct: dict[str, Optional[float]]
     margin_gl_months: dict[str, str]
-    vol_margin_reading: str
+    vol_margin_quadrant: str
     concentration: BhConcentration
     reconciliation: BhReconciliation
 
@@ -3771,7 +3779,7 @@ def build_business_health_categories(
 
         # Lever C — Gross Profit % per period + Vol×Margin quadrant reading.
         margin_pct = {p: _bh_margin_pct(finance_series, p) for p in BH_PERIOD_ORDER}
-        vol_margin_reading = _bh_vol_margin_reading(
+        vol_margin_quadrant = _bh_vol_margin_quadrant(
             ship_series["L3M"]["yoy"], margin_pct["L3M"], margin_pct["L12M"])
 
         # Lever D — top movers by the L3M ORDER-lbs swing (demand signal), so
@@ -3789,7 +3797,7 @@ def build_business_health_categories(
             finance_series=finance_series, gap_flag=gap_flag,
             decomp=decomp, decomp_sowhat=decomp_sowhat,
             margin_pct=margin_pct, margin_gl_months=margin_gl_months,
-            vol_margin_reading=vol_margin_reading,
+            vol_margin_quadrant=vol_margin_quadrant,
             concentration=concentration, reconciliation=reconciliation))
     return out
 

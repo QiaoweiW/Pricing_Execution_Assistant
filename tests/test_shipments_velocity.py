@@ -138,3 +138,28 @@ def test_product_minor_filter_reacts_in_velocity():
     assert wk1[sv.COL_SHIPPED_LBS] == pytest.approx(100.0)
     assert wk1[sv.SHIP_TO_COUNT] == 1
     assert wk1[sv.SHIPPED_VELOCITY] == pytest.approx(100.0)
+
+
+# ── Fixed-baseline index + Fill Rate ─────────────────────────────────────────
+
+def test_velocity_index_and_fill_rate():
+    res = sv.build_weekly_velocity(_tidy_shipto())
+    wk1, wk2 = res.weekly.iloc[0], res.weekly.iloc[1]
+    # Baseline = median velocity over active weeks: demand median(85,220)=152.5.
+    assert res.baseline_demand == pytest.approx(152.5)
+    assert res.baseline_supply == pytest.approx(135.0)     # median(70,200)
+    assert wk1[sv.DEMAND_INDEX] == pytest.approx(85 / 152.5 * 100)
+    assert wk2[sv.DEMAND_INDEX] == pytest.approx(220 / 152.5 * 100)
+    assert wk1[sv.SUPPLY_INDEX] == pytest.approx(70 / 135 * 100)
+    assert wk1[sv.FILL_RATE] == pytest.approx(140 / 170)
+    assert res.fill_rate == pytest.approx(340 / 390)       # 0.872
+
+
+def test_velocity_baseline_is_fixed_when_window_sliced():
+    """Slicing the Week window must NOT re-centre the index — the baseline stays
+    the full-history median, so week 1 reads 55.7, not 100."""
+    res = sv.build_weekly_velocity(
+        _tidy_shipto(), date_range=(date(2026, 7, 6), date(2026, 7, 10)))
+    assert len(res.weekly) == 1                             # week 1 only, displayed
+    assert res.baseline_demand == pytest.approx(152.5)      # median over BOTH weeks
+    assert res.weekly.iloc[0][sv.DEMAND_INDEX] == pytest.approx(85 / 152.5 * 100)

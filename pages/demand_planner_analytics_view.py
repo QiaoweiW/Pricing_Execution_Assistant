@@ -373,6 +373,8 @@ from data_sources.ro_summary_report import (
 )
 from data_sources import ro_pipeline_analytics as rpa
 from data_sources import shipments_velocity as vel
+from data_sources import iri_velocity as iri
+from data_sources import velocity_signals as vsig
 from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
@@ -11084,13 +11086,12 @@ def _render_velocity_analysis() -> None:
     """
     with st.expander("🚀 Velocity Analysis", expanded=False):
         st.caption(
-            "Week-over-week **ordered vs shipped lbs** from `dbo.Shipments`, "
-            "sliced by Portfolio, Portfolio Minor, Product Description, Customer, "
-            "Business Unit and Product Format over a chosen order-date range.  "
-            "The right axis shows **Demand Velocity** (ordered lbs ÷ distinct "
-            "ship-to) and **Supply Velocity** (shipped lbs ÷ distinct ship-to).  "
-            "The two overlap when fill rate is near 100% (ordered ≈ shipped); they "
-            "separate only by the fill gap."
+            "**Leading-signal view**: consumer **Sell-through (IRI)** vs our "
+            "**Demand** (orders) and **Supply** (shipments) velocity — all rebased "
+            "to an index (100 = a typical week) so a demand planner can see the "
+            "signal chain (shelf leads → orders follow → shipments lag) and get a "
+            "warning when they diverge.  A **Fill Rate** metric (shipped ÷ ordered) "
+            "tracks service.  Slice one **Week** window to watch the indices move."
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.info(
@@ -11100,9 +11101,184 @@ def _render_velocity_analysis() -> None:
         _render_velocity_analysis_body()
 
 
+# Velocity index chart palette (all rebased to 100 = a typical week).
+_VEL_ST_COLOR: str = "#1f77b4"     # sell-through (IRI) — leads (solid, hero)
+_VEL_DEMAND_COLOR: str = "#e67e22"  # our orders — follows (dashed)
+_VEL_SUPPLY_COLOR: str = "#8e44ad"  # our shipments — lags (dotted)
+_VEL_SIGNAL_STYLE: dict[str, tuple[str, str]] = {
+    vsig.LEVEL_ALIGNED: ("#137d78", "#e8f5f3"),
+    vsig.LEVEL_WATCH:   ("#c05621", "#fdf1e7"),
+    vsig.LEVEL_ALERT:   ("#c0392b", "#fbeaea"),
+}
+
+
+def _render_velocity_methodology(iri_file: str) -> None:
+    """Explicit index methodology, pinned above the chart."""
+    with st.expander("🧮 How the velocity index is built", expanded=False):
+        st.markdown(
+            "Three weekly series rebased to a common **index (100 = a typical "
+            "week)** so their *shapes and timing* compare even though the units "
+            "differ:\n"
+            "- **Sell-through (IRI) Velocity** — consumer POS: Σ Units ÷ Σ stores "
+            "selling (distribution-neutral).  *Leads.*\n"
+            "- **Demand Velocity** — our retailer **orders** lbs ÷ distinct "
+            "ship-to.  *Follows.*\n"
+            "- **Supply Velocity** — our **shipments** lbs ÷ distinct ship-to.  "
+            "*Lags / overshoots.*\n\n"
+            "For each series: **baseline = MEDIAN velocity over weeks with "
+            "activity (full history)**; **index = velocity ÷ baseline × 100**.  "
+            "The baseline is fixed, so the Week slider only zooms — the index "
+            "always reads *vs normal*, never re-centred.  Only **shape/timing** is "
+            "comparable across series, not levels.  **Fill Rate = shipped ÷ "
+            "ordered lbs.**"
+            + (f"\n\n_IRI source: `Files/RO Tracking/IRI/{iri_file}`._" if iri_file else "")
+        )
+
+
+def _velocity_merge(result: "vel.WeeklyVelocity", iri_res) -> pd.DataFrame:
+    """Outer-merge the shipment weekly (indexed) and IRI weekly (indexed) on
+    week_start → one full-history frame for the chart / signals."""
+    ship = result.weekly.copy()
+    keep = [c for c in (vel.WEEK_START, vel.COL_ORDERED_LBS, vel.COL_SHIPPED_LBS,
+                        vel.DEMAND_INDEX, vel.SUPPLY_INDEX, vel.FILL_RATE)
+            if c in ship.columns]
+    ship = ship[keep]
+    if iri_res is not None and not iri_res.weekly.empty:
+        irw = iri_res.weekly[[iri.WEEK_START, iri.SELL_THROUGH_INDEX]].rename(
+            columns={iri.WEEK_START: vel.WEEK_START})
+        merged = ship.merge(irw, on=vel.WEEK_START, how="outer")
+    else:
+        merged = ship
+        merged[iri.SELL_THROUGH_INDEX] = float("nan")
+    return merged.sort_values(vel.WEEK_START).reset_index(drop=True)
+
+
+def _velocity_default_window(merged: pd.DataFrame) -> tuple:
+    """Default Week window = the overlap where BOTH sell-through and demand exist
+    (the tri-line comparison is meaningful there); else the full range."""
+    wk = merged[vel.WEEK_START].dt.date
+    _nan = pd.Series(float("nan"), index=merged.index)
+    both = merged[
+        merged.get(iri.SELL_THROUGH_INDEX, _nan).notna()
+        & merged.get(vel.DEMAND_INDEX, _nan).notna()]
+    if not both.empty:
+        w = both[vel.WEEK_START].dt.date
+        return w.min(), w.max()
+    return wk.min(), wk.max()
+
+
+def _render_velocity_signal(disp: pd.DataFrame) -> None:
+    """Traffic-light divergence banner + lead/lag readout above the chart."""
+    sig = vsig.divergence_signal(
+        disp.get(iri.SELL_THROUGH_INDEX), disp.get(vel.DEMAND_INDEX),
+        disp.get(vel.SUPPLY_INDEX), disp.get(vel.FILL_RATE))
+    fg, bg = _VEL_SIGNAL_STYLE.get(sig["level"], ("#374151", "#f3f4f6"))
+    lag, corr = vsig.cross_correlation_lag(
+        disp.get(iri.SELL_THROUGH_INDEX), disp.get(vel.DEMAND_INDEX))
+    lag_txt = (f"  Orders follow sell-through by ≈ <b>{lag} week{'s' if lag != 1 else ''}</b> "
+               f"(corr {corr:.2f})." if lag is not None else "")
+    st.markdown(
+        f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
+        f"border-radius:6px;font-size:0.95rem'>{sig['icon']} <b style='color:{fg}'>"
+        f"{_esc_html(sig['headline'])}</b><br><span style='color:#374151'>"
+        f"{_esc_html(sig['detail'])}{lag_txt}</span></div>",
+        unsafe_allow_html=True)
+
+
+def _vel_last(series: Optional[pd.Series]) -> Optional[float]:
+    if series is None:
+        return None
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    return float(s.iloc[-1]) if not s.empty else None
+
+
+def _render_velocity_kpis(disp: pd.DataFrame) -> None:
+    """KPI tiles: window fill rate + latest index of each series + sell-in gap."""
+    o = float(pd.to_numeric(disp.get(vel.COL_ORDERED_LBS), errors="coerce").fillna(0).sum())
+    s = float(pd.to_numeric(disp.get(vel.COL_SHIPPED_LBS), errors="coerce").fillna(0).sum())
+    fill = (s / o) if o else None
+    st_last = _vel_last(disp.get(iri.SELL_THROUGH_INDEX))
+    dem_last = _vel_last(disp.get(vel.DEMAND_INDEX))
+    sup_last = _vel_last(disp.get(vel.SUPPLY_INDEX))
+
+    def _idx(v):
+        # Each index is vs its OWN normal (100) — comparable within a series only.
+        return f"{v:.0f}" if v is not None else "—"
+    tiles = [
+        ("Fill Rate", f"{fill * 100:.1f}%" if fill is not None else "—", "shipped ÷ ordered (window)"),
+        ("Sell-through idx", _idx(st_last), "latest · 100 = its own normal"),
+        ("Demand idx", _idx(dem_last), "latest · 100 = its own normal"),
+        ("Supply idx", _idx(sup_last), "latest · 100 = its own normal"),
+    ]
+    cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk"><div class="k-label">{_esc_html(t)}</div>'
+        f'<div class="k-value">{_esc_html(v)}</div><span class="k-sub">{_esc_html(sub)}</span></div>'
+        for t, v, sub in tiles)
+    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
+
+
+def _render_velocity_chart(disp: pd.DataFrame) -> None:
+    """Hero chart: three index lines (primary axis) + muted, toggleable
+    ordered/shipped lbs bars (secondary axis)."""
+    weeks = list(disp[vel.WEEK_START])
+    index_specs = [
+        ("Sell-through (IRI) Velocity", iri.SELL_THROUGH_INDEX, _VEL_ST_COLOR, "solid", 3.0),
+        ("Demand Velocity", vel.DEMAND_INDEX, _VEL_DEMAND_COLOR, "dash", 2.5),
+        ("Supply Velocity", vel.SUPPLY_INDEX, _VEL_SUPPLY_COLOR, "dot", 2.5),
+    ]
+    present = [s for s in index_specs if s[1] in disp.columns and disp[s[1]].notna().any()]
+    if not present:
+        st.info("No indexed series in the selected window.")
+        return
+    names = [s[0] for s in present]
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        shown = st.multiselect("Show index lines", options=names, default=names,
+                               key="velocity_show_lines")
+    with c2:
+        show_bars = st.checkbox("Show volume bars", value=False, key="velocity_show_bars",
+                                help="Absolute ordered/shipped lbs (right axis, muted).")
+    if not shown and not show_bars:
+        st.info("Pick at least one line or the volume bars.")
+        return
+
+    fig = go.Figure()
+    if show_bars:
+        for name, col, color in (("Ordered lbs", vel.COL_ORDERED_LBS, "#c0392b"),
+                                  ("Shipped lbs", vel.COL_SHIPPED_LBS, "#137d78")):
+            if col in disp.columns:
+                fig.add_bar(x=weeks, y=disp[col], name=name, yaxis="y2",
+                            marker=dict(color=color, opacity=0.20),
+                            hovertemplate=f"{name}: %{{y:,.0f}} lbs<extra></extra>")
+    for name, col, color, dash, width in present:
+        if name not in shown:
+            continue
+        fig.add_scatter(
+            x=weeks, y=disp[col], name=name, mode="lines+markers", yaxis="y",
+            line=dict(color=color, dash=dash, width=width),
+            marker=dict(color=color, size=6),
+            hovertemplate=f"{name}: %{{y:.0f}}<br>week of %{{x|%Y-%m-%d}}<extra></extra>")
+    fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
+    layout = dict(
+        height=420, margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=13), barmode="group", bargap=0.25,
+        xaxis=dict(title=dict(text="Week"), tickmode="array", tickvals=weeks,
+                   tickformat="%b %d", tickangle=-45, showgrid=True, gridcolor="#eeeeee"),
+        yaxis=dict(title=dict(text="Velocity index (100 = typical week)"),
+                   showgrid=True, gridcolor="#eeeeee"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="white",
+    )
+    if show_bars:
+        layout["yaxis2"] = dict(title=dict(text="Lbs"), overlaying="y", side="right",
+                                rangemode="tozero", showgrid=False)
+    fig.update_layout(**layout)
+    st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
+
+
 @st.fragment
 def _render_velocity_analysis_body() -> None:
-    """Filters + KPI tiles + weekly ordered/shipped line chart (fragment)."""
+    """IRI sell-through vs our demand/supply velocity — indexed leading-signal view."""
     try:
         df = vel.fetch_shipments_df()
     except vel.ShipmentsVelocityError as exc:
@@ -11111,21 +11287,19 @@ def _render_velocity_analysis_body() -> None:
     if df is None or df.empty or vel.COL_ORDER_DATE not in df.columns:
         st.info("No shipment rows available.")
         return
-
-    # Portfolio Minor: use the shipments column when present, else fall back to
-    # the PDH reference (join on the item column, matched with the codebase's
-    # canonical item-key normaliser so it lines up with every other PDH join).
     df = _velocity_attach_portfolio_minor(df)
 
-    # ── Filters — one multiselect per dimension that resolved in the table ──
-    order_dt = pd.to_datetime(df[vel.COL_ORDER_DATE], errors="coerce")
-    min_d, max_d = order_dt.min(), order_dt.max()
-    if pd.isna(min_d) or pd.isna(max_d):
-        st.info("Shipment rows carry no parseable order dates.")
-        return
-    min_d, max_d = min_d.date(), max_d.date()
+    # IRI consumer sell-through (best-effort — the section still works without it).
+    iri_raw: Optional[pd.DataFrame] = None
+    iri_file, iri_err = "", None
+    try:
+        iri_raw, iri_file = iri.fetch_iri_df()
+    except iri.IRIVelocityError as exc:
+        iri_err = str(exc)
 
-    # Business Unit first so its default (B2C) is prominent; then the rest.
+    _render_velocity_methodology(iri_file)
+
+    # ── Our shipment filters ────────────────────────────────────────────────
     dim_specs = [
         (vel.COL_BUSINESS_UNIT, "Business Unit"),
         (vel.COL_PORTFOLIO,     "Portfolio"),
@@ -11135,30 +11309,39 @@ def _render_velocity_analysis_body() -> None:
         (vel.COL_CUSTOMER,      "Customer"),
     ]
     selections: dict[str, list[str]] = {}
+    st.markdown("**Our shipments — filters** (`dbo.Shipments`)")
     cols = st.columns(3)
     for i, (canonical, label) in enumerate(dim_specs):
         options = vel.distinct_values(df, canonical)
         if not options:
-            continue                              # dimension absent in this table
-        # Business Unit defaults to B2C (when present); others default to all.
-        default = (
-            [vel.DEFAULT_BUSINESS_UNIT]
-            if canonical == vel.COL_BUSINESS_UNIT
-            and vel.DEFAULT_BUSINESS_UNIT in options
-            else []
-        )
+            continue
+        default = ([vel.DEFAULT_BUSINESS_UNIT]
+                   if canonical == vel.COL_BUSINESS_UNIT
+                   and vel.DEFAULT_BUSINESS_UNIT in options else [])
         with cols[i % 3]:
             selections[canonical] = st.multiselect(
-                label, options=options, default=default,
-                key=f"velocity_{canonical}",
-                help="Leave empty to include all." if default == [] else None,
-            )
+                label, options=options, default=default, key=f"velocity_{canonical}",
+                help="Leave empty to include all." if default == [] else None)
 
-    date_range = st.slider(
-        "Order date range", min_value=min_d, max_value=max_d,
-        value=(min_d, max_d), format="YYYY-MM-DD", key="velocity_date_range",
-    )
+    # ── IRI consumer sell-through filters (new block) ───────────────────────
+    iri_sel: dict[str, list[str]] = {}
+    if iri_raw is not None:
+        st.markdown("**IRI — consumer sell-through filters** (Circana POS; includes competitors)")
+        icols = st.columns(3)
+        for i, col in enumerate(iri.FILTER_COLS):
+            opts = iri.distinct_values(iri_raw, col)
+            if not opts:
+                continue
+            default = ["DARIGOLD"] if col == iri.COL_BRAND and "DARIGOLD" in opts else []
+            with icols[i % 3]:
+                iri_sel[col] = st.multiselect(
+                    f"IRI · {col}", options=opts, default=default,
+                    key=f"velocity_iri_{col}",
+                    help="Leave empty to include all." if not default else None)
+    elif iri_err:
+        st.caption(f"ℹ️ IRI sell-through unavailable — showing our velocities only.  ({iri_err})")
 
+    # ── Build full-history indexed series, merge on the weekly grid ─────────
     result = vel.build_weekly_velocity(
         df,
         portfolios=selections.get(vel.COL_PORTFOLIO) or None,
@@ -11167,93 +11350,50 @@ def _render_velocity_analysis_body() -> None:
         customers=selections.get(vel.COL_CUSTOMER) or None,
         business_units=selections.get(vel.COL_BUSINESS_UNIT) or None,
         product_formats=selections.get(vel.COL_PRODUCT_FORMAT) or None,
-        date_range=date_range,
+        date_range=None,   # full history — baseline stays fixed
     )
-
-    # ── Summary metric tiles (respond to every filter) ──────────────────────
-    tiles = (
-        ("Total Ordered", _fmt_m_lbs(result.total_ordered), "lbs, all filters applied"),
-        ("Total Shipped", _fmt_m_lbs(result.total_shipped), "lbs, all filters applied"),
-    )
-    cards = "".join(
-        f'<div class="dpc-kpi dpc-kpi--walk">'
-        f'<div class="k-label">{_esc_html(label)}</div>'
-        f'<div class="k-value">{_esc_html(value)}</div>'
-        f'<span class="k-sub">{_esc_html(sub)}</span></div>'
-        for label, value, sub in tiles
-    )
-    st.markdown(
-        f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>',
-        unsafe_allow_html=True,
-    )
-
-    if result.weekly.empty:
-        st.info("No shipments match the current filters / date range.")
-        return
-
-    # ── Weekly line chart ────────────────────────────────────────────────────
-    # Aggregate lbs on the left axis; per-ship-to velocity RATES on the right
-    # axis (a much smaller scale).  A "Show lines" picker lets the planner remove
-    # any line — it's also how to isolate Ordered lbs, which otherwise sits
-    # invisibly under the near-identical Shipped lbs line.
-    weeks = list(result.weekly[vel.WEEK_START])
-    # (name, column, y-axis, line style, hover unit)
-    _line_specs = [
-        ("Ordered lbs",      vel.COL_ORDERED_LBS,  "y",  dict(color="#c0392b", dash="dot"),   "lbs"),
-        ("Shipped lbs",      vel.COL_SHIPPED_LBS,  "y",  dict(color="#137d78", dash="solid"), "lbs"),
-        ("Demand Velocity",  vel.ORDER_VELOCITY,   "y2", dict(color="#e67e22", dash="dot"),   "lbs/ship-to"),
-        ("Supply Velocity",  vel.SHIPPED_VELOCITY, "y2", dict(color="#8e44ad", dash="dash"),  "lbs/ship-to"),
-    ]
-    present = [s for s in _line_specs if s[1] in result.weekly.columns]
-    present_names = [s[0] for s in present]
-    shown = st.multiselect(
-        "Show lines", options=present_names, default=present_names,
-        key="velocity_show_lines",
-        help="Untick a line to remove it — e.g. hide Shipped lbs to see the "
-             "near-identical Ordered lbs line.",
-    )
-    if not shown:
-        st.info("Pick at least one line to show.")
-        return
-
-    fig = go.Figure()
-    uses_y2 = False
-    for name, col, axis, style, unit in present:
-        if name not in shown:
-            continue
-        uses_y2 = uses_y2 or (axis == "y2")
-        fig.add_scatter(
-            x=weeks, y=result.weekly[col], name=name, mode="lines+markers",
-            yaxis=axis,
-            line=dict(color=style["color"], dash=style["dash"], width=2.5),
-            marker=dict(color=style["color"], size=7),
-            hovertemplate=(f"{name}: %{{y:,.0f}} {unit}"
-                           "<br>week of %{x|%Y-%m-%d}<extra></extra>"),
+    iri_res = None
+    if iri_raw is not None:
+        iri_res = iri.build_iri_weekly(
+            iri_raw,
+            geographies=iri_sel.get(iri.COL_GEOGRAPHY) or None,
+            brands=iri_sel.get(iri.COL_BRAND) or None,
+            subtypes=iri_sel.get(iri.COL_SUBTYPE) or None,
+            processes=iri_sel.get(iri.COL_PROCESS) or None,
+            sizes=iri_sel.get(iri.COL_SIZE) or None,
         )
-    layout = dict(
-        height=380, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13),
-        # Mark every data week on the x-axis (dates, angled so they don't crowd).
-        xaxis=dict(title=dict(text="Week (of order date)"),
-                   tickmode="array", tickvals=weeks, tickformat="%b %d",
-                   tickangle=-45, showgrid=True, gridcolor="#eeeeee"),
-        yaxis=dict(title=dict(text="Lbs"), rangemode="tozero",
-                   showgrid=True, gridcolor="#eeeeee"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        plot_bgcolor="white",
-    )
-    # Right-hand axis only when a velocity (rate) line is actually shown.
-    if uses_y2:
-        layout["yaxis2"] = dict(
-            title=dict(text="Velocity (lbs / ship-to)"),
-            overlaying="y", side="right", rangemode="tozero", showgrid=False)
-    fig.update_layout(**layout)
-    st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
+    merged = _velocity_merge(result, iri_res)
+    merged = merged[merged[vel.WEEK_START].notna()]
+    if merged.empty:
+        st.info("No shipments/IRI match the current filters.")
+        return
+
+    # ── Shared Week slider (renamed from Order date range) ──────────────────
+    wk_dates = sorted(merged[vel.WEEK_START].dt.date.unique())
+    wk_min, wk_max = wk_dates[0], wk_dates[-1]
+    if wk_min == wk_max:
+        week_range = (wk_min, wk_max)
+        st.caption(f"Single week: {wk_min:%Y-%m-%d}")
+    else:
+        d_lo, d_hi = _velocity_default_window(merged)
+        week_range = st.slider(
+            "Week", min_value=wk_min, max_value=wk_max, value=(d_lo, d_hi),
+            format="YYYY-MM-DD", key="velocity_week_range",
+            help="Harmonised weekly grid across `dbo.Shipments` and the IRI file "
+                 "(Circana weeks, Monday-anchored).  Defaults to the overlap.")
+    disp = merged[merged[vel.WEEK_START].dt.date.between(*week_range)].reset_index(drop=True)
+    if disp.empty:
+        st.info("No weeks in the selected range.")
+        return
+
+    _render_velocity_signal(disp)
+    _render_velocity_kpis(disp)
+    _render_velocity_chart(disp)
 
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")
     st.download_button(
-        "⬇️ Download weekly velocity (CSV)",
-        data=result.weekly.to_csv(index=False).encode("utf-8"),
+        "⬇️ Download weekly velocity + index (CSV)",
+        data=disp.to_csv(index=False).encode("utf-8"),
         file_name=f"velocity_weekly_{today}.csv", mime="text/csv",
         key="velocity_download", use_container_width=True,
     )

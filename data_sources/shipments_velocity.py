@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -215,12 +216,21 @@ class WeeklyVelocity:
     total_ordered: float
     total_shipped: float
     has_velocity: bool = False
+    # Fixed full-history median velocities (the "100" of the demand/supply index).
+    baseline_demand: Optional[float] = None
+    baseline_supply: Optional[float] = None
+    # Overall shipped ÷ ordered for the displayed window (service / fill rate).
+    fill_rate: Optional[float] = None
 
 
 WEEK_START: str = "week_start"
 SHIP_TO_COUNT: str = "ship_to_count"
 SHIPPED_VELOCITY: str = "shipped_velocity"
 ORDER_VELOCITY: str = "order_velocity"
+# Rebased-to-100 indices (velocity ÷ fixed full-history median × 100) + fill rate.
+DEMAND_INDEX: str = "demand_index"
+SUPPLY_INDEX: str = "supply_index"
+FILL_RATE: str = "fill_rate"
 
 
 def _week_start(order_dt: pd.Series) -> pd.Series:
@@ -271,13 +281,12 @@ def build_weekly_velocity(
         COL_PRODUCT_DESC: product_descs, COL_CUSTOMER: customers,
         COL_BUSINESS_UNIT: business_units, COL_PRODUCT_FORMAT: product_formats,
     }
+    # Dimension filters only — the date window is applied AFTER indexing so the
+    # baseline stays a fixed full-history reference (the index means "vs normal").
     mask = work[COL_ORDER_DATE].notna()
     for col, values in _dim_filters.items():
         if values and col in work.columns:
             mask &= work[col].astype(str).str.strip().isin([str(v) for v in values])
-    if date_range is not None:
-        lo, hi = date_range
-        mask &= work[COL_ORDER_DATE].dt.date.between(lo, hi)
     work = work.loc[mask]
     if work.empty:
         return empty
@@ -294,20 +303,49 @@ def build_weekly_velocity(
     agg = {COL_ORDERED_LBS: "sum", COL_SHIPPED_LBS: "sum"}
     if has_velocity:
         agg[COL_SHIP_TO] = "nunique"
-    weekly = (grouped.groupby(WEEK_START, as_index=False).agg(agg)
-                     .sort_values(WEEK_START).reset_index(drop=True))
-    if has_velocity:
-        weekly = weekly.rename(columns={COL_SHIP_TO: SHIP_TO_COUNT})
-        # Average lbs per ship-to location; NaN (not ∞) when a week has none.
-        _denom = weekly[SHIP_TO_COUNT].where(weekly[SHIP_TO_COUNT] > 0)
-        weekly[SHIPPED_VELOCITY] = weekly[COL_SHIPPED_LBS] / _denom
-        weekly[ORDER_VELOCITY] = weekly[COL_ORDERED_LBS] / _denom
+    # Full weekly series across ALL weeks (baseline reference).
+    full = (grouped.groupby(WEEK_START, as_index=False).agg(agg)
+                   .sort_values(WEEK_START).reset_index(drop=True))
+    # Weekly fill rate = shipped ÷ ordered (service level).
+    full[FILL_RATE] = np.where(full[COL_ORDERED_LBS] > 0,
+                               full[COL_SHIPPED_LBS] / full[COL_ORDERED_LBS], np.nan)
 
+    baseline_demand = baseline_supply = None
+    if has_velocity:
+        full = full.rename(columns={COL_SHIP_TO: SHIP_TO_COUNT})
+        # Average lbs per ship-to location; NaN (not ∞) when a week has none.
+        _denom = full[SHIP_TO_COUNT].where(full[SHIP_TO_COUNT] > 0)
+        full[SHIPPED_VELOCITY] = full[COL_SHIPPED_LBS] / _denom
+        full[ORDER_VELOCITY] = full[COL_ORDERED_LBS] / _denom
+        # Fixed baseline = median velocity over weeks with activity (full history).
+        d_active = full.loc[full[COL_ORDERED_LBS] > 0, ORDER_VELOCITY].dropna()
+        s_active = full.loc[full[COL_SHIPPED_LBS] > 0, SHIPPED_VELOCITY].dropna()
+        baseline_demand = float(d_active.median()) if not d_active.empty and d_active.median() > 0 else None
+        baseline_supply = float(s_active.median()) if not s_active.empty and s_active.median() > 0 else None
+        full[DEMAND_INDEX] = (full[ORDER_VELOCITY] / baseline_demand * 100.0
+                              if baseline_demand else np.nan)
+        full[SUPPLY_INDEX] = (full[SHIPPED_VELOCITY] / baseline_supply * 100.0
+                              if baseline_supply else np.nan)
+
+    # Slice to the display window — the index is already rebased to the fixed
+    # full-history baseline, so slicing only zooms the view.
+    weekly = full
+    if date_range is not None:
+        lo, hi = date_range
+        weekly = full[full[WEEK_START].dt.date.between(lo, hi)].reset_index(drop=True)
+    if weekly.empty:
+        return empty
+
+    _to = float(weekly[COL_ORDERED_LBS].sum())
+    _ts = float(weekly[COL_SHIPPED_LBS].sum())
     return WeeklyVelocity(
         weekly=weekly,
-        total_ordered=float(weekly[COL_ORDERED_LBS].sum()),
-        total_shipped=float(weekly[COL_SHIPPED_LBS].sum()),
+        total_ordered=_to,
+        total_shipped=_ts,
         has_velocity=has_velocity,
+        baseline_demand=baseline_demand,
+        baseline_supply=baseline_supply,
+        fill_rate=(_ts / _to) if _to else None,
     )
 
 
@@ -409,6 +447,7 @@ __all__ = [
     "WeeklyVelocity",
     "DEFAULT_BUSINESS_UNIT",
     "WEEK_START", "SHIP_TO_COUNT", "SHIPPED_VELOCITY", "ORDER_VELOCITY",
+    "DEMAND_INDEX", "SUPPLY_INDEX", "FILL_RATE",
     "COL_ORDER_DATE", "COL_ORDERED_LBS", "COL_SHIPPED_LBS", "COL_PORTFOLIO",
     "COL_PRODUCT_MINOR", "COL_PRODUCT_DESC", "COL_CUSTOMER", "COL_BUSINESS_UNIT",
     "COL_PRODUCT_FORMAT", "COL_ITEM", "COL_SHIP_TO",

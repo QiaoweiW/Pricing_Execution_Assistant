@@ -112,12 +112,23 @@ def test_window_metrics_drop_and_mix():
     assert m["mileage"] == pytest.approx(250.0)
 
 
-def test_build_momentum_shape():
+def test_build_customer_deepdive_fee_bridge_and_metrics():
     enr = _enriched()
     w = page._trailing_windows(enr["Order Date"])
-    mom = page._build_momentum(enr, w)
-    assert list(mom["Metric"]) == [name for name, _, _ in page._MOMENTUM_METRICS]
-    assert {"L12M", "L6M", "L3M"}.issubset(mom.columns)
+    # threshold=0 so the synthetic S1 drift (≈$9k/yr) qualifies for the test.
+    dd = page._build_customer_deepdive(enr, w, None, None, None, None, monthly_threshold=0.0)
+    assert dd, "expected at least one deep-dive"
+    top = dd[0]
+    assert top["customer"] == "C1"                       # the drifting customer
+    assert top["annual_impact"] > 0 and top["total_delta"] > 0
+    # Fee bridge is internally consistent.
+    assert len(top["components"]) == 4
+    assert sum(c["delta"] for c in top["components"]) == pytest.approx(top["total_delta"], rel=1e-6)
+    assert top["annual_impact"] == pytest.approx(top["total_delta"] * top["annual_volume"], rel=1e-6)
+    # Drop size moved (shrank), so it is charted; stable metrics are not.
+    charted = {m["key"] for m in top["metrics"]}
+    assert "drop_size" in charted
+    assert all(m["chart"] in ("bar", "line") for m in top["metrics"])
 
 
 # ── Requote detection ────────────────────────────────────────────────────────

@@ -11029,19 +11029,28 @@ def _render_promotion_lift_analysis() -> None:
         st.info("ℹ️ Promotion Lift Analysis is coming soon.")
 
 
+def _velocity_norm_desc(s: pd.Series) -> pd.Series:
+    """Normalise item descriptions for a robust join (strip · collapse spaces ·
+    casefold) so ``dbo.Shipments.PRODUCTDESC`` lines up with PDH's Item Description."""
+    return (s.astype(str).str.strip()
+            .str.replace(r"\s+", " ", regex=True).str.casefold())
+
+
 def _velocity_attach_portfolio_minor(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure a Portfolio Minor column on the shipments frame.
 
-    Uses the shipments table's own Portfolio Minor when present; otherwise falls
-    back to the **PDH reference** — joining on the item column with the
-    codebase's canonical item-key normaliser (:func:`_vectorised_item_key`) so it
-    lines up with every other PDH-dim join.  Best-effort: a missing item column
-    or any PDH load/join failure leaves the frame unchanged (the Portfolio Minor
-    filter then simply doesn't appear), so it never breaks the section.
+    Uses the shipments table's own Portfolio Minor when present; otherwise
+    derives it from the **PDH reference by Product Description** — ``dbo.Shipments``
+    carries ``PRODUCTDESC`` (not an item number), so we match it to PDH's Item
+    Description with the same normalisation, then back-fill any residual misses
+    from an item column when one exists.  Best-effort: any PDH load/join failure
+    leaves the frame unchanged, so it never breaks the section.
     """
     if df is None or df.empty or vel.COL_PRODUCT_MINOR in df.columns:
         return df
-    if vel.COL_ITEM not in df.columns:
+    has_desc = vel.COL_PRODUCT_DESC in df.columns
+    has_item = vel.COL_ITEM in df.columns
+    if not (has_desc or has_item):
         return df
     try:
         dim = build_item_dim_frame(_load_demand_comparison_pdh())
@@ -11049,10 +11058,20 @@ def _velocity_attach_portfolio_minor(df: pd.DataFrame) -> pd.DataFrame:
         return df
     if dim is None or dim.empty or "pminor" not in dim.columns:
         return df
-    minor_by_key = dict(zip(dim["__item_key"], dim["pminor"].astype(str)))
+
     out = df.copy()
-    out[vel.COL_PRODUCT_MINOR] = (
-        _vectorised_item_key(out[vel.COL_ITEM]).map(minor_by_key).fillna(""))
+    minor = pd.Series(pd.NA, index=out.index, dtype="object")
+    # Primary: Product Description → PDH Item Description → Portfolio Minor.
+    if has_desc and "desc" in dim.columns:
+        desc_map = dict(zip(_velocity_norm_desc(dim["desc"]), dim["pminor"].astype(str)))
+        minor = _velocity_norm_desc(out[vel.COL_PRODUCT_DESC]).map(desc_map)
+    # Secondary: item-number join fills any rows the description didn't resolve.
+    if has_item:
+        item_map = dict(zip(dim["__item_key"], dim["pminor"].astype(str)))
+        item_minor = _vectorised_item_key(out[vel.COL_ITEM]).map(item_map)
+        blank = minor.isna() | (minor.astype(str).str.strip() == "")
+        minor = minor.where(~blank, item_minor)
+    out[vel.COL_PRODUCT_MINOR] = minor.fillna("").astype(str)
     return out
 
 
@@ -11132,20 +11151,6 @@ def _render_velocity_analysis_body() -> None:
                 key=f"velocity_{canonical}",
                 help="Leave empty to include all." if default == [] else None,
             )
-
-    # Portfolio Minor diagnostic: if it resolved neither in dbo.Shipments nor
-    # via the PDH fallback, surface the real source columns so the item/SKU
-    # column can be identified and wired in.
-    if vel.COL_PRODUCT_MINOR not in df.columns:
-        with st.expander("🔎 Portfolio Minor unavailable — dbo.Shipments columns",
-                         expanded=False):
-            st.caption(
-                "Portfolio Minor isn't a column in `dbo.Shipments`, and the PDH "
-                "fallback couldn't attach it (no recognizable **item** column to "
-                "join on, or no PDH match).  The table's actual columns are below "
-                "— tell me which one is the item / SKU code and I'll wire the join."
-            )
-            st.write(vel.fetch_source_columns() or "Could not read source columns.")
 
     date_range = st.slider(
         "Order date range", min_value=min_d, max_value=max_d,

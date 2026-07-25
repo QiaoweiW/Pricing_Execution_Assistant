@@ -109,6 +109,7 @@ from datetime import datetime
 from typing import NamedTuple, Optional
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from data_sources.htst_shipment import (
@@ -1055,15 +1056,31 @@ def _window_slice(df: pd.DataFrame, window: tuple[pd.Timestamp, pd.Timestamp, in
     return df[((dt >= start) & (dt <= end)).fillna(False)]
 
 
-# Momentum metric rows: (display label, unit, key).  Order = top → bottom.
-_MOMENTUM_METRICS: tuple[tuple[str, str, str], ...] = (
-    ("Mixed-pallet share", "%", "mixed_pct"),
-    ("Full-pallet share", "%", "full_pct"),
-    ("Annualized sell-to volume", "gal", "sellto_vol"),
-    ("Annualized custom-label volume", "gal", "customlabel_vol"),
-    ("Drop size", "lbs/drop", "drop_size"),
-    ("Travel distance", "mi", "mileage"),
+# Deep-dive charts: (_window_metrics key, display label, unit, chart type).  A
+# metric is charted only when it MOVED (see _metric_moved).  Volumes & drop size
+# read best as bars with data labels; pallet share as a line.
+_DEEPDIVE_CHART_METRICS: tuple[tuple[str, str, str, str], ...] = (
+    ("sellto_vol", "Annualized sell-to volume", "gal", "bar"),
+    ("customlabel_vol", "Annualized custom-label volume", "gal", "bar"),
+    ("drop_size", "Drop size", "lbs", "bar"),
+    ("mileage", "Travel distance", "mi", "bar"),
+    ("mixed_pct", "Mixed-pallet share", "%", "line"),
 )
+# A metric "moved" if L3M vs L12M changed materially: ≥1pp for shares, ≥5% for
+# the rest (so a stable series isn't charted just for noise).
+_DEEPDIVE_MOVE_PP: float = 0.01
+_DEEPDIVE_MOVE_REL: float = 0.05
+
+
+def _metric_moved(first: Optional[float], last: Optional[float], unit: str) -> bool:
+    """True when a metric changed enough (L12M→L3M) to be worth charting."""
+    if first is None or last is None or pd.isna(first) or pd.isna(last):
+        return False
+    if unit == "%":
+        return abs(last - first) >= _DEEPDIVE_MOVE_PP
+    if abs(first) < 1e-9:
+        return abs(last) > 1e-9
+    return abs(last - first) / abs(first) >= _DEEPDIVE_MOVE_REL
 
 
 def _window_metrics(df: pd.DataFrame, days: int) -> dict[str, Optional[float]]:
@@ -1096,26 +1113,88 @@ def _window_metrics(df: pd.DataFrame, days: int) -> dict[str, Optional[float]]:
     }
 
 
-def _build_momentum(filtered_df: pd.DataFrame, windows: dict) -> pd.DataFrame:
-    """Momentum table: one row per metric, columns L12M / L6M / L3M (raw values).
+# A customer qualifies for a deep-dive when the fee change would recover more
+# than this per MONTH (annualized ÷ 12) — sales-actionable, not noise.
+_DEEPDIVE_MONTHLY_THRESHOLD: float = 1_000.0
+_DEEPDIVE_FEE_COMPONENTS: tuple[tuple[str, str], ...] = (
+    ("Sell-to Fee", "Sell-to"),
+    ("Custom-label Fee", "Custom-label"),
+    ("Delivery Fee", "Delivery"),
+    ("Mixed-pallet Fee", "Mixed-pallet"),
+)
 
-    Reactive to the caller's Customer / Format / Product filters; the windows
-    are computed once from the full dataset so the anchor is filter-independent.
+
+def _build_customer_deepdive(
+    filtered_df: pd.DataFrame,
+    windows: dict,
+    pallet_fee_df: Optional[pd.DataFrame],
+    sell_to_df: Optional[pd.DataFrame],
+    custom_label_df: Optional[pd.DataFrame],
+    delivery_df: Optional[pd.DataFrame],
+    monthly_threshold: float = _DEEPDIVE_MONTHLY_THRESHOLD,
+) -> list[dict]:
+    """Per-customer requote deep-dives (> *monthly_threshold* $/mo), ranked by
+    annualized $ impact.
+
+    Rolls the site fee stacks up to the CUSTOMER level: each fee component's
+    before (L12M) / after (L3M) $/gal is the customer's L3M-volume-weighted
+    average across its ship-to sites, so ``Σ Δcomponent × volume`` equals the
+    exact dollar impact.  Also attaches each metric's L12M/L6M/L3M series (only
+    the ones that moved) for the charts.  Only sites present in BOTH windows
+    count (a drift needs a baseline).
     """
-    if not windows or filtered_df.empty:
-        return pd.DataFrame()
-    per_window = {
-        label: _window_metrics(_window_slice(filtered_df, w), w[2])
-        for label, w in windows.items()
-    }
-    labels = [lbl for lbl, _ in _TRAILING_WINDOWS if lbl in windows]
-    rows = []
-    for name, unit, key in _MOMENTUM_METRICS:
-        row = {"Metric": name, "Unit": unit}
-        for lbl in labels:
-            row[lbl] = per_window[lbl][key]
-        rows.append(row)
-    return pd.DataFrame(rows)
+    if not windows or filtered_df.empty or {"L12M", "L3M"} - set(windows):
+        return []
+    kw = dict(pallet_fee_df=pallet_fee_df, sell_to_df=sell_to_df,
+              custom_label_df=custom_label_df, delivery_df=delivery_df)
+    s12 = _site_fee_stack(_build_customer_site_summary(
+        _window_slice(filtered_df, windows["L12M"]), windows["L12M"][2], **kw))
+    s3 = _site_fee_stack(_build_customer_site_summary(
+        _window_slice(filtered_df, windows["L3M"]), windows["L3M"][2], **kw))
+    if s3.empty or s12.empty:
+        return []
+
+    m = s3.merge(s12, on=["Customer", "SHIPTONAME"], how="inner",
+                 suffixes=(" (L3M)", " (L12M)"))
+    m["_vol"] = pd.to_numeric(m["Sell-to Volume (Gal) (L3M)"], errors="coerce").fillna(0.0)
+
+    out: list[dict] = []
+    for cust, g in m.groupby("Customer"):
+        tot_vol = float(g["_vol"].sum())
+        if tot_vol <= 0:
+            continue
+        components, total_before, total_after = [], 0.0, 0.0
+        for col, name in _DEEPDIVE_FEE_COMPONENTS:
+            before = float((g[f"{col} (L12M)"] * g["_vol"]).sum()) / tot_vol
+            after = float((g[f"{col} (L3M)"] * g["_vol"]).sum()) / tot_vol
+            components.append({"name": name, "before": before, "after": after,
+                               "delta": after - before})
+            total_before += before
+            total_after += after
+        annual_impact = (total_after - total_before) * tot_vol
+        monthly_impact = annual_impact / 12.0
+        if monthly_impact <= monthly_threshold:
+            continue
+
+        # Customer-level metric series for the charts (only the ones that moved).
+        cust_df = filtered_df[filtered_df["Customer"].astype(str) == str(cust)]
+        per_window = {lbl: _window_metrics(_window_slice(cust_df, w), w[2])
+                      for lbl, w in windows.items()}
+        metrics = []
+        for key, label, unit, chart in _DEEPDIVE_CHART_METRICS:
+            vals = {lbl: per_window[lbl].get(key) for lbl in windows}
+            if _metric_moved(vals.get("L12M"), vals.get("L3M"), unit):
+                metrics.append({"key": key, "label": label, "unit": unit,
+                                "chart": chart, "values": vals})
+        out.append({
+            "customer": str(cust), "annual_impact": annual_impact,
+            "monthly_impact": monthly_impact, "annual_volume": tot_vol,
+            "components": components, "total_before": total_before,
+            "total_after": total_after, "total_delta": total_after - total_before,
+            "metrics": metrics,
+        })
+    out.sort(key=lambda d: d["annual_impact"], reverse=True)
+    return out
 
 
 def _site_fee_stack(summary: pd.DataFrame) -> pd.DataFrame:
@@ -1502,77 +1581,133 @@ def _render_formula_panel() -> None:
         )
 
 
-def _fmt_metric(v: Optional[float], unit: str) -> str:
-    """Format one momentum/KPI value by unit (— when None)."""
-    if v is None or (isinstance(v, float) and pd.isna(v)):
-        return "—"
+# Polished chart palette — professional, presentation-ready.
+_DEEPDIVE_BAR: str = "#2c6e9c"       # bars (blue)
+_DEEPDIVE_BAR_HL: str = "#14476b"    # L3M bar highlighted (darker)
+_DEEPDIVE_LINE: str = "#137d78"      # pallet-share line (teal)
+_DEEPDIVE_WINDOW_ORDER: tuple[str, ...] = ("L12M", "L6M", "L3M")
+
+
+def _deepdive_axis(v: Optional[float], unit: str) -> Optional[float]:
+    """Chart y-value for a metric (share → percent points; else raw)."""
+    if v is None or pd.isna(v):
+        return None
+    return v * 100.0 if unit == "%" else v
+
+
+def _deepdive_label(v: Optional[float], unit: str) -> str:
+    """Compact on-chart data label."""
+    if v is None or pd.isna(v):
+        return ""
     if unit == "%":
         return f"{v * 100:.1f}%"
     if unit == "gal":
-        return f"{v / 1e6:.2f}M gal" if abs(v) >= 1e6 else f"{v:,.0f} gal"
-    if unit == "lbs":
-        return f"{v:,.0f} lbs"
-    if unit == "mi":
-        return f"{v:,.0f} mi"
-    return f"{v:,.2f}"
+        return f"{v / 1e6:.1f}M" if abs(v) >= 1e6 else f"{v / 1e3:.0f}K" if abs(v) >= 1e3 else f"{v:,.0f}"
+    return f"{v:,.0f}"
 
 
-def _trend_str(first: Optional[float], last: Optional[float], unit: str) -> str:
-    """Arrow + change from L12M (first) to L3M (last); pp for %, else % change."""
-    if first is None or last is None or pd.isna(first) or pd.isna(last):
-        return "—"
-    delta = last - first
-    arrow = "▲" if delta > 1e-9 else "▼" if delta < -1e-9 else "▬"
-    if unit == "%":
-        return f"{arrow} {delta * 100:+.1f}pp"
-    if abs(first) < 1e-9:
-        return f"{arrow} n/a"
-    return f"{arrow} {delta / abs(first) * 100:+.0f}%"
+def _render_deepdive_metric_chart(customer: str, metric: dict) -> None:
+    """One polished L12M→L6M→L3M chart for a moved metric (bar or pallet line)."""
+    order = [lbl for lbl in _DEEPDIVE_WINDOW_ORDER if lbl in metric["values"]]
+    unit = metric["unit"]
+    ys = [_deepdive_axis(metric["values"][lbl], unit) for lbl in order]
+    labels = [_deepdive_label(metric["values"][lbl], unit) for lbl in order]
+    if metric["chart"] == "line":
+        fig = go.Figure(go.Scatter(
+            x=order, y=ys, mode="lines+markers+text", text=labels,
+            textposition="top center", textfont=dict(size=12, color=_DEEPDIVE_LINE),
+            line=dict(color=_DEEPDIVE_LINE, width=3),
+            marker=dict(size=11, color=_DEEPDIVE_LINE, line=dict(color="white", width=1.5)),
+            hovertemplate="%{x}: %{text}<extra></extra>"))
+        yaxis = dict(ticksuffix="%", rangemode="tozero", showgrid=True, gridcolor="#eee")
+    else:
+        colors = [_DEEPDIVE_BAR] * len(order)
+        if order:
+            colors[-1] = _DEEPDIVE_BAR_HL      # emphasise the latest quarter
+        fig = go.Figure(go.Bar(
+            x=order, y=ys, text=labels, textposition="outside",
+            textfont=dict(size=12, color="#374151"), marker_color=colors,
+            cliponaxis=False, hovertemplate="%{x}: %{text}<extra></extra>"))
+        yaxis = dict(rangemode="tozero", showgrid=True, gridcolor="#eee", showticklabels=False)
+    fig.update_layout(
+        title=dict(text=metric["label"], font=dict(size=13, color="#111827")),
+        height=250, margin=dict(l=8, r=8, t=44, b=8), showlegend=False,
+        plot_bgcolor="white", font=dict(color="#374151", size=12),
+        xaxis=dict(tickfont=dict(size=12)), yaxis=yaxis, bargap=0.35,
+    )
+    st.plotly_chart(fig, use_container_width=True,
+                    key=f"dd_{_widget_key(customer)}_{metric['key']}")
 
 
-def _render_kpis(filtered_df: pd.DataFrame, windows: dict) -> None:
-    """Latest-quarter (L3M) KPI tiles for the current filter."""
-    if not windows or "L3M" not in windows:
-        return
-    l3 = _window_slice(filtered_df, windows["L3M"])
-    m = _window_metrics(l3, windows["L3M"][2])
-    start, end, _ = windows["L3M"]
-    st.markdown(f"### 📌 Latest quarter at a glance — L3M ({start:%b %Y}–{end:%b %Y})")
-    sites = int(l3[["Customer", "SHIPTONAME"]].drop_duplicates().shape[0]) if not l3.empty else 0
-    cols = st.columns(5)
-    cols[0].metric("Ship-To sites", f"{sites:,}")
-    cols[1].metric("Mixed-pallet share", _fmt_metric(m["mixed_pct"], "%"))
-    cols[2].metric("Annualized sell-to vol", _fmt_metric(m["sellto_vol"], "gal"))
-    cols[3].metric("Avg drop size", _fmt_metric(m["drop_size"], "lbs"))
-    cols[4].metric("Avg travel distance", _fmt_metric(m["mileage"], "mi"))
+def _bh_fee_money(v: float) -> str:
+    return f"${v:,.3f}"
 
 
-def _render_momentum(momentum_df: pd.DataFrame, windows: dict) -> None:
-    """Trailing-window momentum table (metric × L12M/L6M/L3M) + trend + CSV."""
-    st.markdown("### 📈 Metric momentum — L12M → L6M → L3M")
+def _render_deepdive_fee_table(dd: dict) -> None:
+    """Storytelling fee bridge: each component before → after → Δ, summing to the
+    total activity-fee delta and the annualized $ impact."""
+    def _row(name, before, after, delta, bold=False):
+        dcol = "#c0392b" if delta > 1e-9 else "#137d78" if delta < -1e-9 else "#6b7280"
+        nm = f"<b>{name}</b>" if bold else name
+        tr_style = " style='border-top:1px solid #d1d5db'" if bold else ""
+        sign = "+" if delta >= 0 else "−"
+        return (
+            f"<tr{tr_style}>"
+            f"<td style='text-align:left;padding:2px 10px'>{nm}</td>"
+            f"<td style='text-align:right;padding:2px 10px'>{_bh_fee_money(before)}</td>"
+            f"<td style='text-align:right;padding:2px 10px'>{_bh_fee_money(after)}</td>"
+            f"<td style='text-align:right;padding:2px 10px;color:{dcol}'>"
+            f"{sign}${abs(delta):,.3f}</td></tr>"
+        )
+    head = ("<tr><th style='text-align:left;padding:2px 10px'>Activity fee ($/gal)</th>"
+            "<th style='text-align:right;padding:2px 10px'>Before (L12M)</th>"
+            "<th style='text-align:right;padding:2px 10px'>After (L3M)</th>"
+            "<th style='text-align:right;padding:2px 10px'>Δ</th></tr>")
+    body = "".join(_row(c["name"], c["before"], c["after"], c["delta"]) for c in dd["components"])
+    body += _row("Total activity fee", dd["total_before"], dd["total_after"], dd["total_delta"], bold=True)
+    st.markdown(
+        f"<table style='font-size:0.9rem;border-collapse:collapse'>{head}{body}</table>",
+        unsafe_allow_html=True)
+    st.markdown(
+        f"<div style='margin-top:8px;font-size:0.95rem'>Annualized volume "
+        f"<b>{dd['annual_volume']:,.0f} gal</b> × <b>+${dd['total_delta']:,.3f}/gal</b> = "
+        f"<b style='color:#c0392b'>${dd['annual_impact']:,.0f} / yr</b> "
+        f"(≈ ${dd['monthly_impact']:,.0f} / mo) of activity-fee recovery if repriced.</div>",
+        unsafe_allow_html=True)
+
+
+def _render_customer_deepdive(deepdives: list[dict]) -> None:
+    """One foldable section per requote-candidate customer, ranked by $ impact —
+    the storytelling fee bridge + polished charts sales can show the customer."""
+    st.markdown("### 🧲 Customer deep-dive — requote opportunities")
     st.caption(
-        "How the activity metrics move as the window narrows to the most recent "
-        "quarter.  Rising Mixed-pallet share, falling drop size, or rising travel "
-        "distance all push the fee a customer should be charged **up**."
+        "One section per customer whose activity-based fee has risen enough to "
+        "matter (> **$1k / month** impact), ranked by annualized $ impact.  Open a "
+        "customer for the fee bridge and the charts you can show them to explain "
+        "*why* the rate should change."
     )
-    if momentum_df.empty:
-        st.info("Not enough order history for the trailing-window view.")
+    if not deepdives:
+        st.success(
+            "✅ No customers cross the $1k/month activity-fee impact threshold this "
+            "quarter under the current filter."
+        )
         return
-    labels = [lbl for lbl, _ in _TRAILING_WINDOWS if lbl in windows]
-    rows = []
-    for _, r in momentum_df.iterrows():
-        unit = r["Unit"]
-        cell = {"Metric": r["Metric"]}
-        for lbl in labels:
-            cell[lbl] = _fmt_metric(r.get(lbl), unit)
-        cell["Trend (L3M vs L12M)"] = _trend_str(r.get("L12M"), r.get("L3M"), unit)
-        rows.append(cell)
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    today = datetime.now().strftime("%Y%m%d")
-    st.download_button(
-        "⬇️ Download Momentum (CSV)", data=_to_csv_bytes(momentum_df),
-        file_name=f"HTST_Momentum_{today}.csv", mime="text/csv", key="htst_dl_momentum",
-    )
+    for dd in deepdives:
+        title = (f"{dd['customer']}  —  ${dd['annual_impact']:,.0f}/yr impact "
+                 f"(≈ ${dd['monthly_impact']:,.0f}/mo)")
+        with st.expander(title, expanded=False):
+            _render_deepdive_fee_table(dd)
+            if dd["metrics"]:
+                st.markdown(
+                    "**What changed** — L12M → L6M → L3M (only metrics that moved):")
+                for i in range(0, len(dd["metrics"]), 2):
+                    for col, metric in zip(st.columns(2), dd["metrics"][i:i + 2]):
+                        with col:
+                            _render_deepdive_metric_chart(dd["customer"], metric)
+            else:
+                st.caption(
+                    "_Fee moved via a bracket boundary; the underlying metrics were "
+                    "otherwise stable._")
 
 
 def _render_requote(requote_df: pd.DataFrame) -> None:
@@ -1797,9 +1932,8 @@ def render() -> None:
     windows = _trailing_windows(enriched_df["Order Date"]) if "Order Date" in enriched_df.columns else {}
     st.markdown("---")
 
-    _render_kpis(filtered_df, windows)
-    st.markdown("---")
-    _render_momentum(_build_momentum(filtered_df, windows), windows)
+    _render_customer_deepdive(_build_customer_deepdive(
+        filtered_df, windows, pallet_fee_df, sell_to_df, custom_label_df, delivery_df))
     st.markdown("---")
     _render_requote(_build_requote(
         filtered_df, windows, pallet_fee_df, sell_to_df, custom_label_df, delivery_df))

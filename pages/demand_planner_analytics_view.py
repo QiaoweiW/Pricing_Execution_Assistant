@@ -11087,8 +11087,10 @@ def _render_velocity_analysis() -> None:
             "Week-over-week **ordered vs shipped lbs** from `dbo.Shipments`, "
             "sliced by Portfolio, Portfolio Minor, Product Description, Customer, "
             "Business Unit and Product Format over a chosen order-date range.  "
-            "The right axis shows **Shipped Velocity** (shipped lbs ÷ distinct "
-            "ship-to locations) when the table carries a ship-to column."
+            "The right axis shows **Demand Velocity** (ordered lbs ÷ distinct "
+            "ship-to) and **Supply Velocity** (shipped lbs ÷ distinct ship-to).  "
+            "The two overlap when fill rate is near 100% (ordered ≈ shipped); they "
+            "separate only by the fill gap."
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.info(
@@ -11199,8 +11201,8 @@ def _render_velocity_analysis_body() -> None:
     _line_specs = [
         ("Ordered lbs",      vel.COL_ORDERED_LBS,  "y",  dict(color="#c0392b", dash="dot"),   "lbs"),
         ("Shipped lbs",      vel.COL_SHIPPED_LBS,  "y",  dict(color="#137d78", dash="solid"), "lbs"),
-        ("Order Velocity",   vel.ORDER_VELOCITY,   "y2", dict(color="#e67e22", dash="dot"),   "lbs/ship-to"),
-        ("Shipped Velocity", vel.SHIPPED_VELOCITY, "y2", dict(color="#8e44ad", dash="dash"),  "lbs/ship-to"),
+        ("Demand Velocity",  vel.ORDER_VELOCITY,   "y2", dict(color="#e67e22", dash="dot"),   "lbs/ship-to"),
+        ("Supply Velocity",  vel.SHIPPED_VELOCITY, "y2", dict(color="#8e44ad", dash="dash"),  "lbs/ship-to"),
     ]
     present = [s for s in _line_specs if s[1] in result.weekly.columns]
     present_names = [s[0] for s in present]

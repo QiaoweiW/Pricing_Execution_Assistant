@@ -35,14 +35,54 @@ def test_build_iri_quality_base_incremental_split():
     # Efficiency NaN when ACV<2 (week1), else lift/ACV.
     assert np.isnan(w[dq.EFFICIENCY].iloc[0])
     assert w[dq.EFFICIENCY].iloc[1] == pytest.approx(33.3 / 20, rel=1e-2)
+    # New columns: stores (10 each), distribution index (flat 100), abs base units.
+    assert list(w[dq.STORES].round(1)) == [10.0, 10.0, 10.0]
+    assert list(w[dq.DIST_INDEX].round(1)) == [100.0, 100.0, 100.0]
+    assert list(w[dq.BASE_UNITS]) == [300, 300, 250]
 
 
-def test_base_erosion_signal_flags_eroding_and_masked():
-    q = dq.build_iri_quality(_raw_quality())
-    sig = dq.base_erosion_signal(q.weekly, recent_weeks=3)
+def _weekly(base_index, total_index, base_vel=None, stores=None) -> pd.DataFrame:
+    n = len(base_index)
+    d = {iri.WEEK_START: [_mon(k) for k in range(n)],
+         dq.BASE_INDEX: base_index, dq.TOTAL_INDEX: total_index}
+    if base_vel is not None:
+        d[dq.BASE_VEL] = base_vel
+    if stores is not None:
+        d[dq.STORES] = stores
+    return pd.DataFrame(d)
+
+
+def test_base_erosion_significant_masked_and_rate_driven():
+    n = 10
+    w = _weekly(list(np.linspace(100, 85, n)), [110.0] * n,
+                base_vel=list(np.linspace(20, 17, n)), stores=[100.0] * n)
+    sig = dq.base_erosion_signal(w)
     assert "ERODING" in sig["headline"]
-    assert sig["level"] == dq.LEVEL_ALERT          # total holds while base falls → masked
-    assert sig["base_slope"] < 0
+    assert sig["significant"] and sig["level"] == dq.LEVEL_ALERT   # total holds → masked
+    assert sig["base_slope"] < 0 and sig["base_r2"] > 0.99
+    assert "rate-of-sale" in sig["detail"]                         # stores flat → velocity-driven
+
+
+def test_base_erosion_not_significant_reads_holding():
+    w = _weekly([100, 102, 98, 101, 99, 100, 101, 99, 100, 102], [110.0] * 10)
+    sig = dq.base_erosion_signal(w)
+    assert "HOLDING" in sig["headline"] and not sig["significant"]
+
+
+def test_base_erosion_min_sample_guard():
+    w = _weekly([100, 96, 92], [110, 110, 110])       # only 3 weeks < min points
+    sig = dq.base_erosion_signal(w)
+    assert "Not enough weeks" in sig["headline"] and sig["base_slope"] is None
+
+
+def test_promo_response_curve():
+    n = 12
+    depth = list(np.linspace(2, 20, n))
+    w = pd.DataFrame({dq.DEPTH_PCT: depth, dq.LIFT_PCT: [2 * x + 5 for x in depth]})
+    rc = dq.promo_response_curve(w)
+    assert rc["available"] and rc["n"] == n
+    assert rc["marginal"] == pytest.approx(2.0, rel=1e-6)          # lift = 2·depth + 5
+    assert rc["r2"] == pytest.approx(1.0, abs=1e-9)
 
 
 def test_promo_economics_signal():

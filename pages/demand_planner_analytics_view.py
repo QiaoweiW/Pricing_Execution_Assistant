@@ -10809,21 +10809,30 @@ def _render_base_health(qd: pd.DataFrame) -> None:
     sig = dq.base_erosion_signal(qd)
     _dq_banner(sig)                                       # banner
     sl = sig.get("base_slope")
+    trend = ("—" if sl is None else f"{sl:+.1f}/wk" + ("" if sig.get("significant") else " (n.s.)"))
+    dist_last = _vel_last(qd.get(dq.DIST_INDEX))
+    base_u = _vel_last(qd.get(dq.BASE_UNITS))
     _dq_kpis([                                            # metrics
         ("Base index", f"{sig.get('base_last'):.0f}" if sig.get("base_last") is not None else "—",
          "latest · everyday demand"),
-        ("Total index", f"{sig.get('total_last'):.0f}" if sig.get("total_last") is not None else "—",
-         "base + promo"),
-        ("Base trend", f"{sl:+.1f}/wk" if sl is not None else "—", "last 13 wks"),
+        ("Distribution idx", f"{dist_last:.0f}" if dist_last is not None else "—",
+         "stores selling · vs normal"),
+        ("Base trend", trend, "OLS slope, last 13 wks"),
+        ("Base units", f"{base_u:,.0f}" if base_u is not None else "—", "latest week (absolute)"),
     ])
     _chart_method(                                        # explanation
         "- **Formula** — Base velocity = Σ **Base Units** ÷ Σ stores selling "
-        "(distribution-neutral); indexed = ÷ its own full-history median × 100.\n"
-        "- **Read** — base *below* total = the promo cushion (shaded); base trending "
-        "down while total holds = base is promo-masked (erosion).\n"
+        "(distribution-neutral, indexed ÷ its own full-history median × 100).  "
+        "**Distribution** = Σ stores selling, indexed the same way.  "
+        "Base **volume** ≈ base velocity × stores, so a base decline is split by "
+        "shift-share into **rate-of-sale** (velocity) vs **distribution** (stores).\n"
+        "- **Trend** — OLS slope over the last 13 wks with a significance test "
+        "(‘n.s.’ = not statistically distinguishable from flat, so don't over-react).\n"
+        "- **Read** — base *below* total = promo cushion (shaded); base sliding while "
+        "total holds = promo-masked erosion; falling distribution vs falling velocity "
+        "tells you *why*.\n"
         "- **Source** — IRI POS `Base Units`, `U Sales`, `Units per Store Selling`; "
-        "reacts to the **IRI** filters + Week window.\n"
-        "- **Chart** — Base (bold) vs Total (light), the gap filled = incremental cushion.")
+        "reacts to the **IRI** filters + Week window.")
     x = list(qd[iri.WEEK_START])                          # chart
     fig = go.Figure()
     fig.add_scatter(x=x, y=qd[dq.TOTAL_INDEX], name="Total velocity", mode="lines",
@@ -10833,6 +10842,10 @@ def _render_base_health(qd: pd.DataFrame) -> None:
                     mode="lines+markers", line=dict(color="#1f77b4", width=3),
                     marker=dict(size=5), fill="tonexty", fillcolor="rgba(244,180,0,0.14)",
                     hovertemplate="Base: %{y:.0f}<extra></extra>")
+    if dq.DIST_INDEX in qd.columns and qd[dq.DIST_INDEX].notna().any():
+        fig.add_scatter(x=x, y=qd[dq.DIST_INDEX], name="Distribution (stores)", mode="lines",
+                        line=dict(color="#2ca02c", dash="dot", width=2),
+                        hovertemplate="Distribution: %{y:.0f}<extra></extra>")
     fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=30, b=10),
@@ -10889,6 +10902,31 @@ def _render_promo_economics(qd: pd.DataFrame) -> None:
                    rangemode="tozero"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
     st.plotly_chart(fig, use_container_width=True, key="dq_promo_chart")
+
+    # Drill-in: depth → lift response curve (diminishing returns).
+    rc = dq.promo_response_curve(qd)
+    if rc.get("available"):
+        r2 = rc.get("r2")
+        st.caption(
+            f"🔎 **Depth → lift response** — marginal ≈ **{rc['marginal']:.1f} lift‑pts "
+            f"per point of discount depth**"
+            + (f" (R²={r2:.2f})" if r2 is not None else "")
+            + f" across {rc['n']} promoted weeks.  A flat/negative slope means deeper "
+            "cuts aren't buying proportional lift (diminishing returns / fatigue).")
+        fig2 = go.Figure()
+        fig2.add_scatter(x=rc["depth"], y=rc["lift"], mode="markers", name="promoted weeks",
+                         marker=dict(size=7, color="#f4b400", opacity=0.6),
+                         hovertemplate="depth %{x:.1f}% → lift %{y:.0f}%<extra></extra>")
+        fig2.add_scatter(x=rc["fit_x"], y=rc["fit_y"], mode="lines", name="fit",
+                         line=dict(color="#c0392b", width=2))
+        fig2.update_layout(
+            height=300, margin=dict(l=10, r=10, t=20, b=10),
+            font=dict(color=_BH_FONT_COLOR, size=13),
+            xaxis=dict(title=dict(text="Discount depth %"), showgrid=True, gridcolor="#eeeeee"),
+            yaxis=dict(title=dict(text="Lift %"), showgrid=True, gridcolor="#eeeeee",
+                       rangemode="tozero"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
+        st.plotly_chart(fig2, use_container_width=True, key="dq_response_chart")
 
 
 def _render_promo_cohort(cohort) -> None:
@@ -10952,6 +10990,10 @@ def _render_demand_quality(quality_weekly, cohort, week_range: tuple) -> None:
     if qd.empty:
         st.info("No IRI quality weeks in the selected range.")
         return
+    if len(qd) < 8:
+        st.warning(
+            f"⚠️ Only {len(qd)} IRI weeks in view — reads here can be noisy.  Widen the "
+            "Week window or loosen the IRI filters before acting on the trends.")
     _render_base_health(qd)
     _render_promo_economics(qd)
     _render_promo_cohort(cohort)

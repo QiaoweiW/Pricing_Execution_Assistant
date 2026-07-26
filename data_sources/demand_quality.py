@@ -45,6 +45,9 @@ INC_SHARE = "inc_share"        # incremental ÷ total  (share of volume on deal)
 DEPTH_PCT = "depth_pct"        # (base price − realised) ÷ base price
 ACV = "acv"                    # % ACV on feature/display (merch support)
 EFFICIENCY = "efficiency"      # lift% per ACV point (promo weeks only)
+STORES = "stores"              # Σ stores selling (distribution breadth)
+DIST_INDEX = "dist_index"      # stores ÷ own full-history median × 100
+BASE_UNITS = "base_units"      # Σ base units (absolute, everyday)
 
 # Signal levels (reuse the velocity traffic light vocabulary).
 LEVEL_GOOD = "aligned"
@@ -54,6 +57,8 @@ LEVEL_ALERT = "alert"
 _ACV_MIN = 2.0        # need ≥2% ACV feature/display to call a week "on promo"
 _SLOPE_EPS = 0.4      # base-index pts/wk to call a real trend
 _RECENT_WEEKS = 13    # base-erosion look-back
+_MIN_POINTS = 6       # min weeks to fit a trustworthy base trend
+_T_SIGNIF = 2.0       # |slope ÷ std-err| for ~95% significance
 
 
 @dataclass(frozen=True)
@@ -86,7 +91,8 @@ def build_iri_quality(
     lift% ÷ ACV, only where ACV ≥ 2% (else NaN — it explodes near zero).
     """
     cols = [iri.WEEK_START, TOTAL_VEL, BASE_VEL, INC_VEL, TOTAL_INDEX, BASE_INDEX,
-            LIFT_PCT, INC_SHARE, DEPTH_PCT, ACV, EFFICIENCY]
+            LIFT_PCT, INC_SHARE, DEPTH_PCT, ACV, EFFICIENCY, STORES, DIST_INDEX,
+            BASE_UNITS]
     empty = IRIQuality(pd.DataFrame(columns=cols), None, None)
     if df is None or df.empty or iri.COL_WEEK not in df.columns \
             or COL_BASE_UNITS not in df.columns:
@@ -145,17 +151,58 @@ def build_iri_quality(
     wk[BASE_INDEX] = wk[BASE_VEL] / base_baseline * 100.0 if base_baseline else np.nan
     wk[TOTAL_INDEX] = wk[TOTAL_VEL] / total_baseline * 100.0 if total_baseline else np.nan
 
+    # Distribution (stores selling) indexed to its own median + absolute base units.
+    dist_active = wk.loc[wk["stores"] > 0, "stores"].dropna()
+    dist_baseline = float(dist_active.median()) if not dist_active.empty and dist_active.median() > 0 else None
+    wk[STORES] = wk["stores"]
+    wk[DIST_INDEX] = wk["stores"] / dist_baseline * 100.0 if dist_baseline else np.nan
+    wk[BASE_UNITS] = wk["base"]
+
     return IRIQuality(weekly=wk[[iri.WEEK_START, *cols[1:]]].reset_index(drop=True),
                       base_baseline=base_baseline, total_baseline=total_baseline)
 
 
 # ── Signals (pure) ───────────────────────────────────────────────────────────
 
-def _slope(series: pd.Series, n: int) -> Optional[float]:
+def _slope_ols(series: pd.Series, n: int):
+    """OLS slope over the last *n* non-null points → ``(slope, std_err, r2, m)``.
+    ``slope`` is None when there are fewer than :data:`_MIN_POINTS` points."""
     s = pd.to_numeric(pd.Series(series), errors="coerce").dropna().tail(n)
-    if len(s) < 3:
+    m = len(s)
+    if m < _MIN_POINTS:
+        return None, None, None, m
+    x = np.arange(m, dtype=float)
+    y = s.to_numpy(float)
+    xm, ym = x.mean(), y.mean()
+    sxx = float(((x - xm) ** 2).sum())
+    if sxx == 0:
+        return 0.0, None, None, m
+    b = float(((x - xm) * (y - ym)).sum() / sxx)
+    resid = y - (ym + b * (x - xm))
+    dof = m - 2
+    s2 = float((resid ** 2).sum() / dof) if dof > 0 else None
+    se = float((s2 / sxx) ** 0.5) if s2 is not None and s2 >= 0 else None
+    sst = float(((y - ym) ** 2).sum())
+    r2 = float(1 - (resid ** 2).sum() / sst) if sst > 0 else None
+    return b, se, r2, m
+
+
+def _rate_dist_split(weekly: pd.DataFrame, n: int):
+    """Shift-share of the recent base-VOLUME change into rate-of-sale vs
+    distribution: Δ(base units) ≈ Δvelocity·avg-stores + Δstores·avg-velocity."""
+    if BASE_VEL not in weekly.columns or STORES not in weekly.columns:
         return None
-    return float(np.polyfit(np.arange(len(s), dtype=float), s.to_numpy(float), 1)[0])
+    r = weekly.tail(n)
+    v = pd.to_numeric(r[BASE_VEL], errors="coerce")
+    s = pd.to_numeric(r[STORES], errors="coerce")
+    ok = v.notna() & s.notna()
+    v, s = v[ok], s[ok]
+    if len(v) < 2:
+        return None
+    v0, v1, s0, s1 = float(v.iloc[0]), float(v.iloc[-1]), float(s.iloc[0]), float(s.iloc[-1])
+    rate = (v1 - v0) * (s0 + s1) / 2.0        # velocity move × avg stores
+    dist = (s1 - s0) * (v0 + v1) / 2.0        # stores move × avg velocity
+    return {"rate": rate, "dist": dist, "total": rate + dist}
 
 
 def _last(series: pd.Series) -> Optional[float]:
@@ -164,38 +211,54 @@ def _last(series: pd.Series) -> Optional[float]:
 
 
 def base_erosion_signal(weekly: pd.DataFrame, *, recent_weeks: int = _RECENT_WEEKS) -> dict:
-    """Assumption + drill-in on whether the base is eroding."""
+    """Assumption + drill-in on whether the base is eroding — with significance
+    (OLS slope vs its std-error) and a rate-of-sale vs distribution attribution."""
     if weekly is None or weekly.empty or BASE_INDEX not in weekly.columns:
         return {"level": LEVEL_GOOD, "headline": "No base data in view.",
-                "detail": "", "drill_in": ""}
-    bslope = _slope(weekly[BASE_INDEX], recent_weeks)
-    blast = _last(weekly[BASE_INDEX])
-    tlast = _last(weekly.get(TOTAL_INDEX))
-    if bslope is None or blast is None:
-        return {"level": LEVEL_GOOD, "headline": "Not enough weeks to read base trend.",
-                "detail": "Widen the Week window.", "drill_in": ""}
-    masked = tlast is not None and (tlast - blast) >= 8 and bslope < -_SLOPE_EPS
-    if bslope < -_SLOPE_EPS:
+                "detail": "", "drill_in": "", "significant": False}
+    b, se, r2, npts = _slope_ols(weekly[BASE_INDEX], recent_weeks)
+    blast, tlast = _last(weekly[BASE_INDEX]), _last(weekly.get(TOTAL_INDEX))
+    if b is None or blast is None:
+        return {"level": LEVEL_GOOD,
+                "headline": f"Not enough weeks to read a base trend (need ≥{_MIN_POINTS}).",
+                "detail": "Widen the Week window or loosen the IRI filters.",
+                "drill_in": "", "base_slope": None, "base_last": blast,
+                "total_last": tlast, "base_r2": None, "significant": False}
+    significant = se is not None and se > 0 and abs(b / se) >= _T_SIGNIF
+    material = significant and abs(b) >= _SLOPE_EPS
+    conf = f", R²={r2:.2f}" if r2 is not None else ""
+    split = _rate_dist_split(weekly, recent_weeks)
+    attr = ""
+    if split and abs(split["total"]) > 1e-9:
+        driver = ("rate-of-sale (per-store velocity)"
+                  if abs(split["rate"]) >= abs(split["dist"])
+                  else "distribution (stores selling)")
+        attr = f"  Driven mostly by **{driver}**."
+    masked = tlast is not None and (tlast - blast) >= 8 and material and b < 0
+    if material and b < 0:
         level = LEVEL_ALERT if masked else LEVEL_WATCH
         headline = "Assume the base is ERODING."
-        detail = (f"Base velocity is trending down ({bslope:+.1f} idx-pts/wk over "
-                  f"{recent_weeks} wks, now {blast:.0f}% of normal)"
-                  + (f" while total holds at {tlast:.0f}% — the flat total is "
-                     "promo-masked, so a baseline forecast off it is overstated."
-                     if masked else "."))
-    elif bslope > _SLOPE_EPS:
+        detail = (f"Base velocity is trending down ({b:+.1f} idx-pts/wk over {npts} wks"
+                  f"{conf}, now {blast:.0f}% of normal)"
+                  + (f" while total holds at {tlast:.0f}% — the flat total is promo-masked."
+                     if masked else ".") + attr)
+    elif material and b > 0:
         level, headline = LEVEL_GOOD, "Assume the base is GROWING."
-        detail = (f"Base velocity is rising ({bslope:+.1f} idx-pts/wk, now "
-                  f"{blast:.0f}% of normal) — real underlying demand, not just promo.")
+        detail = (f"Base velocity is rising ({b:+.1f} idx-pts/wk{conf}, now {blast:.0f}% of "
+                  f"normal) — real underlying demand, not just promo." + attr)
     else:
         level, headline = LEVEL_GOOD, "Assume the base is HOLDING."
-        detail = f"Base velocity is flat ({blast:.0f}% of normal) over {recent_weeks} wks."
+        why = ("not statistically distinguishable from flat" if not significant
+               else "within the noise band")
+        detail = (f"Base velocity trend {b:+.1f} idx-pts/wk{conf} is {why}; base is "
+                  f"~{blast:.0f}% of normal over {npts} wks." + attr)
     return {"level": level, "headline": headline, "detail": detail,
-            "base_slope": bslope, "base_last": blast, "total_last": tlast,
-            "drill_in": ("To solidify: split the base move into **distribution** "
-                         "(ACV / stores selling) vs **rate-of-sale** (per-store base "
-                         "velocity), and by subtype / size / geography — is it broad "
-                         "or one SKU?")}
+            "base_slope": b, "base_last": blast, "total_last": tlast,
+            "base_r2": r2, "significant": significant,
+            "drill_in": ("Now shown below: the **distribution** (stores selling) line "
+                         "splits a base move into breadth vs per-store **rate-of-sale**.  "
+                         "Drill further by subtype / size / geography to see if it's broad "
+                         "or one SKU.")}
 
 
 def promo_economics_signal(weekly: pd.DataFrame, *, recent_weeks: int = 8) -> dict:
@@ -234,6 +297,34 @@ def promo_economics_signal(weekly: pd.DataFrame, *, recent_weeks: int = 8) -> di
                          "(diminishing returns), split by tactic (Feature vs TPR), and "
                          "overlay **competitor price** (IRI carries every brand) — are "
                          "you discounting to defend share?")}
+
+
+def promo_response_curve(weekly: pd.DataFrame, *, min_points: int = _MIN_POINTS) -> dict:
+    """Depth→lift response points + an OLS fit → diminishing-returns read.
+
+    Returns ``{available, depth, lift, fit_x, fit_y, marginal, r2, n}`` over the
+    weeks with a real discount (depth > 0).  ``marginal`` = extra lift‑points per
+    point of discount depth (the slope); a low/flat slope = promo not pulling its
+    weight.  Empty / too‑few‑points → ``{"available": False}``.
+    """
+    out = {"available": False}
+    if weekly is None or weekly.empty:
+        return out
+    d = pd.to_numeric(weekly.get(DEPTH_PCT), errors="coerce")
+    lift = pd.to_numeric(weekly.get(LIFT_PCT), errors="coerce")
+    ok = d.notna() & lift.notna() & (d > 0)          # promoted weeks only
+    d, lift = d[ok], lift[ok]
+    if len(d) < min_points:
+        return out
+    x, y = d.to_numpy(float), lift.to_numpy(float)
+    b, a = np.polyfit(x, y, 1)
+    yhat = a + b * x
+    sst = float(((y - y.mean()) ** 2).sum())
+    r2 = float(1 - ((y - yhat) ** 2).sum() / sst) if sst > 0 else None
+    lo, hi = float(x.min()), float(x.max())
+    return {"available": True, "depth": [float(v) for v in x], "lift": [float(v) for v in y],
+            "fit_x": [lo, hi], "fit_y": [float(a + b * lo), float(a + b * hi)],
+            "marginal": float(b), "r2": r2, "n": int(len(x))}
 
 
 # ── Promo cohort (event study around OUR promo onsets) ───────────────────────
@@ -351,7 +442,8 @@ __all__ = [
     "IRIQuality", "PromoCohort",
     "TOTAL_VEL", "BASE_VEL", "INC_VEL", "TOTAL_INDEX", "BASE_INDEX",
     "LIFT_PCT", "INC_SHARE", "DEPTH_PCT", "ACV", "EFFICIENCY",
+    "STORES", "DIST_INDEX", "BASE_UNITS",
     "LEVEL_GOOD", "LEVEL_WATCH", "LEVEL_ALERT",
     "build_iri_quality", "base_erosion_signal", "promo_economics_signal",
-    "promo_onsets", "build_promo_cohort", "promo_cohort_signal",
+    "promo_response_curve", "promo_onsets", "build_promo_cohort", "promo_cohort_signal",
 ]

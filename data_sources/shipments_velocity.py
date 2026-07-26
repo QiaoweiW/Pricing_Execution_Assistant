@@ -69,6 +69,10 @@ COL_PRODUCT_DESC:   str = "product_desc"
 COL_CUSTOMER:       str = "customer"
 COL_BUSINESS_UNIT:  str = "business_unit"
 COL_PRODUCT_FORMAT: str = "product_format"
+# Corporate Group is not a source column — the page attaches it by resolving the
+# Party Site Number (ship-to) through the dp_dimshiptosites → plantosites →
+# customernames chain, so it can be filtered exactly like the source dims.
+COL_CORP_GROUP:     str = "corporate_group"
 # Non-filter helper columns: item (for a PDH Portfolio-Minor fallback join when
 # the shipments table lacks Portfolio Minor) and ship-to (for Shipped Velocity).
 COL_ITEM:           str = "item"
@@ -255,6 +259,7 @@ def build_weekly_velocity(
     customers:       Optional[list[str]] = None,
     business_units:  Optional[list[str]] = None,
     product_formats: Optional[list[str]] = None,
+    corporate_groups: Optional[list[str]] = None,
     date_range:      Optional[tuple[date, date]] = None,
 ) -> WeeklyVelocity:
     """Filter the tidy shipments frame and aggregate ordered/shipped lbs by week.
@@ -280,6 +285,7 @@ def build_weekly_velocity(
         COL_PORTFOLIO: portfolios, COL_PRODUCT_MINOR: product_minors,
         COL_PRODUCT_DESC: product_descs, COL_CUSTOMER: customers,
         COL_BUSINESS_UNIT: business_units, COL_PRODUCT_FORMAT: product_formats,
+        COL_CORP_GROUP: corporate_groups,
     }
     # Dimension filters only — the date window is applied AFTER indexing so the
     # baseline stays a fixed full-history reference (the index means "vs normal").
@@ -450,7 +456,7 @@ __all__ = [
     "DEMAND_INDEX", "SUPPLY_INDEX", "FILL_RATE",
     "COL_ORDER_DATE", "COL_ORDERED_LBS", "COL_SHIPPED_LBS", "COL_PORTFOLIO",
     "COL_PRODUCT_MINOR", "COL_PRODUCT_DESC", "COL_CUSTOMER", "COL_BUSINESS_UNIT",
-    "COL_PRODUCT_FORMAT", "COL_ITEM", "COL_SHIP_TO",
+    "COL_PRODUCT_FORMAT", "COL_CORP_GROUP", "COL_ITEM", "COL_SHIP_TO",
     "REQUIRED_FIELDS", "FILTER_FIELDS", "EXTRA_FIELDS",
     "resolve_columns", "build_weekly_velocity", "distinct_values",
     "fetch_shipments_df", "fetch_source_columns",

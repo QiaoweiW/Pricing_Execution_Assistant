@@ -66,6 +66,15 @@ def test_weekly_velocity_business_unit_filter_and_weeks():
     assert res.total_shipped == pytest.approx(310.0)
 
 
+def test_weekly_velocity_corporate_group_filter():
+    d = _tidy()
+    d[sv.COL_CORP_GROUP] = ["Kroger", "Target", "Kroger", "Kroger"]
+    res = sv.build_weekly_velocity(d, business_units=["B2C"], corporate_groups=["Kroger"])
+    # Kroger∩B2C = row0 (100/90, wk1) + row2 (200/180, wk2); Target + B2B dropped.
+    assert res.total_ordered == pytest.approx(300.0)
+    assert res.total_shipped == pytest.approx(270.0)
+
+
 def test_weekly_velocity_portfolio_filter():
     res = sv.build_weekly_velocity(_tidy(), portfolios=["Butter"], business_units=["B2C"])
     assert res.total_ordered == pytest.approx(300.0)   # 100 (wk1) + 200 (wk2)

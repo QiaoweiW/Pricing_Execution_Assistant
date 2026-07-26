@@ -136,6 +136,7 @@ from data_sources.demand_plan_comparison import (
     build_enriched_sources,
     build_item_dim_frame,
     build_item_dim_frame_cascade,
+    build_corp_group_lookups,
     _vectorised_item_key,
     ComparisonNotCaptured,
     DIAG_COL_LBS,
@@ -375,6 +376,9 @@ from data_sources import ro_pipeline_analytics as rpa
 from data_sources import shipments_velocity as vel
 from data_sources import iri_velocity as iri
 from data_sources import velocity_signals as vsig
+from data_sources import trade_spend as tsp
+from data_sources import ship_to_sites as sts
+from data_sources import customer_dims as cd
 from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
@@ -11077,6 +11081,56 @@ def _velocity_attach_portfolio_minor(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def _velocity_corp_lookup() -> dict:
+    """``party_site → corporate_group`` via the existing dim chain
+    (dp_dimshiptosites → dp_dimplantosites → dp_dimcustomernames).  Best-effort:
+    any dim read failure returns an empty map (the corp filter simply disables)."""
+    try:
+        party2corp, _cust2corp = build_corp_group_lookups(
+            sts.fetch_dimshiptosites_df(), sts.fetch_dp_dimplantosites_df(),
+            cd.fetch_dp_dimcustomernames_df())
+        return dict(party2corp)
+    except Exception:  # noqa: BLE001 — keep the section alive
+        return {}
+
+
+def _velocity_attach_corp_group(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach a Corporate Group column by resolving the ship-to (Party Site
+    Number) through :func:`_velocity_corp_lookup`.  Unmapped ship-tos stay blank
+    (no synthetic bucket) — the retained Customer filter still slices them."""
+    if df is None or df.empty or vel.COL_SHIP_TO not in df.columns:
+        return df
+    party2corp = _velocity_corp_lookup()
+    if not party2corp:
+        return df
+    out = df.copy()
+    out[vel.COL_CORP_GROUP] = (out[vel.COL_SHIP_TO].astype(str).str.strip()
+                               .map(party2corp).fillna(""))
+    return out
+
+
+def _velocity_item_scope(scoped_df: pd.DataFrame) -> Optional[set]:
+    """Normalised item keys behind the product-filtered shipment frame, via the
+    PDH description bridge (``dbo.Shipments`` has no SKU) — the scope that links
+    the promo overlay to the velocity filters.  ``None`` → no product filter /
+    unresolved (overlay uses all items)."""
+    if scoped_df is None or scoped_df.empty or vel.COL_PRODUCT_DESC not in scoped_df.columns:
+        return None
+    try:
+        pdh = _load_demand_comparison_pdh()
+    except Exception:  # noqa: BLE001
+        return None
+    if pdh is None or pdh.empty or "Item Description" not in pdh.columns \
+            or "Item No" not in pdh.columns:
+        return None
+    descs = set(_velocity_norm_desc(scoped_df[vel.COL_PRODUCT_DESC]).dropna())
+    if not descs:
+        return set()
+    match = _velocity_norm_desc(pdh["Item Description"]).isin(descs)
+    return {tsp.norm_item(x) for x in pdh.loc[match, "Item No"] if str(x).strip()}
+
+
 def _render_velocity_analysis() -> None:
     """Foldable 'Velocity Analysis' section — weekly ordered vs shipped lbs.
 
@@ -11130,7 +11184,14 @@ def _render_velocity_methodology(iri_file: str) -> None:
             "The baseline is fixed, so the Week slider only zooms — the index "
             "always reads *vs normal*, never re-centred.  Only **shape/timing** is "
             "comparable across series, not levels.  **Fill Rate = shipped ÷ "
-            "ordered lbs.**"
+            "ordered lbs.**\n\n"
+            "**Promo shading** — weeks with a consumer promo (`dp_fy_*_actual_"
+            "trade_spend`) are shaded on the first chart, coloured by **tactic** "
+            "(Ad Feature / TPR / Display / EDLP), depth ∝ # SKUs on promo.  Scope "
+            "follows the filters: promo `item_number` → **PDH** → shipment "
+            "attributes for the product filters, and **Corporate Group** for the "
+            "customer side.  Year-long *Corp Program* / fee rows and *Cancelled* "
+            "promos are excluded."
             + (f"\n\n_IRI source: `Files/RO Tracking/IRI/{iri_file}`._" if iri_file else "")
         )
 
@@ -11217,9 +11278,48 @@ def _render_velocity_kpis(disp: pd.DataFrame) -> None:
     st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
 
 
-def _render_velocity_chart(disp: pd.DataFrame) -> None:
+def _render_promo_shading(fig: "go.Figure", disp: pd.DataFrame, promo) -> None:
+    """Shade consumer-promo weeks: one ``vrect`` per active week, colour = the
+    dominant tactic, opacity ∝ # SKUs on promo — plus a tactic legend and a
+    hover marker per week carrying the so-what (SKUs, spend, volume, corps)."""
+    if promo is None or getattr(promo, "bands", None) is None or promo.bands.empty:
+        return
+    bands = promo.bands
+    mx = float(promo.max_weight) or 1.0
+    for r in bands.itertuples(index=False):
+        op = min(0.10 + 0.24 * (r.weight / mx), 0.42)   # graded, capped
+        fig.add_vrect(x0=r.x0, x1=r.x1, fillcolor=r.color, opacity=op,
+                      line_width=0, layer="below")
+    # Legend proxy (one square per dominant tactic present).
+    for t in promo.tactics:
+        fig.add_scatter(x=[None], y=[None], mode="markers", name=f"Promo · {t}",
+                        marker=dict(size=11, symbol="square", opacity=0.55,
+                                    color=tsp.TACTIC_COLORS.get(t, "#8e8e8e")),
+                        legendgroup="promo", hoverinfo="skip", showlegend=True)
+    # Hover markers at the top of each promo week (the actionable detail).
+    idx_cols = [iri.SELL_THROUGH_INDEX, vel.DEMAND_INDEX, vel.SUPPLY_INDEX]
+    tops = [pd.to_numeric(disp[c], errors="coerce").max()
+            for c in idx_cols if c in disp.columns]
+    ytop = max([float(v) for v in tops if pd.notna(v)] + [120.0])
+    htext = [
+        f"<b>Promo · week of {pd.Timestamp(w):%b %d, %Y}</b><br>"
+        f"Dominant: {t}<br>Active: {_esc_html(a)}<br>"
+        f"SKUs on promo: {int(n)}<br>Spend ${s:,.0f} · Vol {v:,.0f} lbs<br>"
+        f"{_esc_html(cs)}" + (f"<br><i>{_esc_html(d)}</i>" if d else "")
+        for w, t, a, n, s, v, cs, d in zip(
+            bands["week_start"], bands["tactic"], bands["tactics_active"],
+            bands["total_skus"], bands["spend"], bands["volume"],
+            bands["corps"], bands["descs"])]
+    fig.add_scatter(
+        x=list(bands["week_start"]), y=[ytop] * len(bands), mode="markers",
+        marker=dict(size=9, symbol="triangle-down", color="#555", opacity=0.5),
+        name="Promo detail", hovertext=htext, hoverinfo="text", showlegend=False)
+
+
+def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
     """Hero chart: three index lines (primary axis) + muted, toggleable
-    ordered/shipped lbs bars (secondary axis)."""
+    ordered/shipped lbs bars (secondary axis) + shaded consumer-promo windows
+    (per-week intensity bands, colour = dominant tactic, opacity = # SKUs)."""
     weeks = list(disp[vel.WEEK_START])
     index_specs = [
         ("Sell-through (IRI) Velocity", iri.SELL_THROUGH_INDEX, _VEL_ST_COLOR, "solid", 3.0),
@@ -11243,6 +11343,7 @@ def _render_velocity_chart(disp: pd.DataFrame) -> None:
         return
 
     fig = go.Figure()
+    _render_promo_shading(fig, disp, promo)
     if show_bars:
         for name, col, color in (("Ordered lbs", vel.COL_ORDERED_LBS, "#c0392b"),
                                   ("Shipped lbs", vel.COL_SHIPPED_LBS, "#137d78")):
@@ -11435,6 +11536,7 @@ def _render_velocity_analysis_body() -> None:
         st.info("No shipment rows available.")
         return
     df = _velocity_attach_portfolio_minor(df)
+    df = _velocity_attach_corp_group(df)
 
     # IRI consumer sell-through (best-effort — the section still works without it).
     iri_raw: Optional[pd.DataFrame] = None
@@ -11443,6 +11545,14 @@ def _render_velocity_analysis_body() -> None:
         iri_raw, iri_file = iri.fetch_iri_df()
     except iri.IRIVelocityError as exc:
         iri_err = str(exc)
+
+    # Trade-spend promo windows (best-effort — overlay only).
+    ts_df: Optional[pd.DataFrame] = None
+    ts_err = None
+    try:
+        ts_df = tsp.fetch_trade_spend_df()
+    except tsp.TradeSpendError as exc:
+        ts_err = str(exc)
 
     _render_velocity_methodology(iri_file)
 
@@ -11453,6 +11563,7 @@ def _render_velocity_analysis_body() -> None:
         (vel.COL_PRODUCT_MINOR, "Portfolio Minor"),
         (vel.COL_PRODUCT_FORMAT, "Product Format"),
         (vel.COL_PRODUCT_DESC,  "Product Description"),
+        (vel.COL_CORP_GROUP,    "Corporate Group"),
         (vel.COL_CUSTOMER,      "Customer"),
     ]
     selections: dict[str, list[str]] = {}
@@ -11497,6 +11608,7 @@ def _render_velocity_analysis_body() -> None:
         customers=selections.get(vel.COL_CUSTOMER) or None,
         business_units=selections.get(vel.COL_BUSINESS_UNIT) or None,
         product_formats=selections.get(vel.COL_PRODUCT_FORMAT) or None,
+        corporate_groups=selections.get(vel.COL_CORP_GROUP) or None,
         date_range=None,   # full history — baseline stays fixed
     )
     iri_res = None
@@ -11533,9 +11645,51 @@ def _render_velocity_analysis_body() -> None:
         st.info("No weeks in the selected range.")
         return
 
+    # ── Promo overlay (trade spend) ─────────────────────────────────────────
+    promo = None
+    if ts_df is not None:
+        tac_opts = tsp.distinct_tactics(ts_df)
+        default_tacs = [t for t in tsp.CONSUMER_TACTICS if t in tac_opts]
+        sel_tacs = st.multiselect(
+            "🎯 Shade promo tactics (consumer shelf events)", options=tac_opts,
+            default=default_tacs, key="velocity_promo_tactics",
+            help="Trade-spend promo windows shaded on the chart, coloured by tactic.  "
+                 "Year-long 'Corp Program' / fee rows are available but off by default "
+                 "(they'd flood the chart).  Cancelled promos are excluded.")
+        # Item scope = SKUs behind the PRODUCT-filtered shipments (bridged to
+        # trade-spend item_number via PDH, since dbo.Shipments has no SKU); the
+        # corp scope reuses the Corporate Group filter.  (Customer refines the
+        # velocity lines only — trade spend has no grain below Corporate Group.)
+        prod_cols = (vel.COL_BUSINESS_UNIT, vel.COL_PORTFOLIO, vel.COL_PRODUCT_MINOR,
+                     vel.COL_PRODUCT_FORMAT, vel.COL_PRODUCT_DESC)
+        any_prod = any(selections.get(c) for c in prod_cols)
+        item_keys = None
+        if any_prod:
+            m = pd.Series(True, index=df.index)
+            for c in prod_cols:
+                vals = selections.get(c)
+                if vals and c in df.columns:
+                    m &= df[c].astype(str).str.strip().isin([str(v) for v in vals])
+            item_keys = _velocity_item_scope(df[m])
+        if sel_tacs:
+            promo = tsp.build_promo_windows(
+                ts_df, item_keys=item_keys,
+                corporate_groups=selections.get(vel.COL_CORP_GROUP) or None,
+                tactics=sel_tacs, week_window=week_range)
+    elif ts_err:
+        st.caption(f"ℹ️ Promo overlay unavailable — {ts_err}")
+
     _render_velocity_signal(disp)
     _render_velocity_kpis(disp)
-    _render_velocity_chart(disp)
+    _render_velocity_chart(disp, promo=promo)
+    if promo is not None and not promo.bands.empty:
+        st.caption(
+            "🎯 Shaded bands = weeks with a consumer promo for the filtered SKUs / "
+            "corporate group (trade-spend `item_number` → PDH → shipment "
+            "attributes).  Colour = the week's **dominant tactic**; depth ∝ # SKUs "
+            "on promo.  Hover a ▾ for tactics, spend, promo volume and accounts.  "
+            "Our order velocity typically **leads** the on-shelf window, so expect "
+            "the orange line to rise just before/into a band.")
 
     # Second chart: consumer mix shift (needs the IRI file).
     if iri_raw is not None:

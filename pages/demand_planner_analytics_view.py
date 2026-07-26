@@ -377,6 +377,7 @@ from data_sources import shipments_velocity as vel
 from data_sources import iri_velocity as iri
 from data_sources import velocity_signals as vsig
 from data_sources import trade_spend as tsp
+from data_sources import demand_quality as dq
 from data_sources import ship_to_sites as sts
 from data_sources import customer_dims as cd
 from data_sources.ro_seed_pipeline import (
@@ -11320,9 +11321,10 @@ def _render_promo_shading(fig: "go.Figure", disp: pd.DataFrame, promo) -> None:
 
 
 def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
-    """Hero chart: three index lines (primary axis) + muted, toggleable
-    ordered/shipped lbs bars (secondary axis) + shaded consumer-promo windows
-    (per-week intensity bands, colour = dominant tactic, opacity = # SKUs)."""
+    """Hero chart: the three velocity index lines + shaded consumer-promo windows
+    (per-week intensity bands, colour = dominant tactic, opacity = # SKUs).
+    Absolute lbs now live in their own titled chart (:func:`_render_volume_chart`)."""
+    st.markdown("#### 📈 Velocity Index — leading signal (shelf → orders → shipments)")
     weeks = list(disp[vel.WEEK_START])
     index_specs = [
         ("Sell-through (IRI) Velocity", iri.SELL_THROUGH_INDEX, _VEL_ST_COLOR, "solid", 3.0),
@@ -11334,26 +11336,14 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
         st.info("No indexed series in the selected window.")
         return
     names = [s[0] for s in present]
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        shown = st.multiselect("Show index lines", options=names, default=names,
-                               key="velocity_show_lines")
-    with c2:
-        show_bars = st.checkbox("Show volume bars", value=False, key="velocity_show_bars",
-                                help="Absolute ordered/shipped lbs (right axis, muted).")
-    if not shown and not show_bars:
-        st.info("Pick at least one line or the volume bars.")
+    shown = st.multiselect("Show index lines", options=names, default=names,
+                           key="velocity_show_lines")
+    if not shown:
+        st.info("Pick at least one line.")
         return
 
     fig = go.Figure()
     _render_promo_shading(fig, disp, promo)
-    if show_bars:
-        for name, col, color in (("Ordered lbs", vel.COL_ORDERED_LBS, "#c0392b"),
-                                  ("Shipped lbs", vel.COL_SHIPPED_LBS, "#137d78")):
-            if col in disp.columns:
-                fig.add_bar(x=weeks, y=disp[col], name=name, yaxis="y2",
-                            marker=dict(color=color, opacity=0.20),
-                            hovertemplate=f"{name}: %{{y:,.0f}} lbs<extra></extra>")
     for name, col, color, dash, width in present:
         if name not in shown:
             continue
@@ -11363,9 +11353,9 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
             marker=dict(color=color, size=6),
             hovertemplate=f"{name}: %{{y:.0f}}<br>week of %{{x|%Y-%m-%d}}<extra></extra>")
     fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
-    layout = dict(
+    fig.update_layout(
         height=420, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13), barmode="group", bargap=0.25,
+        font=dict(color=_BH_FONT_COLOR, size=13),
         xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
                    tickvals=weeks, tickformat="%b %d", tickangle=-45,
                    showgrid=True, gridcolor="#eeeeee"),
@@ -11374,11 +11364,191 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
-    if show_bars:
-        layout["yaxis2"] = dict(title=dict(text="Lbs"), overlaying="y", side="right",
-                                rangemode="tozero", showgrid=False)
-    fig.update_layout(**layout)
     st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
+
+
+def _render_volume_chart(disp: pd.DataFrame) -> None:
+    """Dedicated absolute-volume chart: weekly Ordered vs Shipped lbs (grouped
+    bars) + Fill Rate line — the raw pounds a planner plans/ships against."""
+    st.markdown("#### 📦 Weekly Ordered vs Shipped lbs — our volume & fill rate")
+    weeks = list(disp[vel.WEEK_START])
+    o = pd.to_numeric(disp.get(vel.COL_ORDERED_LBS), errors="coerce")
+    s = pd.to_numeric(disp.get(vel.COL_SHIPPED_LBS), errors="coerce")
+    if o is None or o.dropna().empty:
+        st.info("No ordered/shipped lbs in the selected window.")
+        return
+    fill = (s / o.replace(0, float("nan"))) * 100.0
+    fig = go.Figure()
+    fig.add_bar(x=weeks, y=o, name="Ordered lbs", marker=dict(color="#e67e22"),
+                hovertemplate="Ordered: %{y:,.0f} lbs<extra></extra>")
+    fig.add_bar(x=weeks, y=s, name="Shipped lbs", marker=dict(color="#137d78"),
+                hovertemplate="Shipped: %{y:,.0f} lbs<extra></extra>")
+    fig.add_scatter(x=weeks, y=fill, name="Fill rate %", yaxis="y2", mode="lines+markers",
+                    line=dict(color="#c0392b", width=2), marker=dict(size=5),
+                    hovertemplate="Fill: %{y:.0f}%<extra></extra>")
+    fig.update_layout(
+        height=360, margin=dict(l=10, r=10, t=40, b=10), barmode="group", bargap=0.2,
+        font=dict(color=_BH_FONT_COLOR, size=13),
+        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
+                   tickvals=weeks, tickformat="%b %d", tickangle=-45, showgrid=False),
+        yaxis=dict(title=dict(text="Lbs"), showgrid=True, gridcolor="#eeeeee",
+                   rangemode="tozero"),
+        yaxis2=dict(title=dict(text="Fill %"), overlaying="y", side="right",
+                    range=[0, 110], showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="velocity_volume_chart")
+    to, ts = float(o.fillna(0).sum()), float(s.fillna(0).sum())
+    _dq_kpis([
+        ("Ordered (window)", f"{to:,.0f} lbs", "sum of the displayed weeks"),
+        ("Shipped (window)", f"{ts:,.0f} lbs", "sum of the displayed weeks"),
+        ("Fill rate", f"{ts / to * 100:.1f}%" if to else "—", "shipped ÷ ordered"),
+    ])
+
+
+# ── Demand Quality & Base Erosion (three MECE charts) ────────────────────────
+
+def _dq_kpis(tiles) -> None:
+    cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk"><div class="k-label">{_esc_html(t)}</div>'
+        f'<div class="k-value">{_esc_html(v)}</div><span class="k-sub">{_esc_html(sub)}</span></div>'
+        for t, v, sub in tiles)
+    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
+
+
+def _dq_banner(sig: dict) -> None:
+    """Assumption banner (traffic light) + a markdown drill-in caption."""
+    fg, bg = _VEL_SIGNAL_STYLE.get(sig.get("level"), ("#374151", "#f3f4f6"))
+    icon = {"alert": "🔴", "watch": "🟠", "aligned": "🟢"}.get(sig.get("level"), "⚪")
+    st.markdown(
+        f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
+        f"border-radius:6px;font-size:0.95rem'>{icon} <b style='color:{fg}'>"
+        f"{_esc_html(sig.get('headline', ''))}</b><br><span style='color:#374151'>"
+        f"{_esc_html(sig.get('detail', ''))}</span></div>", unsafe_allow_html=True)
+    if sig.get("drill_in"):
+        st.caption(f"🔎 **Drill-in to solidify:** {sig['drill_in']}")
+
+
+def _render_base_health(qd: pd.DataFrame) -> None:
+    """① Base vs Total velocity — is the base eroding beneath the promos?"""
+    st.markdown("#### ① Base Demand Health — is the base eroding under the promos?")
+    sig = dq.base_erosion_signal(qd)
+    _dq_banner(sig)
+    x = list(qd[iri.WEEK_START])
+    fig = go.Figure()
+    fig.add_scatter(x=x, y=qd[dq.TOTAL_INDEX], name="Total velocity", mode="lines",
+                    line=dict(color="#9ca3af", width=1.5),
+                    hovertemplate="Total: %{y:.0f}<extra></extra>")
+    fig.add_scatter(x=x, y=qd[dq.BASE_INDEX], name="Base velocity (everyday)",
+                    mode="lines+markers", line=dict(color="#1f77b4", width=3),
+                    marker=dict(size=5), fill="tonexty", fillcolor="rgba(244,180,0,0.14)",
+                    hovertemplate="Base: %{y:.0f}<extra></extra>")
+    fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=30, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=13),
+        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array", tickvals=x,
+                   tickformat="%b %d", tickangle=-45, showgrid=False),
+        yaxis=dict(title=dict(text="Velocity index (100 = normal)"),
+                   showgrid=True, gridcolor="#eeeeee"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
+    st.plotly_chart(fig, use_container_width=True, key="dq_base_chart")
+    st.caption("Shaded gap between the lines = the **incremental (promo) cushion**.")
+    sl = sig.get("base_slope")
+    _dq_kpis([
+        ("Base index", f"{sig.get('base_last'):.0f}" if sig.get("base_last") is not None else "—",
+         "latest · everyday demand"),
+        ("Total index", f"{sig.get('total_last'):.0f}" if sig.get("total_last") is not None else "—",
+         "base + promo"),
+        ("Base trend", f"{sl:+.1f}/wk" if sl is not None else "—", "last 13 wks"),
+    ])
+
+
+def _render_promo_economics(qd: pd.DataFrame) -> None:
+    """② Promo dependency, price give-up and efficiency."""
+    st.markdown("#### ② Promo Economics — renting volume, and is it still efficient?")
+    sig = dq.promo_economics_signal(qd)
+    _dq_banner(sig)
+    x = list(qd[iri.WEEK_START])
+    fig = go.Figure()
+    fig.add_scatter(x=x, y=qd[dq.LIFT_PCT], name="Lift % (promo dependency)", mode="lines",
+                    fill="tozeroy", line=dict(color="#f4b400", width=2),
+                    fillcolor="rgba(244,180,0,0.15)",
+                    hovertemplate="Lift: %{y:.0f}%<extra></extra>")
+    fig.add_scatter(x=x, y=qd[dq.DEPTH_PCT], name="Discount depth %", mode="lines",
+                    line=dict(color="#c0392b", dash="dash", width=2),
+                    hovertemplate="Depth: %{y:.1f}%<extra></extra>")
+    fig.add_scatter(x=x, y=qd[dq.ACV], name="ACV feature/display %", mode="lines",
+                    line=dict(color="#2ca02c", dash="dot", width=2),
+                    hovertemplate="ACV: %{y:.1f}%<extra></extra>")
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=30, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=13),
+        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array", tickvals=x,
+                   tickformat="%b %d", tickangle=-45, showgrid=False),
+        yaxis=dict(title=dict(text="%"), showgrid=True, gridcolor="#eeeeee",
+                   rangemode="tozero"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
+    st.plotly_chart(fig, use_container_width=True, key="dq_promo_chart")
+    et = sig.get("eff_trend")
+    _dq_kpis([
+        ("Recent lift %", f"{sig.get('lift_recent'):.0f}%" if sig.get("lift_recent") is not None else "—",
+         "incremental ÷ base"),
+        ("Discount depth", f"{sig.get('depth_recent'):.0f}%" if sig.get("depth_recent") is not None else "—",
+         "base price vs realised"),
+        ("Promo efficiency", "n/a" if et is None else ("falling" if et < 0 else "steady/rising"),
+         "lift per ACV point, trend"),
+    ])
+
+
+def _render_promo_cohort(cohort) -> None:
+    """③ Event-study around our promo onsets — build vs borrow."""
+    st.markdown("#### ③ Promo Cohort — do promos build demand or borrow it?")
+    _dq_banner(dq.promo_cohort_signal(cohort))
+    if cohort is None or cohort.curve is None or cohort.curve.empty:
+        return
+    c = cohort.curve
+    fig = go.Figure()
+    fig.add_vrect(x0=-0.5, x1=2.5, fillcolor="rgba(244,180,0,0.10)", line_width=0,
+                  layer="below", annotation_text="in-promo", annotation_position="top left")
+    fig.add_scatter(x=c["offset"], y=c["total_mean"], name="Total velocity",
+                    mode="lines+markers", line=dict(color="#9ca3af", width=2))
+    fig.add_scatter(x=c["offset"], y=c["base_mean"], name="Base velocity",
+                    mode="lines+markers", line=dict(color="#1f77b4", width=3))
+    pre = cohort.summary.get("tot_pre")
+    if pre is not None and pd.notna(pre):
+        fig.add_hline(y=float(pre), line=dict(color="#9ca3af", dash="dash", width=1),
+                      annotation_text="pre-promo baseline", annotation_position="bottom right")
+    fig.add_vline(x=0, line=dict(color="#f4b400", width=2))
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=30, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=13),
+        xaxis=dict(title=dict(text="Weeks relative to promo start"), tickmode="array",
+                   tickvals=list(c["offset"]), showgrid=True, gridcolor="#eeeeee"),
+        yaxis=dict(title=dict(text="Velocity index (100 = normal)"),
+                   showgrid=True, gridcolor="#eeeeee"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
+    st.plotly_chart(fig, use_container_width=True, key="dq_cohort_chart")
+
+
+def _render_demand_quality(quality, cohort, week_range: tuple) -> None:
+    """Delineated section: base vs promo decomposition — three MECE reads."""
+    if quality is None or quality.weekly.empty:
+        return
+    st.markdown("---")
+    st.markdown("### 🔬 Demand Quality & Base Erosion")
+    st.caption(
+        "Splits the Sell-through line into **BASE** (everyday, full-price) vs "
+        "**PROMO** (incremental) demand — three MECE reads: ① is the base eroding, "
+        "② is the promo worth it, ③ do promos build or borrow.  Each banner states "
+        "an **assumption** to act on, plus a **drill-in** to confirm it.")
+    qd = quality.weekly[quality.weekly[iri.WEEK_START].dt.date.between(*week_range)].reset_index(drop=True)
+    if qd.empty:
+        st.info("No IRI quality weeks in the selected range.")
+        return
+    _render_base_health(qd)
+    _render_promo_economics(qd)
+    _render_promo_cohort(cohort)
 
 
 # Mix-shift palette (segments); size uses the first four = small→large like the
@@ -11405,14 +11575,14 @@ def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple
     shipment-velocity rebuild).  The Week slider and IRI filters live in the
     parent, so changing them still reruns the parent and re-calls this with
     fresh args — both charts stay in sync."""
-    st.markdown("#### 🧺 Consumer mix shift — what shoppers are choosing")
+    st.markdown("#### 🧺 Consumer Mix Shift — are shoppers trading down or switching away?")
     st.caption(
-        "Velocity says *how fast* the category sells; this says *what* shoppers "
-        "buy — and whether that's shifting.  Unit shares from the IRI POS file "
-        "(same filters); top segments shown, the tail rolled into **Other**.  "
-        "**Brand** spans the whole category, so it ignores the IRI Brand filter.  "
-        "The file covers all dairy — filter the IRI block to a product family "
-        "(e.g. a Subtype / Size scope) for the sharpest premium / trade-down read.")
+        "Base health tells you *how much* everyday demand you have; this tells you "
+        "*where it's going* — smaller packs (affordability), premium→regular "
+        "(de-premiumising) or your brand→a competitor (share loss).  Unit shares "
+        "from the IRI POS file (same filters); top segments shown, the tail rolled "
+        "into **Other**.  **Brand** spans the whole category, so it ignores the IRI "
+        "Brand filter.  Filter the IRI block to a product family for the sharpest read.")
 
     labels = [lab for _, lab in iri.MIX_DIMENSIONS]
     key_by_label = {lab: k for k, lab in iri.MIX_DIMENSIONS}
@@ -11651,6 +11821,8 @@ def _render_velocity_analysis_body() -> None:
 
     # ── Promo overlay (trade spend) ─────────────────────────────────────────
     promo = None
+    sel_tacs: list[str] = []
+    item_keys = None
     if ts_df is not None:
         tac_opts = tsp.distinct_tactics(ts_df)
         default_tacs = [t for t in tsp.CONSUMER_TACTICS if t in tac_opts]
@@ -11695,7 +11867,33 @@ def _render_velocity_analysis_body() -> None:
             "Our order velocity typically **leads** the on-shelf window, so expect "
             "the orange line to rise just before/into a band.")
 
-    # Second chart: consumer mix shift (needs the IRI file).
+    # Dedicated absolute-volume chart (our ordered vs shipped lbs).
+    st.markdown("---")
+    _render_volume_chart(disp)
+
+    # Demand Quality & Base Erosion — base vs promo decomposition (needs IRI).
+    quality = cohort = None
+    if iri_raw is not None:
+        quality = dq.build_iri_quality(
+            iri_raw,
+            geographies=iri_sel.get(iri.COL_GEOGRAPHY) or None,
+            brands=iri_sel.get(iri.COL_BRAND) or None,
+            subtypes=iri_sel.get(iri.COL_SUBTYPE) or None,
+            processes=iri_sel.get(iri.COL_PROCESS) or None,
+            sizes=iri_sel.get(iri.COL_SIZE) or None,
+        )
+        # Cohort onsets from the FULL-history promo calendar (window-independent
+        # — the event study should use every clean start, not just the view).
+        if ts_df is not None and sel_tacs:
+            promo_full = tsp.build_promo_windows(
+                ts_df, item_keys=item_keys,
+                corporate_groups=selections.get(vel.COL_CORP_GROUP) or None,
+                tactics=sel_tacs, week_window=None)
+            onsets = dq.promo_onsets(set(promo_full.bands["week_start"]))
+            cohort = dq.build_promo_cohort(quality.weekly, onsets)
+    _render_demand_quality(quality, cohort, week_range)
+
+    # Consumer mix shift (needs the IRI file).
     if iri_raw is not None:
         st.markdown("---")
         _render_velocity_mix(iri_raw, iri_sel, week_range)

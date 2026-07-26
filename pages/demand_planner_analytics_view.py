@@ -11276,6 +11276,141 @@ def _render_velocity_chart(disp: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
 
 
+# Mix-shift palette (segments); size uses the first four = small→large like the
+# stacked-area convention (single-serve → half-gallon).
+_VEL_MIX_PALETTE: tuple[str, ...] = (
+    "#1f77b4", "#2ca02c", "#f5a623", "#e0523d", "#8e44ad", "#17becf", "#7f7f7f",
+)
+
+
+def _hex_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple) -> None:
+    """Second chart: consumer MIX SHIFT (pack size / brand / subtype) — is the
+    shopper's basket composition moving?  100%-stacked share (or indexed share)
+    + adaptive KPIs + an auto so-what, reactive to the same Week window."""
+    st.markdown("#### 🧺 Consumer mix shift — what shoppers are choosing")
+    st.caption(
+        "Velocity says *how fast* the category sells; this says *what* shoppers "
+        "buy — and whether that's shifting.  Unit shares from the IRI POS file "
+        "(same filters); top segments shown, the tail rolled into **Other**.  "
+        "**Brand** spans the whole category, so it ignores the IRI Brand filter.  "
+        "The file covers all dairy — filter the IRI block to a product family "
+        "(e.g. a Subtype / Size scope) for the sharpest premium / trade-down read.")
+
+    labels = [lab for _, lab in iri.MIX_DIMENSIONS]
+    key_by_label = {lab: k for k, lab in iri.MIX_DIMENSIONS}
+    c_dim, c_view = st.columns([1.2, 1])
+    with c_dim:
+        dim_label = st.radio("Mix lens", options=labels, horizontal=True,
+                             key="velocity_mix_dim")
+    with c_view:
+        view = st.radio("View", options=["Share mix (100% stacked)",
+                                          "Indexed share (base = 100)"],
+                        horizontal=True, key="velocity_mix_view")
+
+    mix = iri.build_iri_mix(
+        iri_raw, key_by_label[dim_label],
+        geographies=iri_sel.get(iri.COL_GEOGRAPHY) or None,
+        brands=iri_sel.get(iri.COL_BRAND) or None,
+        subtypes=iri_sel.get(iri.COL_SUBTYPE) or None,
+        processes=iri_sel.get(iri.COL_PROCESS) or None,
+        sizes=iri_sel.get(iri.COL_SIZE) or None,
+    )
+    if mix.weekly.empty or not mix.segments:
+        st.info("No IRI rows match the current filters for this mix lens.")
+        return
+    dm = mix.weekly[mix.weekly[iri.WEEK_START].dt.date.between(*week_range)].reset_index(drop=True)
+    if dm.empty:
+        st.info("No IRI weeks in the selected range.")
+        return
+
+    summ = iri.summarize_iri_mix(dm, mix)
+
+    # ── KPI tiles (marquee metric adapts to the lens) ───────────────────────
+    def _fmt(v):
+        if v is None:
+            return "—"
+        return f"{v:.1f} oz" if mix.marquee_unit == "oz" else f"{v:.1f}%"
+    mq_first, mq_last = summ.get("marquee_first"), summ.get("marquee_last")
+    arrow = ""
+    if mq_first is not None and mq_last is not None:
+        arrow = " ↑" if mq_last > mq_first else (" ↓" if mq_last < mq_first else "")
+    tiles = [
+        (f"{mix.marquee_label} · start", _fmt(mq_first), "first week in view"),
+        (f"{mix.marquee_label} · latest", _fmt(mq_last) + arrow, "last week in view"),
+        ("Shift", summ.get("shift_text", "—"),
+         f"mix-shift index {summ.get('mix_index', 0):.0f}% of vol. reallocated"),
+    ]
+    cards = "".join(
+        f'<div class="dpc-kpi dpc-kpi--walk"><div class="k-label">{_esc_html(t)}</div>'
+        f'<div class="k-value">{_esc_html(v)}</div><span class="k-sub">{_esc_html(sub)}</span></div>'
+        for t, v, sub in tiles)
+    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
+
+    # ── Auto so-what banner ─────────────────────────────────────────────────
+    if summ.get("available"):
+        fg, bg = _VEL_SIGNAL_STYLE.get(summ["level"], ("#374151", "#f3f4f6"))
+        icon = "🟠" if summ["level"] == vsig.LEVEL_WATCH else "🟢"
+        (gn, gd), (ln, ld) = summ["gainer"], summ["loser"]
+        movers = (f"  Biggest gainer <b>{_esc_html(gn)}</b> ({gd:+.1f} pp), "
+                  f"biggest loser <b>{_esc_html(ln)}</b> ({ld:+.1f} pp).")
+        st.markdown(
+            f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
+            f"border-radius:6px;font-size:0.95rem'>{icon} <b style='color:{fg}'>"
+            f"{_esc_html(summ['headline'])}</b><br><span style='color:#374151'>"
+            f"{_esc_html(summ['detail'])}{movers}</span></div>",
+            unsafe_allow_html=True)
+
+    # ── Chart ───────────────────────────────────────────────────────────────
+    weeks = list(dm[iri.WEEK_START])
+    segs = [s for s in mix.segments if s in dm.columns]
+    colors = {s: _VEL_MIX_PALETTE[i % len(_VEL_MIX_PALETTE)] for i, s in enumerate(segs)}
+    fig = go.Figure()
+    if view.startswith("Share mix"):
+        for s in segs:
+            col = colors[s]
+            fig.add_scatter(
+                x=weeks, y=dm[s], name=s, mode="lines", stackgroup="one",
+                line=dict(width=0.5, color=col), fillcolor=_hex_rgba(col, 0.75),
+                hovertemplate=f"{s}: %{{y:.1f}}%<extra></extra>")
+        yaxis = dict(title=dict(text="Unit share (%)"), range=[0, 100],
+                     ticksuffix="%", showgrid=True, gridcolor="#eeeeee")
+    else:
+        base = dm.iloc[0]
+        for s in segs:
+            b = float(base.get(s, 0.0) or 0.0)
+            if b <= 0:
+                continue
+            fig.add_scatter(
+                x=weeks, y=dm[s] / b * 100.0, name=s, mode="lines+markers",
+                line=dict(width=2.5, color=colors[s]), marker=dict(size=5, color=colors[s]),
+                hovertemplate=f"{s}: %{{y:.0f}} (100 = first week)<extra></extra>")
+        fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
+        yaxis = dict(title=dict(text="Share index (first week = 100)"),
+                     showgrid=True, gridcolor="#eeeeee")
+    fig.update_layout(
+        height=380, margin=dict(l=10, r=10, t=40, b=10),
+        font=dict(color=_BH_FONT_COLOR, size=13),
+        xaxis=dict(title=dict(text="Week"), tickmode="array", tickvals=weeks,
+                   tickformat="%b %d", tickangle=-45, showgrid=False),
+        yaxis=yaxis,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key="velocity_mix_chart")
+    st.download_button(
+        "⬇️ Download weekly mix shares (CSV)",
+        data=dm.to_csv(index=False).encode("utf-8"),
+        file_name=f"velocity_mix_{key_by_label[dim_label]}_"
+                  f"{pd.Timestamp.utcnow():%Y%m%d}.csv",
+        mime="text/csv", key="velocity_mix_download", use_container_width=True)
+
+
 @st.fragment
 def _render_velocity_analysis_body() -> None:
     """IRI sell-through vs our demand/supply velocity — indexed leading-signal view."""
@@ -11389,6 +11524,11 @@ def _render_velocity_analysis_body() -> None:
     _render_velocity_signal(disp)
     _render_velocity_kpis(disp)
     _render_velocity_chart(disp)
+
+    # Second chart: consumer mix shift (needs the IRI file).
+    if iri_raw is not None:
+        st.markdown("---")
+        _render_velocity_mix(iri_raw, iri_sel, week_range)
 
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")
     st.download_button(

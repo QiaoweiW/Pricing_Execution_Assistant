@@ -11289,10 +11289,17 @@ def _hex_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+@st.fragment
 def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple) -> None:
     """Second chart: consumer MIX SHIFT (pack size / brand / subtype) — is the
     shopper's basket composition moving?  100%-stacked share (or indexed share)
-    + adaptive KPIs + an auto so-what, reactive to the same Week window."""
+    + adaptive KPIs + an auto so-what, reactive to the same Week window.
+
+    Its own fragment so the lens / view toggles rerun ONLY this chart (~100 ms
+    mix rebuild) instead of the whole section (which re-does the ~500 ms
+    shipment-velocity rebuild).  The Week slider and IRI filters live in the
+    parent, so changing them still reruns the parent and re-calls this with
+    fresh args — both charts stay in sync."""
     st.markdown("#### 🧺 Consumer mix shift — what shoppers are choosing")
     st.caption(
         "Velocity says *how fast* the category sells; this says *what* shoppers "
@@ -11321,6 +11328,11 @@ def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple
         processes=iri_sel.get(iri.COL_PROCESS) or None,
         sizes=iri_sel.get(iri.COL_SIZE) or None,
     )
+    if key_by_label[dim_label] == iri.MIX_BRAND:
+        st.caption("ℹ️ Brand lens = share of the **whole category**, so the IRI "
+                   "**Major Brand** filter is intentionally ignored here (a brand's "
+                   "share of itself is 100%).  All other IRI filters + the Week "
+                   "window still apply.")
     if mix.weekly.empty or not mix.segments:
         st.info("No IRI rows match the current filters for this mix lens.")
         return

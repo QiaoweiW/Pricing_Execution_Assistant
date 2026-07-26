@@ -11290,9 +11290,12 @@ def _render_promo_shading(fig: "go.Figure", disp: pd.DataFrame, promo) -> None:
         op = min(0.10 + 0.24 * (r.weight / mx), 0.42)   # graded, capped
         fig.add_vrect(x0=r.x0, x1=r.x1, fillcolor=r.color, opacity=op,
                       line_width=0, layer="below")
-    # Legend proxy (one square per dominant tactic present).
+    # Legend proxy (one square per dominant tactic present).  Use a REAL date x
+    # with a null y (no point plots) so Plotly still infers the date x-axis —
+    # an all-None first trace makes it mis-type the axis and drop every trace.
+    x_anchor = disp[vel.WEEK_START].iloc[0] if not disp.empty else None
     for t in promo.tactics:
-        fig.add_scatter(x=[None], y=[None], mode="markers", name=f"Promo · {t}",
+        fig.add_scatter(x=[x_anchor], y=[None], mode="markers", name=f"Promo · {t}",
                         marker=dict(size=11, symbol="square", opacity=0.55,
                                     color=tsp.TACTIC_COLORS.get(t, "#8e8e8e")),
                         legendgroup="promo", hoverinfo="skip", showlegend=True)
@@ -11363,8 +11366,9 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
     layout = dict(
         height=420, margin=dict(l=10, r=10, t=40, b=10),
         font=dict(color=_BH_FONT_COLOR, size=13), barmode="group", bargap=0.25,
-        xaxis=dict(title=dict(text="Week"), tickmode="array", tickvals=weeks,
-                   tickformat="%b %d", tickangle=-45, showgrid=True, gridcolor="#eeeeee"),
+        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
+                   tickvals=weeks, tickformat="%b %d", tickangle=-45,
+                   showgrid=True, gridcolor="#eeeeee"),
         yaxis=dict(title=dict(text="Velocity index (100 = typical week)"),
                    showgrid=True, gridcolor="#eeeeee"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),

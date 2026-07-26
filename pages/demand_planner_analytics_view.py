@@ -11167,36 +11167,6 @@ _VEL_SIGNAL_STYLE: dict[str, tuple[str, str]] = {
 }
 
 
-def _render_velocity_methodology(iri_file: str) -> None:
-    """Explicit index methodology, pinned above the chart."""
-    with st.expander("🧮 How the velocity index is built", expanded=False):
-        st.markdown(
-            "Three weekly series rebased to a common **index (100 = a typical "
-            "week)** so their *shapes and timing* compare even though the units "
-            "differ:\n"
-            "- **Sell-through (IRI) Velocity** — consumer POS: Σ Units ÷ Σ stores "
-            "selling (distribution-neutral).  *Leads.*\n"
-            "- **Demand Velocity** — our retailer **orders** lbs ÷ distinct "
-            "ship-to.  *Follows.*\n"
-            "- **Supply Velocity** — our **shipments** lbs ÷ distinct ship-to.  "
-            "*Lags / overshoots.*\n\n"
-            "For each series: **baseline = MEDIAN velocity over weeks with "
-            "activity (full history)**; **index = velocity ÷ baseline × 100**.  "
-            "The baseline is fixed, so the Week slider only zooms — the index "
-            "always reads *vs normal*, never re-centred.  Only **shape/timing** is "
-            "comparable across series, not levels.  **Fill Rate = shipped ÷ "
-            "ordered lbs.**\n\n"
-            "**Promo shading** — weeks with a consumer promo (`dp_fy_*_actual_"
-            "trade_spend`) are shaded on the first chart, coloured by **tactic** "
-            "(Ad Feature / TPR / Display / EDLP), depth ∝ # SKUs on promo.  Scope "
-            "follows the filters: promo `item_number` → **PDH** → shipment "
-            "attributes for the product filters, and **Corporate Group** for the "
-            "customer side.  Year-long *Corp Program* / fee rows and *Cancelled* "
-            "promos are excluded."
-            + (f"\n\n_IRI source: `Files/RO Tracking/IRI/{iri_file}`._" if iri_file else "")
-        )
-
-
 def _velocity_merge(result: "vel.WeeklyVelocity", iri_res) -> pd.DataFrame:
     """Outer-merge the shipment weekly (indexed) and IRI weekly (indexed) on
     week_start → one full-history frame for the chart / signals."""
@@ -11320,11 +11290,30 @@ def _render_promo_shading(fig: "go.Figure", disp: pd.DataFrame, promo) -> None:
         name="Promo detail", hovertext=htext, hoverinfo="text", showlegend=False)
 
 
-def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
-    """Hero chart: the three velocity index lines + shaded consumer-promo windows
-    (per-week intensity bands, colour = dominant tactic, opacity = # SKUs).
-    Absolute lbs now live in their own titled chart (:func:`_render_volume_chart`)."""
+_VELOCITY_METHOD_MD = (
+    "- **Formula** — each series is rebased: `index = velocity ÷ baseline × 100`, "
+    "where **baseline = MEDIAN velocity over weeks with activity (full history)**, "
+    "so the index reads *vs a typical week* and the Week slider only zooms.\n"
+    "- **Series** — **Sell-through (IRI)** = Σ Units ÷ Σ stores selling (consumer POS, "
+    "*leads*); **Demand** = our order lbs ÷ distinct ship-to (*follows*); **Supply** = "
+    "our shipped lbs ÷ distinct ship-to (*lags*).  Only shape/timing compares across "
+    "series, never levels.\n"
+    "- **Promo shading** — weeks with a consumer promo (`dp_fy_*_actual_trade_spend`), "
+    "colour = dominant tactic, depth ∝ # SKUs on promo (scope = filtered SKUs via "
+    "`item_number`→PDH + Corporate Group).\n"
+    "- **Source** — IRI POS file + `dbo.Shipments`; reacts to the shipment **and** IRI "
+    "filters + the Week window."
+)
+
+
+def _render_velocity_chart(disp: pd.DataFrame, promo=None, iri_file: str = "") -> None:
+    """Hero chart: signal banner → KPIs → methodology → the three velocity index
+    lines + shaded consumer-promo windows (colour = dominant tactic, depth = SKUs)."""
     st.markdown("#### 📈 Velocity Index — leading signal (shelf → orders → shipments)")
+    _render_velocity_signal(disp)                         # banner
+    _render_velocity_kpis(disp)                           # metrics
+    _chart_method(_VELOCITY_METHOD_MD                     # explanation
+                  + (f"\n- **IRI file** — `{iri_file}`." if iri_file else ""))
     weeks = list(disp[vel.WEEK_START])
     index_specs = [
         ("Sell-through (IRI) Velocity", iri.SELL_THROUGH_INDEX, _VEL_ST_COLOR, "solid", 3.0),
@@ -11365,11 +11354,16 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None) -> None:
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
+    if promo is not None and not promo.bands.empty:
+        st.caption(
+            "🎯 Shaded bands = weeks with a consumer promo for the filtered SKUs / "
+            "corporate group.  Hover a ▾ for tactics, spend, promo volume and accounts.  "
+            "Our order velocity typically **leads** the on-shelf window.")
 
 
 def _render_volume_chart(disp: pd.DataFrame) -> None:
-    """Dedicated absolute-volume chart: weekly Ordered vs Shipped lbs (grouped
-    bars) + Fill Rate line — the raw pounds a planner plans/ships against."""
+    """Dedicated absolute-volume chart (title → banner → KPIs → method → chart):
+    weekly Ordered vs Shipped lbs + Fill Rate — the raw pounds a planner ships."""
     st.markdown("#### 📦 Weekly Ordered vs Shipped lbs — our volume & fill rate")
     weeks = list(disp[vel.WEEK_START])
     o = pd.to_numeric(disp.get(vel.COL_ORDERED_LBS), errors="coerce")
@@ -11377,6 +11371,30 @@ def _render_volume_chart(disp: pd.DataFrame) -> None:
     if o is None or o.dropna().empty:
         st.info("No ordered/shipped lbs in the selected window.")
         return
+    to, ts = float(o.fillna(0).sum()), float(s.fillna(0).sum())
+    fillw = (ts / to) if to else None
+    # banner
+    if fillw is not None:
+        lvl = "aligned" if fillw >= 0.99 else ("watch" if fillw >= 0.95 else "alert")
+        head = ("Orders and shipments are matched." if fillw >= 0.99
+                else "Shipments are running below orders — a service gap.")
+        _dq_banner({"level": lvl, "headline": head,
+                    "detail": f"Window fill rate {fillw * 100:.1f}% "
+                              f"(shipped {ts:,.0f} ÷ ordered {to:,.0f} lbs).", "drill_in": ""})
+    # metrics
+    _dq_kpis([
+        ("Ordered (window)", f"{to:,.0f} lbs", "sum of the displayed weeks"),
+        ("Shipped (window)", f"{ts:,.0f} lbs", "sum of the displayed weeks"),
+        ("Fill rate", f"{fillw * 100:.1f}%" if fillw is not None else "—", "shipped ÷ ordered"),
+    ])
+    # explanation
+    _chart_method(
+        "- **Formula** — Fill rate = Σ Shipped lbs ÷ Σ Ordered lbs (per week).\n"
+        "- **Method** — weekly sums on the Monday-anchored grid; reacts to the shipment "
+        "filters (Business Unit … Customer, Corporate Group) + the Week window.\n"
+        "- **Source** — `dbo.Shipments` (`Ordered LBS`, `Shipped LBS`).\n"
+        "- **Chart** — grouped bars (ordered vs shipped) + a fill-rate line on the right axis.")
+    # chart
     fill = (s / o.replace(0, float("nan"))) * 100.0
     fig = go.Figure()
     fig.add_bar(x=weeks, y=o, name="Ordered lbs", marker=dict(color="#e67e22"),
@@ -11398,12 +11416,6 @@ def _render_volume_chart(disp: pd.DataFrame) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="velocity_volume_chart")
-    to, ts = float(o.fillna(0).sum()), float(s.fillna(0).sum())
-    _dq_kpis([
-        ("Ordered (window)", f"{to:,.0f} lbs", "sum of the displayed weeks"),
-        ("Shipped (window)", f"{ts:,.0f} lbs", "sum of the displayed weeks"),
-        ("Fill rate", f"{ts / to * 100:.1f}%" if to else "—", "shipped ÷ ordered"),
-    ])
 
 
 # ── Demand Quality & Base Erosion (three MECE charts) ────────────────────────
@@ -11429,12 +11441,34 @@ def _dq_banner(sig: dict) -> None:
         st.caption(f"🔎 **Drill-in to solidify:** {sig['drill_in']}")
 
 
+def _chart_method(md: str) -> None:
+    """Collapsed 'how this chart is built' block — formula, method, source."""
+    with st.expander("ℹ️ Formula · methodology · data source", expanded=False):
+        st.markdown(md)
+
+
 def _render_base_health(qd: pd.DataFrame) -> None:
     """① Base vs Total velocity — is the base eroding beneath the promos?"""
     st.markdown("#### ① Base Demand Health — is the base eroding under the promos?")
     sig = dq.base_erosion_signal(qd)
-    _dq_banner(sig)
-    x = list(qd[iri.WEEK_START])
+    _dq_banner(sig)                                       # banner
+    sl = sig.get("base_slope")
+    _dq_kpis([                                            # metrics
+        ("Base index", f"{sig.get('base_last'):.0f}" if sig.get("base_last") is not None else "—",
+         "latest · everyday demand"),
+        ("Total index", f"{sig.get('total_last'):.0f}" if sig.get("total_last") is not None else "—",
+         "base + promo"),
+        ("Base trend", f"{sl:+.1f}/wk" if sl is not None else "—", "last 13 wks"),
+    ])
+    _chart_method(                                        # explanation
+        "- **Formula** — Base velocity = Σ **Base Units** ÷ Σ stores selling "
+        "(distribution-neutral); indexed = ÷ its own full-history median × 100.\n"
+        "- **Read** — base *below* total = the promo cushion (shaded); base trending "
+        "down while total holds = base is promo-masked (erosion).\n"
+        "- **Source** — IRI POS `Base Units`, `U Sales`, `Units per Store Selling`; "
+        "reacts to the **IRI** filters + Week window.\n"
+        "- **Chart** — Base (bold) vs Total (light), the gap filled = incremental cushion.")
+    x = list(qd[iri.WEEK_START])                          # chart
     fig = go.Figure()
     fig.add_scatter(x=x, y=qd[dq.TOTAL_INDEX], name="Total velocity", mode="lines",
                     line=dict(color="#9ca3af", width=1.5),
@@ -11453,23 +11487,32 @@ def _render_base_health(qd: pd.DataFrame) -> None:
                    showgrid=True, gridcolor="#eeeeee"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
     st.plotly_chart(fig, use_container_width=True, key="dq_base_chart")
-    st.caption("Shaded gap between the lines = the **incremental (promo) cushion**.")
-    sl = sig.get("base_slope")
-    _dq_kpis([
-        ("Base index", f"{sig.get('base_last'):.0f}" if sig.get("base_last") is not None else "—",
-         "latest · everyday demand"),
-        ("Total index", f"{sig.get('total_last'):.0f}" if sig.get("total_last") is not None else "—",
-         "base + promo"),
-        ("Base trend", f"{sl:+.1f}/wk" if sl is not None else "—", "last 13 wks"),
-    ])
 
 
 def _render_promo_economics(qd: pd.DataFrame) -> None:
     """② Promo dependency, price give-up and efficiency."""
     st.markdown("#### ② Promo Economics — renting volume, and is it still efficient?")
     sig = dq.promo_economics_signal(qd)
-    _dq_banner(sig)
-    x = list(qd[iri.WEEK_START])
+    _dq_banner(sig)                                       # banner
+    et = sig.get("eff_trend")
+    _dq_kpis([                                            # metrics
+        ("Recent lift %", f"{sig.get('lift_recent'):.0f}%" if sig.get("lift_recent") is not None else "—",
+         "incremental ÷ base"),
+        ("Discount depth", f"{sig.get('depth_recent'):.0f}%" if sig.get("depth_recent") is not None else "—",
+         "base price vs realised"),
+        ("Promo efficiency", "n/a" if et is None else ("falling" if et < 0 else "steady/rising"),
+         "lift per ACV point, trend"),
+    ])
+    _chart_method(                                        # explanation
+        "- **Formula** — Lift % = Σ Incremental ÷ Σ Base; Discount depth = (base price − "
+        "realised price) ÷ base price; Efficiency = Lift % ÷ ACV feature/display "
+        "(only where ACV ≥ 2%, else it explodes near zero).\n"
+        "- **Read** — rising lift = more promo-dependent; deeper depth for the same lift "
+        "= paying more per point; falling efficiency = promo fatigue.\n"
+        "- **Source** — IRI POS `Incremental/Base Units`, `$ Sales`, `Base Price`, "
+        "`ACV Feature and/or Display`; reacts to the **IRI** filters + Week window.\n"
+        "- **Chart** — Lift % area + Discount depth + ACV lines (all %).")
+    x = list(qd[iri.WEEK_START])                          # chart
     fig = go.Figure()
     fig.add_scatter(x=x, y=qd[dq.LIFT_PCT], name="Lift % (promo dependency)", mode="lines",
                     fill="tozeroy", line=dict(color="#f4b400", width=2),
@@ -11490,24 +11533,32 @@ def _render_promo_economics(qd: pd.DataFrame) -> None:
                    rangemode="tozero"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
     st.plotly_chart(fig, use_container_width=True, key="dq_promo_chart")
-    et = sig.get("eff_trend")
-    _dq_kpis([
-        ("Recent lift %", f"{sig.get('lift_recent'):.0f}%" if sig.get("lift_recent") is not None else "—",
-         "incremental ÷ base"),
-        ("Discount depth", f"{sig.get('depth_recent'):.0f}%" if sig.get("depth_recent") is not None else "—",
-         "base price vs realised"),
-        ("Promo efficiency", "n/a" if et is None else ("falling" if et < 0 else "steady/rising"),
-         "lift per ACV point, trend"),
-    ])
 
 
 def _render_promo_cohort(cohort) -> None:
     """③ Event-study around our promo onsets — build vs borrow."""
     st.markdown("#### ③ Promo Cohort — do promos build demand or borrow it?")
-    _dq_banner(dq.promo_cohort_signal(cohort))
+    _dq_banner(dq.promo_cohort_signal(cohort))            # banner
     if cohort is None or cohort.curve is None or cohort.curve.empty:
         return
-    c = cohort.curve
+    su = cohort.summary
+    shift, pull = su.get("base_shift_pct"), su.get("pull_forward_ratio")
+    _dq_kpis([                                            # metrics
+        ("Promo onsets", f"{cohort.n_events}", "clean starts averaged"),
+        ("Base shift", f"{shift:+.0f} pts" if pd.notna(shift) else "—", "post vs pre-promo base"),
+        ("Pull-forward", f"{pull * 100:.0f}%" if pd.notna(pull) else "—", "of lift given back after"),
+    ])
+    _chart_method(                                        # explanation
+        "- **Method** — event study: each **promo onset** (a fresh start on our "
+        "`dp_fy_*_actual_trade_spend` calendar) is aligned to event-time (weeks −4…+6) "
+        "and the IRI base/total velocity is averaged across onsets.\n"
+        "- **Read** — a post-promo trough below the pre-promo baseline = **borrowing** "
+        "(pull-forward); base settling above baseline = **building** (recruitment).\n"
+        "- **Metrics** — Base shift = post − pre base; Pull-forward = post deficit ÷ "
+        "in-promo lift.  Needs ≥3 clean onsets, else it says so.\n"
+        "- **Source** — trade-spend onsets (our items/corp) + IRI velocity; window-"
+        "independent (uses every onset in history).")
+    c = cohort.curve                                      # chart
     fig = go.Figure()
     fig.add_vrect(x0=-0.5, x1=2.5, fillcolor="rgba(244,180,0,0.10)", line_width=0,
                   layer="below", annotation_text="in-promo", annotation_position="top left")
@@ -11535,7 +11586,6 @@ def _render_demand_quality(quality, cohort, week_range: tuple) -> None:
     """Delineated section: base vs promo decomposition — three MECE reads."""
     if quality is None or quality.weekly.empty:
         return
-    st.markdown("---")
     st.markdown("### 🔬 Demand Quality & Base Erosion")
     st.caption(
         "Splits the Sell-through line into **BASE** (everyday, full-price) vs "
@@ -11618,6 +11668,20 @@ def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple
 
     summ = iri.summarize_iri_mix(dm, mix)
 
+    # ── Auto so-what banner ─────────────────────────────────────────────────
+    if summ.get("available"):
+        fg, bg = _VEL_SIGNAL_STYLE.get(summ["level"], ("#374151", "#f3f4f6"))
+        icon = "🟠" if summ["level"] == vsig.LEVEL_WATCH else "🟢"
+        (gn, gd), (ln, ld) = summ["gainer"], summ["loser"]
+        movers = (f"  Biggest gainer <b>{_esc_html(gn)}</b> ({gd:+.1f} pp), "
+                  f"biggest loser <b>{_esc_html(ln)}</b> ({ld:+.1f} pp).")
+        st.markdown(
+            f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
+            f"border-radius:6px;font-size:0.95rem'>{icon} <b style='color:{fg}'>"
+            f"{_esc_html(summ['headline'])}</b><br><span style='color:#374151'>"
+            f"{_esc_html(summ['detail'])}{movers}</span></div>",
+            unsafe_allow_html=True)
+
     # ── KPI tiles (marquee metric adapts to the lens) ───────────────────────
     def _fmt(v):
         if v is None:
@@ -11639,19 +11703,15 @@ def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple
         for t, v, sub in tiles)
     st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
 
-    # ── Auto so-what banner ─────────────────────────────────────────────────
-    if summ.get("available"):
-        fg, bg = _VEL_SIGNAL_STYLE.get(summ["level"], ("#374151", "#f3f4f6"))
-        icon = "🟠" if summ["level"] == vsig.LEVEL_WATCH else "🟢"
-        (gn, gd), (ln, ld) = summ["gainer"], summ["loser"]
-        movers = (f"  Biggest gainer <b>{_esc_html(gn)}</b> ({gd:+.1f} pp), "
-                  f"biggest loser <b>{_esc_html(ln)}</b> ({ld:+.1f} pp).")
-        st.markdown(
-            f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
-            f"border-radius:6px;font-size:0.95rem'>{icon} <b style='color:{fg}'>"
-            f"{_esc_html(summ['headline'])}</b><br><span style='color:#374151'>"
-            f"{_esc_html(summ['detail'])}{movers}</span></div>",
-            unsafe_allow_html=True)
+    _chart_method(
+        "- **Formula** — each segment's weekly **unit share** = its U Sales ÷ total; "
+        "the marquee is weighted-avg pack size (oz) for Size, else the tracked segment's "
+        "share.  Mix-shift index = ½·Σ|Δ share| (% of volume reallocated).\n"
+        "- **Method** — top segments shown, the tail rolled into **Other**; **Brand** "
+        "spans the whole category (ignores the IRI Brand filter).  Reacts to the **IRI** "
+        "filters + Week window.\n"
+        "- **Source** — IRI POS `U Sales` by Custom Size / Major Brand / Custom Subtype.\n"
+        "- **Chart** — 100%-stacked share (or each segment indexed to its first week).")
 
     # ── Chart ───────────────────────────────────────────────────────────────
     weeks = list(dm[iri.WEEK_START])
@@ -11727,8 +11787,6 @@ def _render_velocity_analysis_body() -> None:
         ts_df = tsp.fetch_trade_spend_df()
     except tsp.TradeSpendError as exc:
         ts_err = str(exc)
-
-    _render_velocity_methodology(iri_file)
 
     # ── Our shipment filters ────────────────────────────────────────────────
     dim_specs = [
@@ -11819,7 +11877,11 @@ def _render_velocity_analysis_body() -> None:
         st.info("No weeks in the selected range.")
         return
 
-    # ── Promo overlay (trade spend) ─────────────────────────────────────────
+    # ① Absolute-volume chart FIRST (our ordered vs shipped lbs).
+    _render_volume_chart(disp)
+    st.markdown("---")
+
+    # ── Promo overlay controls (drive the velocity index shading + the cohort) ─
     promo = None
     sel_tacs: list[str] = []
     item_keys = None
@@ -11829,9 +11891,9 @@ def _render_velocity_analysis_body() -> None:
         sel_tacs = st.multiselect(
             "🎯 Shade promo tactics (consumer shelf events)", options=tac_opts,
             default=default_tacs, key="velocity_promo_tactics",
-            help="Trade-spend promo windows shaded on the chart, coloured by tactic.  "
-                 "Year-long 'Corp Program' / fee rows are available but off by default "
-                 "(they'd flood the chart).  Cancelled promos are excluded.")
+            help="Trade-spend promo windows shaded on the velocity index chart, "
+                 "coloured by tactic.  Year-long 'Corp Program' / fee rows are available "
+                 "but off by default (they'd flood the chart).  Cancelled promos excluded.")
         # Item scope = SKUs behind the PRODUCT-filtered shipments (bridged to
         # trade-spend item_number via PDH, since dbo.Shipments has no SKU); the
         # corp scope reuses the Corporate Group filter.  (Customer refines the
@@ -11839,7 +11901,6 @@ def _render_velocity_analysis_body() -> None:
         prod_cols = (vel.COL_BUSINESS_UNIT, vel.COL_PORTFOLIO, vel.COL_PRODUCT_MINOR,
                      vel.COL_PRODUCT_FORMAT, vel.COL_PRODUCT_DESC)
         any_prod = any(selections.get(c) for c in prod_cols)
-        item_keys = None
         if any_prod:
             m = pd.Series(True, index=df.index)
             for c in prod_cols:
@@ -11855,23 +11916,11 @@ def _render_velocity_analysis_body() -> None:
     elif ts_err:
         st.caption(f"ℹ️ Promo overlay unavailable — {ts_err}")
 
-    _render_velocity_signal(disp)
-    _render_velocity_kpis(disp)
-    _render_velocity_chart(disp, promo=promo)
-    if promo is not None and not promo.bands.empty:
-        st.caption(
-            "🎯 Shaded bands = weeks with a consumer promo for the filtered SKUs / "
-            "corporate group (trade-spend `item_number` → PDH → shipment "
-            "attributes).  Colour = the week's **dominant tactic**; depth ∝ # SKUs "
-            "on promo.  Hover a ▾ for tactics, spend, promo volume and accounts.  "
-            "Our order velocity typically **leads** the on-shelf window, so expect "
-            "the orange line to rise just before/into a band.")
-
-    # Dedicated absolute-volume chart (our ordered vs shipped lbs).
+    # ② Velocity index (self-contained: signal → KPIs → method → chart).
+    _render_velocity_chart(disp, promo=promo, iri_file=iri_file)
     st.markdown("---")
-    _render_volume_chart(disp)
 
-    # Demand Quality & Base Erosion — base vs promo decomposition (needs IRI).
+    # ③ Demand Quality & Base Erosion — base vs promo decomposition (needs IRI).
     quality = cohort = None
     if iri_raw is not None:
         quality = dq.build_iri_quality(
@@ -11917,14 +11966,12 @@ def render() -> None:
     ----
     1. Page header + Instructions
     2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
-    3. Plan Lift Analysis           (📈, collapsible, collapsed; above RO)
-    4. Promotion Lift Analysis      (🎯, collapsible, collapsed)
-    5. Velocity Analysis           (🚀, collapsible, collapsed)
-    6. RO Comparison                (collapsible, expanded by default)
-    7. Demand Summary               (collapsible, collapsed by default)
-    8. Product Line Review          (collapsible, collapsed by default)
-    9. Sales Distribution Tracker   (🚚, collapsible, collapsed)
-    10. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
+    3. Velocity Analysis           (🚀, collapsible, collapsed)
+    4. RO Comparison                (collapsible, expanded by default)
+    5. Demand Summary               (collapsible, collapsed by default)
+    6. Product Line Review          (collapsible, collapsed by default)
+    7. Sales Distribution Tracker   (🚚, collapsible, collapsed)
+    8. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -11936,14 +11983,6 @@ def render() -> None:
     st.markdown("---")
 
     _render_ibp_supporting_files()
-    st.markdown("---")
-
-    # Plan Lift Analysis sits ABOVE RO Comparison and reads its own Fabric
-    # sources, so it stays fully independent of the RO calculations below.
-    _render_plan_lift_analysis()
-    st.markdown("---")
-
-    _render_promotion_lift_analysis()
     st.markdown("---")
 
     _render_velocity_analysis()

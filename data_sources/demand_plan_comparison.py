@@ -3335,14 +3335,36 @@ BH_CATEGORY_LABELS: dict[str, str] = {
 }
 # Periods shown left→right in the Lever B / C tables (widest → narrowest).
 BH_PERIOD_ORDER: tuple[str, ...] = ("L12M", "L6M", "L3M")
-# Lever D ranks the top-N individual movers; the rest collapse to "All others".
-BH_MOVER_TOP_N: int = 3
+# Lever D ranks the top-N individual movers per direction (growers / decliners).
+BH_MOVER_TOP_N: int = 5
 
-# Lever A — channel gap read (Orders YoY vs Shipments YoY at L3M).  Orders ABOVE
-# shipments ⇒ sell-in outpacing sell-through ⇒ channel building inventory.
+# Lever A — Darigold **internal** finished-goods inventory read (an ASSUMPTION,
+# not a fact — we don't see production).  Rationale: we produce to demand
+# (orders), so ΔFG ≈ Orders − Shipments.  Orders YoY ABOVE Shipments YoY ⇒ we're
+# booking demand faster than we ship ⇒ finished goods / backlog BUILDING; the
+# reverse ⇒ we're shipping down our own stock ⇒ DRAINING.  Only called when the
+# gap is material AND consistent across L6M and L3M — else "flat".
 BH_GAP_BUILDING: str = "Building"
 BH_GAP_DRAINING: str = "Draining"
 BH_GAP_BALANCED: str = "Balanced"
+# Lever A gap must clear this (fraction, i.e. 0.01 = 1pp) in BOTH L6M and L3M,
+# same sign, before we call building/draining — a single-period 0.5pp wobble is
+# noise, not an inventory signal.
+_BH_GAP_DEADBAND: float = 0.01
+
+# Lever D — per-mover classification tags (page renders icon + wording).
+BH_TAG_EXIT: str = "exit"                  # decliner: last-year lbs → ~0 (walked away)
+BH_TAG_SOFTENING: str = "softening"        # decliner: partial decline, still buying
+BH_TAG_SUBSTITUTION: str = "substitution"  # mover offset within same customer/SKU
+BH_TAG_GROWTH: str = "growth"              # grower: organic expansion of existing line
+BH_TAG_NEW: str = "new"                    # grower: from ~0 last year (new business)
+# A decliner is an EXIT when this-year L3M lbs fall below this fraction of last
+# year's (a near-complete walk-away); a mover is SUBSTITUTION when its customer
+# (or its SKU) is roughly volume-neutral overall — the lbs moved, not lost.
+_BH_EXIT_RATIO: float = 0.15
+_BH_SUBST_RATIO: float = 0.5
+# Concentration read: how many accounts explain this share of the L3M decline.
+_BH_CONCENTRATION_PCT: float = 0.80
 
 # Lever B — Price-Volume-Mix (PVM) read on the L3M Net-Sales move: which term
 # (units, or price & mix) drove the Net Sales YoY, and which way.  Tokens; the
@@ -3366,15 +3388,24 @@ BH_VM_DOWN_DOWN: str = "down_down"
 BH_NO_PROMO_CATEGORIES: frozenset = frozenset({"fresh_milk"})
 
 
-def _bh_gap_flag(order_yoy: Optional[float], ship_yoy: Optional[float]) -> str:
-    """Lever A: classify the Orders−Shipments YoY gap into building/draining/flat."""
-    if (order_yoy is None or ship_yoy is None
-            or pd.isna(order_yoy) or pd.isna(ship_yoy)):
+def _bh_gap_flag(
+    order_l6m: Optional[float], ship_l6m: Optional[float],
+    order_l3m: Optional[float], ship_l3m: Optional[float],
+) -> str:
+    """Lever A: classify the Orders−Shipments YoY gap into building / draining /
+    flat — an assumption about Darigold's own finished-goods inventory.
+
+    Robust (not one-period): calls building/draining ONLY when the gap clears the
+    deadband with the **same sign in BOTH L6M and L3M**.  A single-period wobble
+    inside the band reads as ``Balanced`` (flat — no clear inventory signal)."""
+    vals = (order_l6m, ship_l6m, order_l3m, ship_l3m)
+    if any(v is None or pd.isna(v) for v in vals):
         return ""
-    gap = order_yoy - ship_yoy
-    if gap > _BH_FLAG_DEADBAND:
+    gap_l6m = order_l6m - ship_l6m
+    gap_l3m = order_l3m - ship_l3m
+    if gap_l6m > _BH_GAP_DEADBAND and gap_l3m > _BH_GAP_DEADBAND:
         return BH_GAP_BUILDING
-    if gap < -_BH_FLAG_DEADBAND:
+    if gap_l6m < -_BH_GAP_DEADBAND and gap_l3m < -_BH_GAP_DEADBAND:
         return BH_GAP_DRAINING
     return BH_GAP_BALANCED
 
@@ -3421,13 +3452,16 @@ class BhMoverSegment:
     ``delta_m`` is the signed L3M **order**-lbs swing (millions); ``share`` is
     |Δ| ÷ the category's total gross movement (0–1) — this line's **percentage
     of impact**, used as the bar's data label; ``yoy_pct`` is context only
-    (never used to rank); ``kind`` is ``"grower"`` or ``"decliner"``.
+    (never used to rank); ``kind`` is ``"grower"`` or ``"decliner"``; ``tag`` is
+    the structural classification (``BH_TAG_*``) that separates exits / softening
+    from substitution (a within-customer/SKU move, not net demand loss).
     """
     label: str
     delta_m: float
     yoy_pct: Optional[float]
     share: float
     kind: str
+    tag: str = ""
 
 
 @dataclass(frozen=True)
@@ -3440,10 +3474,18 @@ class BhConcentration:
     for the diverging bar (green right / red left).  Ranking is by ABSOLUTE
     pound impact — never by YoY % — so a tiny-base line can't hijack the chart.
     Empty tuples when the category had no movement.
+
+    ``decline_k`` / ``decline_accounts`` answer "concentrated vs broad": how many
+    accounts (customers) explain :data:`_BH_CONCENTRATION_PCT` of the L3M net
+    decline, out of how many declining accounts total.  ``decline_total_m`` is
+    that net decline (millions, positive number) — 0 when nothing declined.
     """
     total_abs_m: float
     growers: tuple[BhMoverSegment, ...]
     decliners: tuple[BhMoverSegment, ...]
+    decline_k: int = 0
+    decline_accounts: int = 0
+    decline_total_m: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -3592,20 +3634,55 @@ def _category_concentration(
     if total_abs <= 1e-9:
         return BhConcentration(0.0, (), ())
 
+    # Net swing rolled up by customer and by SKU (millions) — used to tell a
+    # SUBSTITUTION (the lost lbs re-appear under the same customer or SKU) from a
+    # genuine exit / softening, and to measure decline concentration by account.
+    cust_net = delta_m.groupby(level=0).sum()
+    sku_net = delta_m.groupby(level=1).sum()
+
+    def _tag(key, d: float, c: float, y: float) -> str:
+        cust, sku = key
+        cn, sn = float(cust_net.get(cust, 0.0)), float(sku_net.get(sku, 0.0))
+        # Substitution FIRST: the swing is offset within its customer OR its SKU
+        # (that roll-up is ~flat vs this line's move → the lbs MOVED, not lost) —
+        # so a drop-to-zero that reappears under the same customer is a switch,
+        # not an exit.
+        if abs(cn) < _BH_SUBST_RATIO * abs(d) or abs(sn) < _BH_SUBST_RATIO * abs(d):
+            return BH_TAG_SUBSTITUTION
+        if d < 0:
+            if y > 1e-9 and c < _BH_EXIT_RATIO * y:   # last-year lbs → ~0 (walked away)
+                return BH_TAG_EXIT
+            return BH_TAG_SOFTENING
+        return BH_TAG_NEW if y < 1e-9 else BH_TAG_GROWTH
+
     def _seg(key) -> BhMoverSegment:
         cust, sku = key
         d, c, y = float(delta_m.loc[key]), float(cur.loc[key]), float(yag.loc[key])
         yoy = _safe_ratio(c - y, y) if abs(y) > 1e-9 else None
         return BhMoverSegment(
             label=f"{cust} × {sku}", delta_m=d, yoy_pct=yoy,
-            share=abs(d) / total_abs, kind="grower" if d > 0 else "decliner")
+            share=abs(d) / total_abs, kind="grower" if d > 0 else "decliner",
+            tag=_tag(key, d, c, y))
 
     pos = delta_m[delta_m > 0].sort_values(ascending=False)   # biggest gainers
     neg = delta_m[delta_m < 0].sort_values()                  # biggest losers
     growers = tuple(_seg(k) for k in pos.index[:top_n])
     decliners = tuple(_seg(k) for k in neg.index[:top_n])
+
+    # Concentration of the NET decline by account (customer): how many customers
+    # explain _BH_CONCENTRATION_PCT of the total net drop.
+    cust_drop = (-cust_net[cust_net < 0]).sort_values(ascending=False)  # positive magnitudes
+    decline_total = float(cust_drop.sum())
+    decline_k = decline_accounts = 0
+    if decline_total > 1e-9:
+        decline_accounts = int(len(cust_drop))
+        cum = cust_drop.cumsum()
+        decline_k = int((cum < _BH_CONCENTRATION_PCT * decline_total).sum() + 1)
+        decline_k = min(decline_k, decline_accounts)
     return BhConcentration(
-        total_abs_m=total_abs, growers=growers, decliners=decliners)
+        total_abs_m=total_abs, growers=growers, decliners=decliners,
+        decline_k=decline_k, decline_accounts=decline_accounts,
+        decline_total_m=decline_total)
 
 
 def _bh_margin_pct(
@@ -3762,8 +3839,10 @@ def build_business_health_categories(
         net_ser = finance_series.get("Net Sales", {})
         flag = _bh_flag(order_series["L3M"]["yoy"], order_series["L12M"]["yoy"])
 
-        # Lever A — channel gap read (L3M Orders vs Shipments YoY).
+        # Lever A — Darigold internal inventory read (L6M+L3M Orders vs Shipments
+        # YoY; building/draining only when material AND consistent across both).
         gap_flag = _bh_gap_flag(
+            order_series["L6M"]["yoy"], ship_series["L6M"]["yoy"],
             order_series["L3M"]["yoy"], ship_series["L3M"]["yoy"])
 
         # Lever B — Net Sales ≈ Volume (IBP shipped) + Price/mix (residual),

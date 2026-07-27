@@ -21,6 +21,11 @@ from data_sources.demand_plan_comparison import (
     BH_VM_UP_DOWN,
     BH_VM_DOWN_UP,
     BH_VM_DOWN_DOWN,
+    BH_TAG_EXIT,
+    BH_TAG_SOFTENING,
+    BH_TAG_SUBSTITUTION,
+    BH_TAG_GROWTH,
+    BH_TAG_NEW,
     _bh_gap_flag,
     _bh_decomp_sowhat,
     _bh_vol_margin_quadrant,
@@ -35,10 +40,17 @@ PRIOR = date(2026, 6, 1)   # single-month fixtures land in every window ending h
 # ── Pure-helper tests (exhaustive over the branches) ─────────────────────────
 
 def test_gap_flag_branches():
-    assert _bh_gap_flag(0.30, 0.20) == BH_GAP_BUILDING     # orders outpace ships
-    assert _bh_gap_flag(0.10, 0.30) == BH_GAP_DRAINING     # ships outpace orders
-    assert _bh_gap_flag(0.20, 0.20) == BH_GAP_BALANCED
-    assert _bh_gap_flag(None, 0.2) == "" and _bh_gap_flag(0.2, None) == ""
+    # Building / draining require a material gap with the SAME sign in BOTH L6M
+    # and L3M (args: order_l6m, ship_l6m, order_l3m, ship_l3m).
+    assert _bh_gap_flag(0.30, 0.20, 0.28, 0.18) == BH_GAP_BUILDING   # orders outpace both
+    assert _bh_gap_flag(0.10, 0.30, 0.12, 0.28) == BH_GAP_DRAINING   # ships outpace both
+    assert _bh_gap_flag(0.20, 0.20, 0.20, 0.20) == BH_GAP_BALANCED   # no gap
+    # Sign flips between periods → flat (no clear signal).
+    assert _bh_gap_flag(0.30, 0.20, 0.18, 0.28) == BH_GAP_BALANCED
+    # Inside the 1pp noise band even if same sign → flat.
+    assert _bh_gap_flag(0.204, 0.20, 0.203, 0.20) == BH_GAP_BALANCED
+    assert _bh_gap_flag(None, 0.2, 0.2, 0.2) == ""
+    assert _bh_gap_flag(0.2, 0.2, 0.2, None) == ""
 
 
 def test_decomp_sowhat_branches():
@@ -218,6 +230,43 @@ def test_lever_d_concentration_order_based_captures_mt_food_bank():
     # Ranking is by absolute pounds — never YoY% (MT Food Bank's −100% doesn't
     # jump it above a bigger-pound line; it wins here on 1.4M lbs, not the %).
     assert all(g.kind == "grower" for g in conc.growers)
+
+
+def test_lever_d_tags_and_decline_concentration():
+    """Each mover is tagged exit / softening / substitution / growth / new, and
+    the decline concentration answers 'few accounts or broad?'."""
+    conc = _butter().concentration
+    tags = {s.label: s.tag for s in (*conc.decliners, *conc.growers)}
+    assert tags["MT Food Bank × DG Btr"] == BH_TAG_EXIT            # 1.4M → 0 (walked away)
+    assert tags["Golden State (McD) × DG Btr"] == BH_TAG_SOFTENING  # 0.8M → 0.2M partial
+    assert tags["Costco × KS Btr Qtr"] == BH_TAG_GROWTH             # 1.0M → 2.0M
+    # Net decline: MT 1.4 + Baugh 0.8 + Golden 0.6 = 2.8M across 3 accounts.
+    assert conc.decline_total_m == pytest.approx(2.8, rel=1e-3)
+    assert conc.decline_accounts == 3
+    assert conc.decline_k == 3
+
+
+def test_lever_d_substitution_tag():
+    """A customer that drops one SKU and picks up another (net ~flat) is tagged
+    SUBSTITUTION on both lines — the lbs moved, not lost/gained."""
+    from data_sources.demand_plan_comparison import (
+        _category_concentration, COMPARISON_TEMPLATE, _last_n_months, _shift_year_back,
+    )
+    tby = {r.row_id: r for r in COMPARISON_TEMPLATE}
+    cur = _last_n_months(PRIOR, 3)
+    yag = {_shift_year_back(m) for m in cur}
+    rows = [   # Costco: SKU A 1.0M → 0 ; SKU B 0 → 1.0M (same customer, net flat)
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "SKU A", "2025-06-01", 1_000_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "SKU B", "2026-06-01", 1_000_000),
+    ]
+    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
+    df = pd.DataFrame(rows, columns=cols)
+    df["month"] = pd.to_datetime(df["month"]).dt.date
+    df["item_key"] = df["item_desc"]
+    conc = _category_concentration(df, "butter", cur, yag, tby)
+    tags = {s.label: s.tag for s in (*conc.decliners, *conc.growers)}
+    assert tags["Costco × SKU A"] == BH_TAG_SUBSTITUTION   # dropped but reappears
+    assert tags["Costco × SKU B"] == BH_TAG_SUBSTITUTION   # as SKU B, same customer
 
 
 def test_lever_d_ships_only_would_miss_mt_food_bank():

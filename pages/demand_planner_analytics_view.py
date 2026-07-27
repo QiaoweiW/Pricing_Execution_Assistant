@@ -163,6 +163,11 @@ from data_sources.demand_plan_comparison import (
     BH_GAP_BUILDING,
     BH_GAP_DRAINING,
     BH_GAP_BALANCED,
+    BH_TAG_EXIT,
+    BH_TAG_SOFTENING,
+    BH_TAG_SUBSTITUTION,
+    BH_TAG_GROWTH,
+    BH_TAG_NEW,
     BH_MOVE_PRICE_UP,
     BH_MOVE_VOLUME_UP,
     BH_MOVE_VOLUME_DOWN,
@@ -734,16 +739,24 @@ _BH_FLAG_CHIP: dict[str, str] = {
 
 # ── Per-category four-lever deep-dive (one expandable row per category) ───────
 
-# Lever A gap read → header chip + longer caption words.
+# Lever A gap read → header chip + longer caption words.  Framed as an ASSUMPTION
+# about DARIGOLD's own finished-goods inventory (ΔFG ≈ Orders − Shipments; we
+# produce to demand) — not the customer's / channel inventory.
 _BH_GAP_HEADER: dict[str, str] = {
-    BH_GAP_BUILDING: "📦▲ channel building",
-    BH_GAP_DRAINING: "📦▼ channel draining",
-    BH_GAP_BALANCED: "📦= channel balanced",
+    BH_GAP_BUILDING: "📦▲ our inventory building",
+    BH_GAP_DRAINING: "📦▼ our inventory draining",
+    BH_GAP_BALANCED: "📦= flat — no clear signal",
 }
 _BH_GAP_WORDS: dict[str, str] = {
-    BH_GAP_BUILDING: "building (orders outpacing shipments)",
-    BH_GAP_DRAINING: "draining (shipments outpacing orders)",
-    BH_GAP_BALANCED: "balanced (orders and shipments in line)",
+    BH_GAP_BUILDING: ("building — orders are outpacing shipments in both L6M and "
+                      "L3M, so we're booking demand faster than we ship it; finished "
+                      "goods / order backlog accumulate on our side"),
+    BH_GAP_DRAINING: ("draining — shipments are outpacing orders in both L6M and "
+                      "L3M, so we're shipping our own stock down faster than new "
+                      "demand arrives"),
+    BH_GAP_BALANCED: ("flat — orders and shipments move together (the gap is inside "
+                      "the noise band or flips sign between L6M and L3M), so there's "
+                      "no clear internal-inventory signal right now"),
 }
 # Lever B — Price-Volume-Mix token → (short header tag, plain-English so-what).
 # Industry-standard PVM read: a revenue move is either price/mix-led (better
@@ -801,6 +814,14 @@ _BH_VM_READING: dict[str, dict[str, str]] = {
 }
 # Lever D diverging-bar colours by mover kind (green growers / red decliners).
 _BH_SEG_COLOR: dict[str, str] = {"grower": "#137d78", "decliner": "#c0392b"}
+# Lever D per-mover structural tags → (icon, label) for the bar + definitions.
+_BH_TAG_DISPLAY: dict[str, tuple[str, str]] = {
+    BH_TAG_EXIT: ("🚪", "exit"),
+    BH_TAG_SOFTENING: ("📉", "softening"),
+    BH_TAG_SUBSTITUTION: ("🔁", "substitution"),
+    BH_TAG_GROWTH: ("📈", "growth"),
+    BH_TAG_NEW: ("✨", "new"),
+}
 # Signed-value colours for the Lever B decomposition table.
 _BH_POS_COLOR: str = "#137d78"
 _BH_NEG_COLOR: str = "#c0392b"
@@ -841,11 +862,12 @@ def _render_business_health_category_levers(categories: list) -> None:
 
 
 def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
-    """Lever A — Orders vs Shipments YoY (L12M→L3M); gap read as the header so-what."""
+    """Lever A — Order lbs vs Shipment lbs YoY (L12M→L3M); the gap is an
+    assumption about Darigold's OWN finished-goods inventory (not the customer's)."""
     gap = _BH_GAP_HEADER.get(cat.gap_flag, "")
     st.markdown(
-        f"**A · Orders vs Shipments YoY**  —  {gap}" if gap
-        else "**A · Orders vs Shipments YoY**")
+        f"**A · Order lbs vs Shipment lbs YoY**  —  {gap}" if gap
+        else "**A · Order lbs vs Shipment lbs YoY**")
     fig = go.Figure()
     for src, series in (("Orders", cat.order_series), ("Shipments", cat.ship_series)):
         color = _BH_CHART_STYLE[src]["line"]
@@ -874,7 +896,14 @@ def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
         showlegend=True, plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_la_{cat.row_id}")
-    st.caption(f"gap read → channel inventory **{_BH_GAP_WORDS.get(cat.gap_flag, 'n/a')}**")
+    words = _BH_GAP_WORDS.get(cat.gap_flag)
+    if words:
+        st.caption(
+            f"**Assume Darigold inventory is {words}.**  _ΔFG ≈ Orders − Shipments "
+            "(we produce to demand); an assumption to confirm against actual stock, "
+            "not a fact._")
+    else:
+        st.caption("_Order/shipment YoY not available for an inventory read._")
 
 
 def _bh_signed_html(value) -> str:
@@ -1068,33 +1097,47 @@ def _render_bh_lever_c_recon(cat) -> None:
 
 
 def _render_bh_lever_d(cat) -> None:
-    """Lever D — diverging bar of the top-3 growers (green) and top-3 decliners
-    (red) by L3M **order**-lbs Δ; each bar's data label is its % of impact.
-
-    Bar length = absolute pound impact (what ranks); the % share label answers
-    "how much of the move is this line".  YoY% is hover-only so a tiny-base
-    outlier can't hijack the ranking.
+    """Lever D — diverging bar of the top-5 growers (green) and top-5 decliners
+    (red) by L3M **order**-lbs Δ, each tagged exit / softening / substitution
+    (growth / new for gainers), plus a decline-**concentration** read that
+    answers Lever B's question: is the drop a few accounts or broad-based?
     """
-    st.markdown("**D · Top movers** — L3M order Δ (ranked by |Δ| lbs)")
+    st.markdown("**D · Mix Shifts & Exits** — L3M order Δ, top 5 each way (ranked by |Δ| lbs)")
     conc = cat.concentration
+    # Concentration of the net decline — the "concentrated vs broad" decision.
+    if conc.decline_total_m > 1e-9 and conc.decline_accounts:
+        k, n = conc.decline_k, conc.decline_accounts
+        verdict = ("**concentrated** → likely a deliberate/structural exit; re-baseline down"
+                   if k <= 3 else
+                   "**broad-based** → a demand problem to defend, not a re-baseline")
+        st.caption(
+            f"🎯 **{k} account{'s' if k != 1 else ''} explain 80% of the L3M decline** "
+            f"(of {n} declining accounts · {conc.decline_total_m:.2f}M lbs) — {verdict}.")
     # Biggest decliners on top, growers below (matches the diverging mockup).
     movers = list(conc.decliners) + list(conc.growers)
     if not movers:
         st.caption("_No order movement under the current filters._")
         return
+
+    def _ylabel(seg):
+        icon = _BH_TAG_DISPLAY.get(seg.tag, ("", ""))[0]
+        return f"{icon} {seg.label}" if icon else seg.label
+
     fig = go.Figure(go.Bar(
-        y=[seg.label for seg in movers],
+        y=[_ylabel(seg) for seg in movers],
         x=[seg.delta_m for seg in movers],
         orientation="h",
         marker=dict(color=[_BH_SEG_COLOR[seg.kind] for seg in movers]),
-        text=[f"{seg.share * 100:.0f}%" for seg in movers],
+        text=[f"{seg.share * 100:.0f}% · {_BH_TAG_DISPLAY.get(seg.tag, ('', seg.tag))[1]}"
+              for seg in movers],
         textposition="outside", textfont=dict(size=11, color=_BH_FONT_COLOR),
         customdata=[
-            "—" if seg.yoy_pct is None else f"{seg.yoy_pct * 100:+.1f}%"
+            ["—" if seg.yoy_pct is None else f"{seg.yoy_pct * 100:+.1f}%",
+             _BH_TAG_DISPLAY.get(seg.tag, ("", seg.tag))[1]]
             for seg in movers],
         hovertemplate=(
-            "%{y}<br>Δ %{x:+.2f}M lbs · YoY %{customdata}"
-            "<br>%{text} of total move<extra></extra>"),
+            "%{y}<br>Δ %{x:+.2f}M lbs · YoY %{customdata[0]}"
+            "<br>%{customdata[1]}<extra></extra>"),
     ))
     fig.update_layout(
         height=max(150, 34 * len(movers) + 60),
@@ -1108,8 +1151,12 @@ def _render_bh_lever_d(cat) -> None:
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_ld_{cat.row_id}")
     st.caption(
-        f"Data labels = **% of total gross move** "
-        f"({conc.total_abs_m:.2f}M lbs).  Ranked by absolute lbs, not YoY%."
+        f"Labels = **% of total gross move** ({conc.total_abs_m:.2f}M lbs) · ranked by "
+        "|Δ| lbs, not YoY%.  **Tags** — 🚪 **exit**: last-year lbs → ~0 (walked away → "
+        "re-baseline) · 📉 **softening**: partial decline, still buying · 🔁 "
+        "**substitution**: fell/grew but the same customer *or* SKU is ~flat overall "
+        "(lbs moved, not lost) · 📈 **growth**: existing line expanding · ✨ **new**: "
+        "from ~0 a year ago."
     )
 
 

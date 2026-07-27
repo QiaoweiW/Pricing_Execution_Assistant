@@ -331,6 +331,7 @@ from data_sources.ro_comparison import (
     list_pipeline_review_snapshots,
     save_pipeline_review_snapshot,
     save_ro_comparison_output,
+    fetch_ro_comparison_output_df,
 )
 from data_sources.ro_summary_report import (
     COL_DELTA_CHANGE as SR_COL_DELTA_CHANGE,
@@ -528,6 +529,11 @@ def _render_ibp_supporting_files() -> None:
 
 # Session-state keys.  Centralised so we never typo a key elsewhere.
 _SS_SUMMARY_DF      = "_ro_cmp_summary_df"
+# "Regenerate from published RO_Comparison_Output.csv" panel — a read-only
+# snapshot the planner pulls on demand, kept separate from the live in-memory
+# frame so the RO_History rebuild above never clobbers it.
+_SS_RO_REGEN_DF     = "_ro_regen_published_df"
+_SS_RO_REGEN_AT     = "_ro_regen_published_at"
 _SS_MONTHS_SIG      = "_ro_cmp_months_sig"
 _SS_WARNINGS        = "_ro_cmp_warnings"
 _SS_DIMITEMS_ERROR  = "_ro_cmp_dimitems_error"
@@ -1839,8 +1845,101 @@ def _render_ro_comparison() -> None:
         st.markdown("---")
         _render_summary_report_section()
 
+        # 13. Regenerate-from-published — rebuild the driver table, Pipeline at a
+        #     Glance and RO Summary Report straight from the published
+        #     RO_Comparison_Output.csv (read-only snapshot, on-demand button).
+        st.markdown("---")
+        _render_ro_regen_from_published()
+
 
 # ── RO Comparison helpers ───────────────────────────────────────────────────
+
+
+def _render_ro_regen_from_published() -> None:
+    """Button + read-only panel that (re)builds the R&O driver table, Pipeline
+    at a Glance and RO Summary Report straight from the **published**
+    ``Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`` — a fresh Fabric
+    read, independent of the live RO_History → in-memory frame above.
+
+    Kept read-only and in its own session slot (:data:`_SS_RO_REGEN_DF`) so it
+    never fights the RO_History rebuild that owns ``_SS_SUMMARY_DF``; unique
+    widget keys (``…_regen``) avoid colliding with the live sections."""
+    with st.expander("📄 Regenerate from published RO_Comparison_Output.csv", expanded=False):
+        st.caption(
+            "Reads the **published** `Files/RO Tracking/RO_Reporting/"
+            "RO_Comparison_Output.csv` fresh from Fabric and rebuilds the R&O "
+            "driver table, Pipeline at a Glance and RO Summary Report **from that "
+            "file** — a read-only snapshot (the live views above run off RO_History)."
+        )
+        if st.button("🔄 Regenerate from published RO_Comparison_Output.csv",
+                     key="ro_regen_from_published_btn", use_container_width=True):
+            try:
+                with st.spinner("Reading published RO_Comparison_Output.csv from Microsoft Fabric…"):
+                    st.session_state[_SS_RO_REGEN_DF] = fetch_ro_comparison_output_df()
+                    st.session_state[_SS_RO_REGEN_AT] = datetime.now()
+            except RoComparisonError as exc:
+                st.session_state.pop(_SS_RO_REGEN_DF, None)
+                st.error(f"❌ Could not read RO_Comparison_Output.csv.\n\n{exc}")
+
+        df = st.session_state.get(_SS_RO_REGEN_DF)
+        if df is None or df.empty:
+            return
+        at = st.session_state.get(_SS_RO_REGEN_AT)
+        st.caption(f"Regenerated from the published file · {len(df):,} rows"
+                   + (f" · read {at:%Y-%m-%d %H:%M}" if at else ""))
+
+        # 1) R&O driver table (top-3 buckets per Format) — read-only snapshot.
+        st.markdown("**Δ Current Fiscal Probabilized Lbs — by Format** _(top 3 drivers)_")
+        summary = compute_per_format_summary(df)
+        if summary.empty:
+            st.caption("_No driver movement in the published file._")
+        else:
+            def _color_signed(v):
+                try:
+                    x = float(v)
+                except (TypeError, ValueError):
+                    return ""
+                return ("color:#1b7f3a;font-weight:600" if x > 0
+                        else "color:#c0392b;font-weight:600" if x < 0 else "")
+
+            def _bold_total(row):
+                return (["font-weight:700"] * len(row)
+                        if row[PER_FORMAT_FORMAT_COL] == PER_FORMAT_TOTAL_LABEL
+                        else [""] * len(row))
+            styler = (summary.style.map(_color_signed, subset=[PER_FORMAT_DELTA_COL])
+                      .apply(_bold_total, axis=1))
+            cc = st.column_config
+            st.dataframe(
+                styler, use_container_width=True, hide_index=True,
+                height=min(36 * (len(summary) + 1) + 38, 480),
+                column_config={
+                    PER_FORMAT_FORMAT_COL: cc.TextColumn("Format", width="small"),
+                    PER_FORMAT_DELTA_COL: cc.NumberColumn(format="accounting"),
+                    **{c: cc.TextColumn(c, width="large") for c in PER_FORMAT_DRIVER_COLS}})
+
+        # 2) Pipeline at a Glance — tiles + charts from the published file.
+        st.markdown("### 🎯 Pipeline at a Glance — published file")
+        in_year_m, full_year_m = _ro_total_b2c_totals(df)
+        _render_ro_pipeline_tiles(df, in_year_m=in_year_m, full_year_m=full_year_m)
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            _render_ro_urgency_chart(df, key_suffix="_regen")
+        with cc2:
+            _render_ro_buildup_chart(df, key_suffix="_regen")
+
+        # 3) RO Summary Report — hierarchical roll-up of the published file.
+        st.markdown("### 📊 RO Summary Report — published file")
+        try:
+            report_df, _warn, _tpl = build_summary_report(df)
+        except RoSummaryReportError as exc:
+            st.error(f"❌ Could not build the RO Summary Report.\n\n{exc}")
+            return
+        st.dataframe(report_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Download regenerated RO Summary Report (CSV)",
+            data=report_df.to_csv(index=False).encode("utf-8"),
+            file_name="RO_Summary_Report_regenerated.csv", mime="text/csv",
+            key="ro_regen_summary_download", use_container_width=True)
 
 def _render_ro_item_master_download_button() -> None:
     """Render a red download button for ``RO_Item_Master.csv`` from Fabric."""
@@ -3306,7 +3405,7 @@ _RO_SHIP_BUCKET_COLORS: dict[str, str] = {
 _RO_CHART_FONT: str = _BH_FONT_COLOR
 
 
-def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
+def _render_ro_urgency_chart(comp_df: pd.DataFrame, *, key_suffix: str = "") -> None:
     """Horizontal stacked bar: FY27 in-year probabilized lbs per Portfolio × Format.
 
     One row per Portfolio Major × Supply Format, stacked by first-ship-date
@@ -3335,7 +3434,7 @@ def _render_ro_urgency_chart(comp_df: pd.DataFrame) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
-    st.plotly_chart(fig, use_container_width=True, key="ro_urgency_chart")
+    st.plotly_chart(fig, use_container_width=True, key=f"ro_urgency_chart{key_suffix}")
 
 
 # Session store for planner Action edits, keyed by the stable Program string so
@@ -3507,7 +3606,7 @@ _RO_BUILDUP_STYLE: dict[str, dict] = {
 }
 
 
-def _render_ro_buildup_chart(comp_df: pd.DataFrame) -> None:
+def _render_ro_buildup_chart(comp_df: pd.DataFrame, *, key_suffix: str = "") -> None:
     """Stacked bar per Portfolio × Format: FY27 probabilized → Gross Pipeline.
 
     Solid FY27 Probabilized base + a Year-effect increment (probabilized volume
@@ -3539,7 +3638,7 @@ def _render_ro_buildup_chart(comp_df: pd.DataFrame) -> None:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
-    st.plotly_chart(fig, use_container_width=True, key="ro_buildup_chart")
+    st.plotly_chart(fig, use_container_width=True, key=f"ro_buildup_chart{key_suffix}")
 
 
 def _render_ro_pipeline_analytics_section() -> None:

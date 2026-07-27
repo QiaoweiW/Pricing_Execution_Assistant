@@ -1609,6 +1609,33 @@ def save_ro_comparison_output(df: pd.DataFrame) -> str:
     return _RO_REPORTING_BLOB_PATH
 
 
+def fetch_ro_comparison_output_df() -> pd.DataFrame:
+    """Read the PUBLISHED ``Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv``
+    back into a DataFrame — a fresh Fabric read (no cache), so it reflects the
+    file as it currently stands on disk.
+
+    Ship-date columns (serialised as ``YYYY-MM-DD`` strings by
+    :func:`save_ro_comparison_output`) are coerced back to ``datetime64``.  Raises
+    :class:`RoComparisonError` if the file is missing or unreadable.
+    """
+    try:
+        df, _etag = read_csv(_SECRETS_SECTION, _RO_REPORTING_BLOB_PATH)
+    except LakehouseIOError as exc:
+        raise RoComparisonError(
+            "Could not read RO_Comparison_Output.csv from "
+            f"'Files/{_RO_REPORTING_BLOB_PATH}': {exc}"
+        ) from exc
+    if df is None:
+        raise RoComparisonError(
+            "RO_Comparison_Output.csv not found at "
+            f"'Files/{_RO_REPORTING_BLOB_PATH}' — save it first (or run Generate)."
+        )
+    for col in ("Prior First Ship Date", "LE First Ship Date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
 def save_pipeline_review_snapshot(
     df: pd.DataFrame, *, timestamp: Optional[str] = None,
 ) -> str:
@@ -1928,6 +1955,7 @@ __all__ = [
     "ro_item_master_blob_path",
     "list_months",
     "save_ro_comparison_output",
+    "fetch_ro_comparison_output_df",
     "upload_customer_input",
     # Auto-regenerate flow.
     "auto_regenerate_if_history_changed",

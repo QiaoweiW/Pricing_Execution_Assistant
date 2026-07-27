@@ -972,11 +972,11 @@ def _render_bh_lever_b(cat) -> None:
     Sequence: definition/legend → so-what (a decision QUESTION on the L3M move) →
     table."""
     st.markdown("**B · Decomposition**")
-    st.caption("Net Sales YoY% ≈ Units YoY% + Price/mix YoY%  (price/mix = the residual)")
+    st.caption("Net Sales YoY% ≈ Shipped lbs YoY% + Price/mix YoY%  (price/mix = the residual)")
     _bh_sowhat(_bh_lever_b_question(cat))
     periods = list(BH_PERIOD_ORDER)
     rows = (
-        ("Units YoY%", "volume"),
+        ("Shipped lbs YoY%", "volume"),
         ("Price/mix YoY%", "price_mix"),
         ("Net Sales YoY%", "net_sales"),
     )
@@ -1245,31 +1245,53 @@ def _render_bh_lever_d(cat) -> None:
 
 
 def _render_bh_lever_d_allmovers(cat) -> None:
-    """Foldable table of EVERY mover (Customer×SKU) ranked by |Δ| L3M, with its
-    tag (full explanation) and % of the total gross move."""
-    movers = cat.concentration.all_movers
-    if not movers:
+    """Foldable movers table grouped BY CUSTOMER: each customer is a block headed
+    by its **net** L3M swing (biggest net impact on top), listing the SKU ins /
+    outs within it (ranked by |Δ|), each tagged, with its % of the total gross
+    move.  Lines below ~0.5% of the gross move are dropped as noise."""
+    groups = cat.concentration.by_customer
+    if not groups:
         return
-    with st.expander(f"📋 All movers ({len(movers)}) — ranked by |Δ| L3M · tags", expanded=False):
+    n_cust = len(groups)
+    n_skus = sum(len(g.movers) for g in groups)
+    with st.expander(
+        f"📋 Movers by customer ({n_cust} customers · {n_skus} SKU lines) — net "
+        "impact + SKU ins/outs", expanded=False,
+    ):
         st.caption(_BH_TAG_LEGEND)
         head = ("<tr>"
-                "<th style='text-align:left'>Customer × SKU</th>"
+                "<th style='text-align:left'>Customer / SKU</th>"
                 "<th style='text-align:right;padding-left:12px'>L3M Δ (M lbs)</th>"
                 "<th style='text-align:center;padding-left:12px'>Tag</th>"
                 "<th style='text-align:right;padding-left:12px'>% of gross move</th>"
                 "</tr>")
         body = ""
-        for seg in movers:
-            icon, word = _BH_TAG_DISPLAY.get(seg.tag, ("", seg.tag))
-            color = _BH_SEG_COLOR.get(seg.kind, "#111827")
+        for g in groups:
+            net_color = _BH_SEG_COLOR["grower"] if g.net_delta_m >= 0 else _BH_SEG_COLOR["decliner"]
+            # Customer header row: net impact (headline) + gross churn.
             body += (
-                "<tr>"
-                f"<td style='text-align:left'>{_esc_html(seg.label)}</td>"
-                f"<td style='text-align:right;padding-left:12px;color:{color}'>"
-                f"{seg.delta_m:+.2f}M</td>"
-                f"<td style='text-align:center;padding-left:12px'>{icon} {word}</td>"
-                f"<td style='text-align:right;padding-left:12px'>{seg.share * 100:.0f}%</td>"
+                "<tr style='background:#f3f4f6'>"
+                f"<td style='text-align:left'><b>{_esc_html(g.customer)}</b></td>"
+                f"<td style='text-align:right;padding-left:12px;color:{net_color}'>"
+                f"<b>net {g.net_delta_m:+.2f}M</b></td>"
+                "<td style='text-align:center;padding-left:12px;color:#6b7280'>"
+                f"{len(g.movers)} SKU{'s' if len(g.movers) != 1 else ''}</td>"
+                f"<td style='text-align:right;padding-left:12px;color:#6b7280'>"
+                f"gross {g.gross_m:.2f}M</td>"
                 "</tr>")
+            # SKU ins/outs within the customer.
+            for seg in g.movers:
+                icon, word = _BH_TAG_DISPLAY.get(seg.tag, ("", seg.tag))
+                color = _BH_SEG_COLOR.get(seg.kind, "#111827")
+                body += (
+                    "<tr>"
+                    f"<td style='text-align:left;padding-left:22px;color:#374151'>"
+                    f"{_esc_html(seg.sku)}</td>"
+                    f"<td style='text-align:right;padding-left:12px;color:{color}'>"
+                    f"{seg.delta_m:+.2f}M</td>"
+                    f"<td style='text-align:center;padding-left:12px'>{icon} {word}</td>"
+                    f"<td style='text-align:right;padding-left:12px'>{seg.share * 100:.0f}%</td>"
+                    "</tr>")
         st.markdown(
             f"<table style='font-size:0.82rem;border-collapse:collapse;width:100%'>"
             f"{head}{body}</table>", unsafe_allow_html=True)

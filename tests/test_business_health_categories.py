@@ -266,12 +266,21 @@ def test_lever_d_tags_and_decline_concentration():
     assert conc.decline_total_m == pytest.approx(2.8, rel=1e-3)
     assert conc.decline_accounts == 3
     assert conc.decline_k == 3
-    # all_movers = every nonzero mover, ranked by |Δ| desc, each tagged.
+    # all_movers = every significant mover, ranked by |Δ| desc, each tagged.
     am = conc.all_movers
     assert len(am) == 5                                        # 2 growers + 3 decliners
     assert am[0].label == "MT Food Bank × DG Btr"             # biggest |Δ| (1.4M)
     assert abs(am[0].delta_m) >= abs(am[-1].delta_m)          # sorted by |Δ|
-    assert all(s.tag for s in am)                             # every mover tagged
+    assert all(s.tag and s.customer and s.sku for s in am)    # tagged + customer/sku set
+    # by_customer: one block per customer, ordered by |net|, biggest on top.
+    bc = conc.by_customer
+    assert {g.customer for g in bc} == {
+        "Costco", "Kroger", "MT Food Bank", "Baugh", "Golden State (McD)"}
+    assert bc[0].customer == "MT Food Bank"                    # |net 1.4| is largest
+    assert bc[0].net_delta_m == pytest.approx(-1.4, rel=1e-3)
+    assert bc[0].movers[0].sku == "DG Btr"                     # SKU ins/outs within
+    assert all(abs(g.net_delta_m) >= abs(nxt.net_delta_m)      # net-descending order
+               for g, nxt in zip(bc, bc[1:]))
 
 
 def test_lever_d_substitution_tag():
@@ -295,6 +304,34 @@ def test_lever_d_substitution_tag():
     tags = {s.label: s.tag for s in (*conc.decliners, *conc.growers)}
     assert tags["Costco × SKU A"] == BH_TAG_SUBSTITUTION   # dropped but reappears
     assert tags["Costco × SKU B"] == BH_TAG_SUBSTITUTION   # as SKU B, same customer
+    # Grouped by customer: Costco is one block, net ~0 (substitution), two SKUs.
+    assert len(conc.by_customer) == 1
+    g = conc.by_customer[0]
+    assert g.customer == "Costco" and g.net_delta_m == pytest.approx(0.0, abs=1e-6)
+    assert g.gross_m == pytest.approx(2.0, rel=1e-3) and len(g.movers) == 2
+
+
+def test_lever_d_excludes_near_zero_movers():
+    """Lines below ~0.5% of the gross move are dropped from the mover table."""
+    from data_sources.demand_plan_comparison import (
+        _category_concentration, COMPARISON_TEMPLATE, _last_n_months, _shift_year_back,
+    )
+    tby = {r.row_id: r for r in COMPARISON_TEMPLATE}
+    cur = _last_n_months(PRIOR, 3)
+    yag = {_shift_year_back(m) for m in cur}
+    rows = [   # Big mover 1.0M + a trivial 1k-lb line (~0.1% of gross) → dropped.
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Big", "2026-06-01", 1_000_000),
+        ("Butter", "Sticks", "Branded", "Packaged Butter", "Tiny Co", "Small", "2026-06-01", 1_000),
+    ]
+    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
+    df = pd.DataFrame(rows, columns=cols)
+    df["month"] = pd.to_datetime(df["month"]).dt.date
+    df["item_key"] = df["item_desc"]
+    conc = _category_concentration(df, "butter", cur, yag, tby)
+    labels = {s.label for s in conc.all_movers}
+    assert "Costco × Big" in labels
+    assert not any("Tiny Co" in lbl for lbl in labels)          # near-0% excluded
+    assert {g.customer for g in conc.by_customer} == {"Costco"}  # Tiny Co dropped
 
 
 def test_lever_d_ships_only_would_miss_mt_food_bank():

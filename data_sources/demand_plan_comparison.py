@@ -3374,6 +3374,9 @@ _BH_EXIT_RATIO: float = 0.15
 _BH_SUBST_RATIO: float = 0.5
 # Concentration read: how many accounts explain this share of the L3M decline.
 _BH_CONCENTRATION_PCT: float = 0.80
+# Mover table: drop lines below this share of the category's gross move — they
+# round to "0%" and are just noise the planner shouldn't scan.
+_BH_MOVER_MIN_SHARE: float = 0.005
 
 # Lever B — Price-Volume-Mix (PVM) read on the L3M Net-Sales move: which term
 # (units, or price & mix) drove the Net Sales YoY, and which way.  Tokens; the
@@ -3471,6 +3474,20 @@ class BhMoverSegment:
     share: float
     kind: str
     tag: str = ""
+    customer: str = ""
+    sku: str = ""
+
+
+@dataclass(frozen=True)
+class BhCustomerGroup:
+    """One customer's block in the Lever-D mover table: its **net** L3M swing
+    (ins − outs, millions), its gross churn (Σ|Δ|), and every significant SKU
+    mover within it (``movers``, ranked by |Δ| desc).  Customers are ordered by
+    |net_delta_m| so the biggest net movers sit on top."""
+    customer: str
+    net_delta_m: float
+    gross_m: float
+    movers: tuple["BhMoverSegment", ...]
 
 
 @dataclass(frozen=True)
@@ -3495,9 +3512,12 @@ class BhConcentration:
     decline_k: int = 0
     decline_accounts: int = 0
     decline_total_m: float = 0.0
-    # EVERY mover (nonzero Δ), ranked by |Δ| desc, tagged — for the foldable
-    # "all movers" table under the chart (chart itself shows only the top-3).
+    # EVERY significant mover (share ≥ _BH_MOVER_MIN_SHARE), ranked by |Δ| desc,
+    # tagged — the flat list behind the foldable table (chart shows top-3 only).
     all_movers: tuple[BhMoverSegment, ...] = ()
+    # The SAME significant movers grouped by customer, customers ordered by
+    # |net Δ| — the foldable "movers by customer" table (SKU ins/outs + net).
+    by_customer: tuple[BhCustomerGroup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3684,15 +3704,35 @@ def _category_concentration(
         return BhMoverSegment(
             label=f"{cust} × {sku}", delta_m=d, yoy_pct=yoy,
             share=abs(d) / total_abs, kind="grower" if d > 0 else "decliner",
-            tag=_tag(key, d, c, y))
+            tag=_tag(key, d, c, y), customer=str(cust), sku=str(sku))
 
     pos = delta_m[delta_m > 0].sort_values(ascending=False)   # biggest gainers
     neg = delta_m[delta_m < 0].sort_values()                  # biggest losers
     growers = tuple(_seg(k) for k in pos.index[:top_n])
     decliners = tuple(_seg(k) for k in neg.index[:top_n])
-    # Every nonzero mover, ranked by |Δ| desc — for the foldable table.
-    ranked = delta_m[delta_m.abs() > 1e-9].abs().sort_values(ascending=False).index
-    all_movers = tuple(_seg(k) for k in ranked)
+
+    # Significant movers only (drop lines that round to 0% of the gross move),
+    # ranked by |Δ| desc — the flat list behind the foldable table.
+    sig = delta_m[delta_m.abs() / total_abs >= _BH_MOVER_MIN_SHARE]
+    ranked_keys = list(sig.abs().sort_values(ascending=False).index)
+    all_movers = tuple(_seg(k) for k in ranked_keys)
+
+    # Group those significant movers by customer; the customer's NET impact is
+    # its TRUE net over ALL its SKUs (cust_net), not just the shown lines, so the
+    # headline never drifts.  Customers ordered by |net| (biggest impact on top).
+    by_cust_segs: dict[str, list[BhMoverSegment]] = {}
+    for seg in all_movers:
+        by_cust_segs.setdefault(seg.customer, []).append(seg)
+    groups = [
+        BhCustomerGroup(
+            customer=cust,
+            net_delta_m=float(cust_net.get(cust, sum(s.delta_m for s in segs))),
+            gross_m=float(sum(abs(s.delta_m) for s in segs)),
+            movers=tuple(segs),   # already |Δ|-desc (all_movers order preserved)
+        )
+        for cust, segs in by_cust_segs.items()
+    ]
+    by_customer = tuple(sorted(groups, key=lambda g: abs(g.net_delta_m), reverse=True))
 
     # Concentration of the NET decline by account (customer): how many customers
     # explain _BH_CONCENTRATION_PCT of the total net drop.
@@ -3707,7 +3747,7 @@ def _category_concentration(
     return BhConcentration(
         total_abs_m=total_abs, growers=growers, decliners=decliners,
         decline_k=decline_k, decline_accounts=decline_accounts,
-        decline_total_m=decline_total, all_movers=all_movers)
+        decline_total_m=decline_total, all_movers=all_movers, by_customer=by_customer)
 
 
 def _bh_margin_pct(

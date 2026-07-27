@@ -3343,8 +3343,9 @@ BH_DISCRETE_ORDER: tuple[str, ...] = ("prior6", "prior3", "recent3")
 BH_DISCRETE_LABELS: dict[str, str] = {
     "prior6": "Prior 6 mo", "prior3": "Prior 3 mo", "recent3": "Recent 3 mo",
 }
-# Lever D ranks the top-N individual movers per direction (growers / decliners).
-BH_MOVER_TOP_N: int = 5
+# Lever D chart shows the top-N movers per direction (growers / decliners); the
+# foldable table below the chart lists ALL movers.
+BH_MOVER_TOP_N: int = 3
 
 # Lever A — Darigold **internal** finished-goods inventory read (an ASSUMPTION,
 # not a fact — we don't see production).  Rationale: we produce to demand
@@ -3494,6 +3495,9 @@ class BhConcentration:
     decline_k: int = 0
     decline_accounts: int = 0
     decline_total_m: float = 0.0
+    # EVERY mover (nonzero Δ), ranked by |Δ| desc, tagged — for the foldable
+    # "all movers" table under the chart (chart itself shows only the top-3).
+    all_movers: tuple[BhMoverSegment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3686,6 +3690,9 @@ def _category_concentration(
     neg = delta_m[delta_m < 0].sort_values()                  # biggest losers
     growers = tuple(_seg(k) for k in pos.index[:top_n])
     decliners = tuple(_seg(k) for k in neg.index[:top_n])
+    # Every nonzero mover, ranked by |Δ| desc — for the foldable table.
+    ranked = delta_m[delta_m.abs() > 1e-9].abs().sort_values(ascending=False).index
+    all_movers = tuple(_seg(k) for k in ranked)
 
     # Concentration of the NET decline by account (customer): how many customers
     # explain _BH_CONCENTRATION_PCT of the total net drop.
@@ -3700,7 +3707,7 @@ def _category_concentration(
     return BhConcentration(
         total_abs_m=total_abs, growers=growers, decliners=decliners,
         decline_k=decline_k, decline_accounts=decline_accounts,
-        decline_total_m=decline_total)
+        decline_total_m=decline_total, all_movers=all_movers)
 
 
 def _bh_margin_pct(

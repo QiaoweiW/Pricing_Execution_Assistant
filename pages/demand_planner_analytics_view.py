@@ -863,13 +863,66 @@ def _render_business_health_category_levers(categories: list) -> None:
                 _render_bh_lever_d(cat)
 
 
+_BH_GAP_ICON: dict[str, str] = {
+    BH_GAP_BUILDING: "📦▲", BH_GAP_DRAINING: "📦▼", BH_GAP_BALANCED: "📦=",
+}
+
+
+def _bh_sowhat(html: str) -> None:
+    """Prominent so-what / key-assumption line — bigger, black, sitting ABOVE the
+    table/chart so a planner reads the decision before the data."""
+    st.markdown(
+        f"<div style='font-size:1.02rem;color:#111827;line-height:1.45;"
+        f"margin:2px 0 9px'>{html}</div>", unsafe_allow_html=True)
+
+
+def _bh_lever_b_question(cat) -> str:
+    """Lever B so-what, framed as a decision QUESTION that calls out the L3M move
+    and routes the concentration test to Lever D.
+
+    The exit fingerprint is **volume down while price/mix is *improving*** — where
+    "improving" = L3M price/mix rising vs L6M (less negative), not merely positive
+    (e.g. −20.4% at L3M vs −27% at L6M is improving)."""
+    l3, l6 = cat.decomp.get("L3M", {}), cat.decomp.get("L6M", {})
+    vol, pm, net = l3.get("volume"), l3.get("price_mix"), l3.get("net_sales")
+    pm6 = l6.get("price_mix")
+    if vol is None or net is None:
+        return "<i>Net-Sales decomposition needs the Finance extract.</i>"
+
+    def _p(x):
+        return "n/a" if x is None else f"{x * 100:+.1f}%"
+    volp, pmp, netp = _p(vol), _p(pm), _p(net)
+    q = ("<b>Is that L3M volume move concentrated in a few accounts (Lever D) or "
+         "broad-based?</b>")
+    improving = pm is not None and pm6 is not None and pm > pm6   # rising / less negative
+    if vol < 0 and improving:
+        return (f"L3M: <b>volume turned {volp}</b> while <b>price/mix improved to {pmp}</b> "
+                f"(from {_p(pm6)} at L6M; net sales {netp}) — the fingerprint of a "
+                f"<b>deliberate low-margin exit</b>, not lost demand.  {q}  "
+                "Concentrated → re-baseline down and move on; broad → a demand problem to defend.")
+    if vol < 0:
+        return (f"L3M: <b>volume {volp}</b>, price/mix {pmp} (net sales {netp}) — no margin "
+                f"offset, so this reads as real demand softness.  {q}  "
+                "Broad → defend demand; concentrated → likely a structural exit to re-baseline.")
+    return (f"L3M: net sales {netp} on <b>volume {volp}</b>, price/mix {pmp}.  "
+            "<b>Is that L3M volume real and durable, or a pull-forward?</b>  "
+            "Check the account concentration in Lever D before banking it.")
+
+
 def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
     """Lever A — Order lbs vs Shipment lbs YoY (L12M→L3M); the gap is an
-    assumption about Darigold's OWN finished-goods inventory (not the customer's)."""
-    gap = _BH_GAP_HEADER.get(cat.gap_flag, "")
-    st.markdown(
-        f"**A · Order lbs vs Shipment lbs YoY**  —  {gap}" if gap
-        else "**A · Order lbs vs Shipment lbs YoY**")
+    assumption about Darigold's OWN finished-goods inventory (not the customer's).
+    Sequence: definition/legend → so-what (top, bold black) → chart."""
+    st.markdown("**A · Order lbs vs Shipment lbs YoY**")
+    st.caption("Legend: the gap between the two YoY lines reads on **Darigold's own** "
+               "finished-goods inventory (ΔFG ≈ Orders − Shipments; we produce to demand).")
+    words = _BH_GAP_WORDS.get(cat.gap_flag)
+    if words:
+        _bh_sowhat(f"{_BH_GAP_ICON.get(cat.gap_flag, '')} "
+                   f"<b>Assume Darigold inventory is {words}.</b>  "
+                   "<i>An assumption to confirm against actual stock, not a fact.</i>")
+    else:
+        _bh_sowhat("<i>Order/shipment YoY not available for an inventory read.</i>")
     fig = go.Figure()
     for src, series in (("Orders", cat.order_series), ("Shipments", cat.ship_series)):
         color = _BH_CHART_STYLE[src]["line"]
@@ -898,14 +951,6 @@ def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
         showlegend=True, plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_la_{cat.row_id}")
-    words = _BH_GAP_WORDS.get(cat.gap_flag)
-    if words:
-        st.caption(
-            f"**Assume Darigold inventory is {words}.**  _ΔFG ≈ Orders − Shipments "
-            "(we produce to demand); an assumption to confirm against actual stock, "
-            "not a fact._")
-    else:
-        st.caption("_Order/shipment YoY not available for an inventory read._")
 
 
 def _bh_signed_html(value) -> str:
@@ -917,13 +962,12 @@ def _bh_signed_html(value) -> str:
 
 
 def _render_bh_lever_b(cat) -> None:
-    """Lever B — Net Sales YoY% ≈ Units YoY% + Price/mix YoY% (residual), all
-    periods; a short Price-Volume-Mix tag in the header + a plain so-what line."""
-    tag, explain = _BH_MOVE_READING.get(cat.decomp_sowhat, ("", ""))
-    st.markdown(f"**B · Decomposition**  —  {tag}" if tag else "**B · Decomposition**")
-    st.caption("Net Sales YoY% ≈ Units YoY% + Price/mix YoY%")
-    if explain:
-        st.caption(f"**So-what:** {explain}")
+    """Lever B — Net Sales YoY% ≈ Units YoY% + Price/mix YoY% (residual).
+    Sequence: definition/legend → so-what (a decision QUESTION on the L3M move) →
+    table."""
+    st.markdown("**B · Decomposition**")
+    st.caption("Net Sales YoY% ≈ Units YoY% + Price/mix YoY%  (price/mix = the residual)")
+    _bh_sowhat(_bh_lever_b_question(cat))
     periods = list(BH_PERIOD_ORDER)
     rows = (
         ("Units YoY%", "volume"),
@@ -946,8 +990,6 @@ def _render_bh_lever_b(cat) -> None:
         f"{head}{body}</table>",
         unsafe_allow_html=True,
     )
-    if not cat.decomp_sowhat:
-        st.caption("_Net-Sales decomposition needs the Finance extract._")
 
 
 def _bh_money_m(value) -> str:
@@ -1004,17 +1046,17 @@ def _render_bh_lever_c(cat) -> None:
     The reading is framed as an assumption to validate, not a verdict — and the
     vol-up/margin-down wording drops the promo clause for no-promo categories
     (Fresh Milk)."""
+    # Sequence: definition/legend → key assumption (top, bold black) → table → chart.
+    st.markdown("**C · Margin — Gross Profit %**")
+    st.caption("Legend: discrete, non-overlapping windows (oldest→newest); "
+               "GP% = Gross Profit ÷ Net Sales.  Margin ▲ while lbs ▼ = exiting "
+               "low-margin volume; margin ▲ while lbs hold = pricing power.")
     spec = _BH_VM_READING.get(cat.vol_margin_quadrant)
     if spec:
-        st.markdown(
-            f"**C · Margin**  —  <span style='color:{spec['color']}'>"
-            f"{spec['icon']} {spec['head']}</span>",
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown("**C · Margin** — Gross Profit %")
-    # Monthly GP% (faint) + 3-mo rolling avg (bold) + order/ship lbs bars.
-    _render_bh_lever_c_chart(cat)
+        assume = spec.get("assume", "")
+        if cat.vol_margin_quadrant == BH_VM_UP_DOWN and cat.row_id in BH_NO_PROMO_CATEGORIES:
+            assume = spec.get("assume_nopromo", assume)
+        _bh_sowhat(f"{spec['icon']} <b>{spec['head']}.</b>  <b>Key assumption:</b> {assume}")
     # Discrete (non-overlapping) window table — the auditable arc.
     periods = list(BH_DISCRETE_ORDER)
     disc = cat.margin_discrete or {}
@@ -1038,10 +1080,9 @@ def _render_bh_lever_c(cat) -> None:
             + "</tr>"
         )
         rows = (
+            ("Ordered (M lbs)", [_lbs(disc[p]["order_m"]) for p in periods]),
             ("Gross Profit ($M)", [_bh_money_m(disc[p]["gp_m"]) for p in periods]),
             ("Net Sales ($M)", [_bh_money_m(disc[p]["net_m"]) for p in periods]),
-            ("Order (M lbs)", [_lbs(disc[p]["order_m"]) for p in periods]),
-            ("Shipment (M lbs)", [_lbs(disc[p]["ship_m"]) for p in periods]),
             ("GP%", ["—" if disc[p]["gp_pct"] is None else f"{disc[p]['gp_pct'] * 100:.1f}%"
                      for p in periods]),
         )
@@ -1055,16 +1096,8 @@ def _render_bh_lever_c(cat) -> None:
             f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
             unsafe_allow_html=True,
         )
-        st.caption("Discrete, non-overlapping windows (oldest→newest) — reads as an arc, "
-                   "not nested totals.  Margin ▲ while lbs ▼ = exiting low-margin volume; "
-                   "margin ▲ while lbs hold = pricing power.")
-    # Key assumption — framed as a hypothesis to confirm, not a verdict; the
-    # promo clause is dropped for categories sold without trade/promo.
-    if spec:
-        assume = spec.get("assume", "")
-        if cat.vol_margin_quadrant == BH_VM_UP_DOWN and cat.row_id in BH_NO_PROMO_CATEGORIES:
-            assume = spec.get("assume_nopromo", assume)
-        st.caption(f"**Key assumption:** {assume}")
+    # Monthly GP% (faint) + 3-mo rolling avg (bold) + order/ship lbs bars.
+    _render_bh_lever_c_chart(cat)
     # Foldable RCA aid — kept collapsed so it never crowds the executive glance.
     _render_bh_lever_c_recon(cat)
 
@@ -1148,48 +1181,48 @@ def _render_bh_lever_c_recon(cat) -> None:
             st.caption("Rollup ties to Finance's report for this category.")
 
 
+# Full tag explanations (foldable "all movers" legend under the Lever D chart).
+_BH_TAG_LEGEND: str = (
+    "**Tags** — 🚪 **exit**: last-year lbs → ~0 (walked away → re-baseline) · "
+    "📉 **softening**: partial decline, still buying · 🔁 **substitution**: fell/grew "
+    "but the same customer *or* SKU is ~flat overall (lbs moved, not lost) · "
+    "📈 **growth**: existing line expanding · ✨ **new**: from ~0 a year ago."
+)
+
+
 def _render_bh_lever_d(cat) -> None:
-    """Lever D — diverging bar of the top-5 growers (green) and top-5 decliners
-    (red) by L3M **order**-lbs Δ, each tagged exit / softening / substitution
-    (growth / new for gainers), plus a decline-**concentration** read that
-    answers Lever B's question: is the drop a few accounts or broad-based?
-    """
-    st.markdown("**D · Mix Shifts & Exits** — L3M order Δ, top 5 each way (ranked by |Δ| lbs)")
+    """Lever D — Mix Shifts.  Sequence: definition/legend → so-what (decline
+    concentration) → chart (top-3 each way, NO tags) → foldable table of ALL
+    movers (tagged, ranked by |Δ| L3M)."""
+    st.markdown("**D · Mix Shifts** — L3M order Δ (top 3 each way, ranked by |Δ| lbs)")
+    st.caption("Legend: green = growers (right), red = decliners (left); bar label = "
+               "that line's **% of the total gross move**.  Full mover list + tags below.")
     conc = cat.concentration
-    # Concentration of the net decline — the "concentrated vs broad" decision.
+    # So-what (top, bold black): decline concentration — few accounts or broad?
     if conc.decline_total_m > 1e-9 and conc.decline_accounts:
         k, n = conc.decline_k, conc.decline_accounts
-        verdict = ("**concentrated** → likely a deliberate/structural exit; re-baseline down"
+        verdict = ("<b>concentrated</b> → likely a deliberate/structural exit; re-baseline down"
                    if k <= 3 else
-                   "**broad-based** → a demand problem to defend, not a re-baseline")
-        st.caption(
-            f"🎯 **{k} account{'s' if k != 1 else ''} explain 80% of the L3M decline** "
+                   "<b>broad-based</b> → a demand problem to defend, not a re-baseline")
+        _bh_sowhat(
+            f"🎯 <b>{k} account{'s' if k != 1 else ''} explain 80% of the L3M decline</b> "
             f"(of {n} declining accounts · {conc.decline_total_m:.2f}M lbs) — {verdict}.")
-    # Biggest decliners on top, growers below (matches the diverging mockup).
+    # Chart: top-3 decliners (top) + top-3 growers (below) — NO tags on the chart.
     movers = list(conc.decliners) + list(conc.growers)
     if not movers:
         st.caption("_No order movement under the current filters._")
         return
-
-    def _ylabel(seg):
-        icon = _BH_TAG_DISPLAY.get(seg.tag, ("", ""))[0]
-        return f"{icon} {seg.label}" if icon else seg.label
-
     fig = go.Figure(go.Bar(
-        y=[_ylabel(seg) for seg in movers],
+        y=[seg.label for seg in movers],
         x=[seg.delta_m for seg in movers],
         orientation="h",
         marker=dict(color=[_BH_SEG_COLOR[seg.kind] for seg in movers]),
-        text=[f"{seg.share * 100:.0f}% · {_BH_TAG_DISPLAY.get(seg.tag, ('', seg.tag))[1]}"
-              for seg in movers],
+        text=[f"{seg.share * 100:.0f}%" for seg in movers],
         textposition="outside", textfont=dict(size=11, color=_BH_FONT_COLOR),
-        customdata=[
-            ["—" if seg.yoy_pct is None else f"{seg.yoy_pct * 100:+.1f}%",
-             _BH_TAG_DISPLAY.get(seg.tag, ("", seg.tag))[1]]
-            for seg in movers],
-        hovertemplate=(
-            "%{y}<br>Δ %{x:+.2f}M lbs · YoY %{customdata[0]}"
-            "<br>%{customdata[1]}<extra></extra>"),
+        customdata=["—" if seg.yoy_pct is None else f"{seg.yoy_pct * 100:+.1f}%"
+                    for seg in movers],
+        hovertemplate=("%{y}<br>Δ %{x:+.2f}M lbs · YoY %{customdata}"
+                       "<br>%{text} of total move<extra></extra>"),
     ))
     fig.update_layout(
         height=max(150, 34 * len(movers) + 60),
@@ -1202,14 +1235,38 @@ def _render_bh_lever_d(cat) -> None:
         yaxis=dict(automargin=True, autorange="reversed"),
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_ld_{cat.row_id}")
-    st.caption(
-        f"Labels = **% of total gross move** ({conc.total_abs_m:.2f}M lbs) · ranked by "
-        "|Δ| lbs, not YoY%.  **Tags** — 🚪 **exit**: last-year lbs → ~0 (walked away → "
-        "re-baseline) · 📉 **softening**: partial decline, still buying · 🔁 "
-        "**substitution**: fell/grew but the same customer *or* SKU is ~flat overall "
-        "(lbs moved, not lost) · 📈 **growth**: existing line expanding · ✨ **new**: "
-        "from ~0 a year ago."
-    )
+    _render_bh_lever_d_allmovers(cat)
+
+
+def _render_bh_lever_d_allmovers(cat) -> None:
+    """Foldable table of EVERY mover (Customer×SKU) ranked by |Δ| L3M, with its
+    tag (full explanation) and % of the total gross move."""
+    movers = cat.concentration.all_movers
+    if not movers:
+        return
+    with st.expander(f"📋 All movers ({len(movers)}) — ranked by |Δ| L3M · tags", expanded=False):
+        st.caption(_BH_TAG_LEGEND)
+        head = ("<tr>"
+                "<th style='text-align:left'>Customer × SKU</th>"
+                "<th style='text-align:right;padding-left:12px'>L3M Δ (M lbs)</th>"
+                "<th style='text-align:center;padding-left:12px'>Tag</th>"
+                "<th style='text-align:right;padding-left:12px'>% of gross move</th>"
+                "</tr>")
+        body = ""
+        for seg in movers:
+            icon, word = _BH_TAG_DISPLAY.get(seg.tag, ("", seg.tag))
+            color = _BH_SEG_COLOR.get(seg.kind, "#111827")
+            body += (
+                "<tr>"
+                f"<td style='text-align:left'>{_esc_html(seg.label)}</td>"
+                f"<td style='text-align:right;padding-left:12px;color:{color}'>"
+                f"{seg.delta_m:+.2f}M</td>"
+                f"<td style='text-align:center;padding-left:12px'>{icon} {word}</td>"
+                f"<td style='text-align:right;padding-left:12px'>{seg.share * 100:.0f}%</td>"
+                "</tr>")
+        st.markdown(
+            f"<table style='font-size:0.82rem;border-collapse:collapse;width:100%'>"
+            f"{head}{body}</table>", unsafe_allow_html=True)
 
 
 def _bh_order_combos(

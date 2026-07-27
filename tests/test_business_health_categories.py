@@ -266,6 +266,12 @@ def test_lever_d_tags_and_decline_concentration():
     assert conc.decline_total_m == pytest.approx(2.8, rel=1e-3)
     assert conc.decline_accounts == 3
     assert conc.decline_k == 3
+    # all_movers = every nonzero mover, ranked by |Δ| desc, each tagged.
+    am = conc.all_movers
+    assert len(am) == 5                                        # 2 growers + 3 decliners
+    assert am[0].label == "MT Food Bank × DG Btr"             # biggest |Δ| (1.4M)
+    assert abs(am[0].delta_m) >= abs(am[-1].delta_m)          # sorted by |Δ|
+    assert all(s.tag for s in am)                             # every mover tagged
 
 
 def test_lever_d_substitution_tag():

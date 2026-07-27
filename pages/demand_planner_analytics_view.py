@@ -1197,22 +1197,12 @@ _BH_TAG_LEGEND: str = (
 
 
 def _render_bh_lever_d(cat) -> None:
-    """Lever D — Mix Shifts.  Sequence: definition/legend → so-what (decline
-    concentration) → chart (top-3 each way, NO tags) → foldable table of ALL
-    movers (tagged, ranked by |Δ| L3M)."""
+    """Lever D — Mix Shifts.  Sequence: definition/legend → chart (top-3 each
+    way, NO tags) → foldable table of ALL movers grouped by customer."""
     st.markdown("**D · Mix Shifts** — L3M order Δ (top 3 each way, ranked by |Δ| lbs)")
     st.caption("Legend: green = growers (right), red = decliners (left); bar label = "
                "that line's **% of the total gross move**.  Full mover list + tags below.")
     conc = cat.concentration
-    # So-what (top, bold black): decline concentration — few accounts or broad?
-    if conc.decline_total_m > 1e-9 and conc.decline_accounts:
-        k, n = conc.decline_k, conc.decline_accounts
-        verdict = ("<b>concentrated</b> → likely a deliberate/structural exit; re-baseline down"
-                   if k <= 3 else
-                   "<b>broad-based</b> → a demand problem to defend, not a re-baseline")
-        _bh_sowhat(
-            f"🎯 <b>{k} account{'s' if k != 1 else ''} explain 80% of the L3M decline</b> "
-            f"(of {n} declining accounts · {conc.decline_total_m:.2f}M lbs) — {verdict}.")
     # Chart: top-3 decliners (top) + top-3 growers (below) — NO tags on the chart.
     movers = list(conc.decliners) + list(conc.growers)
     if not movers:

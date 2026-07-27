@@ -160,6 +160,8 @@ from data_sources.demand_plan_comparison import (
     BH_FLAG_FALLING,
     BH_FLAG_FLAT,
     BH_PERIOD_ORDER,
+    BH_DISCRETE_ORDER,
+    BH_DISCRETE_LABELS,
     BH_GAP_BUILDING,
     BH_GAP_DRAINING,
     BH_GAP_BALANCED,
@@ -956,6 +958,45 @@ def _bh_money_m(value) -> str:
     return f"{sign}${abs(value):,.1f}M"
 
 
+def _render_bh_lever_c_chart(cat) -> None:
+    """12-month monthly GP%: faint monthly line + bold 3-mo rolling average, with
+    muted monthly order/shipment lbs bars on a second axis (margin vs volume =
+    the exit-vs-pricing-power read).  Skipped when there's no monthly GP%."""
+    m = getattr(cat, "margin_monthly", None)
+    if m is None or m.empty or not m["gp_pct"].notna().any():
+        return
+    x = [d.strftime("%b %y") if hasattr(d, "strftime") else str(d) for d in m["month"]]
+    gp_pct = pd.to_numeric(m["gp_pct"], errors="coerce") * 100.0
+    roll = pd.to_numeric(m["gp_pct_roll3"], errors="coerce") * 100.0
+    fig = go.Figure()
+    fig.add_bar(x=x, y=m["order_m"], name="Order lbs", yaxis="y2",
+                marker=dict(color="#e67e22", opacity=0.22),
+                hovertemplate="Order: %{y:.2f}M lbs<extra></extra>")
+    fig.add_bar(x=x, y=m["ship_m"], name="Shipment lbs", yaxis="y2",
+                marker=dict(color="#137d78", opacity=0.22),
+                hovertemplate="Shipment: %{y:.2f}M lbs<extra></extra>")
+    fig.add_scatter(x=x, y=gp_pct, name="GP% (monthly)", mode="lines",
+                    line=dict(color="#9ca3af", width=1),
+                    hovertemplate="GP%% mo: %{y:.1f}%%<extra></extra>")
+    fig.add_scatter(x=x, y=roll, name="GP% (3-mo avg)", mode="lines",
+                    line=dict(color="#1f77b4", width=3),
+                    hovertemplate="GP%% 3-mo: %{y:.1f}%%<extra></extra>")
+    fig.update_layout(
+        height=240, margin=dict(l=8, r=8, t=8, b=8), barmode="group", bargap=0.2,
+        font=dict(color=_BH_FONT_COLOR, size=11),
+        xaxis=dict(tickfont=dict(size=9), tickangle=-45),
+        yaxis=dict(title=dict(text="GP %", font=dict(size=10)), ticksuffix="%",
+                   showgrid=True, gridcolor="#eeeeee", tickfont=dict(size=9)),
+        yaxis2=dict(title=dict(text="M lbs", font=dict(size=10)), overlaying="y",
+                    side="right", rangemode="tozero", showgrid=False, tickfont=dict(size=9)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=9)),
+        plot_bgcolor="white",
+    )
+    st.plotly_chart(fig, use_container_width=True, key=f"bh_lc_chart_{cat.row_id}")
+    st.caption("Faint = monthly GP%; **bold = 3-mo rolling avg** (trend + how much to trust "
+               "it).  Bars = monthly order / shipment lbs (right axis) — margin vs volume.")
+
+
 def _render_bh_lever_c(cat) -> None:
     """Lever C — Vol×Margin quadrant (neutral header statement) + an auditable
     margin table + a **key assumption** to confirm (category-aware for promo).
@@ -972,28 +1013,36 @@ def _render_bh_lever_c(cat) -> None:
         )
     else:
         st.markdown("**C · Margin** — Gross Profit %")
-    periods = list(BH_PERIOD_ORDER)
-    if all(cat.margin_pct[p] is None for p in periods):
+    # Monthly GP% (faint) + 3-mo rolling avg (bold) + order/ship lbs bars.
+    _render_bh_lever_c_chart(cat)
+    # Discrete (non-overlapping) window table — the auditable arc.
+    periods = list(BH_DISCRETE_ORDER)
+    disc = cat.margin_discrete or {}
+    if not disc or all(disc.get(p, {}).get("gp_pct") is None for p in periods):
         st.caption("_Margin needs the Finance extract._")
     else:
-        gp = cat.finance_series.get("Gross Profit", {})
-        ns = cat.finance_series.get("Net Sales", {})
-        # Two-line header: period name + its actual GL-month range (Actual only).
+        gl = cat.margin_discrete_gl or {}
+
+        def _lbs(v):
+            return "—" if v is None else f"{v:.2f}M"
+        # Two-line header: discrete-window label + its actual GL-month range.
         head = (
             "<tr><th style='text-align:left'></th>"
-            + "".join(f"<th style='text-align:right;padding-left:12px'>{p}</th>"
+            + "".join(f"<th style='text-align:right;padding-left:12px'>{BH_DISCRETE_LABELS[p]}</th>"
                       for p in periods)
             + "</tr><tr><td></td>"
             + "".join(
                 "<td style='text-align:right;padding-left:12px;font-weight:normal;"
-                f"font-size:0.7rem;color:#6b7280'>{_esc_html(cat.margin_gl_months[p])}</td>"
+                f"font-size:0.7rem;color:#6b7280'>{_esc_html(gl.get(p, '—'))}</td>"
                 for p in periods)
             + "</tr>"
         )
         rows = (
-            ("Gross Profit", [_bh_money_m(gp.get(p, {}).get("vol")) for p in periods]),
-            ("Net Sales", [_bh_money_m(ns.get(p, {}).get("vol")) for p in periods]),
-            ("GP%", ["—" if cat.margin_pct[p] is None else f"{cat.margin_pct[p] * 100:.1f}%"
+            ("Gross Profit ($M)", [_bh_money_m(disc[p]["gp_m"]) for p in periods]),
+            ("Net Sales ($M)", [_bh_money_m(disc[p]["net_m"]) for p in periods]),
+            ("Order (M lbs)", [_lbs(disc[p]["order_m"]) for p in periods]),
+            ("Shipment (M lbs)", [_lbs(disc[p]["ship_m"]) for p in periods]),
+            ("GP%", ["—" if disc[p]["gp_pct"] is None else f"{disc[p]['gp_pct'] * 100:.1f}%"
                      for p in periods]),
         )
         body = "".join(
@@ -1006,6 +1055,9 @@ def _render_bh_lever_c(cat) -> None:
             f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
             unsafe_allow_html=True,
         )
+        st.caption("Discrete, non-overlapping windows (oldest→newest) — reads as an arc, "
+                   "not nested totals.  Margin ▲ while lbs ▼ = exiting low-margin volume; "
+                   "margin ▲ while lbs hold = pricing power.")
     # Key assumption — framed as a hypothesis to confirm, not a verdict; the
     # promo clause is dropped for categories sold without trade/promo.
     if spec:

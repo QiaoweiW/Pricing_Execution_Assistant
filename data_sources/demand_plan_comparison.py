@@ -3333,8 +3333,16 @@ BH_CATEGORY_LABELS: dict[str, str] = {
     "fresh_milk": "Fresh Milk",
     "butter": "Packaged Butter",
 }
-# Periods shown left→right in the Lever B / C tables (widest → narrowest).
+# Periods shown left→right in the Lever B table (widest → narrowest, OVERLAPPING
+# trailing windows).  Lever A/B/D still use these.
 BH_PERIOD_ORDER: tuple[str, ...] = ("L12M", "L6M", "L3M")
+# Lever C uses DISCRETE (non-overlapping) windows instead, left→right oldest→
+# newest, so the turnaround arc reads as distinct chunks rather than nested
+# cumulative totals: prior 6 mo (mo 7-12) → prior 3 mo (mo 4-6) → recent 3 mo.
+BH_DISCRETE_ORDER: tuple[str, ...] = ("prior6", "prior3", "recent3")
+BH_DISCRETE_LABELS: dict[str, str] = {
+    "prior6": "Prior 6 mo", "prior3": "Prior 3 mo", "recent3": "Recent 3 mo",
+}
 # Lever D ranks the top-N individual movers per direction (growers / decliners).
 BH_MOVER_TOP_N: int = 5
 
@@ -3546,6 +3554,16 @@ class BusinessHealthCategory:
     vol_margin_quadrant: str
     concentration: BhConcentration
     reconciliation: BhReconciliation
+    # Lever C detail: a 12-month monthly margin series (GP% faint + 3-mo rolling,
+    # with monthly order/ship lbs) and DISCRETE (non-overlapping) window totals.
+    #   margin_monthly — DataFrame[month, gp_m, net_m, order_m, ship_m, gp_pct,
+    #                    gp_pct_roll3] ordered oldest→newest.
+    #   margin_discrete — {window: {gp_m, net_m, order_m, ship_m, gp_pct}} over
+    #                    the three discrete windows (:data:`BH_DISCRETE_ORDER`).
+    #   margin_discrete_gl — {window: GL-month range label} (Actual finance).
+    margin_monthly: "pd.DataFrame" = field(default_factory=lambda: pd.DataFrame())
+    margin_discrete: dict = field(default_factory=dict)
+    margin_discrete_gl: dict = field(default_factory=dict)
 
 
 def _category_leaf_rows(
@@ -3784,6 +3802,75 @@ def _bh_reconciliation(
     return BhReconciliation(True, net_pdh, net_fin, gp_pdh, gp_fin, tuple(drivers))
 
 
+def _bh_cat_frame(
+    frame: Optional[pd.DataFrame], row_id: str,
+    template_by_id: dict[str, "TemplateRow"],
+) -> Optional[pd.DataFrame]:
+    """The category's rows from an enriched frame (PDH mask); None when empty."""
+    if frame is None or frame.empty:
+        return None
+    sub = frame[_category_mask(frame, row_id, template_by_id)]
+    return sub if not sub.empty else None
+
+
+def _bh_window_sum(masked: Optional[pd.DataFrame], months: set, col: str) -> float:
+    """Σ of *col* over an already-category-masked frame's rows whose month ∈ *months*."""
+    if masked is None or masked.empty or col not in masked.columns:
+        return 0.0
+    w = masked[masked["month"].isin(months)]
+    return float(pd.to_numeric(w[col], errors="coerce").fillna(0.0).sum())
+
+
+def _bh_margin_detail(
+    finance: Optional[pd.DataFrame], orders: Optional[pd.DataFrame],
+    shipments: Optional[pd.DataFrame], row_id: str,
+    template_by_id: dict[str, "TemplateRow"], months_ordered: list,
+    discrete: dict[str, set],
+) -> tuple[pd.DataFrame, dict]:
+    """Lever C detail for one category: ``(monthly_df, discrete_dict)``.
+
+    Monthly (oldest→newest, one row per month in *months_ordered*): GP$/NS$
+    (finance), order/ship lbs — all in millions — plus **GP%** and its **3-mo
+    trailing rolling average**.  Discrete: the same totals over each
+    non-overlapping window in *discrete*, with a per-window GP%.
+    """
+    fin = _bh_cat_frame(finance, row_id, template_by_id)
+    ord_ = _bh_cat_frame(orders, row_id, template_by_id)
+    shp = _bh_cat_frame(shipments, row_id, template_by_id)
+
+    def _monthly(masked, col):
+        s = pd.Series(0.0, index=months_ordered, dtype=float)
+        if masked is not None and col in masked.columns:
+            g = (pd.to_numeric(masked[col], errors="coerce").fillna(0.0)
+                 .groupby(masked["month"]).sum())
+            s = g.reindex(months_ordered).fillna(0.0)
+        return s
+    gp, ns = _monthly(fin, "gross_profit"), _monthly(fin, "net_sales")
+    monthly = pd.DataFrame({
+        "month": list(months_ordered),
+        "gp_m": gp.to_numpy() / _LBS_PER_MILLION,
+        "net_m": ns.to_numpy() / _LBS_PER_MILLION,
+        "order_m": _monthly(ord_, "pounds").to_numpy() / _LBS_PER_MILLION,
+        "ship_m": _monthly(shp, "pounds").to_numpy() / _LBS_PER_MILLION,
+    })
+    # GP% only where net sales are non-trivial (else NaN → a gap in the line).
+    gp_pct = gp.divide(ns.where(ns > 1e-9)).reset_index(drop=True)
+    monthly["gp_pct"] = gp_pct
+    monthly["gp_pct_roll3"] = gp_pct.rolling(3, min_periods=1).mean()
+
+    discrete_out: dict[str, dict] = {}
+    for wk, wv in discrete.items():
+        g = _bh_window_sum(fin, wv, "gross_profit")
+        n = _bh_window_sum(fin, wv, "net_sales")
+        discrete_out[wk] = {
+            "gp_m": g / _LBS_PER_MILLION, "net_m": n / _LBS_PER_MILLION,
+            "order_m": _bh_window_sum(ord_, wv, "pounds") / _LBS_PER_MILLION,
+            "ship_m": _bh_window_sum(shp, wv, "pounds") / _LBS_PER_MILLION,
+            "gp_pct": (g / n) if n > 1e-9 else None,
+        }
+    return monthly, discrete_out
+
+
 def build_business_health_categories(
     orders_enriched: Optional[pd.DataFrame],
     shipments_enriched: Optional[pd.DataFrame],
@@ -3828,6 +3915,13 @@ def build_business_health_categories(
     margin_gl_months = {
         p: _gl_months_label(fin_months & cur_windows[p]) for p in BH_PERIOD_ORDER
     }
+    # Lever C DISCRETE (non-overlapping) windows + their 12 ordered months.
+    _w3, _w6, _w12 = cur_windows["L3M"], cur_windows["L6M"], cur_windows["L12M"]
+    discrete_windows = {"recent3": _w3, "prior3": _w6 - _w3, "prior6": _w12 - _w6}
+    months_12 = sorted(_w12)
+    margin_discrete_gl = {
+        k: _gl_months_label(fin_months & v) for k, v in discrete_windows.items()
+    }
 
     out: list[BusinessHealthCategory] = []
     for rid in BH_CATEGORY_ROWS:
@@ -3870,6 +3964,11 @@ def build_business_health_categories(
         reconciliation = _bh_reconciliation(
             finance_enriched, rid, template_by_id, cur_windows)
 
+        # Lever C detail — 12-month monthly margin + discrete-window totals.
+        margin_monthly, margin_discrete = _bh_margin_detail(
+            finance_enriched, orders_enriched, shipments_enriched, rid,
+            template_by_id, months_12, discrete_windows)
+
         out.append(BusinessHealthCategory(
             row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,
             order_series=order_series, ship_series=ship_series,
@@ -3877,7 +3976,9 @@ def build_business_health_categories(
             decomp=decomp, decomp_sowhat=decomp_sowhat,
             margin_pct=margin_pct, margin_gl_months=margin_gl_months,
             vol_margin_quadrant=vol_margin_quadrant,
-            concentration=concentration, reconciliation=reconciliation))
+            concentration=concentration, reconciliation=reconciliation,
+            margin_monthly=margin_monthly, margin_discrete=margin_discrete,
+            margin_discrete_gl=margin_discrete_gl))
     return out
 
 

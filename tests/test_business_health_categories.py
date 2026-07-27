@@ -186,6 +186,28 @@ def test_lever_c_margin_table_and_reading():
     assert butter.vol_margin_quadrant == BH_VM_UP_UP
 
 
+def test_lever_c_discrete_windows_and_monthly():
+    """Lever C now uses DISCRETE (non-overlapping) windows + a 12-month monthly
+    GP% series with order/ship lbs (single-month fixture lands in recent3)."""
+    butter = _butter(finance_enriched=_finance_enriched())
+    d = butter.margin_discrete
+    assert set(d) == {"recent3", "prior3", "prior6"}
+    # Jun-2026 fixture lands only in recent3 (Apr–Jun 2026).
+    assert d["recent3"]["gp_pct"] == pytest.approx(0.20, rel=1e-3)   # 0.6 / 3.0
+    assert d["recent3"]["ship_m"] == pytest.approx(3.0, rel=1e-3)
+    assert d["recent3"]["order_m"] == pytest.approx(3.1, rel=1e-3)   # 2.0+0.8+0.1+0.2
+    assert d["prior3"]["gp_pct"] is None and d["prior6"]["gp_pct"] is None
+    # Explicit GL months on the recent window.
+    assert butter.margin_discrete_gl["recent3"] == "Jun 2026 · 1 mo"
+    # Monthly: 12 ordered months; GP% present only for the funded month.
+    m = butter.margin_monthly
+    assert len(m) == 12
+    assert list(m["month"]) == sorted(m["month"])                   # oldest → newest
+    assert m["gp_pct"].notna().sum() == 1
+    assert float(m["gp_pct"].dropna().iloc[0]) == pytest.approx(0.20, rel=1e-3)
+    assert m["gp_pct_roll3"].notna().sum() >= 1                     # rolling avg present
+
+
 def test_margin_gl_months_actual_only():
     """GL months reflect ONLY Actual finance rows (Budget dropped by enrichment)."""
     pdh = pd.DataFrame({

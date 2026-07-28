@@ -96,6 +96,12 @@ _BASE_PLAN_REQUIRED = [
 ]
 # Item-level attributes resolved PDH-first, RO-master-fallback (per field).
 _ATTR_COLS = ["Portfolio Major", "Portfolio Minor", "Supply Format"]
+# Portfolio Minor that marks the consumer (B2C) butter category.  PDH tags most
+# packaged-butter SKUs B2B (they ship through retailer / distributor accounts),
+# so the B2C filter forces this Portfolio Minor to B2C — matching the Demand
+# Plan Comparison, which scopes Butter to "Packaged Butter".  Bulk / ingredient
+# butter carries Portfolio Minor "Bulk Butter" and correctly stays B2B.
+_PACKAGED_BUTTER_PMINOR = "Packaged Butter"
 # Carried on qry_mgmt_plan_full + the history tracker so the Demand Plan
 # Comparison reads its categorisation dims straight off the file instead of
 # re-joining PDH + RO_Item_Master.  All three PDH dims travel; Brand is NOT
@@ -200,6 +206,55 @@ def _attach_item_attrs(
         d[c] = (d[f"{c}_pdh"].astype("string").str.strip()
                   .combine_first(d[f"{c}_ro"].astype("string").str.strip()))
     return d.drop(columns=[f"{c}_pdh" for c in cols] + [f"{c}_ro" for c in cols])
+
+
+def _resolve_b2c_business_unit(
+    df: pd.DataFrame,
+    pdh: pd.DataFrame,
+    ro_master: pd.DataFrame,
+    ro_items_set: set,
+) -> pd.Series:
+    """Resolve each row's Business Unit for the B2C filter (aligned to ``df.index``).
+
+    Resolution order:
+      1. PDH ``Business Unit`` (primary), matched on the normalised Item.
+      2. Items PDH doesn't classify (blank/missing) fall back to ``B2C`` when
+         they appear in ``RO_Item_Master`` — the planner's curated B2C list.
+      3. **Packaged Butter is forced to B2C** regardless of PDH.  PDH tags most
+         packaged-butter SKUs ``B2B`` (they move through retailer / distributor
+         accounts), so without this the demand plan kept only the handful PDH
+         happens to mark B2C — in practice a few **Western Quarters** items —
+         and silently dropped Elgin Solid / Elgin Quarter / Chips / …  This
+         matches the Demand Plan Comparison, which already scopes Butter to
+         Portfolio Minor = "Packaged Butter" as a B2C category.  Bulk /
+         ingredient butter ("Bulk Butter") is untouched and stays B2B.
+
+    Portfolio Minor for step 3 uses the SAME PDH-primary → RO-master cascade as
+    :func:`_attach_item_attrs`, so the classification is consistent with the
+    dims the file ultimately carries.
+    """
+    items = _norm_item(df["Item"])
+    pdh_bu = (
+        pdh[["Item No", "Business Unit"]].dropna(subset=["Item No"])
+        .assign(**{"Item No": lambda d: _norm_item(d["Item No"]),
+                   "Business Unit": lambda d: d["Business Unit"].astype("string").str.strip()})
+        .drop_duplicates("Item No", keep="first")
+        .set_index("Item No")["Business Unit"]
+    )
+    bu = items.map(pdh_bu)
+    bu = bu.where(bu.ne(""), other=pd.NA)          # blank PDH BU == unclassified
+    fb = bu.isna() & items.isin(ro_items_set)
+    bu = bu.mask(fb, "B2C")
+    # Packaged Butter → B2C (positional mask: _attach_item_attrs resets index).
+    pminor = _attach_item_attrs(
+        pd.DataFrame({"Item": items.to_numpy()}), pdh, ro_master,
+        cols=["Portfolio Minor"],
+    )["Portfolio Minor"]
+    is_pkg_butter = (
+        pminor.astype("string").str.strip().str.casefold()
+        == _PACKAGED_BUTTER_PMINOR.casefold()
+    ).fillna(False).to_numpy(dtype=bool)
+    return bu.mask(is_pkg_butter, "B2C")
 
 
 def _single_value(series: pd.Series, label: str) -> str:
@@ -367,21 +422,10 @@ def _build_mgmt_plan_and_detail(
     combined["Start of Month"] = combined["Start of Month"].dt.normalize()
     combined["Item"] = _norm_item(combined["Item"])
 
-    # --- Business Unit (PDH primary, RO-master → B2C fallback) ---------------
-    pdh_bu = (
-        pdh[["Item No", "Business Unit"]].dropna(subset=["Item No"])
-        .assign(**{"Item No": lambda d: _norm_item(d["Item No"]),
-                   "Business Unit": lambda d: d["Business Unit"].astype("string").str.strip()})
-        .drop_duplicates(subset=["Item No"], keep="first")
-        .rename(columns={"Item No": "Item", "Business Unit": "Business Unit_pdh"})
-    )
+    # --- Business Unit (PDH primary, RO-master fallback, Packaged Butter=B2C) -
     ro_items_set = set(_norm_item(ro_master["Item #"]).dropna())
-
-    combined = combined.merge(pdh_bu, on="Item", how="left")
-    combined["Business Unit"] = combined["Business Unit_pdh"]
-    fb = combined["Business Unit"].isna() & combined["Item"].isin(ro_items_set)
-    combined.loc[fb, "Business Unit"] = "B2C"
-    combined = combined.drop(columns=["Business Unit_pdh"])
+    combined["Business Unit"] = _resolve_b2c_business_unit(
+        combined, pdh, ro_master, ro_items_set)
     combined = combined[combined["Business Unit"] == "B2C"].reset_index(drop=True)
 
     # Attach Portfolio Major + Supply Format so the file is self-describing and
@@ -416,15 +460,10 @@ def _build_detail(
     """Item × Customer detail: reuse the B2C base-plan branch, re-melt R&O w/ Customer."""
 
     def _keep_b2c(df: pd.DataFrame) -> pd.DataFrame:
-        d = df.merge(
-            pdh[["Item No", "Business Unit"]].assign(
-                **{"Item No": lambda x: _norm_item(x["Item No"])}
-            ).drop_duplicates("Item No").rename(columns={"Item No": "Item"}),
-            on="Item", how="left")
-        bu = d["Business Unit"]
-        bu = bu.where(bu.notna(), other=pd.NA)
-        fb = bu.isna() & d["Item"].isin(ro_items_set)
-        d.loc[fb, "Business Unit"] = "B2C"
+        # Same resolution as the mgmt-plan branch — incl. Packaged Butter = B2C.
+        d = df.copy()
+        d["Business Unit"] = _resolve_b2c_business_unit(
+            d, pdh, ro_master, ro_items_set)
         return d[d["Business Unit"] == "B2C"].drop(columns=["Business Unit"]).reset_index(drop=True)
 
     def _attach_attrs(df: pd.DataFrame) -> pd.DataFrame:

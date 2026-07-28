@@ -174,6 +174,49 @@ def test_backfill_adds_attribute_columns_and_archives(monkeypatch):
     assert trk.iloc[0]["Supply Format"] == "Carton"
 
 
+def test_packaged_butter_forced_b2c_bulk_butter_stays_b2b(monkeypatch):
+    """PDH tags packaged-butter SKUs B2B, but the pipeline forces Portfolio
+    Minor 'Packaged Butter' to B2C so EVERY format flows in (not just the few
+    PDH marks B2C).  Regression: 'Western Quarters only'.  'Bulk Butter'
+    (ingredient) stays B2B and is dropped."""
+    base = pd.DataFrame({
+        "Start of Month": ["2026-06-01"] * 3,
+        "Item": ["500001", "500002", "500003"],
+        "Item Description": ["WhF Btr Elg 30-1lb", "Btr Gr AA 25kg", "DG Btr Chip"],
+        "Value": ["10036"] * 3,
+        "Total": ["1000", "2000", "3000"],
+        "Corporate Group": ["ACME"] * 3,
+        "month": ["2026-06-01"] * 3,
+        "Cycle": ["C5"] * 3,
+    }).to_csv(index=False).encode()
+
+    reads = _sources()
+    # PDH marks ALL three butter items B2B (as the live PDH does).
+    reads[dp._PDH_BLOB] = pd.DataFrame({
+        "Item No": ["500001", "500002", "500003", "310180"],
+        "Business Unit": ["B2B", "B2B", "B2B", "B2C"],
+        "Portfolio Major": ["Butter", "Butter", "Butter", "Butter"],
+        "Portfolio Minor": ["Packaged Butter", "Bulk Butter", "Packaged Butter", "Qtr"],
+        "Supply Format": ["Elgin Solid", "Bulk", "Chips", "Carton"],
+    })
+    # None of the butter items are in RO_Item_Master (so the NaN-fallback can't
+    # rescue them) — only the Packaged Butter override can keep them.
+    written = _patch_io(monkeypatch, reads)
+    res = dp.run_demand_plan_pipeline(base)
+    assert res.ok, res.errors
+
+    mgmt = written[dp._MGMT_PLAN_FULL_BLOB]
+    base_rows = mgmt[mgmt["Forecast Type"] == "Base Plan"]
+    kept = set(base_rows["Item"])
+    # Packaged Butter (Elgin Solid + Chips) kept despite PDH B2B.
+    assert "500001" in kept and "500003" in kept
+    assert set(base_rows[base_rows["Item"] == "500001"]["Supply Format"]) == {"Elgin Solid"}
+    assert set(base_rows[base_rows["Item"] == "500003"]["Supply Format"]) == {"Chips"}
+    # Bulk Butter dropped (stays B2B).
+    assert "500002" not in kept
+    assert (mgmt["Business Unit"] == "B2C").all()
+
+
 def test_history_tracker_dedupes_identical_rows(monkeypatch):
     """Existing duplicate rows for other cycles collapse; no dupes in output."""
     dup = {

@@ -890,3 +890,77 @@ def test_aps_ro_var_ignores_ro_summary_subtotal_override():
     # Tracker leg delta = C4 R&O (5) − C3 R&O (3) = 2 — NOT the -99 report value.
     assert round(float(t.loc[t["_row_id"] == "esl_lc_branded"].iloc[0]["R&O Var."]), 3) == 2.0
     assert round(float(t.loc[t["_row_id"] == "total_b2c"].iloc[0]["R&O Var."]), 3) == 2.0
+
+
+def test_ibp_butter_ro_var_rolls_up_from_detail_rows():
+    """The dynamic Branded/Private -> format detail rows read the RO Summary
+    Report's OWN Butter (format, brand) detail, so R&O Var -- and the Base Plan
+    Var residual -- foot at the parent 'Packaged Butter' row (regression for the
+    parent 0.70 vs children 0.00 gap in the Cycle-over-Cycle table)."""
+    filters = _filters_apr_jun_actual()
+
+    def bt(brand, sfmt):
+        return dict(item_key="x", item_desc="x", party_site="1", month=_JUL,
+                    pounds=2e6, forecast_type=FORECAST_BASE_PLAN, cycle="C4",
+                    pmaj="Butter", sfmt=sfmt, pminor="Packaged Butter", brand=brand)
+
+    trk = _enriched_trk([
+        bt("Branded", "Western Quarters"),
+        bt("Private", "Western Quarters"),
+        bt("Branded", "Elgin Solid"),
+    ])
+    ro = {
+        ("Total B2C", "Butter"): 0.7,
+        ("Total B2C", "Butter", "Western Quarters"): 0.7,
+        ("Total B2C", "Butter", "Western Quarters", "Branded"): -0.2,
+        ("Total B2C", "Butter", "Western Quarters", "Private Label"): 0.9,
+    }
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, _enriched_ibp([])),
+        ro_total_delta_by_path=ro)
+    t = res.table
+
+    def rov(rid):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0]["R&O Var."]), 3)
+
+    def base(rid):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0]["Base Plan Var."]), 3)
+
+    # Detail brand subtotals read the report's Butter (format, brand) detail;
+    # Elgin Solid contributes 0 (absent from the report -> loose miss).
+    assert rov("butter_branded") == -0.2
+    assert rov("butter_private") == 0.9
+    # Parent 'Packaged Butter' = Branded + Private (foots -- was 0.70 vs 0.00).
+    assert rov("butter") == 0.7
+    # Base Plan Var (residual) foots too, because R&O now foots.
+    assert base("butter") == round(base("butter_branded") + base("butter_private"), 3)
+
+
+def test_aps_butter_ro_var_uses_tracker_not_ro_summary():
+    """APS butter R&O comes from the tracker cycle delta (not the RO Summary
+    detail), and still foots parent = Branded + Private."""
+    filters = _filters_apr_jun_actual()
+
+    def bt(brand, ft, cyc, lbs):
+        return dict(item_key="x", item_desc="x", party_site="1", month=_JUL,
+                    pounds=lbs, forecast_type=ft, cycle=cyc, pmaj="Butter",
+                    sfmt="Western Quarters", pminor="Packaged Butter", brand=brand)
+
+    trk = _enriched_trk([
+        bt("Branded", FORECAST_R_AND_O, "C4", 5e6),
+        bt("Branded", FORECAST_R_AND_O, "C3", 3e6),
+        bt("Private", FORECAST_R_AND_O, "C4", 4e6),
+    ])
+    ro = {("Total B2C", "Butter", "Western Quarters", "Branded"): -99.0}  # ignored in APS
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, _enriched_ibp([])),
+        ro_total_delta_by_path=ro, shift_last_plan_window=False, ro_var_from_tracker=True)
+    t = res.table
+
+    def rov(rid):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0]["R&O Var."]), 3)
+
+    # Branded = C4 R&O (5) - C3 R&O (3) = 2; Private = 4 - 0 = 4 -- tracker, not -99.
+    assert rov("butter_branded") == 2.0
+    assert rov("butter_private") == 4.0
+    assert rov("butter") == 6.0     # foots parent = Branded + Private

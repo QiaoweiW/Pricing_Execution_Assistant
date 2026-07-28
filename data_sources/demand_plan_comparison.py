@@ -2387,6 +2387,43 @@ def _build_runtime_artifacts(
             measures["butter"][COL_BUDGET] = float(sum(
                 m for b, s, m in butter_budget.combos if (b, s) in kept))
 
+    # ── Butter R&O Var roll-up (IBP) ─────────────────────────────────────
+    # The parent "butter" leaf reads the RO Summary "Butter" total, but its
+    # dynamic Branded/Private → format detail rows carry no RO Summary path, so
+    # R&O never rolled up (parent 0.70 vs children 0.00) — and because Base Plan
+    # Var is the residual (Total Delta − PM − R&O), that gap also broke Base
+    # Plan Var's footing.  Map each detail leaf to the RO Summary Report's OWN
+    # Butter detail — ("Total B2C","Butter",<Format>,<Brand>), matched on a loose
+    # Supply-Format key + normalised Brand — then set the parent = sum of the
+    # detail rows so the whole Butter block foots at every level.  Runs BEFORE
+    # the subtotal roll-up so butter_branded / butter_private pick it up.  APS
+    # (ro_var_from_tracker) keeps its tracker cycle-delta roll-up (its butter
+    # detail already foots from the tracker), so this is IBP-only.
+    if not ro_var_from_tracker and ro_total_delta_by_path:
+        ro_butter: dict[tuple[str, str], float] = {}
+        for path, val in ro_total_delta_by_path.items():
+            if len(path) == 4 and path[0] == _RO_TOTAL and path[1] == "Butter":
+                brand = (
+                    BRAND_PRIVATE if "private" in str(path[3]).casefold()
+                    else BRAND_BRANDED
+                )
+                ro_butter[(_loose_sfmt_key(path[2]), brand)] = float(val)
+        butter_detail = [
+            tpl for tpl in runtime_template
+            if not tpl.is_subtotal and tpl.row_id != "butter"
+            and str(tpl.row_id).startswith("butter_")
+            and tpl.brand_match and tpl.sfmt_match and tpl.row_id in measures
+        ]
+        if butter_detail:
+            butter_ro_sum = 0.0
+            for tpl in butter_detail:
+                v = ro_butter.get(
+                    (_loose_sfmt_key(tpl.sfmt_match), str(tpl.brand_match)), 0.0)
+                measures[tpl.row_id][COL_R_AND_O] = v
+                butter_ro_sum += v
+            if "butter" in measures:
+                measures["butter"][COL_R_AND_O] = butter_ro_sum
+
     for tpl in runtime_template:
         if tpl.is_subtotal:
             measures[tpl.row_id] = _rollup_subtotal(tpl, measures, runtime_template_by_id)

@@ -438,6 +438,21 @@ _RO_FRESH_MILK = "Fresh Milk"
 _RO_BRANDED = "Branded"
 _RO_PRIVATE = "Private Label"      # RO Summary labels Private as "Private Label"
 
+# RO Summary Report label path for each comparison SUBTOTAL row.  Used to tie
+# the IBP R&O Var subtotals to the report's OWN subtotal rows (see the override
+# in _build_runtime_artifacts) instead of re-summing the report's pre-rounded
+# per-leaf values.  Leaf paths live on the template rows themselves
+# (``ro_summary_path``); these are the subtotal counterparts.
+_RO_SUMMARY_SUBTOTAL_PATH_BY_ROW_ID: dict[str, tuple[str, ...]] = {
+    "total_b2c":  (_RO_TOTAL,),
+    "esl":        (_RO_TOTAL, _RO_ESL),
+    "esl_lc":     (_RO_TOTAL, _RO_ESL, "Large Carton"),
+    "esl_sc":     (_RO_TOTAL, _RO_ESL, "Small Carton"),
+    "aseptic":    (_RO_TOTAL, _RO_ASEPTIC),
+    "cultured":   (_RO_TOTAL, _RO_CULTURED),
+    "fresh_milk": (_RO_TOTAL, _RO_FRESH_MILK),
+}
+
 
 # The reporting template.  Declaration order == display order.  Subtotals
 # are declared before their children (top-down, screenshot order); the
@@ -2375,6 +2390,29 @@ def _build_runtime_artifacts(
     for tpl in runtime_template:
         if tpl.is_subtotal:
             measures[tpl.row_id] = _rollup_subtotal(tpl, measures, runtime_template_by_id)
+
+    # ── R&O Var subtotals: mirror the RO Summary Report exactly ──────────
+    # IBP mode only.  Leaves already read their OWN RO Summary path value
+    # (_compute_leaf_measures).  For subtotals, read the report's OWN subtotal
+    # row instead of re-summing the report's per-leaf values: the saved
+    # RO_Summary_Report.csv stores every value pre-rounded to 0.1M, so a
+    # leaf-sum accumulates rounding drift away from the report's own
+    # single-rounded subtotal (the -1.3 vs -1.2 Total B2C gap the planner sees),
+    # AND it silently omits report leaves the template doesn't map (e.g.
+    # Cultured "Totes", Fresh Milk "QT Jug").  Reading the report's subtotal row
+    # fixes both, so the comparison's R&O Var column ties to the RO Summary
+    # Report headline-for-headline.  Base Plan Var stays the per-row residual
+    # (Total Delta − PM Actual − R&O), so the horizontal identity still holds.
+    # APS (ro_var_from_tracker) keeps its tracker cycle-delta roll-up — a
+    # deliberately different, self-consistent definition.
+    if not ro_var_from_tracker and ro_total_delta_by_path:
+        for tpl in runtime_template:
+            if not tpl.is_subtotal:
+                continue
+            ro_path = _RO_SUMMARY_SUBTOTAL_PATH_BY_ROW_ID.get(tpl.row_id)
+            if ro_path is not None and ro_path in ro_total_delta_by_path:
+                measures[tpl.row_id][COL_R_AND_O] = float(
+                    ro_total_delta_by_path[ro_path])
 
     return _RuntimeBuildArtifacts(
         template=runtime_template,

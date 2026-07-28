@@ -824,3 +824,69 @@ def test_tracker_has_dim_columns():
     }))
     assert not tracker_has_dim_columns(pd.DataFrame({TRK_ITEM: ["1"]}))  # legacy
     assert not tracker_has_dim_columns(None)
+
+
+# ── R&O Var reconciles to the RO Summary Report (IBP) ─────────────────────────
+
+def test_ibp_ro_var_subtotals_mirror_ro_summary_report():
+    """IBP R&O Var reads the RO Summary Report's OWN subtotal rows — not a sum of
+    its per-leaf values — so Total B2C / family subtotals reconcile to the RO
+    Summary section headline-for-headline even when the report's subtotal
+    disagrees with the sum of its (0.1M-rounded) leaves.
+
+    Regression for the -1.3 (leaf-sum) vs -1.2 (report subtotal) Total B2C gap.
+    """
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded",
+               forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([{**esl, "month": _JUL, "cycle": "C4", "pounds": 1e6}])
+    # Report where the SUBTOTAL rows deliberately differ from the sum of their
+    # rounded leaves (LC leaves -0.3 + -0.1 = -0.4, but the LC subtotal reads
+    # -0.3; ESL -0.3; Total B2C -0.2) — exactly the rounding drift in the file.
+    ro = {
+        ("Total B2C",): -0.2,
+        ("Total B2C", "Extended Shelf Life"): -0.3,
+        ("Total B2C", "Extended Shelf Life", "Large Carton"): -0.3,
+        ("Total B2C", "Extended Shelf Life", "Large Carton", "Branded"): -0.3,
+        ("Total B2C", "Extended Shelf Life", "Large Carton", "Private Label"): -0.1,
+    }
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, _enriched_ibp([])),
+        ro_total_delta_by_path=ro)
+    t = res.table
+
+    def rov(rid):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0]["R&O Var."]), 3)
+
+    # Subtotals read the report's OWN rows (NOT the -0.4 leaf sum).
+    assert rov("total_b2c") == -0.2
+    assert rov("esl") == -0.3
+    assert rov("esl_lc") == -0.3
+    # Leaves still read their own path values.
+    assert rov("esl_lc_branded") == -0.3
+    assert rov("esl_lc_private") == -0.1
+
+
+def test_aps_ro_var_ignores_ro_summary_subtotal_override():
+    """APS (ro_var_from_tracker) keeps its tracker cycle-delta roll-up — the RO
+    Summary subtotal override is IBP-only."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4", "pounds": 5e6},
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C3", "pounds": 3e6},
+    ])
+    ro = {  # absurd values that MUST be ignored in APS mode
+        ("Total B2C",): -99.0,
+        ("Total B2C", "Extended Shelf Life"): -99.0,
+        ("Total B2C", "Extended Shelf Life", "Large Carton"): -99.0,
+    }
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, _enriched_ibp([])),
+        ro_total_delta_by_path=ro, shift_last_plan_window=False, ro_var_from_tracker=True)
+    t = res.table
+    # Tracker leg delta = C4 R&O (5) − C3 R&O (3) = 2 — NOT the -99 report value.
+    assert round(float(t.loc[t["_row_id"] == "esl_lc_branded"].iloc[0]["R&O Var."]), 3) == 2.0
+    assert round(float(t.loc[t["_row_id"] == "total_b2c"].iloc[0]["R&O Var."]), 3) == 2.0

@@ -27,12 +27,14 @@ Public surface
 
 Cache model
 -----------
-Both fetchers are wrapped in ``@st.cache_data`` with a 15-minute TTL —
-identical to the RO Comparison / IBP cadence so the planner has one
-mental model for "how fresh is the data on this page".  Cache keys are
-trivial sentinel strings (no signature) because there is exactly one
-canonical blob per file; the public wrappers accept ``force_refresh`` to
-bypass.
+Each fetcher is wrapped in ``@st.cache_data`` (a 1-hour TTL as a memory
+backstop) but keyed on the blob's **ETag** — read body-less via
+``get_file_properties`` on every call — so a Fabric overwrite flips the
+cache key and the next render reads the fresh file *immediately* (no
+1-hour wait, no manual refresh).  This is the same ETag-driven freshness
+the RO Comparison section uses.  If the properties read fails, the key
+degrades to a sentinel string (TTL-only, never worse than before).  The
+public wrappers still accept ``force_refresh`` as a hard override.
 
 Errors
 ------
@@ -314,14 +316,35 @@ def _cached_fetch(
     return df, etag, size, last_modified_utc
 
 
+def _blob_signature(blob_path: str) -> str:
+    """A body-less change-detector for *blob_path* used as the cache key.
+
+    Reads only the blob's metadata (``get_file_properties`` — no download) and
+    returns its **ETag** (or ``last_modified|size`` if the ETag is absent).  When
+    a Fabric overwrite changes the file, this string changes → the
+    ``@st.cache_data`` key changes → the next call re-reads the fresh body.  On a
+    metadata-read failure it degrades to ``"default"`` (TTL-only, as before)."""
+    try:
+        props = get_file_properties(_SECRETS_SECTION, blob_path)
+    except LakehouseIOError:
+        return "default"
+    if props is None:
+        return "default"
+    return props.etag or (f"{props.last_modified}|{props.size}"
+                          if (props.last_modified or props.size) else "default")
+
+
 def _fetch_snapshot(blob_path: str) -> DemandSummarySnapshot:
     """Assemble a :class:`DemandSummarySnapshot` from the cached payload.
 
     Built *outside* the cache so the cached layer only ever stores
     native types (see the note above the cached impl).  Cheap: the
     DataFrame is shared by reference from the cache, not copied here.
+
+    The cache is keyed on the blob's ETag (:func:`_blob_signature`), so a Fabric
+    overwrite invalidates it on the very next render — no 1-hour TTL wait.
     """
-    df, etag, size, last_modified = _cached_fetch(blob_path, "default")
+    df, etag, size, last_modified = _cached_fetch(blob_path, _blob_signature(blob_path))
     return DemandSummarySnapshot(
         df=df,
         etag=etag,

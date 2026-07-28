@@ -88,6 +88,7 @@ import pandas as pd
 # one behaviour, for Start-of-Month parsing, item-key normalisation, and
 # Forecast Type bucketing across the whole Demand Planner page.
 from data_sources.demand_summary import (
+    _loose_sfmt_key,
     _normalise_item_key,
     _resolve_column,
     FORECAST_BASE_PLAN,
@@ -97,6 +98,7 @@ from data_sources.demand_summary import (
     # Pivot uses, so the two views stay pixel-identical in layout.
     BudgetLookup,
     MonthlyBudgetLookup,
+    PackagedButterBudget,
     PMAJ_BLANK_LABEL,
     assemble_hierarchical_pivot,
     build_month_wide,
@@ -2111,6 +2113,7 @@ def build_demand_plan_comparison(
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]] = None,
     enriched: Optional[EnrichedSources] = None,
     budget_by_row_id: Optional[dict[str, float]] = None,
+    butter_budget: Optional[PackagedButterBudget] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
     shift_last_plan_window: bool = True,
     ro_var_from_tracker: bool = False,
@@ -2174,6 +2177,7 @@ def build_demand_plan_comparison(
         ro_total_delta_by_path=ro_total_delta_by_path,
         enriched=enriched,
         budget_by_row_id=budget_by_row_id,
+        butter_budget=butter_budget,
         ibp_py_df=ibp_py_df,
         shift_last_plan_window=shift_last_plan_window,
         ro_var_from_tracker=ro_var_from_tracker,
@@ -2221,6 +2225,7 @@ def _build_runtime_artifacts(
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
     enriched: Optional[EnrichedSources],
     budget_by_row_id: Optional[dict[str, float]] = None,
+    butter_budget: Optional[PackagedButterBudget] = None,
     ibp_py_df: Optional[pd.DataFrame] = None,
     shift_last_plan_window: bool = True,
     ro_var_from_tracker: bool = False,
@@ -2338,6 +2343,35 @@ def _build_runtime_artifacts(
             measures[tpl.row_id][COL_BUDGET] = float(
                 budget_by_row_id[tpl.row_id],
             )
+
+    # Packaged-Butter budget from the static base file (Static_Budget_Base_Lbs
+    # .csv), keyed by (Brand, Supply Format) — overrides the FY27 workbook's
+    # single whole-Portfolio-Major "Butter" figure (which left the Branded /
+    # Private → format detail rows at 0).  Each dynamic detail leaf gets its own
+    # (Brand, SFmt) budget; the parent "butter" row gets the total re-filtered
+    # to the active selection so it always equals the sum of the rows shown.
+    # Applied BEFORE the subtotal roll-up so butter_branded / butter_private and
+    # Total B2C pick up the fresh numbers.  Runs only when the file has data;
+    # otherwise the workbook value above stands.
+    if butter_budget is not None and butter_budget.has_data:
+        for tpl in runtime_template:
+            if (
+                not tpl.is_subtotal
+                and tpl.row_id != "butter"
+                and str(tpl.row_id).startswith("butter_")
+                and tpl.brand_match and tpl.sfmt_match
+                and tpl.row_id in measures
+            ):
+                key = (str(tpl.brand_match), _loose_sfmt_key(tpl.sfmt_match))
+                measures[tpl.row_id][COL_BUDGET] = float(
+                    butter_budget.by_brand_sfmt.get(key, 0.0),
+                )
+        if "butter" in measures:
+            kept = set(_filter_butter_combos(
+                [(b, s) for b, s, _m in butter_budget.combos], filters))
+            measures["butter"][COL_BUDGET] = float(sum(
+                m for b, s, m in butter_budget.combos if (b, s) in kept))
+
     for tpl in runtime_template:
         if tpl.is_subtotal:
             measures[tpl.row_id] = _rollup_subtotal(tpl, measures, runtime_template_by_id)

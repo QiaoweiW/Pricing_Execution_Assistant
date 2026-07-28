@@ -63,10 +63,12 @@ from data_sources.demand_summary import (
     FORECAST_BASE_PLAN,
     FORECAST_R_AND_O,
     MonthlyBudgetLookup,
+    PackagedButterBudget,
     TOTAL_BUDGET_COLUMN_LABEL,
     TOTAL_COLUMN_LABEL,
     build_budget_lookup,
     build_monthly_budget_lookup,
+    build_packaged_butter_budget,
     fetch_mgmt_plan_full,
     fetch_mgmt_plan_history_tracker,
     fetch_pdh,
@@ -6184,6 +6186,32 @@ def _fy27_budget_workbook_etag() -> str:
         return ""
 
 
+def _static_budget_base_etag() -> str:
+    """Cheap cache-bust key for Static_Budget_Base_Lbs.csv in Fabric.
+
+    Busts the cached Packaged-Butter budget the instant the base file is
+    re-published (same ETag-first freshness the fetchers use)."""
+    try:
+        from data_sources.demand_summary import (
+            _SECRETS_SECTION, _STATIC_BUDGET_BASE_BLOB_PATH,
+        )
+        from data_sources.fabric_lakehouse_io import get_file_properties
+        props = get_file_properties(_SECRETS_SECTION, _STATIC_BUDGET_BASE_BLOB_PATH)
+        return str(getattr(props, "etag", "") or "")
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_packaged_butter_budget(base_etag: str) -> PackagedButterBudget:
+    """Cache the per-(Brand, SFmt) Packaged-Butter budget, keyed on the base
+    file's ETag so a fresh Static_Budget_Base_Lbs.csv re-reads immediately."""
+    try:
+        return build_packaged_butter_budget(fetch_static_budget_base().df)
+    except Exception:
+        return PackagedButterBudget(by_brand_sfmt={}, combos=(), total_m=0.0, has_data=False)
+
+
 def _signature_for(df: Optional[pd.DataFrame]) -> tuple[int, int]:
     """Return a cheap ``(rows, cols)`` signature for a DataFrame.
 
@@ -6266,6 +6294,8 @@ class _ComparisonSupportingSources:
     budget_by_row_id: dict
     budget_warnings: tuple
     budget_lookup_key: tuple
+    butter_budget: PackagedButterBudget
+    butter_budget_key: tuple
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
@@ -6363,6 +6393,12 @@ def _load_comparison_supporting_sources(
     budget_etag = _fy27_budget_workbook_etag()
     budget_by_row_id, budget_warnings = _cached_fy27_budget_by_row_id(budget_etag)
     budget_lookup_key = tuple(sorted(budget_by_row_id.items()))
+    # Packaged-Butter budget from the static base file (Branded/Private × SFmt),
+    # keyed on the base ETag so a re-published file re-reads immediately.  This
+    # overrides the workbook's single "Butter" line inside the comparison build.
+    butter_budget = _cached_packaged_butter_budget(_static_budget_base_etag())
+    butter_budget_key = tuple(sorted(
+        (k, round(v, 6)) for k, v in butter_budget.by_brand_sfmt.items()))
     return _ComparisonSupportingSources(
         pdh_df=pdh_df, item_master_df=item_master_df,
         ibp_df=ibp_df, ibp_warning=ibp_warning,
@@ -6370,7 +6406,8 @@ def _load_comparison_supporting_sources(
         ibp_py_df=ibp_py_df, ibp_recent_df=ibp_recent_df,
         ibp_recent_py_df=ibp_recent_py_df,
         budget_by_row_id=budget_by_row_id, budget_warnings=budget_warnings,
-        budget_lookup_key=budget_lookup_key)
+        budget_lookup_key=budget_lookup_key,
+        butter_budget=butter_budget, butter_budget_key=butter_budget_key)
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
@@ -6382,6 +6419,7 @@ def _cached_demand_plan_comparison_payload(
     _enriched: EnrichedSources,
     _ro_lookup: dict,
     _budget_by_row_id: dict[str, float],
+    _butter_budget: Optional[PackagedButterBudget] = None,
     shift_last_plan_window: bool = True,
     ro_var_from_tracker: bool = False,
 ) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
@@ -6402,6 +6440,7 @@ def _cached_demand_plan_comparison_payload(
         ro_total_delta_by_path=_ro_lookup,
         enriched=_enriched,
         budget_by_row_id=_budget_by_row_id,
+        butter_budget=_butter_budget,
         shift_last_plan_window=shift_last_plan_window,
         ro_var_from_tracker=ro_var_from_tracker,
     )
@@ -6605,6 +6644,8 @@ def _render_demand_plan_comparison_fragment() -> None:
     budget_by_row_id = _src.budget_by_row_id
     budget_warnings = _src.budget_warnings
     budget_lookup_key = _src.budget_lookup_key
+    butter_budget = _src.butter_budget
+    butter_budget_key = _src.butter_budget_key
     # IBP-only supporting sources (the APS section carries no RO Summary; it
     # loads its dim frame in the driver section).
     ro_lookup = fetch_ro_summary_total_delta_by_path()
@@ -6635,13 +6676,14 @@ def _render_demand_plan_comparison_fragment() -> None:
             ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df,
         )
         table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-            enrich_sig + (ro_sig, budget_lookup_key),
+            enrich_sig + (ro_sig, budget_lookup_key, butter_budget_key),
             filters,
             ro_sig,
             budget_lookup_key,
             enriched,
             ro_lookup,
             budget_by_row_id,
+            _butter_budget=butter_budget,
         )
         prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
             enrich_sig + (filters.prior_month,), filters, enriched,
@@ -9004,6 +9046,8 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
         budget_by_row_id = _src.budget_by_row_id
         budget_warnings = _src.budget_warnings
         budget_lookup_key = _src.budget_lookup_key
+        butter_budget = _src.butter_budget
+        butter_budget_key = _src.butter_budget_key
 
         tracker_sig = _signature_for(merged)
         enrich_sig = (
@@ -9023,8 +9067,10 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
             # delta of the tracker's R&O rows (current APS − prior IBP), so it
             # ties to the tracker and reconciles with the RO Comparison table.
             table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-                enrich_sig + (empty_ro_sig, budget_lookup_key, "noshift", "rotrk"),
+                enrich_sig + (empty_ro_sig, budget_lookup_key, butter_budget_key,
+                              "noshift", "rotrk"),
                 filters, empty_ro_sig, budget_lookup_key, enriched, {}, budget_by_row_id,
+                _butter_budget=butter_budget,
                 shift_last_plan_window=False, ro_var_from_tracker=True)
             prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
                 enrich_sig + (filters.prior_month,), filters, enriched)

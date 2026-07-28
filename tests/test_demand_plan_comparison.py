@@ -636,6 +636,124 @@ def test_dim_frame_from_tracker_empty_signals_fallback():
     assert build_item_dim_frame_from_tracker(trk).empty
 
 
+# ── Packaged-Butter budget from the static base file (Branded/Private × SFmt) ─
+
+def test_packaged_butter_budget_from_base_file():
+    """build_packaged_butter_budget sums Static_Budget_Base_Lbs.csv rows scoped
+    to Portfolio Minor = 'Packaged Butter', keyed by normalised Brand × SFmt.
+    Non-packaged Butter rows are excluded; the loose SFmt key drops trailing
+    's' so the plan's plural formats match."""
+    from data_sources.demand_summary import build_packaged_butter_budget
+    base = pd.DataFrame([
+        {"Portfolio Major": "Butter", "Supply Format": "Elgin Solid",
+         "Brand Name": "Darigold", "Portfolio Minor": "Packaged Butter",
+         "Demand Plan Pounds": 11_000_000.0},
+        {"Portfolio Major": "Butter", "Supply Format": "Western Quarters",
+         "Brand Name": "Private", "Portfolio Minor": "Packaged Butter",
+         "Demand Plan Pounds": 60_000_000.0},
+        {"Portfolio Major": "Butter", "Supply Format": "Elgin Quarters",
+         "Brand Name": "Private", "Portfolio Minor": "Packaged Butter",
+         "Demand Plan Pounds": 22_000_000.0},
+        # Bulk / ingredient butter shares the Butter PMaj but is NOT Packaged
+        # Butter — the Portfolio Minor scope must drop it.
+        {"Portfolio Major": "Butter", "Supply Format": "Bulk",
+         "Brand Name": "Darigold", "Portfolio Minor": "Bulk Butter",
+         "Demand Plan Pounds": 999_000_000.0},
+    ])
+    bb = build_packaged_butter_budget(base)
+    assert bb.has_data
+    assert round(bb.total_m, 3) == 93.0                       # 11 + 60 + 22 (bulk excluded)
+    assert round(bb.by_brand_sfmt[("Branded", "elgin solid")], 3) == 11.0
+    assert round(bb.by_brand_sfmt[("Private", "western quarter")], 3) == 60.0
+    # "Darigold" → Branded; "Elgin Quarters" loose-keys to "elgin quarter".
+    assert round(bb.by_brand_sfmt[("Private", "elgin quarter")], 3) == 22.0
+
+
+def test_packaged_butter_budget_empty_when_no_packaged_rows():
+    """No Packaged-Butter rows → has_data False so the comparison keeps the
+    workbook fallback."""
+    from data_sources.demand_summary import build_packaged_butter_budget
+    base = pd.DataFrame([
+        {"Portfolio Major": "ESL", "Supply Format": "Large Carton",
+         "Brand Name": "Darigold", "Portfolio Minor": "Whipping Cream",
+         "Demand Plan Pounds": 5_000_000.0},
+    ])
+    assert not build_packaged_butter_budget(base).has_data
+
+
+def test_butter_budget_overrides_workbook_in_comparison():
+    """A CSV-sourced PackagedButterBudget overrides the FY27 workbook's single
+    'butter' figure: the parent 'Packaged Butter' row shows the CSV total and
+    each Branded/Private → SFmt detail row its own budget (both IBP and APS)."""
+    from data_sources.demand_summary import PackagedButterBudget
+    filters = _filters_apr_jun_actual()
+    branded = dict(item_key="b1", item_desc="DG Elgin", party_site="1",
+                   pmaj="Butter", sfmt="Elgin Solid", pminor="Packaged Butter",
+                   brand="Branded", forecast_type=FORECAST_BASE_PLAN)
+    private = dict(item_key="b2", item_desc="PL WQ", party_site="1",
+                   pmaj="Butter", sfmt="Western Quarters", pminor="Packaged Butter",
+                   brand="Private", forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([
+        {**branded, "month": _JUL, "cycle": "C4", "pounds": 5e6},
+        {**private, "month": _JUL, "cycle": "C4", "pounds": 3e6},
+    ])
+    ibp = _enriched_ibp([])
+    bb = PackagedButterBudget(
+        by_brand_sfmt={("Branded", "elgin solid"): 11.0,
+                       ("Private", "western quarter"): 60.0},
+        combos=(("Branded", "Elgin Solid", 11.0),
+                ("Private", "Western Quarters", 60.0)),
+        total_m=71.0, has_data=True)
+
+    def _bud(table, rid):
+        r = table.loc[table["_row_id"] == rid]
+        return round(float(r.iloc[0]["Budget"]), 3)
+
+    for kw in ({}, {"shift_last_plan_window": False, "ro_var_from_tracker": True}):
+        res = build_demand_plan_comparison(
+            None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+            ro_total_delta_by_path={}, budget_by_row_id={"butter": 7.5},
+            butter_budget=bb, **kw)
+        t = res.table
+        assert _bud(t, "butter") == 71.0            # overrode the workbook's 7.5
+        assert _bud(t, "butter_branded_sfmt_elgin_solid") == 11.0
+        assert _bud(t, "butter_private_sfmt_western_quarters") == 60.0
+        assert _bud(t, "butter_private") == 60.0    # subtotal rolls up its child
+
+    # Regression guard: without butter_budget the workbook value stands.
+    res2 = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={}, budget_by_row_id={"butter": 7.5})
+    assert _bud(res2.table, "butter") == 7.5
+
+
+def test_butter_budget_parent_respects_brand_filter():
+    """The parent 'Packaged Butter' budget re-filters the CSV combos to the
+    active selection, so a Branded-only filter drops Private from the total."""
+    from data_sources.demand_summary import PackagedButterBudget
+    filters = ComparisonFilters(
+        current_cycle="C4", prior_cycle="C3",
+        actual_start=_APR, actual_end=_JUN,
+        forecast_start=_JUL, forecast_end=dt.date(2027, 3, 1),
+        prior_month=_JUN, brand_filter=("Branded",))
+    branded = dict(item_key="b1", item_desc="DG Elgin", party_site="1",
+                   pmaj="Butter", sfmt="Elgin Solid", pminor="Packaged Butter",
+                   brand="Branded", forecast_type=FORECAST_BASE_PLAN)
+    trk = _enriched_trk([{**branded, "month": _JUL, "cycle": "C4", "pounds": 5e6}])
+    bb = PackagedButterBudget(
+        by_brand_sfmt={("Branded", "elgin solid"): 11.0,
+                       ("Private", "western quarter"): 60.0},
+        combos=(("Branded", "Elgin Solid", 11.0),
+                ("Private", "Western Quarters", 60.0)),
+        total_m=71.0, has_data=True)
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, _enriched_ibp([])),
+        ro_total_delta_by_path={}, budget_by_row_id={"butter": 7.5}, butter_budget=bb)
+    t = res.table
+    row = t.loc[t["_row_id"] == "butter"].iloc[0]
+    assert round(float(row["Budget"]), 3) == 11.0   # Private (60) filtered out
+
+
 def test_not_captured_flags_items_outside_the_template():
     """A 'Whey/Bag' SKU (no template family) is logged for both cycles."""
     filters = ComparisonFilters(

@@ -1231,6 +1231,129 @@ def build_budget_lookup(
     return BudgetLookup(by_leaf=by_leaf, has_data=has_data)
 
 
+# ── Packaged-Butter budget (Static_Budget_Base_Lbs.csv, per Brand · SFmt) ────
+#
+# The Demand Plan Comparison Summary (IBP + APS) formerly took its Butter
+# budget from a single "Butter" line in the FY27 workbook — a whole-Portfolio-
+# Major figure applied to a row scoped to Portfolio Minor = "Packaged Butter",
+# with the Branded/Private → Supply-Format detail rows left at 0.  The static
+# base file now carries the real Packaged-Butter detail (Branded/Private ×
+# Elgin Solid / Western Quarters / Elgin Quarter / Chips …), so we source the
+# comparison's Butter budget from it instead: the parent row gets the filtered
+# total and each detail row its own (Brand, SFmt) budget.
+
+_BUTTER_PMAJ_LABEL: str = "Butter"
+_PACKAGED_BUTTER_PMINOR: str = "Packaged Butter"
+_BUDGET_BASE_BRAND_CANDIDATES: tuple[str, ...] = (
+    "Brand Name", "BrandName", "Brand",
+)
+_BUDGET_BASE_PMINOR_CANDIDATES: tuple[str, ...] = (
+    "Portfolio Minor", "Portfolio_Minor", "PortfolioMinor", "PMinor",
+)
+
+
+def _loose_sfmt_key(value) -> str:
+    """Loose Supply-Format key: casefold + drop a trailing ``s``.
+
+    Mirrors the comparison's dynamic-butter combo key (``demand_plan_
+    comparison._build_dynamic_butter_rows``) so the budget file's "Elgin
+    Quarter" matches the plan's "Elgin Quarters".
+    """
+    return " ".join(str(value).split()).strip().casefold().rstrip("s")
+
+
+def _norm_budget_brand(value) -> str:
+    """Normalise a budget-file Brand Name to ``Branded`` / ``Private``.
+
+    The comparison splits Butter into Branded (Darigold) vs Private label;
+    the base file uses the raw brand ("Darigold" / "Private"), so anything
+    containing "private" is Private and everything else is Branded — matching
+    ``_vectorised_brand``'s DG-vs-else rule from the plan side.
+    """
+    return "Private" if "private" in str(value).strip().casefold() else "Branded"
+
+
+@dataclass(frozen=True)
+class PackagedButterBudget:
+    """Packaged-Butter budget (millions of lbs) per (Brand, Supply Format).
+
+    Sourced from ``Static_Budget_Base_Lbs.csv`` (Portfolio Minor ==
+    "Packaged Butter").  ``by_brand_sfmt`` is keyed on
+    ``(Branded|Private, loose_sfmt)`` so the comparison's dynamic detail rows
+    can attach their own budget; ``combos`` keeps the display Supply-Format so
+    the parent row's total can be re-filtered to the active selection.
+    """
+    by_brand_sfmt: dict[tuple[str, str], float]
+    combos: tuple[tuple[str, str, float], ...]
+    total_m: float
+    has_data: bool
+
+
+def build_packaged_butter_budget(
+    base_df: Optional[pd.DataFrame],
+) -> PackagedButterBudget:
+    """Build the per-(Brand, Supply Format) Packaged-Butter budget in millions.
+
+    Scopes ``base_df`` to Portfolio Minor = "Packaged Butter" (falling back to
+    Portfolio Major = "Butter" when the file has no Portfolio Minor column),
+    then sums ``Demand Plan Pounds`` by normalised Brand × display Supply
+    Format.  Degrades to an empty, ``has_data=False`` result on any missing
+    column so callers keep the prior (workbook) behaviour.
+    """
+    empty = PackagedButterBudget(by_brand_sfmt={}, combos=(), total_m=0.0, has_data=False)
+    if base_df is None or base_df.empty:
+        return empty
+    pmaj_col = _resolve_column(base_df, _BUDGET_BASE_PMAJ_CANDIDATES)
+    sfmt_col = _resolve_column(base_df, _BUDGET_BASE_SFMT_CANDIDATES)
+    val_col = _resolve_column(base_df, _BUDGET_BASE_VALUE_CANDIDATES)
+    brand_col = _resolve_column(base_df, _BUDGET_BASE_BRAND_CANDIDATES)
+    pminor_col = _resolve_column(base_df, _BUDGET_BASE_PMINOR_CANDIDATES)
+    if not (pmaj_col and sfmt_col and val_col and brand_col):
+        return empty
+
+    work = base_df.copy()
+    if pminor_col:
+        scope = (
+            work[pminor_col].astype(str).str.strip().str.casefold()
+            == _PACKAGED_BUTTER_PMINOR.casefold()
+        )
+    else:
+        scope = (
+            work[pmaj_col].astype(str).str.strip().str.casefold()
+            == _BUTTER_PMAJ_LABEL.casefold()
+        )
+    work = work.loc[scope]
+    if work.empty:
+        return empty
+
+    brand = work[brand_col].map(_norm_budget_brand)
+    sfmt_disp = work[sfmt_col].map(lambda v: " ".join(str(v).split()).strip())
+    lbs_m = pd.to_numeric(work[val_col], errors="coerce").fillna(0.0) / _LBS_PER_MILLION
+    tmp = pd.DataFrame({"brand": brand, "sfmt": sfmt_disp, "m": lbs_m})
+    tmp = tmp.loc[tmp["sfmt"] != ""]
+    if tmp.empty:
+        return empty
+    grouped = tmp.groupby(["brand", "sfmt"], dropna=False)["m"].sum()
+
+    by_brand_sfmt: dict[tuple[str, str], float] = {}
+    combos: list[tuple[str, str, float]] = []
+    for (brand_v, sfmt_v), m in grouped.items():
+        combos.append((str(brand_v), str(sfmt_v), float(m)))
+        key = (str(brand_v), _loose_sfmt_key(sfmt_v))
+        by_brand_sfmt[key] = by_brand_sfmt.get(key, 0.0) + float(m)
+    total_m = float(sum(m for _b, _s, m in combos))
+    logger.info(
+        "Packaged-Butter budget built: %s combo(s), %.3f M lbs total.",
+        len(combos), total_m,
+    )
+    return PackagedButterBudget(
+        by_brand_sfmt=by_brand_sfmt,
+        combos=tuple(combos),
+        total_m=total_m,
+        has_data=bool(combos),
+    )
+
+
 # ── Monthly budget (Static_Budget_Base&RO_by_Month.csv) ─────────────────────
 
 # Column-name candidates for the monthly bundled-budget CSV.

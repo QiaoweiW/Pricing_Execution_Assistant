@@ -499,9 +499,13 @@ def test_current_plan_split_o_pct_and_py_actual():
          "customer_name": "C", "month": dt.date(2025, 7, 1), "pounds": 6_000_000.0,
          "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"},
     ])
+    # IBP R&O Volume (Current Plan R&O) ties to the RO Summary Report's
+    # "Current Plan" by label path — NOT the tracker's R&O rows.
+    ro_cp = {("Total B2C", "Extended Shelf Life", "Large Carton", "Branded"): 2.0}
     result = build_demand_plan_comparison(
         None, None, None, filters,
-        enriched=_enriched_sources(trk, ibp, py), ro_total_delta_by_path={},
+        enriched=_enriched_sources(trk, ibp, py),
+        ro_total_delta_by_path={}, ro_current_plan_by_path=ro_cp,
     )
     row = result.table.loc[result.table["_row_id"] == "esl_lc_branded"].iloc[0]
     assert float(row["Current Plan (Base)"]) == 10.0
@@ -531,9 +535,12 @@ def test_build_comparison_kpis():
         "pmaj": "ESL", "sfmt": "Large Carton", "pminor": "", "brand": "Branded"}
     ibp = _enriched_ibp([ship(_APR, 1e6), ship(_MAY, 2e6), ship(_JUN, 4e6)])  # actuals=7
     py = _enriched_ibp([ship(dt.date(2025, 7, 1), 6e6)])                      # PY Actual=6
+    # IBP R&O Volume ties to the RO Summary "Current Plan" by path (not tracker).
+    ro_cp = {("Total B2C", "Extended Shelf Life", "Large Carton", "Branded"): 2.0}
     result = build_demand_plan_comparison(
         None, None, None, filters,
-        enriched=_enriched_sources(trk, ibp, py), ro_total_delta_by_path={},
+        enriched=_enriched_sources(trk, ibp, py),
+        ro_total_delta_by_path={}, ro_current_plan_by_path=ro_cp,
     )
 
     # Trailing-6-month shipments ending Jun 2026 (T3M = Apr–Jun).
@@ -964,3 +971,45 @@ def test_aps_butter_ro_var_uses_tracker_not_ro_summary():
     assert rov("butter_branded") == 2.0
     assert rov("butter_private") == 4.0
     assert rov("butter") == 6.0     # foots parent = Branded + Private
+
+
+def test_ibp_ro_volume_and_variance_tie_to_ro_summary():
+    """IBP R&O Volume ties to the RO Summary 'Current Plan' and R&O Variance to
+    'Total Delta' — at BOTH leaf and subtotal — so Total plan = actuals + Base +
+    RO-Summary R&O, and the tracker's own R&O rows are ignored for R&O Volume."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL, "cycle": "C4", "pounds": 10e6},
+        # A tracker R&O row that MUST be ignored for R&O Volume in IBP mode.
+        {**esl, "forecast_type": FORECAST_R_AND_O, "month": _JUL, "cycle": "C4", "pounds": 99e6},
+    ])
+    ibp = _enriched_ibp([
+        {"item_key": "100", "item_desc": "DG Milk", "customer_no": "1", "customer_name": "C",
+         "month": m, "pounds": p, "pmaj": "ESL", "sfmt": "Large Carton",
+         "pminor": "", "brand": "Branded"}
+        for m, p in ((_APR, 1e6), (_MAY, 2e6), (_JUN, 4e6))       # actuals = 7
+    ])
+    lc = ("Total B2C", "Extended Shelf Life", "Large Carton", "Branded")
+    cp = {("Total B2C",): 3.0, ("Total B2C", "Extended Shelf Life"): 3.0,
+          ("Total B2C", "Extended Shelf Life", "Large Carton"): 3.0, lc: 3.0}
+    td = {("Total B2C",): -0.5, ("Total B2C", "Extended Shelf Life"): -0.5,
+          ("Total B2C", "Extended Shelf Life", "Large Carton"): -0.5, lc: -0.5}
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path=td, ro_current_plan_by_path=cp)
+    t = res.table
+
+    def cell(rid, col):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0][col]), 3)
+
+    # Leaf: R&O Volume = RO Summary Current Plan (3.0), NOT the tracker's 99M.
+    assert cell("esl_lc_branded", "Current Plan (R&O)") == 3.0
+    assert cell("esl_lc_branded", "R&O Var.") == -0.5
+    # Total plan (leaf) = actuals(7) + Base(10) + R&O Volume(3) = 20.
+    assert cell("esl_lc_branded", "Current Plan (incl. RO)") == 20.0
+    # Subtotals read the report's OWN Current Plan / Total Delta rows.
+    assert cell("esl", "Current Plan (R&O)") == 3.0 and cell("esl", "R&O Var.") == -0.5
+    assert cell("total_b2c", "Current Plan (R&O)") == 3.0
+    assert cell("total_b2c", "R&O Var.") == -0.5

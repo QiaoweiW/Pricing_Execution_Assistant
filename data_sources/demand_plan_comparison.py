@@ -314,6 +314,11 @@ _RO_SUMMARY_TOTAL_DELTA_CANDIDATES: tuple[str, ...] = (
     "FY27 Probabilized|Total Delta",
     "FY27 Probabilized  | Total Delta",
 )
+_RO_SUMMARY_CURRENT_PLAN_CANDIDATES: tuple[str, ...] = (
+    "FY27 Probabilized | Current Plan",
+    "FY27 Probabilized|Current Plan",
+    "FY27 Probabilized  | Current Plan",
+)
 # Non-breaking space used by the RO Summary exporter to indent the tree.
 _NBSP: str = "\u00A0"
 
@@ -1560,31 +1565,25 @@ def _sum_millions(
 # RO Summary Report — R&O lookup (FY27 Total Delta, matched by path)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_ro_summary_metric_by_path(
+def _ro_summary_metric_from_df(
+    df: Optional[pd.DataFrame],
     metric_candidates: tuple[str, ...],
 ) -> dict[tuple[str, ...], float]:
-    """Return ``{label_path -> metric}`` from the saved RO Summary Report.
+    """Parse ``{label_path -> metric}`` from an RO-Summary-shaped frame.
 
-    Shared parser for any single metric column (Total Delta, Current
-    Plan, etc.).  Returns an empty dict when the file is missing /
-    unreadable / lacks the expected columns — callers treat that as zero
-    and surface a soft warning.  Never raises on a missing file.
+    Walks the NBSP-indented label column into a path stack.  Works on either
+    the saved ``RO_Summary_Report.csv`` or a freshly-built, export-shaped
+    frame (:func:`ro_summary_report.prepare_summary_for_export`) — both carry
+    the same label column + ``FY27 Probabilized | …`` metric columns.  Returns
+    an empty dict when the frame is missing / lacks the expected columns.
     """
-    try:
-        df, _etag = read_csv(_RO_SUMMARY_SECRETS_SECTION, _RO_SUMMARY_REPORT_BLOB_PATH)
-    except LakehouseIOError as exc:
-        logger.info("RO Summary Report read failed: %s", exc)
-        return {}
-
     if df is None or df.empty:
-        logger.info("RO Summary Report is missing or empty.")
         return {}
-
     label_col = _resolve_column(df, _RO_SUMMARY_LABEL_CANDIDATES)
     metric_col = _resolve_column(df, metric_candidates)
     if not label_col or not metric_col:
         logger.info(
-            "RO Summary Report present but expected columns not found "
+            "RO Summary frame present but expected columns not found "
             "(label=%r, metric=%r).  Available columns: %r.",
             label_col, metric_col, list(df.columns),
         )
@@ -1608,9 +1607,56 @@ def _fetch_ro_summary_metric_by_path(
     return by_path
 
 
+def _fetch_ro_summary_metric_by_path(
+    metric_candidates: tuple[str, ...],
+) -> dict[tuple[str, ...], float]:
+    """Return ``{label_path -> metric}`` from the **saved** RO Summary Report."""
+    try:
+        df, _etag = read_csv(_RO_SUMMARY_SECRETS_SECTION, _RO_SUMMARY_REPORT_BLOB_PATH)
+    except LakehouseIOError as exc:
+        logger.info("RO Summary Report read failed: %s", exc)
+        return {}
+    if df is None or df.empty:
+        logger.info("RO Summary Report is missing or empty.")
+        return {}
+    return _ro_summary_metric_from_df(df, metric_candidates)
+
+
 def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
     """Return ``{label_path -> FY27 Total Delta}`` from the saved RO Summary."""
     return _fetch_ro_summary_metric_by_path(_RO_SUMMARY_TOTAL_DELTA_CANDIDATES)
+
+
+def fetch_ro_summary_metrics_by_path() -> tuple[
+    dict[tuple[str, ...], float], dict[tuple[str, ...], float],
+]:
+    """Return ``(current_plan_by_path, total_delta_by_path)`` from the LIVE
+    RO Comparison Output — the SAME rollup the RO Summary Report section shows.
+
+    The comparison ties its R&O Volume (Current Plan) and R&O Variance (Total
+    Delta) columns to the RO Summary Report.  Reading the live
+    ``RO_Comparison_Output.csv`` through :func:`ro_summary_report.
+    build_summary_report` (instead of the saved ``RO_Summary_Report.csv``)
+    guarantees the comparison matches the on-screen RO Summary Report even when
+    the saved file hasn't been re-published yet.  Degrades to ``({}, {})`` when
+    the source is missing/unreadable, so R&O falls back to zero rather than
+    raising.
+    """
+    try:                                    # lazy import: avoid an import cycle
+        from data_sources.ro_summary_report import (
+            build_summary_report,
+            fetch_ro_comparison_output_df,
+            prepare_summary_for_export,
+        )
+        comp = fetch_ro_comparison_output_df()
+        report, _warnings, _tpl = build_summary_report(comp)
+        export = prepare_summary_for_export(report)
+    except Exception as exc:                 # noqa: BLE001 — never fatal
+        logger.info("Live RO Summary rollup unavailable (%s); R&O → 0.", exc)
+        return {}, {}
+    current_plan = _ro_summary_metric_from_df(export, _RO_SUMMARY_CURRENT_PLAN_CANDIDATES)
+    total_delta = _ro_summary_metric_from_df(export, _RO_SUMMARY_TOTAL_DELTA_CANDIDATES)
+    return current_plan, total_delta
 
 
 def months_in_range(start: date, end: date) -> set[date]:
@@ -2126,6 +2172,7 @@ def build_demand_plan_comparison(
     *,
     item_master_df: Optional[pd.DataFrame] = None,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]] = None,
+    ro_current_plan_by_path: Optional[dict[tuple[str, ...], float]] = None,
     enriched: Optional[EnrichedSources] = None,
     budget_by_row_id: Optional[dict[str, float]] = None,
     butter_budget: Optional[PackagedButterBudget] = None,
@@ -2190,6 +2237,7 @@ def build_demand_plan_comparison(
         tracker_df, ibp_df, pdh_df, filters,
         item_master_df=item_master_df,
         ro_total_delta_by_path=ro_total_delta_by_path,
+        ro_current_plan_by_path=ro_current_plan_by_path,
         enriched=enriched,
         budget_by_row_id=budget_by_row_id,
         butter_budget=butter_budget,
@@ -2238,6 +2286,7 @@ def _build_runtime_artifacts(
     *,
     item_master_df: Optional[pd.DataFrame] = None,
     ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
+    ro_current_plan_by_path: Optional[dict[tuple[str, ...], float]] = None,
     enriched: Optional[EnrichedSources],
     budget_by_row_id: Optional[dict[str, float]] = None,
     butter_budget: Optional[PackagedButterBudget] = None,
@@ -2267,8 +2316,17 @@ def _build_runtime_artifacts(
     ibp_recent = _apply_dim_filter(enriched.ibp_recent, filters)
     ibp_recent_py = _apply_dim_filter(enriched.ibp_recent_py, filters)
 
-    if ro_total_delta_by_path is None:
+    # RO Summary metrics (live rollup): Total Delta feeds R&O Var, Current Plan
+    # feeds R&O Volume — both tied to the RO Summary Report by label path (IBP).
+    # When the caller passes neither, fetch both live in one read; when it
+    # passes only Total Delta (legacy callers / tests), Current Plan defaults to
+    # empty (R&O Volume falls back to 0 for those builds).
+    if ro_total_delta_by_path is None and ro_current_plan_by_path is None:
+        ro_current_plan_by_path, ro_total_delta_by_path = fetch_ro_summary_metrics_by_path()
+    elif ro_total_delta_by_path is None:
         ro_total_delta_by_path = fetch_ro_summary_total_delta_by_path()
+    if ro_current_plan_by_path is None:
+        ro_current_plan_by_path = {}
     ro_available = bool(ro_total_delta_by_path)
     if not ro_available:
         warnings.append(
@@ -2349,6 +2407,7 @@ def _build_runtime_artifacts(
             prior_forecast_months=prior_forecast_months,
             prior_month=prior_month,
             ro_total_delta_by_path=ro_total_delta_by_path,
+            ro_current_plan_by_path=ro_current_plan_by_path,
             ro_var_from_tracker=ro_var_from_tracker,
             ibp_py=ibp_py,
             ibp_recent=ibp_recent, ibp_recent_py=ibp_recent_py,
@@ -2387,27 +2446,29 @@ def _build_runtime_artifacts(
             measures["butter"][COL_BUDGET] = float(sum(
                 m for b, s, m in butter_budget.combos if (b, s) in kept))
 
-    # ── Butter R&O Var roll-up (IBP) ─────────────────────────────────────
-    # The parent "butter" leaf reads the RO Summary "Butter" total, but its
+    # ── Butter R&O roll-up (IBP) ─────────────────────────────────────────
+    # The parent "butter" leaf reads the RO Summary "Butter" figures, but its
     # dynamic Branded/Private → format detail rows carry no RO Summary path, so
-    # R&O never rolled up (parent 0.70 vs children 0.00) — and because Base Plan
-    # Var is the residual (Total Delta − PM − R&O), that gap also broke Base
-    # Plan Var's footing.  Map each detail leaf to the RO Summary Report's OWN
-    # Butter detail — ("Total B2C","Butter",<Format>,<Brand>), matched on a loose
-    # Supply-Format key + normalised Brand — then set the parent = sum of the
-    # detail rows so the whole Butter block foots at every level.  Runs BEFORE
-    # the subtotal roll-up so butter_branded / butter_private pick it up.  APS
-    # (ro_var_from_tracker) keeps its tracker cycle-delta roll-up (its butter
-    # detail already foots from the tracker), so this is IBP-only.
-    if not ro_var_from_tracker and ro_total_delta_by_path:
-        ro_butter: dict[tuple[str, str], float] = {}
-        for path, val in ro_total_delta_by_path.items():
-            if len(path) == 4 and path[0] == _RO_TOTAL and path[1] == "Butter":
-                brand = (
-                    BRAND_PRIVATE if "private" in str(path[3]).casefold()
-                    else BRAND_BRANDED
-                )
-                ro_butter[(_loose_sfmt_key(path[2]), brand)] = float(val)
+    # R&O Var (Total Delta) and R&O Volume (Current Plan) never rolled up
+    # (parent nonzero vs children 0) — and because Base Plan Var is the residual
+    # (Total Delta − PM − R&O), the Var gap also broke Base Plan Var's footing.
+    # Map each detail leaf to the RO Summary Report's OWN Butter detail —
+    # ("Total B2C","Butter",<Format>,<Brand>), matched on a loose Supply-Format
+    # key + normalised Brand — then set the parent = sum of the detail rows so
+    # the whole Butter block foots at every level.  Runs BEFORE the subtotal
+    # roll-up so butter_branded / butter_private pick it up.  APS
+    # (ro_var_from_tracker) keeps its tracker roll-up, so this is IBP-only.
+    if not ro_var_from_tracker and (ro_total_delta_by_path or ro_current_plan_by_path):
+        def _ro_butter_lookup(src: dict) -> dict[tuple[str, str], float]:
+            out: dict[tuple[str, str], float] = {}
+            for path, val in (src or {}).items():
+                if len(path) == 4 and path[0] == _RO_TOTAL and path[1] == "Butter":
+                    brand = (BRAND_PRIVATE if "private" in str(path[3]).casefold()
+                             else BRAND_BRANDED)
+                    out[(_loose_sfmt_key(path[2]), brand)] = float(val)
+            return out
+        ro_butter_var = _ro_butter_lookup(ro_total_delta_by_path)
+        ro_butter_vol = _ro_butter_lookup(ro_current_plan_by_path)
         butter_detail = [
             tpl for tpl in runtime_template
             if not tpl.is_subtotal and tpl.row_id != "butter"
@@ -2415,41 +2476,50 @@ def _build_runtime_artifacts(
             and tpl.brand_match and tpl.sfmt_match and tpl.row_id in measures
         ]
         if butter_detail:
-            butter_ro_sum = 0.0
+            var_sum = vol_sum = 0.0
             for tpl in butter_detail:
-                v = ro_butter.get(
-                    (_loose_sfmt_key(tpl.sfmt_match), str(tpl.brand_match)), 0.0)
-                measures[tpl.row_id][COL_R_AND_O] = v
-                butter_ro_sum += v
+                key = (_loose_sfmt_key(tpl.sfmt_match), str(tpl.brand_match))
+                v_var = ro_butter_var.get(key, 0.0)
+                v_vol = ro_butter_vol.get(key, 0.0)
+                measures[tpl.row_id][COL_R_AND_O] = v_var
+                measures[tpl.row_id][COL_CURRENT_PLAN_RO] = v_vol
+                var_sum += v_var
+                vol_sum += v_vol
             if "butter" in measures:
-                measures["butter"][COL_R_AND_O] = butter_ro_sum
+                measures["butter"][COL_R_AND_O] = var_sum
+                measures["butter"][COL_CURRENT_PLAN_RO] = vol_sum
 
     for tpl in runtime_template:
         if tpl.is_subtotal:
             measures[tpl.row_id] = _rollup_subtotal(tpl, measures, runtime_template_by_id)
 
-    # ── R&O Var subtotals: mirror the RO Summary Report exactly ──────────
-    # IBP mode only.  Leaves already read their OWN RO Summary path value
-    # (_compute_leaf_measures).  For subtotals, read the report's OWN subtotal
-    # row instead of re-summing the report's per-leaf values: the saved
-    # RO_Summary_Report.csv stores every value pre-rounded to 0.1M, so a
-    # leaf-sum accumulates rounding drift away from the report's own
-    # single-rounded subtotal (the -1.3 vs -1.2 Total B2C gap the planner sees),
-    # AND it silently omits report leaves the template doesn't map (e.g.
-    # Cultured "Totes", Fresh Milk "QT Jug").  Reading the report's subtotal row
-    # fixes both, so the comparison's R&O Var column ties to the RO Summary
+    # ── R&O subtotals: mirror the RO Summary Report exactly ──────────────
+    # IBP mode only.  Leaves already read their OWN RO Summary path value for
+    # R&O Var (Total Delta) and R&O Volume (Current Plan).  For subtotals, read
+    # the report's OWN subtotal row instead of re-summing the report's per-leaf
+    # values: the report stores every value pre-rounded to 0.1M, so a leaf-sum
+    # accumulates rounding drift away from the report's own single-rounded
+    # subtotal, AND it silently omits report leaves the template doesn't map
+    # (e.g. Cultured "Totes", Fresh Milk "QT Jug").  Reading the report's
+    # subtotal row fixes both, so R&O Var AND R&O Volume tie to the RO Summary
     # Report headline-for-headline.  Base Plan Var stays the per-row residual
-    # (Total Delta − PM Actual − R&O), so the horizontal identity still holds.
-    # APS (ro_var_from_tracker) keeps its tracker cycle-delta roll-up — a
-    # deliberately different, self-consistent definition.
-    if not ro_var_from_tracker and ro_total_delta_by_path:
+    # (Total Delta − PM Actual − R&O) and Current Plan stays actuals + Base +
+    # R&O Volume, so the horizontal identities still hold.  APS
+    # (ro_var_from_tracker) keeps its tracker roll-up — a deliberately
+    # different, self-consistent definition.
+    if not ro_var_from_tracker and (ro_total_delta_by_path or ro_current_plan_by_path):
         for tpl in runtime_template:
             if not tpl.is_subtotal:
                 continue
             ro_path = _RO_SUMMARY_SUBTOTAL_PATH_BY_ROW_ID.get(tpl.row_id)
-            if ro_path is not None and ro_path in ro_total_delta_by_path:
+            if ro_path is None:
+                continue
+            if ro_path in ro_total_delta_by_path:
                 measures[tpl.row_id][COL_R_AND_O] = float(
                     ro_total_delta_by_path[ro_path])
+            if ro_path in ro_current_plan_by_path:
+                measures[tpl.row_id][COL_CURRENT_PLAN_RO] = float(
+                    ro_current_plan_by_path[ro_path])
 
     return _RuntimeBuildArtifacts(
         template=runtime_template,
@@ -2474,6 +2544,7 @@ def _compute_leaf_measures(
     prior_forecast_months: set[date],
     prior_month: date,
     ro_total_delta_by_path: dict[tuple[str, ...], float],
+    ro_current_plan_by_path: Optional[dict[tuple[str, ...], float]] = None,
     ro_var_from_tracker: bool = False,
     ibp_py: Optional[pd.DataFrame] = None,
     ibp_recent: Optional[pd.DataFrame] = None,
@@ -2554,8 +2625,19 @@ def _compute_leaf_measures(
         is_base = is_ro = pd.Series([], dtype=bool)
     current_plan_base = _sum_millions(
         trk, trk_mask & cur_cycle & is_base & trk_in_forecast)
-    current_plan_ro = _sum_millions(
+    tracker_current_plan_ro = _sum_millions(
         trk, trk_mask & cur_cycle & is_ro & trk_in_forecast)
+    # R&O Volume (the R&O leg of the current plan).  IBP: the RO Summary
+    # Report's probabilized "Current Plan" for this row, matched by label path
+    # — so R&O Volume ties to the RO Summary and Total plan = actuals + Base +
+    # RO-Summary R&O.  APS: the tracker's own current-cycle R&O forecast (its
+    # R&O Var is a tracker cycle delta, so it must stay tracker-based).
+    if ro_var_from_tracker:
+        current_plan_ro = tracker_current_plan_ro
+    elif tpl.ro_summary_path is not None and ro_current_plan_by_path:
+        current_plan_ro = float(ro_current_plan_by_path.get(tpl.ro_summary_path, 0.0))
+    else:
+        current_plan_ro = 0.0
 
     # ── Last Plan legs (the one-month-ago snapshot) ──────────────────
     # Actuals over the shifted-back actual window; PRIOR-cycle forecast

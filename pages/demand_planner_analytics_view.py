@@ -188,7 +188,7 @@ from data_sources.demand_plan_comparison import (
     enrich_ibp_shipments_df,
     enrich_finance_df,
     list_driver_buckets_for_group,
-    fetch_ro_summary_total_delta_by_path,
+    fetch_ro_summary_metrics_by_path,
     list_tracker_cycles,
     list_comparison_combos,
     build_forecast_bias_table,
@@ -6420,6 +6420,7 @@ def _cached_demand_plan_comparison_payload(
     _ro_lookup: dict,
     _budget_by_row_id: dict[str, float],
     _butter_budget: Optional[PackagedButterBudget] = None,
+    _ro_current_plan: Optional[dict] = None,
     shift_last_plan_window: bool = True,
     ro_var_from_tracker: bool = False,
 ) -> tuple[pd.DataFrame, tuple[str, ...], bool]:
@@ -6438,6 +6439,7 @@ def _cached_demand_plan_comparison_payload(
     result = build_demand_plan_comparison(
         None, None, None, filters,
         ro_total_delta_by_path=_ro_lookup,
+        ro_current_plan_by_path=_ro_current_plan,
         enriched=_enriched,
         budget_by_row_id=_budget_by_row_id,
         butter_budget=_butter_budget,
@@ -6647,8 +6649,12 @@ def _render_demand_plan_comparison_fragment() -> None:
     butter_budget = _src.butter_budget
     butter_budget_key = _src.butter_budget_key
     # IBP-only supporting sources (the APS section carries no RO Summary; it
-    # loads its dim frame in the driver section).
-    ro_lookup = fetch_ro_summary_total_delta_by_path()
+    # loads its dim frame in the driver section).  R&O Variance (Total Delta)
+    # AND R&O Volume (Current Plan) are read from the LIVE RO Comparison Output
+    # rollup — the SAME numbers the RO Summary Report section shows — so the
+    # comparison ties to it even before the saved RO_Summary_Report.csv is
+    # re-published (fixes the stale-file reconciliation gap).
+    ro_current_plan, ro_lookup = fetch_ro_summary_metrics_by_path()
     dim_df, dim_warning = _load_demand_comparison_dim()
 
     # 5. Build the shared enrichment ONCE, then reuse it across all
@@ -6664,6 +6670,7 @@ def _render_demand_plan_comparison_fragment() -> None:
     item_master_sig = _signature_for(item_master_df)
     dim_sig = _signature_for(dim_df)
     ro_sig = _ro_lookup_signature(ro_lookup)
+    ro_cp_sig = _ro_lookup_signature(ro_current_plan)
     enrich_sig = (
         tracker_sig, ibp_sig, ibp_orders_sig, ibp_py_sig,
         ibp_recent_sig, ibp_recent_py_sig, pdh_sig, item_master_sig)
@@ -6676,7 +6683,7 @@ def _render_demand_plan_comparison_fragment() -> None:
             ibp_recent_df, ibp_recent_py_df, pdh_df, item_master_df,
         )
         table, build_warnings, ro_available = _cached_demand_plan_comparison_payload(
-            enrich_sig + (ro_sig, budget_lookup_key, butter_budget_key),
+            enrich_sig + (ro_sig, budget_lookup_key, butter_budget_key, ro_cp_sig),
             filters,
             ro_sig,
             budget_lookup_key,
@@ -6684,6 +6691,7 @@ def _render_demand_plan_comparison_fragment() -> None:
             ro_lookup,
             budget_by_row_id,
             _butter_budget=butter_budget,
+            _ro_current_plan=ro_current_plan,
         )
         prior_month_vs_fcst = _cached_prior_month_actual_vs_fcst_table(
             enrich_sig + (filters.prior_month,), filters, enriched,

@@ -10,6 +10,18 @@ def get_relative_path(relative_path):
     script_dir = Path(__file__).parent.absolute()
     return script_dir / relative_path
 
+def _norm_id(series):
+    """Normalise an ID column to a clean string join key.
+
+    Numeric ID columns that contain any blank cell are read by pandas as
+    float64, so a plain ``astype(str)`` produces a trailing ``.0``
+    (e.g. ``564052`` -> ``'564052.0'``).  That never matches an integer-typed
+    key on the other side of a join (``'564052'``), silently dropping every
+    row.  Strip surrounding whitespace and a trailing ``.0`` so both sides of
+    every join line up regardless of how each file's column was inferred.
+    """
+    return series.astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+
 def load_date_assumptions(assumptions_path):
     """
     Load and parse the effective_date_assumption.csv file to derive dates
@@ -89,10 +101,13 @@ def process_costco_pricing_data():
     
     print(f"Filtered Price Build Report for KS items: {len(pb_filtered)} rows")
     
-    # Step 2: Join with costco_regions_lookup to get region information
-    # Convert Party Site Number to string for joining
-    pb_filtered['Party Site Number'] = pb_filtered['Party Site Number'].astype(str)
-    costco_regions_lookup['Ship To Site Number'] = costco_regions_lookup['Ship To Site Number'].astype(str)
+    # Step 2: Join with costco_regions_lookup to get region information.
+    # Normalise BOTH keys: 'Party Site Number' is read as float (its column
+    # has blanks) so a plain astype(str) yields '564052.0', which never
+    # matches the integer-typed 'Ship To Site Number' ('564052') — that
+    # mismatch dropped every KS row as "no region" and produced an empty file.
+    pb_filtered['Party Site Number'] = _norm_id(pb_filtered['Party Site Number'])
+    costco_regions_lookup['Ship To Site Number'] = _norm_id(costco_regions_lookup['Ship To Site Number'])
     
     # Left join with costco_regions_lookup
     pb_with_region = pb_filtered.merge(
@@ -107,10 +122,12 @@ def process_costco_pricing_data():
     
     print(f"Joined with regions lookup: {len(pb_with_region)} rows")
     
-    # Step 3: Join with costco_prices to get the correct pricing for each item-region combination
-    # Convert Item to string for joining
-    pb_with_region['Item_str'] = pb_with_region['Item'].astype(str)
-    costco_prices['Prod_#_str'] = costco_prices['Prod #'].astype(str)
+    # Step 3: Join with costco_prices to get the correct pricing for each
+    # item-region combination.  Same float-'.0' hazard on the item↔product
+    # key, so normalise both (also makes the output Item Name a clean integer
+    # string instead of '340981.0').
+    pb_with_region['Item'] = _norm_id(pb_with_region['Item'])
+    costco_prices['Prod #'] = _norm_id(costco_prices['Prod #'])
     
     # Create a mapping of item to region prices
     price_mapping = {}

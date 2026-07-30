@@ -109,25 +109,27 @@ def test_ro_history_merge_replaces_matching_month_without_duplicating():
     assert len(out) == 1
 
 
-def test_build_ro_seed_keeps_negative_volume_risk_bypassing_gates():
-    """A negative-volume line (Lbs./yr < 0 = a demand risk) survives even when
-    it's Declined with Probability 0; a POSITIVE line with the same failing
-    gates is still dropped."""
-    def _r(item, lbs, prob, status):
+def test_build_ro_seed_keeps_only_committed_negative_risk_bypassing_gates():
+    """The R&O risk rule = Reflected-in-APS=no AND Lbs./yr<0 AND Probability=100%.
+    Only a line meeting all three bypasses the Declined gate; a negative line
+    under 100%, or one Reflected in APS, does NOT get the exemption."""
+    def _r(item, lbs, prob, status, reflected="no"):
         return {
             "Format": "F", "Customer": "C", "Taxonomy": "T", "Brand": "B",
             "Item #": item, "Item Desc": "D", "Probability": prob,
             "First Ship Date": "2026-04-01", "Lbs./yr": lbs, "PC$/yr": 0.0,
-            "Slotting": 0.0, "Reflected in APS": "no",
+            "Slotting": 0.0, "Reflected in APS": reflected,
             "Pipeline Status": status, "Month": "2026-06",
         }
     df = pd.DataFrame([
-        _r("100", 1000.0, 1.0, "Open"),        # normal opportunity → kept
-        _r("200", -5000.0, 0.0, "Declined"),   # NEGATIVE risk, declined+prob0 → kept
-        _r("300", 4000.0, 0.0, "Declined"),    # positive, declined+prob0 → dropped
+        _r("100", 1000.0, 1.0, "Open"),                    # normal opportunity → kept
+        _r("200", -5000.0, 1.0, "Declined"),               # RISK (neg + 100% + no) → kept
+        _r("300", -4000.0, 0.5, "Declined"),               # neg but 50% → not risk → dropped
+        _r("400", -3000.0, 1.0, "Declined", reflected="yes"),  # neg+100% but reflected → dropped
     ])
     seed = rsp._build_ro_seed(df, {"2026-06"}, _log())
     items = set(seed["Item #"].astype(str))
     assert "100" in items          # normal
-    assert "200" in items          # negative-volume risk bypasses the gates
-    assert "300" not in items      # positive declined+prob0 correctly dropped
+    assert "200" in items          # committed negative risk bypasses the Declined gate
+    assert "300" not in items      # 50% probability — not a committed risk
+    assert "400" not in items      # Reflected in APS — not incremental R&O

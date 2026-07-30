@@ -8,7 +8,8 @@ that planners previously ran by hand:
      ``Distribution_Tracker_History.csv`` — date-overlap cleanup, schema align,
      dedup, type/customer-name normalisation — then **build** ``RO_Seed.csv``
      (filter ``Reflected in APS = no`` / not ``declined`` / ``Probability > 0``,
-     aggregate duplicate source rows).
+     except **R&O risk lines** — see :mod:`data_sources.ro_risk` — which bypass
+     the ``declined`` gate; aggregate duplicate source rows).
   2. **Expand** RO_Seed (7 computed columns, stable RO Key assignment, ``Month``)
      and **merge** it into ``RO_History_Tracker.csv`` (replace matching-Month
      rows, append, dedup).
@@ -44,6 +45,7 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
+from .ro_risk import risk_mask
 from .fabric_lakehouse_io import (
     LakehouseIOError,
     archive_bytes,
@@ -323,14 +325,16 @@ def _build_ro_seed(
         log.warn(f"Date column '{_DATE_COLUMN}' missing or no snapshot dates — "
                  f"seeding from all {len(df):,} combined rows.")
 
-    # Risk lines — negative anticipated annual volume (Lbs./yr < 0) — bypass the
-    # pipeline-status / probability gates: a planned loss is a risk whatever its
-    # status, so it must still reach RO_Seed → the mgmt plan / history / APS.
-    # (The Reflected-in-APS gate still applies to all — a loss already in the
-    # APS base isn't incremental R&O.)
-    is_risk = (
-        pd.to_numeric(df["Lbs./yr"], errors="coerce").fillna(0.0) < 0
-        if "Lbs./yr" in df.columns else pd.Series(False, index=df.index)
+    # R&O "risk" lines (see data_sources.ro_risk for the one canonical rule:
+    # Reflected-in-APS = no AND Lbs./yr < 0 AND Probability = 100%) bypass the
+    # pipeline-status gate — a committed loss is a risk even if its pipeline
+    # status is declined — so it still reaches RO_Seed → the mgmt plan / history
+    # / APS.  A risk is Reflected-in-APS=no by definition (so it survives that
+    # gate) and Probability=100% (so it clears the Probability>0 gate); the only
+    # gate it needs to skip is the declined filter.
+    is_risk = risk_mask(
+        df, volume_col="Lbs./yr", probability_col="Probability",
+        reflected_col="Reflected in APS",
     )
     if "Reflected in APS" in df.columns:
         df = df[df["Reflected in APS"].astype(str).str.strip().str.lower() == "no"]

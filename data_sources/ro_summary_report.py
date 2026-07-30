@@ -123,6 +123,7 @@ from data_sources.ro_comparison import (
     YEAR1_PROB_LE,
     YEAR1_PROB_PRIOR,
 )
+from data_sources.ro_risk import risk_mask
 
 
 logger = logging.getLogger(__name__)
@@ -746,18 +747,17 @@ def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
     if sub.empty:
         return _zero_values()
 
-    # "Risk" = any line whose latest anticipated annual volume is negative
-    # (LE Annual Opportunity < 0) — a planned loss/de-list.  Per the planner,
-    # this bypasses the New/Exit/Change driver rules: whatever the Driver, a
-    # negative-volume line's probabilized change is reported under Risk instead.
-    # New/Exit/Change therefore EXCLUDE risk lines, and
-    # New + Exit + Change + Risk == Total Delta (unchanged), so Prior Plan /
-    # Current Plan / Total Delta — the columns other sections read — are
-    # untouched; only the Delta Breakdown split changes.
-    if ANNUAL_OPP_LE in sub.columns:
-        is_risk = pd.to_numeric(sub[ANNUAL_OPP_LE], errors="coerce").fillna(0.0) < 0
-    else:                               # frame without the volume column → no risk
-        is_risk = pd.Series(False, index=sub.index)
+    # "Risk" = a committed demand loss — the one canonical rule in
+    # data_sources.ro_risk: LE Annual Opportunity < 0 AND LE Probability = 100%
+    # (Reflected-in-APS = no is already guaranteed here — RO_Seed filtered it
+    # upstream, so reflected_col is omitted).  Whatever its New/Exit/Change
+    # Driver, a risk line's probabilized change is reported under Risk instead,
+    # so New/Exit/Change EXCLUDE risk lines and New + Exit + Change + Risk ==
+    # Total Delta (unchanged) — Prior Plan / Current Plan / Total Delta, the
+    # columns other sections read, are untouched; only the Delta Breakdown
+    # split changes.
+    is_risk = risk_mask(
+        sub, volume_col=ANNUAL_OPP_LE, probability_col="LE Probability")
     risk_val   = float(sub.loc[is_risk, CUR_FISCAL_PROB_CHANGE].sum())
     new_val    = float(sub.loc[(sub["Driver"] == "New")    & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())
     exit_val   = float(sub.loc[(sub["Driver"] == "Exit")   & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())

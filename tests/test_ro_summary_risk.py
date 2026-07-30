@@ -30,7 +30,8 @@ from data_sources.ro_summary_report import (
 
 
 def _comp_df() -> pd.DataFrame:
-    """Three ESL Large Carton lines; the middle one is a Risk (negative LE vol)."""
+    """Three ESL Large Carton lines; the middle one is a Risk — negative LE vol
+    AND 100% probability (Reflected-in-APS is already filtered upstream)."""
     return pd.DataFrame({
         "Portfolio Major": ["ESL", "ESL", "ESL"],
         "Supply Format":   ["Large Carton", "Large Carton", "Large Carton"],
@@ -38,9 +39,10 @@ def _comp_df() -> pd.DataFrame:
         "Brand":           ["DG", "DG", "DG"],
         "Description":     ["A", "B", "C"],
         "Driver":          ["Change", "Change", "New"],
-        # Line 2 has a NEGATIVE latest annual opportunity → Risk, even though its
-        # Driver is "Change".
+        # Line 2 is a Risk: NEGATIVE annual opportunity AND 100% probability,
+        # even though its Driver is "Change".
         ANNUAL_OPP_LE:          [10_000_000, -8_000_000, 4_000_000],
+        "LE Probability":       [0.9, 1.0, 0.9],
         CUR_FISCAL_PROB_LE:     [5_000_000, 1_000_000, 2_000_000],
         CUR_FISCAL_PROB_CHANGE: [5_000_000, -3_000_000, 2_000_000],
         YEAR1_PROB_PRIOR:       [0, 0, 0],
@@ -81,3 +83,14 @@ def test_no_risk_when_no_negative_volume():
     # Change now keeps both change lines (5.0 + -3.0 = 2.0); total still 4.0.
     assert _total(df, COL_DELTA_CHANGE) == 2.0
     assert _total(df, COL_TOTAL_DELTA) == 4.0
+
+
+def test_negative_below_100pct_probability_is_not_risk():
+    """A negative line under 100% probability is NOT a risk — it stays in the
+    New/Exit/Change breakdown."""
+    comp = _comp_df()
+    comp["LE Probability"] = [0.9, 0.5, 0.9]   # the negative line drops to 50%
+    df, _warnings, _template = build_summary_report(comp)
+    assert _total(df, COL_DELTA_RISK) == 0.0          # not a committed loss
+    assert _total(df, COL_DELTA_CHANGE) == 2.0        # -3.0 stays in Change (5.0 - 3.0)
+    assert _total(df, COL_TOTAL_DELTA) == 4.0         # total unchanged

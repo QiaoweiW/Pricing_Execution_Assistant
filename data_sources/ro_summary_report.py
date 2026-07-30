@@ -117,6 +117,7 @@ import streamlit as st
 
 from data_sources.fabric_lakehouse_io import LakehouseIOError, read_csv, write_csv
 from data_sources.ro_comparison import (
+    ANNUAL_OPP_LE,
     CUR_FISCAL_PROB_CHANGE,
     CUR_FISCAL_PROB_LE,
     YEAR1_PROB_LE,
@@ -159,13 +160,14 @@ COL_TOTAL_DELTA: str  = "_fy27_total_delta"
 COL_DELTA_NEW: str    = "_delta_new"
 COL_DELTA_EXIT: str   = "_delta_exit"
 COL_DELTA_CHANGE: str = "_delta_change"
+COL_DELTA_RISK: str   = "_delta_risk"
 COL_Y1_PRIOR: str     = "_y1_prior"
 COL_Y1_CHANGE: str    = "_y1_change"
 COL_Y1_LATEST: str    = "_y1_latest"
 
 DATA_COLS: tuple[str, ...] = (
     COL_PRIOR_PLAN, COL_CURRENT_PLAN, COL_TOTAL_DELTA,
-    COL_DELTA_NEW, COL_DELTA_EXIT, COL_DELTA_CHANGE,
+    COL_DELTA_NEW, COL_DELTA_EXIT, COL_DELTA_CHANGE, COL_DELTA_RISK,
     COL_Y1_PRIOR, COL_Y1_CHANGE, COL_Y1_LATEST,
 )
 
@@ -178,6 +180,7 @@ SAVED_COLUMN_LABELS: dict[str, str] = {
     COL_DELTA_NEW:    "Delta Breakdown | New",
     COL_DELTA_EXIT:   "Delta Breakdown | Exit",
     COL_DELTA_CHANGE: "Delta Breakdown | Change",
+    COL_DELTA_RISK:   "Delta Breakdown | Risk",
     COL_Y1_PRIOR:     "FY28 Probabilized | Prior",
     COL_Y1_CHANGE:    "FY28 Probabilized | Change",
     COL_Y1_LATEST:    "FY28 Probabilized | Latest",
@@ -743,15 +746,28 @@ def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
     if sub.empty:
         return _zero_values()
 
-    new_val    = float(sub.loc[sub["Driver"] == "New",    CUR_FISCAL_PROB_CHANGE].sum())
-    exit_val   = float(sub.loc[sub["Driver"] == "Exit",   CUR_FISCAL_PROB_CHANGE].sum())
-    change_val = float(sub.loc[sub["Driver"] == "Change", CUR_FISCAL_PROB_CHANGE].sum())
+    # "Risk" = any line whose latest anticipated annual volume is negative
+    # (LE Annual Opportunity < 0) — a planned loss/de-list.  Per the planner,
+    # this bypasses the New/Exit/Change driver rules: whatever the Driver, a
+    # negative-volume line's probabilized change is reported under Risk instead.
+    # New/Exit/Change therefore EXCLUDE risk lines, and
+    # New + Exit + Change + Risk == Total Delta (unchanged), so Prior Plan /
+    # Current Plan / Total Delta — the columns other sections read — are
+    # untouched; only the Delta Breakdown split changes.
+    if ANNUAL_OPP_LE in sub.columns:
+        is_risk = pd.to_numeric(sub[ANNUAL_OPP_LE], errors="coerce").fillna(0.0) < 0
+    else:                               # frame without the volume column → no risk
+        is_risk = pd.Series(False, index=sub.index)
+    risk_val   = float(sub.loc[is_risk, CUR_FISCAL_PROB_CHANGE].sum())
+    new_val    = float(sub.loc[(sub["Driver"] == "New")    & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())
+    exit_val   = float(sub.loc[(sub["Driver"] == "Exit")   & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())
+    change_val = float(sub.loc[(sub["Driver"] == "Change") & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())
 
     prior_y1  = float(sub[YEAR1_PROB_PRIOR].sum())
     latest_y1 = float(sub[YEAR1_PROB_LE].sum())
 
     current_plan = float(sub[CUR_FISCAL_PROB_LE].sum())
-    total_delta  = new_val + exit_val + change_val
+    total_delta  = new_val + exit_val + change_val + risk_val
 
     return {
         # Prior Plan is the FY27 plan before this cycle's deltas.  Total
@@ -764,6 +780,7 @@ def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
         COL_DELTA_NEW:    new_val,
         COL_DELTA_EXIT:   exit_val,
         COL_DELTA_CHANGE: change_val,
+        COL_DELTA_RISK:   risk_val,
         COL_Y1_PRIOR:     prior_y1,
         COL_Y1_CHANGE:    latest_y1 - prior_y1,
         COL_Y1_LATEST:    latest_y1,

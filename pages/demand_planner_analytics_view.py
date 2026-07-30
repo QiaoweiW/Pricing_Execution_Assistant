@@ -337,6 +337,7 @@ from data_sources.ro_comparison import (
 )
 from data_sources.ro_summary_report import (
     COL_DELTA_CHANGE as SR_COL_DELTA_CHANGE,
+    COL_DELTA_RISK as SR_COL_DELTA_RISK,
     COL_DELTA_EXIT as SR_COL_DELTA_EXIT,
     COL_DELTA_NEW as SR_COL_DELTA_NEW,
     COL_CURRENT_PLAN as SR_COL_CURRENT_PLAN,
@@ -4097,6 +4098,7 @@ _RO_SR_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (SR_COL_DELTA_NEW, "New"),
         (SR_COL_DELTA_EXIT, "Exit"),
         (SR_COL_DELTA_CHANGE, "Change"),
+        (SR_COL_DELTA_RISK, "Risk"),
     )),
     # Prior → Latest → Change (planner-requested order: where it started, where
     # it landed, then the swing).  Group renamed FY28 Probabilized (see below).

@@ -200,10 +200,8 @@ from data_sources.demand_plan_comparison import (
     BIAS_COL_IMPACT,
     BIAS_COL_FLAG_DIR,
     BIAS_COL_FLAG_SEV,
-    BIAS_COL_FLAG_FVA,
     BIAS_FLAG_PRIORITY,
     BIAS_FLAG_MONITOR,
-    BIAS_FVA_BELOW,
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
@@ -8085,8 +8083,11 @@ _BIAS_CSS: str = """
 .bias .spark {display:inline-flex; align-items:flex-end; gap:1px; height:16px;
   justify-content:flex-end;}
 .bias .spark i {width:4px; display:inline-block; border-radius:1px;}
+.bias .trend {display:inline-flex; align-items:center; gap:8px;}
+.bias .trend b {font-size:.8rem; white-space:nowrap;}
+.bias .flagmsg {font-size:.82rem; color:#334155;}
 .bias .chip {display:inline-block; padding:1px 7px; border-radius:9px;
-  font-size:.7rem; font-weight:700;}
+  font-size:.7rem; font-weight:700; margin-right:6px;}
 .bias .chip.pri {background:#fde2e1; color:#c0392b;}
 .bias .chip.mon {background:#fdf0d5; color:#9a6a00;}
 .bias .chip.dir {background:#eef1f4; color:#55606e; font-weight:600; margin-left:4px;}
@@ -8139,6 +8140,39 @@ def _bias_spark(values: list) -> str:
     return f'<span class="spark">{"".join(bars)}</span>'
 
 
+# Minimum change in mean |bias| (0.5pp) to call an accuracy trend a direction.
+_BIAS_TREND_EPS: float = 0.005
+
+
+def _bias_trend(values: list) -> tuple[str, str, str]:
+    """Return ``(arrow, word, color)`` for the accuracy trend over the months.
+
+    Accuracy = |Bias%|.  Compares the mean |bias| of the recent half of the
+    window vs the older half; a shrinking error reads as **Improving**.  Needs
+    ≥ 4 real months, else "Flat".  Green = improving (good), red = worsening.
+    """
+    nums = [abs(float(v)) for v in values if v is not None and not pd.isna(v)]
+    if len(nums) < 4:
+        return "→", "Flat", "#6b7280"
+    half = len(nums) // 2
+    older = sum(nums[:half]) / half
+    recent = sum(nums[len(nums) - half:]) / half
+    if recent < older - _BIAS_TREND_EPS:
+        return "↘", "Improving", "#1b7f3a"
+    if recent > older + _BIAS_TREND_EPS:
+        return "↗", "Worsening", "#c0392b"
+    return "→", "Flat", "#6b7280"
+
+
+def _bias_trend_cell(values: list) -> str:
+    """Readable Trend cell: arrow + word (improving/worsening/flat) + sparkline."""
+    arrow, word, color = _bias_trend(values)
+    return (
+        f'<span class="trend"><b style="color:{color}">{arrow} {word}</b>'
+        f'{_bias_spark(values)}</span>'
+    )
+
+
 def _wmape_severity_cls(severity: object) -> str:
     """CSS class colouring the WMAPE cell to match its severity chip."""
     if severity == BIAS_FLAG_PRIORITY:
@@ -8148,23 +8182,33 @@ def _wmape_severity_cls(severity: object) -> str:
     return ""
 
 
-def _bias_flag_html(direction: object, severity: object, fva_verdict: object) -> str:
-    """Flag cell: severity chip (Priority/Monitor) + Over/Under + FVA verdict.
+def _bias_flag_html(
+    severity: object, trend_word: str, direction: object, driver: object,
+) -> str:
+    """Flag cell as a trend sentence: severity chip + '<trend> accuracy' + driver.
 
-    The FVA chip only appears in its actionable state (``Below naive`` — the
-    plan lost to a same-month-last-year guess); positive FVA is the expected
-    good case and stays unlabelled to keep the cell readable.
+    Leads with the accuracy trend (Improving / Worsening / Flat) so the planner
+    reads the direction of travel first, keeps the Priority / Monitor chip when
+    the miss is material, notes over/under-forecast, and — for flagged rows —
+    names the top Corporate × SKU driver behind the miss (from the corp×SKU
+    drill).  ``driver`` is ``None`` when unavailable (low attribution / not
+    flagged), and the clause is dropped.
     """
     chips: list[str] = []
     if severity == BIAS_FLAG_PRIORITY:
         chips.append('<span class="chip pri">Priority</span>')
     elif severity == BIAS_FLAG_MONITOR:
         chips.append('<span class="chip mon">Monitor</span>')
+
+    word = (trend_word or "Flat")
+    dir_txt = ""
     if direction and str(direction) not in ("", "Balanced"):
-        chips.append(f'<span class="chip dir">{_esc_html(direction)}</span>')
-    if fva_verdict == BIAS_FVA_BELOW:
-        chips.append(f'<span class="chip fva">{_esc_html(BIAS_FVA_BELOW)}</span>')
-    return "".join(chips) if chips else "—"
+        dir_txt = f", {str(direction).lower()}-forecast"   # Over / Under
+    sentence = f"{word} accuracy{dir_txt}"
+    if driver:
+        sentence += f" — driven by {driver}"
+    chips.append(f'<span class="flagmsg">{_esc_html(sentence)}</span>')
+    return "".join(chips)
 
 
 def _render_bias_tiles(total: pd.Series | None) -> None:
@@ -8262,10 +8306,22 @@ def _render_bias_instructions(month_meta: tuple) -> None:
 
 def _render_bias_tree(
     table: pd.DataFrame, months: tuple[str, ...], month_meta: tuple,
+    *,
+    show_months: bool = False,
+    show_detail: bool = False,
+    driver_by_seg: Optional[dict[str, str]] = None,
 ) -> None:
-    """Render the foldable Bias-by-segment×month tree (fallback months marked *)."""
+    """Render the foldable Bias-by-segment tree.
+
+    Trend leads (arrow + word + sparkline).  The six monthly-bias columns are
+    hidden unless *show_months*; the 6-Mo Avg Bias / WMAPE / FVA detail columns
+    are hidden unless *show_detail*.  Segment, Trend and Flag are always shown.
+    *driver_by_seg* maps a segment row_id → "Corp × SKU" driver string for the
+    flag sentence (flagged rows only).
+    """
     rows = table.reset_index(drop=True)
     indent_flags = rows["_indent"].tolist() if "_indent" in rows.columns else []
+    driver_by_seg = driver_by_seg or {}
     # month_key -> (cycle, lag, is_fallback)
     meta_by_key = {k: (cyc, lag, fb) for k, cyc, lag, fb in month_meta}
 
@@ -8282,32 +8338,39 @@ def _render_bias_tree(
 
     def _make_row(i: int, foldable: bool) -> tuple[str, str]:
         row = rows.iloc[i]
+        monthly = [row.get(mk) for mk in months]
         parts = [f'<span class="lbl">{_tri_span(foldable)}{_esc_html(row.get(DPC_COL_LABEL, ""))}</span>']
-        for mk in months:
-            txt, c = _bias_fmt_pct(row.get(mk))
-            parts.append(f'<span class="{c}">{_esc_html(txt)}</span>')
-        parts.append(f'<span class="wide">{_bias_spark([row.get(mk) for mk in months])}</span>')
-        avg_txt, avg_c = _bias_fmt_pct(row.get(BIAS_COL_AVG))
-        parts.append(f'<span class="{avg_c}">{_esc_html(avg_txt)}</span>')
-        wmape_cls = _wmape_severity_cls(row.get(BIAS_COL_FLAG_SEV))
-        parts.append(
-            f'<span class="{wmape_cls}">'
-            f'{_esc_html(_bias_wmape_txt(row.get(BIAS_COL_WMAPE)))}</span>')
-        fva_txt, fva_c = _bias_pp(row.get(BIAS_COL_FVA))
-        parts.append(f'<span class="{fva_c}">{_esc_html(fva_txt)}</span>')
+        # Trend leads.
+        parts.append(f'<span class="wide">{_bias_trend_cell(monthly)}</span>')
+        if show_months:
+            for mk in months:
+                txt, c = _bias_fmt_pct(row.get(mk))
+                parts.append(f'<span class="{c}">{_esc_html(txt)}</span>')
+        if show_detail:
+            avg_txt, avg_c = _bias_fmt_pct(row.get(BIAS_COL_AVG))
+            parts.append(f'<span class="{avg_c}">{_esc_html(avg_txt)}</span>')
+            wmape_cls = _wmape_severity_cls(row.get(BIAS_COL_FLAG_SEV))
+            parts.append(
+                f'<span class="{wmape_cls}">'
+                f'{_esc_html(_bias_wmape_txt(row.get(BIAS_COL_WMAPE)))}</span>')
+            fva_txt, fva_c = _bias_pp(row.get(BIAS_COL_FVA))
+            parts.append(f'<span class="{fva_c}">{_esc_html(fva_txt)}</span>')
+        _arrow, trend_word, _color = _bias_trend(monthly)
         flag_html = _bias_flag_html(
-            row.get(BIAS_COL_FLAG_DIR), row.get(BIAS_COL_FLAG_SEV),
-            row.get(BIAS_COL_FLAG_FVA))
+            row.get(BIAS_COL_FLAG_SEV), trend_word, row.get(BIAS_COL_FLAG_DIR),
+            driver_by_seg.get(str(row.get("_row_id", ""))))
         parts.append(f'<span class="wide">{flag_html}</span>')
         return _cls(row), "".join(parts)
 
-    head = ['<span class="lbl">Segment</span>']
-    head += [
-        f'<span>{_esc_html(mk)}{"*" if meta_by_key.get(mk, ("", 0, False))[2] else ""}</span>'
-        for mk in months
-    ]
-    head += ['<span class="wide">Trend</span>', "<span>6-Mo Avg Bias</span>",
-             "<span>WMAPE</span>", "<span>FVA</span>", '<span class="wide">Flag</span>']
+    head = ['<span class="lbl">Segment</span>', '<span class="wide">Trend</span>']
+    if show_months:
+        head += [
+            f'<span>{_esc_html(mk)}{"*" if meta_by_key.get(mk, ("", 0, False))[2] else ""}</span>'
+            for mk in months
+        ]
+    if show_detail:
+        head += ["<span>6-Mo Avg Bias</span>", "<span>WMAPE</span>", "<span>FVA</span>"]
+    head += ['<span class="wide">Flag</span>']
     header = '<div class="rw hdr">' + "".join(head) + "</div>"
     body = _foldable_tree_body(len(rows), indent_flags, _make_row)
     st.markdown(
@@ -8386,12 +8449,93 @@ def _render_forecast_bias_section(
     _render_bias_instructions(month_meta)
     by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
     _render_bias_tiles(by_id.get("total_b2c"))
-    _render_bias_tree(table, months, month_meta)
+
+    # Compact by default: lead with Trend, hide the monthly + detail columns
+    # behind toggles.  Trend + Flag stay always on.
+    c1, c2, c3 = st.columns(3)
+    show_detail = c1.toggle(
+        "Show 6-Mo Bias · WMAPE · FVA", value=False, key="bias_show_detail")
+    show_months = c2.toggle(
+        "Show monthly bias columns", value=False, key="bias_show_months")
+    name_drivers = c3.toggle(
+        "Name Corp × SKU driver in flags", value=False, key="bias_flag_drivers",
+        help="Attributes each flagged segment's miss to its top Corporate × SKU "
+             "driver and names it in the Flag.  Off by default — it re-runs the "
+             "corp×SKU attribution per flagged segment (cached after first run).")
+
+    driver_by_seg: dict[str, str] = {}
+    if name_drivers:
+        with st.spinner("Attributing flagged segments to Corporate × SKU…"):
+            driver_by_seg = _bias_driver_by_segment(
+                table, tracker_df, pdh_df, item_master_df, filters,
+                ibp_actuals_df, ibp_naive_df)
+
+    _render_bias_tree(
+        table, months, month_meta,
+        show_months=show_months, show_detail=show_detail,
+        driver_by_seg=driver_by_seg)
 
     # Opt-in drill: Corporate group × SKU drivers of the segment miss.
     _render_bias_corp_sku_drivers(
         tracker_df, pdh_df, item_master_df, filters,
         ibp_actuals_df, ibp_naive_df, table)
+
+
+def _bias_driver_by_segment(
+    table: pd.DataFrame,
+    tracker_df: pd.DataFrame,
+    pdh_df: Optional[pd.DataFrame],
+    item_master_df: Optional[pd.DataFrame],
+    filters: ComparisonFilters,
+    ibp_actuals_df: Optional[pd.DataFrame],
+    ibp_naive_df: Optional[pd.DataFrame],
+) -> dict[str, str]:
+    """Top Corporate × SKU driver string per FLAGGED segment, for the flag.
+
+    Bounded + best-effort: only flagged rows (Priority / Monitor) are attributed,
+    it reuses the same cached corp×SKU builder the drill-in uses (so repeats are
+    free), and a segment is named only when its forecast attribution clears
+    :data:`_BIAS_DRIVERS_MIN_FCST_ATTR` (else the corp split isn't trustworthy).
+    Returns ``{}`` when the corporate-group dims can't be loaded.
+    """
+    if BIAS_COL_FLAG_SEV not in table.columns:
+        return {}
+    flagged = [
+        str(r["_row_id"]) for _, r in table.iterrows()
+        if str(r.get(BIAS_COL_FLAG_SEV, "")).strip()
+    ]
+    if not flagged:
+        return {}
+    sts, pts, names, _warn = _load_corp_group_dims()
+    if sts is None or pts is None or names is None:
+        return {}
+    base_sig = (
+        _signature_for(tracker_df), _signature_for(ibp_actuals_df),
+        _signature_for(ibp_naive_df), _signature_for(pdh_df),
+        _signature_for(item_master_df), _signature_for(sts),
+        _signature_for(pts), _signature_for(names),
+        filters.prior_month.isoformat(), tuple(sorted(filters.combo_exclude)),
+    )
+    out: dict[str, str] = {}
+    for seg in flagged:
+        try:
+            (drivers, _months, _lbl, _vol, _attr, fcst_attr, avail
+             ) = _cached_corp_sku_drivers(
+                base_sig + (seg,), filters, seg, tracker_df, ibp_actuals_df,
+                ibp_naive_df, pdh_df, item_master_df, sts, pts, names)
+        except Exception:                       # noqa: BLE001 — never fatal
+            continue
+        if not avail or drivers is None or drivers.empty:
+            continue
+        if pd.isna(fcst_attr) or fcst_attr < _BIAS_DRIVERS_MIN_FCST_ATTR:
+            continue
+        top = drivers.iloc[0]
+        corp = _corp_driver_label(top)
+        sku = str(top.get("item_desc") or top.get("item_key") or "").strip()
+        label = " × ".join(x for x in (corp, sku) if x)
+        if label:
+            out[seg] = label
+    return out
 
 
 # ── Corporate group × SKU drivers (opt-in drill under the bias tree) ─────────

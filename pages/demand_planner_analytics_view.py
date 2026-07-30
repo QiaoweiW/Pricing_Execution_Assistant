@@ -11839,6 +11839,13 @@ def render() -> None:
     _render_velocity_analysis()
     st.markdown("---")
 
+    # Business Health (trailing-window order momentum) — a self-contained
+    # read-only foldable, kept near the top so it stays visible.  (An earlier
+    # move below the Demand Summary buried it beneath the large, expanded RO
+    # Comparison section, so it is restored here.)
+    _render_business_health()
+    st.markdown("---")
+
     _render_ro_comparison()
     st.markdown("---")
 
@@ -11849,12 +11856,6 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
-    st.markdown("---")
-
-    # Business Health (trailing-window order momentum) — a self-contained
-    # read-only view — now sits BELOW the Demand Summary (YoY Comparison) table
-    # rather than above it, per the planner's requested order.
-    _render_business_health()
     st.markdown("---")
 
     _render_product_line_review()

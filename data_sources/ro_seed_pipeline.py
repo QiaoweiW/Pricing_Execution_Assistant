@@ -323,16 +323,28 @@ def _build_ro_seed(
         log.warn(f"Date column '{_DATE_COLUMN}' missing or no snapshot dates — "
                  f"seeding from all {len(df):,} combined rows.")
 
+    # Risk lines — negative anticipated annual volume (Lbs./yr < 0) — bypass the
+    # pipeline-status / probability gates: a planned loss is a risk whatever its
+    # status, so it must still reach RO_Seed → the mgmt plan / history / APS.
+    # (The Reflected-in-APS gate still applies to all — a loss already in the
+    # APS base isn't incremental R&O.)
+    is_risk = (
+        pd.to_numeric(df["Lbs./yr"], errors="coerce").fillna(0.0) < 0
+        if "Lbs./yr" in df.columns else pd.Series(False, index=df.index)
+    )
     if "Reflected in APS" in df.columns:
         df = df[df["Reflected in APS"].astype(str).str.strip().str.lower() == "no"]
+        is_risk = is_risk.loc[df.index]
         log.info(f"After 'Reflected in APS = no': {len(df):,} rows")
     if "Pipeline Status" in df.columns:
-        df = df[~df["Pipeline Status"].astype(str).str.lower()
-                .str.contains("declined", na=False)]
-        log.info(f"After 'Pipeline Status != declined': {len(df):,} rows")
+        ok = ~df["Pipeline Status"].astype(str).str.lower().str.contains("declined", na=False)
+        df = df[ok | is_risk]
+        is_risk = is_risk.loc[df.index]
+        log.info(f"After 'Pipeline Status != declined' (risk-exempt): {len(df):,} rows")
     if "Probability" in df.columns:
-        df = df[df["Probability"] > 0]
-        log.info(f"After 'Probability > 0': {len(df):,} rows")
+        ok = pd.to_numeric(df["Probability"], errors="coerce").fillna(0.0) > 0
+        df = df[ok | is_risk]
+        log.info(f"After 'Probability > 0' (risk-exempt): {len(df):,} rows")
 
     # Aggregate duplicate source rows: sum the metric columns per business key.
     agg_keys = [c for c in _AGG_KEYS if c in df.columns]

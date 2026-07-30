@@ -343,9 +343,12 @@ def _ro_input_to_long(
               var_name="Attribute", value_name="Value")
         .assign(
             Attribute=lambda d: d["Attribute"].astype(str).str.strip(),
+            # A blank cell ("-") coerces to NaN → 0; a genuine negative
+            # ("-51697") is PRESERVED — it's a demand risk / de-list.  Do NOT
+            # strip "-", which turned "-51697" into "051697" (+51697), silently
+            # flipping a risk into an opportunity.
             Value=lambda d: pd.to_numeric(
-                d["Value"].astype(str).str.replace(",", "", regex=False)
-                          .str.replace("-", "0", regex=False).str.strip(),
+                d["Value"].astype(str).str.replace(",", "", regex=False).str.strip(),
                 errors="coerce").fillna(0),
         )
         .groupby(id_cols + ["Attribute"], as_index=False).agg(Pounds=("Value", "sum"))
@@ -411,12 +414,18 @@ def _build_mgmt_plan_and_detail(
           "Forecast Type", "Demand Plan Pounds"]]
     )
 
-    # --- Combine + row filters (positive demand, dated, forward window) -------
+    # --- Combine + row filters (demand, dated, forward window) ---------------
     combined = pd.concat([base_long, ro_long], ignore_index=True)
     combined["Party Site Number"] = (
         combined["Party Site Number"].fillna("NA")
         if "Party Site Number" in combined.columns else "NA")
-    combined = combined[combined["Demand Plan Pounds"] > 0]
+    # Keep positive demand; ALSO keep NEGATIVE R&O (a demand risk / de-list) so
+    # it flows into qry_mgmt_plan_full, the history tracker and the APS mirror.
+    # Base-plan rows stay strictly positive; zeros are always dropped.
+    _pounds = combined["Demand Plan Pounds"]
+    combined = combined[
+        (_pounds > 0) | ((_pounds < 0) & (combined["Forecast Type"] == "R&O"))
+    ]
     combined = combined[combined["Start of Month"].notna()]
     combined = combined[combined["Start of Month"] < window_end].reset_index(drop=True)
     combined["Start of Month"] = combined["Start of Month"].dt.normalize()
@@ -490,9 +499,12 @@ def _build_detail(
               var_name="Attribute", value_name="Value")
         .assign(
             Attribute=lambda d: d["Attribute"].astype(str).str.strip(),
+            # A blank cell ("-") coerces to NaN → 0; a genuine negative
+            # ("-51697") is PRESERVED — it's a demand risk / de-list.  Do NOT
+            # strip "-", which turned "-51697" into "051697" (+51697), silently
+            # flipping a risk into an opportunity.
             Value=lambda d: pd.to_numeric(
-                d["Value"].astype(str).str.replace(",", "", regex=False)
-                          .str.replace("-", "0", regex=False).str.strip(),
+                d["Value"].astype(str).str.replace(",", "", regex=False).str.strip(),
                 errors="coerce").fillna(0),
         )
         .groupby(["Item #", "Item Desc", "Customer", "Attribute"], as_index=False)
@@ -506,7 +518,8 @@ def _build_detail(
                    "Customer Name": lambda d: d["Customer Name"].astype("string").str.strip(),
                    "Party Site Number": "NA", "Forecast Type": "R&O"})
     )
-    ro_detail = ro_detail[ro_detail["Demand Plan Pounds"] > 0]
+    # R&O detail: keep negatives too (demand risk), drop only zeros.
+    ro_detail = ro_detail[ro_detail["Demand Plan Pounds"] != 0]
     ro_detail = ro_detail[ro_detail["Start of Month"].notna()]
     ro_detail = ro_detail[ro_detail["Start of Month"] < window_end].reset_index(drop=True)
     ro_detail = _keep_b2c(ro_detail)

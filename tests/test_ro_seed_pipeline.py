@@ -107,3 +107,27 @@ def test_ro_history_merge_replaces_matching_month_without_duplicating():
     })
     out = rsp._merge_into_ro_history(seed, df_hist, _log())
     assert len(out) == 1
+
+
+def test_build_ro_seed_keeps_negative_volume_risk_bypassing_gates():
+    """A negative-volume line (Lbs./yr < 0 = a demand risk) survives even when
+    it's Declined with Probability 0; a POSITIVE line with the same failing
+    gates is still dropped."""
+    def _r(item, lbs, prob, status):
+        return {
+            "Format": "F", "Customer": "C", "Taxonomy": "T", "Brand": "B",
+            "Item #": item, "Item Desc": "D", "Probability": prob,
+            "First Ship Date": "2026-04-01", "Lbs./yr": lbs, "PC$/yr": 0.0,
+            "Slotting": 0.0, "Reflected in APS": "no",
+            "Pipeline Status": status, "Month": "2026-06",
+        }
+    df = pd.DataFrame([
+        _r("100", 1000.0, 1.0, "Open"),        # normal opportunity → kept
+        _r("200", -5000.0, 0.0, "Declined"),   # NEGATIVE risk, declined+prob0 → kept
+        _r("300", 4000.0, 0.0, "Declined"),    # positive, declined+prob0 → dropped
+    ])
+    seed = rsp._build_ro_seed(df, {"2026-06"}, _log())
+    items = set(seed["Item #"].astype(str))
+    assert "100" in items          # normal
+    assert "200" in items          # negative-volume risk bypasses the gates
+    assert "300" not in items      # positive declined+prob0 correctly dropped

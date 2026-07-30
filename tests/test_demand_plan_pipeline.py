@@ -238,3 +238,50 @@ def test_history_tracker_dedupes_identical_rows(monkeypatch):
     assert int(combined.duplicated().sum()) == 0        # no duplicate rows
     assert len(combined) == 2                            # 1 deduped C4 + 1 new C5
     assert set(combined["Cycle"]) == {"C4", "C5"}
+
+
+def test_ro_input_to_long_preserves_negative_volume():
+    """A negative RO monthly value (demand risk) survives as negative; a blank
+    '-' still coerces to 0.  Regression for the '-'→'0' mangle that flipped a
+    risk (-51697) into an opportunity (+51697)."""
+    mcols = [f"Month {i}" for i in range(1, dp._N_MONTHS + 1)]
+    row = {"Item #": "500", "Item Desc": "Risk"}
+    for m in mcols:
+        row[m] = "-"                         # blank placeholder → 0
+    row["Month 1"] = "-51,697.97"            # genuine negative (comma fmt)
+    row["Month 2"] = "1,000"                 # positive
+    tri = pd.DataFrame([row])
+    qm = pd.DataFrame({
+        "Month Number": mcols,
+        "Start of Month": [
+            (pd.Timestamp("2026-04-01") + pd.DateOffset(months=i)).date()
+            for i in range(len(mcols))],
+    })
+    out = dp._ro_input_to_long(tri, qm)
+    nz = out[out["Demand Plan Pounds"] != 0].sort_values("Start of Month")
+    vals = [round(float(v), 2) for v in nz["Demand Plan Pounds"]]
+    assert vals == [-51697.97, 1000.0]       # negative preserved, blanks → 0
+
+
+def test_negative_ro_volume_flows_into_mgmt_full(monkeypatch):
+    """A negative-Lbs./yr RO opportunity (a demand risk) reaches qry_mgmt_plan_
+    full as a NEGATIVE R&O row (previously mangled positive, then it would have
+    been dropped by the >0 filter)."""
+    reads = _sources()
+    seed = reads[dp._RO_SEED_BLOB].copy()
+    neg = dict(seed.iloc[0])
+    neg.update({"Item #": "310181", "Item Desc": "Risk SKU", "Lbs./yr": "-3650"})
+    reads[dp._RO_SEED_BLOB] = pd.concat(
+        [seed, pd.DataFrame([neg])], ignore_index=True)
+    pdh = reads[dp._PDH_BLOB].copy()
+    reads[dp._PDH_BLOB] = pd.concat([pdh, pd.DataFrame([{
+        "Item No": "310181", "Business Unit": "B2C", "Portfolio Major": "Butter",
+        "Portfolio Minor": "Qtr", "Supply Format": "Carton"}])], ignore_index=True)
+    written = _patch_io(monkeypatch, reads)
+
+    res = dp.run_demand_plan_pipeline(_base_plan_bytes())
+    assert res.ok, res.errors
+    mgmt = written[dp._MGMT_PLAN_FULL_BLOB]
+    ro = mgmt[(mgmt["Item"] == "310181") & (mgmt["Forecast Type"] == "R&O")]
+    assert not ro.empty                                   # risk row kept
+    assert (pd.to_numeric(ro["Demand Plan Pounds"]) < 0).any()   # and it's NEGATIVE

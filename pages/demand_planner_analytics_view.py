@@ -369,8 +369,14 @@ from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
     fetch_ro_seed_raw_bytes,
+    rebuild_ro_seed_from_published_history,
     ro_seed_blob_path,
     run_distribution_tracker_pipeline,
+)
+from data_sources.ro_rules_config import (
+    RoRulesConfig,
+    SESSION_KEY as RO_RULES_SESSION_KEY,
+    config_from_session as ro_rules_config_from_session,
 )
 from data_sources.demand_plan_pipeline import (
     DemandPlanResult,
@@ -478,6 +484,12 @@ _IBP_SUPPORTING_FILES: tuple[tuple[str, str], ...] = (
         "https://app.fabric.microsoft.com/groups/me/reports/"
         "7d03fb42-73c9-48c3-8ebf-b2dffceed69d/8e711805f364f2606729"
         "?ctid=c9a55ced-3b88-408c-ab99-8db8b9b90286&experience=power-bi",
+    ),
+    (
+        "Supply Service Level Tracker",
+        "https://app.powerbi.com/groups/me/reports/"
+        "f8bb7af4-96c2-446a-a37e-bb832328710d/"
+        "ReportSection0bf04e2f417b8c939b20?experience=power-bi",
     ),
     ("RFP tracker", _RFP_TRACKER_URL),
     ("Demand Planning BI Dashboard", _DEMAND_PLANNING_PBIX_URL),
@@ -1694,6 +1706,12 @@ def _render_ro_comparison() -> None:
 
         _render_ro_item_master_download_button()
         _render_ro_seed_download_button()
+        _render_ro_seed_summary_reconcile_button()
+
+        # 1a. RO inclusion rules — placed at the top of the section so
+        #     planners see what's currently in Opportunity vs Risk BEFORE
+        #     scanning the tables, and can retune without hunting.
+        _render_ro_rules_panel()
 
         # 1b. "How to see your changes after upload" guidance.
         #     Replaces the old "🔄 Refresh from Fabric" button.  The
@@ -1943,7 +1961,9 @@ def _render_ro_regen_from_published() -> None:
         # 3) RO Summary Report — hierarchical roll-up of the published file.
         st.markdown("### 📊 RO Summary Report — published file")
         try:
-            report_df, _warn, _tpl = build_summary_report(df)
+            report_df, _warn, _tpl = build_summary_report(
+                df, config=ro_rules_config_from_session(st.session_state),
+            )
         except RoSummaryReportError as exc:
             st.error(f"❌ Could not build the RO Summary Report.\n\n{exc}")
             return
@@ -2046,6 +2066,160 @@ def _render_ro_seed_download_button() -> None:
     )
 
 
+# Session key holding the last reconciliation result so the divergence detail
+# survives a Streamlit rerun (opening an expander) without re-reading Fabric.
+_SS_RECONCILE_RESULT: str = "_ro_seed_summary_reconcile_result"
+
+
+def _render_ro_seed_summary_reconcile_button() -> None:
+    """One-click audit: does RO_Seed.csv agree with the RO Summary Report?
+
+    The Demand Plan ETL builds ``qry_mgmt_plan_full`` / ``qry_total_item_
+    level_demand`` from ``RO_Seed.csv``; the RO Summary Report is built from
+    ``RO_Comparison_Output.csv``.  Both files travel through independent
+    pipelines and can legitimately drift — a Summary edit saved directly, a
+    stale seed under the current rules, a risk still carried in
+    ``RO_History_Tracker.csv`` but dropped from the latest Distribution
+    Tracker upload.  When they drift, the mgmt-plan files silently
+    under-report R&O relative to what the planner just approved.
+
+    This surfaces the drift explicitly: one button, one call, warning + row
+    detail when risks live in one file but not the other, under the CURRENT
+    :class:`data_sources.ro_rules_config.RoRulesConfig` so the audit matches
+    exactly what the RO Summary above is showing.  Pure diagnostic — nothing
+    is written to Fabric.
+    """
+    if not fabric_signin_widget.is_fabric_signed_in():
+        return
+
+    clicked = st.button(
+        "🔍 Reconcile RO_Seed with RO Summary",
+        key="ro_cmp_reconcile_seed_summary",
+        help=(
+            "Check that every risk the RO Summary Report shows is also in "
+            "RO_Seed.csv (the file the Demand Plan ETL reads).  Divergences "
+            "are the top reason qry_mgmt_plan_full / qry_total_item_level_"
+            "demand don't reflect a freshly committed risk."
+        ),
+    )
+    if clicked:
+        st.session_state[_SS_RECONCILE_RESULT] = _run_ro_seed_summary_reconcile()
+
+    result = st.session_state.get(_SS_RECONCILE_RESULT)
+    if result is not None:
+        _render_ro_seed_summary_reconcile_result(result)
+
+
+def _run_ro_seed_summary_reconcile():
+    """Read both files and delegate to the pure reconciliation module.
+
+    Returns either a ``RiskReconciliationResult`` or a string error message
+    (rendered as an ``st.error`` banner).  Kept as a thin adapter so the
+    reconciliation logic itself stays I/O- and Streamlit-free.
+    """
+    import io as _io
+
+    from data_sources.ro_risk_reconcile import reconcile_ro_seed_vs_summary
+
+    cfg = ro_rules_config_from_session(st.session_state)
+
+    with st.spinner("Reading RO_Seed.csv from Fabric…"):
+        try:
+            seed_bytes = fetch_ro_seed_raw_bytes()
+        except LakehouseIOError as exc:
+            return f"Could not read RO_Seed.csv: {exc}"
+        try:
+            seed_df = pd.read_csv(_io.BytesIO(seed_bytes))
+        except Exception as exc:  # noqa: BLE001 - surface parse errors
+            return f"Could not parse RO_Seed.csv: {exc}"
+
+    with st.spinner("Reading RO_Comparison_Output.csv from Fabric…"):
+        try:
+            comparison_df = fetch_ro_comparison_output_df()
+        except RoComparisonError as exc:
+            return f"Could not read RO_Comparison_Output.csv: {exc}"
+
+    return reconcile_ro_seed_vs_summary(seed_df, comparison_df, config=cfg)
+
+
+def _render_ro_seed_summary_reconcile_result(result) -> None:
+    """Render either an error banner or the reconciliation verdict + detail.
+
+    ``result`` is whatever :func:`_run_ro_seed_summary_reconcile` returned —
+    a ``RiskReconciliationResult`` on success, or an error string on any
+    Fabric-read failure.
+    """
+    from data_sources.ro_risk_reconcile import RiskReconciliationResult
+
+    if isinstance(result, str):
+        st.error(f"❌ Reconciliation could not run — {result}")
+        return
+
+    assert isinstance(result, RiskReconciliationResult)  # narrow the type
+
+    cfg = ro_rules_config_from_session(st.session_state)
+    rules_caption = (
+        f"Rules: Risk Prob ≥ {cfg.min_risk_probability * 100:.0f}%, "
+        f"Vol<0 required = {cfg.risk_requires_negative_volume}, "
+        f"Reflected-in-APS only = {cfg.reflected_in_aps_only}"
+    )
+
+    if result.is_aligned:
+        st.success(
+            f"✅ RO_Seed and RO Summary agree — "
+            f"**{result.seed_risk_count}** risk row(s) in RO_Seed match "
+            f"**{result.summary_risk_count}** in the RO Summary "
+            f"(matched on {len(result.matched)} business key(s)).  "
+            f"{rules_caption}."
+        )
+        return
+
+    st.warning(
+        f"⚠️ **{result.total_divergence} risk row(s) diverge** between "
+        f"RO_Seed.csv and the RO Summary Report.\n\n"
+        f"* **{len(result.missing_from_seed)}** risk(s) in the RO Summary but "
+        f"missing from RO_Seed → `qry_mgmt_plan_full` / "
+        f"`qry_total_item_level_demand` will not reflect them until RO_Seed "
+        f"is rebuilt.\n"
+        f"* **{len(result.missing_from_summary)}** risk(s) in RO_Seed but "
+        f"missing from the RO Summary → usually a stale "
+        f"`RO_Comparison_Output.csv` (Regenerate it below).\n\n"
+        f"{rules_caption}."
+    )
+
+    if not result.missing_from_seed.empty:
+        with st.expander(
+            f"🔻 In RO Summary, missing from RO_Seed "
+            f"({len(result.missing_from_seed)})",
+            expanded=True,
+        ):
+            st.caption(
+                "These lines are classified as risk by the RO Summary but "
+                "have no matching business key in RO_Seed.csv.  Remediation: "
+                "re-upload a Distribution Tracker that includes them (or add "
+                "them to the source), then re-run the Base Plan pipeline so "
+                "the mgmt-plan files pick them up."
+            )
+            st.dataframe(result.missing_from_seed, hide_index=True,
+                         use_container_width=True)
+
+    if not result.missing_from_summary.empty:
+        with st.expander(
+            f"🔺 In RO_Seed, missing from RO Summary "
+            f"({len(result.missing_from_summary)})",
+            expanded=False,
+        ):
+            st.caption(
+                "These lines are risks in RO_Seed.csv but the RO Summary "
+                "does not classify them as risk.  Usually a stale "
+                "`RO_Comparison_Output.csv` — click **Regenerate from "
+                "published RO_Comparison_Output.csv** below to refresh, then "
+                "re-run this reconciliation."
+            )
+            st.dataframe(result.missing_from_summary, hide_index=True,
+                         use_container_width=True)
+
+
 def _render_customer_input_uploader() -> None:
     """Render the Distribution Tracker upload → run-pipeline → RO Summary block.
 
@@ -2109,6 +2283,7 @@ def _render_customer_input_uploader() -> None:
         ):
             result = run_distribution_tracker_pipeline(
                 uploaded.getvalue(), anchor_date=anchor,
+                config=ro_rules_config_from_session(st.session_state),
             )
         st.session_state[_SS_PIPELINE_RESULT] = result
         if result.ok:
@@ -3338,7 +3513,9 @@ def _ro_total_b2c_totals(comp_df: pd.DataFrame) -> tuple[Optional[float], Option
     the roll-up can't be built or has no Total B2C row.
     """
     try:
-        report_df, _warn, _tpl = build_summary_report(comp_df)
+        report_df, _warn, _tpl = build_summary_report(
+            comp_df, config=ro_rules_config_from_session(st.session_state),
+        )
     except RoSummaryReportError:
         return None, None
     row = report_df.loc[report_df[SR_COL_ROW_ID] == "total_b2c"]
@@ -3724,10 +3901,11 @@ def _render_ro_pipeline_analytics_fragment(comp: pd.DataFrame) -> None:
 def _render_summary_report_section() -> None:
     """Render the RO Summary Report header + delegate to the fragment.
 
-    The header (title + caption) is kept OUTSIDE the fragment because
-    it's static text — wrapping it inside would just add another stack
-    frame to every fragment rerun for no benefit.  The fragment owns
-    only the interactive widgets and the table itself.
+    The header (title + caption) and the user-facing **RO inclusion rules**
+    panel are kept OUTSIDE the fragment because they drive the fragment's
+    rebuild signature — wrapping them inside would make the fragment try to
+    re-invoke itself when the user tweaked a rule.  The fragment owns only
+    the table itself and the interactive widgets *on* the table.
     """
     st.markdown("### 📊 RO Summary Report")
     st.caption(
@@ -3741,6 +3919,167 @@ def _render_summary_report_section() -> None:
         "30-row report so downstream consumers keep a stable shape."
     )
     _render_summary_report_fragment()
+
+
+# ── User-facing RO inclusion rules ───────────────────────────────────────────
+
+def _render_ro_rules_panel() -> None:
+    """Render the ⚙️ RO inclusion rules expander (Opportunity + Risk gates).
+
+    Every rule maps to a field on :class:`data_sources.ro_rules_config
+    .RoRulesConfig`, stored in ``st.session_state[RO_RULES_SESSION_KEY]``.
+    Two application scopes are surfaced in-line so the planner knows what a
+    given widget will and will not do:
+
+    * **View-time** — the Risk carve-out (probability threshold + volume gate)
+      re-runs :func:`build_summary_report` immediately, so the Delta
+      Breakdown ↔ Risk column updates on the next fragment rerun without
+      touching Fabric.
+    * **Regeneration** — the Opportunity gate (Reflected-in-APS whitelist,
+      Pipeline Status excludes, Opportunity probability threshold) lives
+      *upstream* of the persisted ``RO_Seed.csv``, so changing it requires
+      the **Regenerate RO_Seed** button below to rewrite the seed and
+      history files with the new rules applied.
+    """
+    current = ro_rules_config_from_session(st.session_state)
+
+    # Always-visible one-line summary of the ACTIVE rules — reads at a glance
+    # even when the expander below is collapsed, so a planner scanning the RO
+    # tables never has to guess "what counts as R vs O right now?".
+    _excludes_txt = (
+        ", ".join(current.pipeline_status_excludes)
+        if current.pipeline_status_excludes else "∅"
+    )
+    _aps_txt = "APS=NO" if current.reflected_in_aps_only else "APS ignored"
+    _neg_txt = "Vol<0" if current.risk_requires_negative_volume else "any volume"
+    st.markdown(
+        f"**Active RO rules** — "
+        f"**Opportunity**: {_aps_txt} · Prob > "
+        f"{current.min_opp_probability * 100:.0f}% · "
+        f"Pipeline Status ∉ ({_excludes_txt}).  "
+        f"**Risk**: {_aps_txt} · Prob ≥ "
+        f"{current.min_risk_probability * 100:.0f}% · {_neg_txt}.  "
+        "_(Change below.)_"
+    )
+
+    with st.expander("⚙️ Change RO inclusion rules (Opportunity + Risk)",
+                     expanded=True):
+        st.caption(
+            "The **Delta Breakdown ▸ Risk** column reacts to the Risk rules "
+            "here immediately.  The Opportunity rules take effect only after "
+            "you click **Regenerate RO_Seed with current rules** below — "
+            "they sit upstream of the persisted RO_Seed."
+        )
+
+        st.markdown("**Opportunity — what lands in RO_Seed**")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            new_aps = st.toggle(
+                "Reflected in APS = NO only",
+                value=current.reflected_in_aps_only,
+                key="ro_rules_reflected_only",
+                help="Restrict RO_Seed to incremental (not-yet-in-APS) rows.",
+            )
+            new_min_opp = st.number_input(
+                "Min Opportunity Probability (%)",
+                min_value=0.0, max_value=100.0, step=1.0,
+                value=float(current.min_opp_probability) * 100.0,
+                key="ro_rules_min_opp_pct",
+                help="A row lands in RO_Seed when its Probability is strictly greater "
+                     "than this.  0 = keep any non-zero probability (historical default).",
+            )
+        with c2:
+            # Preset tokens cover every Pipeline Status the tracker uses today;
+            # the ``options ∪ default`` union keeps custom tokens from prior
+            # sessions selectable even if they're not in the preset list.
+            preset_excludes = ["Declined", "Closed", "Closed Won", "Closed Lost",
+                               "On Hold", "Cancelled"]
+            options_union = sorted(
+                {*preset_excludes, *current.pipeline_status_excludes}
+            )
+            new_excludes = st.multiselect(
+                "Pipeline Status excludes",
+                options=options_union,
+                default=list(current.pipeline_status_excludes),
+                key="ro_rules_status_excludes",
+                help="Case-insensitive substring match.  Rows whose Pipeline "
+                     "Status contains ANY of these are dropped from RO_Seed "
+                     "(Risk lines bypass this gate).",
+            )
+
+        st.markdown("**Risk — Delta Breakdown carve-out (view-time)**")
+        r1, r2 = st.columns([1, 1])
+        with r1:
+            new_min_risk = st.number_input(
+                "Min Risk Probability (%)",
+                min_value=0.0, max_value=100.0, step=5.0,
+                value=float(current.min_risk_probability) * 100.0,
+                key="ro_rules_min_risk_pct",
+                help="A row counts as Risk only when its LE Probability ≥ this.  "
+                     "Planner default: 50%.",
+            )
+        with r2:
+            new_neg_only = st.toggle(
+                "Risk requires negative Anticipated Vol",
+                value=current.risk_requires_negative_volume,
+                key="ro_rules_risk_neg_only",
+                help="Turn off to widen Risk to any probable line, including gains.",
+            )
+
+        # Rebuild the config from the current widget values, then push into
+        # session state.  Frozen dataclass keeps callers immutable.
+        updated = RoRulesConfig(
+            reflected_in_aps_only=new_aps,
+            pipeline_status_excludes=tuple(new_excludes),
+            min_opp_probability=new_min_opp / 100.0,
+            min_risk_probability=new_min_risk / 100.0,
+            risk_requires_negative_volume=new_neg_only,
+        )
+        st.session_state[RO_RULES_SESSION_KEY] = updated
+
+        # Regenerate button — reruns the seed pipeline on the published
+        # Distribution_Tracker_History.csv with the current rules.  Behind an
+        # explicit anchor so the planner keeps FY27 control; defaults match
+        # the upload path's default.
+        st.markdown("---")
+        st.markdown("**Regenerate RO_Seed with current rules**")
+        st.caption(
+            "Re-reads the published `Distribution_Tracker_History.csv` from "
+            "Fabric and rebuilds `RO_Seed.csv` + `RO_History_Tracker.csv` "
+            "with the rules above.  Uses the latest snapshot month(s) in "
+            "history."
+        )
+        anchor = st.date_input(
+            "Fiscal year-end anchor",
+            value=date(2027, 3, 31),
+            format="YYYY-MM-DD",
+            key="ro_rules_regen_anchor",
+            help="Drives 'Days in Year' in the seed expansion.",
+        )
+        if st.button(
+            "🔁 Regenerate RO_Seed with current rules",
+            key="ro_rules_regen_btn",
+            type="primary",
+            help="Rewrites RO_Seed.csv + RO_History_Tracker.csv in Fabric using "
+                 "the rules above — no upload required.",
+        ):
+            with st.spinner("Regenerating RO_Seed from published history…"):
+                result = rebuild_ro_seed_from_published_history(
+                    anchor_date=anchor, config=updated,
+                )
+            st.session_state[_SS_PIPELINE_RESULT] = result
+            if result.ok:
+                # Force the downstream views to re-read the freshly written
+                # files and clear the picker keys so the LE selector snaps to
+                # the newest snapshot month, then rerun — mirrors the upload
+                # path's post-run recovery.
+                fetch_ro_history_df(force_refresh=True)
+                st.session_state.pop("ro_cmp_prior_month", None)
+                st.session_state.pop("ro_cmp_le_month", None)
+                st.rerun()
+            else:
+                st.error("❌ Regenerate failed — see the log below.")
+                _render_ro_pipeline_summary(result)
 
 
 @st.fragment
@@ -3790,17 +4129,23 @@ def _render_summary_report_fragment() -> None:
         )
         return
 
+    # Rebuild signature: months signature + current RO rules config so any
+    # change to the Risk carve-out re-rolls the report immediately.
+    ro_config = ro_rules_config_from_session(st.session_state)
     months_sig = st.session_state.get(_SS_MONTHS_SIG)
+    build_sig = (months_sig, ro_config.signature())
     cached_sig = st.session_state.get(_SS_SUMMARY_REPORT_SIG)
 
-    # ── Rebuild iff the source comparison signature drifted ───────
+    # ── Rebuild iff the source comparison signature or rules drifted ─
     needs_rebuild = (
-        cached_sig != months_sig
+        cached_sig != build_sig
         or _SS_SUMMARY_REPORT_DF not in st.session_state
     )
     if needs_rebuild:
         try:
-            report_df, report_warnings, runtime_template = build_summary_report(summary_df)
+            report_df, report_warnings, runtime_template = build_summary_report(
+                summary_df, config=ro_config,
+            )
         except RoSummaryReportError as exc:
             st.error(f"❌ Could not build the RO Summary Report.\n\n{exc}")
             return
@@ -3809,7 +4154,7 @@ def _render_summary_report_fragment() -> None:
         st.session_state[_SS_SUMMARY_REPORT_TEMPLATE]  = runtime_template
         st.session_state[_SS_SUMMARY_REPORT_LOADED_AT] = datetime.now()
         st.session_state[_SS_SUMMARY_REPORT_RAW_DF]    = summary_df.copy()
-        st.session_state[_SS_SUMMARY_REPORT_SIG]       = months_sig
+        st.session_state[_SS_SUMMARY_REPORT_SIG]       = build_sig
         # Republish the freshly built template to Fabric.  The manual Save
         # button below remains available; this auto-save is the planner's
         # safety net so downstream consumers (PLR R&O, Demand Plan
@@ -3865,7 +4210,8 @@ def _render_summary_report_fragment() -> None:
     if filters_active:
         try:
             display_full, _fw, _ft = build_summary_report(
-                _apply_filters(summary_df, filter_state)
+                _apply_filters(summary_df, filter_state),
+                config=ro_config,
             )
         except RoSummaryReportError as exc:
             st.warning(
@@ -8057,15 +8403,18 @@ def _render_comparison_mix_table(result) -> None:
 _BIAS_CSS: str = """
 <style>
 .bias {overflow-x:auto; margin:.3rem 0 .6rem;}
-.bias-in {min-width:960px; background:#ffffff; color:#1f2430; font-size:1.3rem;}
+.bias-in {min-width:960px; background:#ffffff; color:#1f2430; font-size:.9rem;}
 .bias details {margin:0;}
 .bias .rw {display:flex; align-items:center; border-bottom:1px solid #f1f2f4;}
-.bias .rw > span {flex:1 1 60px; padding:6px 10px; white-space:nowrap;
+.bias .rw > span {flex:1 1 60px; padding:5px 10px; white-space:nowrap;
   text-align:right; overflow:hidden; text-overflow:ellipsis;}
 .bias .rw > span.lbl {flex:0 0 240px; text-align:left; display:flex;
   align-items:center; gap:2px;}
+/* The Trend column carries the sparkline — give it real room so the
+   sparkline can stretch out instead of being crammed against the label. */
+.bias .rw > span.trendcol {flex:2.4 1 220px; overflow:visible;}
 .bias .rw > span.wide {flex:1.4 1 74px;}
-.bias .hdr {background:#fafafa; color:#6b7280; font-weight:600; font-size:1.0rem;
+.bias .hdr {background:#fafafa; color:#6b7280; font-weight:600; font-size:.72rem;
   text-transform:uppercase; letter-spacing:.02em; border-bottom:2px solid #e5e7eb;}
 .bias .hdr > span {text-align:right;}
 .bias .hdr > span.lbl {text-align:left;}
@@ -8080,14 +8429,38 @@ _BIAS_CSS: str = """
 .bias details[open] > summary.rw .tri {transform:rotate(90deg);}
 .bias .pos {color:#1b7f3a;}
 .bias .neg {color:#c0392b;}
-.bias .spark {display:inline-flex; align-items:flex-end; gap:1px; height:16px;
-  justify-content:flex-end;}
-.bias .spark i {width:4px; display:inline-block; border-radius:1px;}
-.bias .trend {display:inline-flex; align-items:center; gap:8px;}
-.bias .trend b {font-size:1.15rem; white-space:nowrap;}
-.bias .flagmsg {font-size:1.15rem; color:#334155;}
+/* Diverging sparkline — over-forecast (positive bias) grows GREEN upward
+   from a centered zero axis; under-forecast grows RED downward.  Direction
+   is now encoded as geometry, not only colour, so a planner reads the sign
+   at a glance even in a b/w print-out.  ``flex:1 1 auto`` lets the chart
+   spread across the whole Trend column; ``position:relative`` anchors the
+   dashed zero line drawn via ::before. */
+.bias .spark {display:flex; align-items:stretch; gap:3px; height:30px;
+  flex:1 1 auto; justify-content:flex-start; max-width:100%; position:relative;
+  padding:0 4px;}
+.bias .spark::before {content:""; position:absolute; left:4px; right:4px;
+  top:50%; border-top:1px dashed #d1d5db; pointer-events:none;}
+/* One column per month.  Split vertically so the top half hosts the green
+   over-forecast bar (aligned to the axis at the bottom of that half) and
+   the bottom half hosts the red under-forecast bar (aligned to the axis at
+   its top).  Missing months render as a tiny grey tick on the axis. */
+.bias .spark .col {display:flex; flex-direction:column; width:9px; height:100%;
+  flex:0 0 auto;}
+.bias .spark .col .hi, .bias .spark .col .lo {flex:1 1 0; display:flex;
+  overflow:hidden;}
+.bias .spark .col .hi {align-items:flex-end;}
+.bias .spark .col .lo {align-items:flex-start;}
+.bias .spark .col i {display:block; width:100%; border-radius:1px;}
+.bias .spark .col i.up {background:#1b7f3a;}
+.bias .spark .col i.dn {background:#c0392b;}
+.bias .spark .col i.na {background:#d1d5db; height:2px !important;
+  align-self:flex-end;}
+/* Trend cell contains ONLY the sparkline now (no "Improving/Worsening"
+   text); stretched to fill the wider trendcol span. */
+.bias .trend {display:flex; align-items:center; width:100%;}
+.bias .flagmsg {color:#334155;}
 .bias .chip {display:inline-block; padding:1px 7px; border-radius:9px;
-  font-size:.95rem; font-weight:700; margin-right:6px;}
+  font-size:.7rem; font-weight:700; margin-right:6px;}
 .bias .chip.pri {background:#fde2e1; color:#c0392b;}
 .bias .chip.mon {background:#fdf0d5; color:#9a6a00;}
 .bias .chip.dir {background:#eef1f4; color:#55606e; font-weight:600; margin-left:4px;}
@@ -8123,21 +8496,69 @@ def _bias_pp(frac: object) -> tuple[str, str]:
     return f"{pp:+.1f}pp", cls
 
 
-def _bias_spark(values: list) -> str:
-    """Tiny bar sparkline of the monthly Bias% (green over / red under)."""
+def _bias_spark(values: list, months: tuple[str, ...] = ()) -> str:
+    """Diverging sparkline of the monthly Bias% (green over ↑ / red under ↓).
+
+    Bars diverge from a **centered zero axis**: an over-forecast month
+    (positive bias) climbs upward as a green bar; an under-forecast month
+    (negative bias) drops downward as a red bar.  This makes direction a
+    visual signal, not only a colour one — a planner reading the chart in
+    b/w print or with a red/green colour-vision deficit still sees the sign.
+    ``months`` is optional metadata used to build a per-bar hover tooltip
+    (``Jul'26: +8% (over)``) so the trend column stays a chart-only cell
+    while still being fully inspectable.
+    """
     nums = [float(v) for v in values if v is not None and not pd.isna(v)]
     if not nums:
         return ""
+    # Scale to the largest ±half-height in the window (15 px each half) so the
+    # tallest bar exactly reaches the top/bottom edge and every other bar is
+    # proportional.  ``0.05`` floor keeps tiny biases visible (else they'd
+    # round to 0 px).
     scale = max(0.05, max(abs(v) for v in nums))
-    bars = []
-    for v in values:
+    max_half_px = 14  # leaves 1 px breathing room from the cell edge
+
+    cols: list[str] = []
+    for idx, v in enumerate(values):
+        month_lbl = months[idx] if idx < len(months) else ""
         if v is None or pd.isna(v):
-            bars.append('<i style="height:2px;background:#d1d5db"></i>')
+            title = f"{month_lbl}: no data" if month_lbl else "no data"
+            cols.append(
+                f'<span class="col" title="{_esc_html(title)}">'
+                '<span class="hi"><i class="na"></i></span>'
+                '<span class="lo"></span></span>'
+            )
             continue
-        h = max(2, min(16, round(abs(float(v)) / scale * 16)))
-        color = "#1b7f3a" if v > 0 else "#c0392b" if v < 0 else "#9ca3af"
-        bars.append(f'<i style="height:{h}px;background:{color}"></i>')
-    return f'<span class="spark">{"".join(bars)}</span>'
+        vf = float(v)
+        pct = vf * 100.0
+        h = max(2, min(max_half_px, round(abs(vf) / scale * max_half_px)))
+        direction_word = "over" if vf > 0 else "under" if vf < 0 else "on plan"
+        sign = "+" if vf > 0 else ""
+        title = (f"{month_lbl}: {sign}{pct:.0f}% ({direction_word}-forecast)"
+                 if month_lbl else
+                 f"{sign}{pct:.0f}% ({direction_word}-forecast)")
+        if vf > 0:
+            cols.append(
+                f'<span class="col" title="{_esc_html(title)}">'
+                f'<span class="hi"><i class="up" style="height:{h}px"></i></span>'
+                '<span class="lo"></span></span>'
+            )
+        elif vf < 0:
+            cols.append(
+                f'<span class="col" title="{_esc_html(title)}">'
+                '<span class="hi"></span>'
+                f'<span class="lo"><i class="dn" style="height:{h}px"></i></span>'
+                '</span>'
+            )
+        else:
+            # Exactly zero: 2-px grey tick straddling the axis so the month is
+            # visible without implying direction.
+            cols.append(
+                f'<span class="col" title="{_esc_html(title)}">'
+                '<span class="hi"><i class="na"></i></span>'
+                '<span class="lo"></span></span>'
+            )
+    return f'<span class="spark">{"".join(cols)}</span>'
 
 
 # Minimum change in mean |bias| (0.5pp) to call an accuracy trend a direction.
@@ -8164,9 +8585,19 @@ def _bias_trend(values: list) -> tuple[str, str, str]:
     return "→", "Flat", "#6b7280"
 
 
-def _bias_trend_cell(values: list) -> str:
-    """Readable Trend cell: arrow + word (improving/worsening/flat) + sparkline."""
-    arrow, word, color = _bias_trend(values)
+def _bias_trend_cell(values: list, months: tuple[str, ...] = ()) -> str:
+    """Trend cell: sparkline ONLY (no text).
+
+    The "Improving/Worsening" narrative moved to the Flag column so this
+    cell can devote every pixel of its width to the diverging sparkline.
+    ``months`` is threaded through only for per-bar tooltips.
+    """
+    return f'<span class="trend">{_bias_spark(values, months)}</span>'
+
+
+def _dead_bias_trend_cell_snippet(values, months, color, arrow, word):
+    """Unused shim, retained to work around a text-encoding artefact in the
+    edit stream; the body is dead code."""
     return (
         f'<span class="trend"><b style="color:{color}">{arrow} {word}</b>'
         f'{_bias_spark(values)}</span>'
@@ -8185,30 +8616,50 @@ def _wmape_severity_cls(severity: object) -> str:
 def _bias_flag_html(
     severity: object, trend_word: str, direction: object, driver: object,
 ) -> str:
-    """Flag cell as a trend sentence: severity chip + '<trend> accuracy' + driver.
+    """Flag cell — the plain-English verdict for each row.
 
-    Leads with the accuracy trend (Improving / Worsening / Flat) so the planner
-    reads the direction of travel first, keeps the Priority / Monitor chip when
-    the miss is material, notes over/under-forecast, and — for flagged rows —
-    names the top Corporate × SKU driver behind the miss (from the corp×SKU
-    drill).  ``driver`` is ``None`` when unavailable (low attribution / not
-    flagged), and the clause is dropped.
+    Format: ``[High impact chip?] <trend> accuracy toward <over|under>-forecast — driven by <X>``.
+
+    Every row gets a sentence.  The chip is now reserved for **Priority-tier**
+    rows only (WMAPE ≥ 10% AND segment |error| ≥ 1% of Total-B2C volume) —
+    a single "High impact" chip whose tooltip carries the rationale (kept
+    off the chip face so the visible table stays scannable).  Monitor-tier
+    rows show only the sentence (still coloured amber in the WMAPE cell
+    when that column is visible).  ``driver`` names the top Corporate × SKU
+    contributor when the "Name Corp × SKU driver in flags" toggle is on and
+    attribution was available.
     """
-    chips: list[str] = []
+    parts: list[str] = []
     if severity == BIAS_FLAG_PRIORITY:
-        chips.append('<span class="chip pri">Priority</span>')
-    elif severity == BIAS_FLAG_MONITOR:
-        chips.append('<span class="chip mon">Monitor</span>')
+        parts.append(
+            '<span class="chip pri" title="WMAPE ≥ 10% AND this segment\'s '
+            'absolute forecast error covers ≥ 1% of Total B2C volume — the '
+            'miss is materially large for the whole business.">'
+            'High impact</span>'
+        )
 
-    word = (trend_word or "Flat")
-    dir_txt = ""
-    if direction and str(direction) not in ("", "Balanced"):
-        dir_txt = f", {str(direction).lower()}-forecast"   # Over / Under
-    sentence = f"{word} accuracy{dir_txt}"
+    trend = (trend_word or "Flat").strip()
+    dir_raw = "" if direction is None else str(direction).strip()
+    has_dir = dir_raw not in ("", "Balanced")
+    dir_lo = dir_raw.lower() if has_dir else ""
+
+    # Compose the sentence.  Four shapes so the copy stays natural whatever
+    # the (trend, direction, flag) combo throws at us.
+    if trend == "Flat" and severity not in (BIAS_FLAG_PRIORITY, BIAS_FLAG_MONITOR):
+        # Small bias, no material miss — the calm case.
+        sentence = "Accuracy on plan"
+    elif trend == "Flat" and has_dir:
+        # Consistent miss without a trend of improvement/deterioration.
+        sentence = f"Persistent {dir_lo}-forecast miss"
+    elif has_dir:
+        sentence = f"{trend} accuracy toward {dir_lo}-forecast"
+    else:
+        sentence = f"{trend} accuracy"
+
     if driver:
         sentence += f" — driven by {driver}"
-    chips.append(f'<span class="flagmsg">{_esc_html(sentence)}</span>')
-    return "".join(chips)
+    parts.append(f'<span class="flagmsg">{_esc_html(sentence)}</span>')
+    return "".join(parts)
 
 
 def _render_bias_tiles(total: pd.Series | None) -> None:
@@ -8282,24 +8733,37 @@ def _render_bias_instructions(month_meta: tuple) -> None:
             "of volume).  It converts a percentage error into what it actually "
             "**costs the total business**, so a big % miss on a tiny line ranks "
             "below a smaller % miss on a large one.\n\n"
-            "**Flag — sized by business impact, not % error alone**\n"
-            "Two questions decide the flag, so a small line's large percentage "
-            "can't outrank a big line's costlier one:\n"
-            "- **Priority** — the forecast is inaccurate (**WMAPE ≥ 10%**) *and* "
-            "the error is **material** (Impact ≥ 1% of total B2C volume).  Big "
-            "business, badly forecast → fix now.\n"
-            "- **Monitor** — a real accuracy gap (**WMAPE ≥ 10%**) but on a "
-            "**small** business (Impact < 1%).  Worth watching, not urgent — "
-            "e.g. Aerosol can miss ~18% yet barely move the total, so it stays "
-            "Monitor, never Priority.\n"
-            "- **Blank** — **WMAPE < 10%**: accurate enough, whatever the size "
-            "(a large, well-forecast line is not flagged just for being large).\n"
-            "- **Direction** (Over > +2pp / Under < −2pp / Balanced) comes from "
-            "the 6-Mo Avg Bias; a **Below naive** tag is added when FVA < −0.5pp "
-            "(the plan lost to a seasonal-naive guess — simplify it).\n"
-            "- **WMAPE colour** echoes the flag: **pink** = Priority, "
-            "**amber** = Monitor.\n\n"
-            "_The search-to-hide filter (Portfolio Major · Supply Format · "
+            "**Trend column (chart-only)**\n"
+            "- Six diverging bars, one per month.  **Green above** the dashed "
+            "zero axis = **over-forecast**; **red below** = **under-forecast**.  "
+            "Bar height is proportional to |Bias %|.\n"
+            "- Hover any bar to see the exact month + bias %.\n"
+            "- Missing months render as a small grey tick on the axis.\n\n"
+            "**Flag column (plain-English verdict)**\n"
+            "- Every row reads as a sentence — the trend of accuracy plus the "
+            "over/under-forecast direction, e.g. *\"Improving accuracy toward "
+            "under-forecast\"*.\n"
+            "- Flat rows without a material miss simply say *\"Accuracy on plan\"*.  "
+            "Flat rows WITH a material miss read *\"Persistent over/under-forecast "
+            "miss\"* — the miss isn't shrinking.\n"
+            "- The **`High impact`** chip appears **only** when a row is both "
+            "inaccurate (**WMAPE ≥ 10%**) *and* materially large (**segment "
+            "|error| ≥ 1% of total B2C volume**).  Big business, badly "
+            "forecast → fix now.  Hover the chip for the exact rationale.\n"
+            "- Rows with WMAPE ≥ 10% on a **small** business (Impact < 1%) "
+            "get no chip — they still show the trend sentence, but a small "
+            "line's large percentage cannot outrank a big line's costlier "
+            "one at a glance.\n"
+            "- Rows below the WMAPE gate are simply forecast well enough at "
+            "their size — no chip, sentence only.\n\n"
+            "**Columns**\n"
+            "- Default view: **Segment · Trend · Flag** — a compact layout "
+            "that gives the sparkline room to breathe.\n"
+            "- Toggle **Show all columns** above to reveal the six monthly "
+            "bias columns AND the **6-Mo Avg Bias · WMAPE · FVA** detail "
+            "columns (WMAPE cell is coloured pink for Priority-tier rows and "
+            "amber for Monitor-tier when visible).\n"
+            "\n_The search-to-hide filter (Portfolio Major · Supply Format · "
             "Brand) at the top narrows this section too._"
         )
 
@@ -8340,8 +8804,10 @@ def _render_bias_tree(
         row = rows.iloc[i]
         monthly = [row.get(mk) for mk in months]
         parts = [f'<span class="lbl">{_tri_span(foldable)}{_esc_html(row.get(DPC_COL_LABEL, ""))}</span>']
-        # Trend leads.
-        parts.append(f'<span class="wide">{_bias_trend_cell(monthly)}</span>')
+        # Trend leads.  The wider ``trendcol`` class lets the sparkline
+        # stretch to fill the space next to the "Improving/Worsening" label
+        # instead of getting squeezed in the middle of the row.
+        parts.append(f'<span class="trendcol">{_bias_trend_cell(monthly, months)}</span>')
         if show_months:
             for mk in months:
                 txt, c = _bias_fmt_pct(row.get(mk))
@@ -8362,7 +8828,18 @@ def _render_bias_tree(
         parts.append(f'<span class="wide">{flag_html}</span>')
         return _cls(row), "".join(parts)
 
-    head = ['<span class="lbl">Segment</span>', '<span class="wide">Trend</span>']
+    # Trend header carries the covered range in-line (e.g. "Trend (Feb'26 –
+    # Jul'26)") so a planner never has to hunt for which months are being
+    # summarised even when the monthly columns are hidden.
+    if months:
+        trend_range = (
+            f"Trend ({months[0]} – {months[-1]})" if len(months) > 1
+            else f"Trend ({months[0]})"
+        )
+    else:
+        trend_range = "Trend"
+    head = ['<span class="lbl">Segment</span>',
+            f'<span class="trendcol">{_esc_html(trend_range)}</span>']
     if show_months:
         head += [
             f'<span>{_esc_html(mk)}{"*" if meta_by_key.get(mk, ("", 0, False))[2] else ""}</span>'
@@ -8450,18 +8927,25 @@ def _render_forecast_bias_section(
     by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
     _render_bias_tiles(by_id.get("total_b2c"))
 
-    # Compact by default: lead with Trend, hide the monthly + detail columns
-    # behind toggles.  Trend + Flag stay always on.
-    c1, c2, c3 = st.columns(3)
-    show_detail = c1.toggle(
-        "Show 6-Mo Bias · WMAPE · FVA", value=False, key="bias_show_detail")
-    show_months = c2.toggle(
-        "Show monthly bias columns", value=False, key="bias_show_months")
-    name_drivers = c3.toggle(
+    # Compact by default: only Segment · Trend · Flag are shown, so the
+    # sparkline has room to breathe.  ONE master toggle brings back the 6
+    # monthly bias columns AND the 6-Mo Avg / WMAPE / FVA detail columns —
+    # matches the layout the planner had before the cramp regression.
+    c1, c2 = st.columns(2)
+    show_all = c1.toggle(
+        "Show all columns (monthly bias · 6-Mo Avg · WMAPE · FVA)",
+        value=False, key="bias_show_all",
+        help="Turn on to reveal the six monthly bias columns AND the "
+             "6-Mo Avg Bias · WMAPE · FVA detail columns.  Off by default "
+             "so Trend + Flag get the full width.",
+    )
+    name_drivers = c2.toggle(
         "Name Corp × SKU driver in flags", value=False, key="bias_flag_drivers",
         help="Attributes each flagged segment's miss to its top Corporate × SKU "
              "driver and names it in the Flag.  Off by default — it re-runs the "
              "corp×SKU attribution per flagged segment (cached after first run).")
+    show_detail = show_all
+    show_months = show_all
 
     driver_by_seg: dict[str, str] = {}
     if name_drivers:

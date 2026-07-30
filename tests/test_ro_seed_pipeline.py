@@ -109,27 +109,131 @@ def test_ro_history_merge_replaces_matching_month_without_duplicating():
     assert len(out) == 1
 
 
-def test_build_ro_seed_keeps_only_committed_negative_risk_bypassing_gates():
-    """The R&O risk rule = Reflected-in-APS=no AND Lbs./yr<0 AND Probability=100%.
-    Only a line meeting all three bypasses the Declined gate; a negative line
-    under 100%, or one Reflected in APS, does NOT get the exemption."""
-    def _r(item, lbs, prob, status, reflected="no"):
-        return {
-            "Format": "F", "Customer": "C", "Taxonomy": "T", "Brand": "B",
-            "Item #": item, "Item Desc": "D", "Probability": prob,
-            "First Ship Date": "2026-04-01", "Lbs./yr": lbs, "PC$/yr": 0.0,
-            "Slotting": 0.0, "Reflected in APS": reflected,
-            "Pipeline Status": status, "Month": "2026-06",
-        }
+def _seed_row(item, lbs, prob, status, reflected="no"):
+    """Factory for a single Distribution Tracker row (post-cleanup dtypes)."""
+    return {
+        "Format": "F", "Customer": "C", "Taxonomy": "T", "Brand": "B",
+        "Item #": item, "Item Desc": "D", "Probability": prob,
+        "First Ship Date": "2026-04-01", "Lbs./yr": lbs, "PC$/yr": 0.0,
+        "Slotting": 0.0, "Reflected in APS": reflected,
+        "Pipeline Status": status, "Month": "2026-06",
+    }
+
+
+def test_build_ro_seed_default_rules_50pct_risk_and_declined_plus_closed_excluded():
+    """Default rules: Risk = neg vol + prob ≥ 50%; Opportunity excludes Declined
+    and Closed; Reflected-in-APS-only whitelist applies."""
     df = pd.DataFrame([
-        _r("100", 1000.0, 1.0, "Open"),                    # normal opportunity → kept
-        _r("200", -5000.0, 1.0, "Declined"),               # RISK (neg + 100% + no) → kept
-        _r("300", -4000.0, 0.5, "Declined"),               # neg but 50% → not risk → dropped
-        _r("400", -3000.0, 1.0, "Declined", reflected="yes"),  # neg+100% but reflected → dropped
+        _seed_row("100", 1000.0, 1.0, "Open"),           # normal opportunity → kept
+        _seed_row("200", -5000.0, 0.75, "Declined"),     # RISK (neg + 75% + no) → kept
+        _seed_row("300", -4000.0, 0.30, "Declined"),     # neg but 30% → not risk → dropped
+        _seed_row("400", -3000.0, 1.0, "Declined", reflected="yes"),  # reflected → dropped
+        _seed_row("500", 2000.0, 0.5, "Closed"),         # Closed → dropped
+        _seed_row("600", 2000.0, 0.5, "Closed Won"),     # substring match: closed → dropped
     ])
     seed = rsp._build_ro_seed(df, {"2026-06"}, _log())
     items = set(seed["Item #"].astype(str))
-    assert "100" in items          # normal
-    assert "200" in items          # committed negative risk bypasses the Declined gate
-    assert "300" not in items      # 50% probability — not a committed risk
+    assert "100" in items          # normal opportunity
+    assert "200" in items          # 75%-prob negative — Risk bypasses Declined
+    assert "300" not in items      # 30% prob — below Risk threshold, still declined
     assert "400" not in items      # Reflected in APS — not incremental R&O
+    assert "500" not in items      # Closed status now excluded
+    assert "600" not in items      # substring "closed" still matches
+
+
+def test_build_ro_seed_config_override_tightens_risk_to_hundred_percent():
+    """Passing a config with 100% Risk threshold recovers yesterday's tight rule."""
+    from data_sources.ro_rules_config import RoRulesConfig
+    df = pd.DataFrame([
+        _seed_row("A", -5000.0, 0.75, "Declined"),  # was Risk at 50%, not at 100%
+        _seed_row("B", -5000.0, 1.0,  "Declined"),  # still Risk at 100%
+    ])
+    cfg = RoRulesConfig.default().with_updates(min_risk_probability=1.0)
+    seed = rsp._build_ro_seed(df, {"2026-06"}, _log(), config=cfg)
+    items = set(seed["Item #"].astype(str))
+    assert "A" not in items
+    assert "B" in items
+
+
+def test_build_ro_seed_carries_forward_risk_from_prior_snapshot():
+    """A risk captured in an EARLIER snapshot must still land in RO_Seed even
+    when this cycle's Distribution Tracker upload doesn't include it — the
+    fix that keeps RO_Seed reconciled with the RO Summary Report.
+
+    Prior-month row (Item 900) is a Risk; the current snapshot (2026-07) only
+    carries an unrelated Opportunity.  The seed builder must carry Item 900
+    forward using its prior-month values.
+    """
+    df = pd.DataFrame([
+        _seed_row("100", 1000.0, 1.0, "Open"),               # current opportunity
+        _seed_row("900", -8000.0, 1.0, "Declined"),          # prior RISK
+    ])
+    # Stamp explicit Months: row 0 is in this cycle (2026-07); row 1 is in
+    # the earlier snapshot (2026-06). The factory's default Month is 2026-06,
+    # so the current-snapshot row must be overridden.
+    df.loc[0, "Month"] = "2026-07"
+    df.loc[1, "Month"] = "2026-06"
+    seed = rsp._build_ro_seed(df, {"2026-07"}, _log())
+    items = set(seed["Item #"].astype(str))
+    assert "100" in items, "current snapshot opportunity should be present"
+    assert "900" in items, "prior-snapshot risk should be carried forward"
+
+
+def test_build_ro_seed_carry_forward_keeps_latest_snapshot_only():
+    """When the same risk business key appears in multiple prior snapshots,
+    only the LATEST-Month copy is carried into RO_Seed (no double-counting)."""
+    df = pd.DataFrame([
+        _seed_row("900", -8000.0, 1.0, "Declined"),  # 2026-04 (older)
+        _seed_row("900", -9000.0, 1.0, "Declined"),  # 2026-05 (newer)
+    ])
+    df.loc[0, "Month"] = "2026-04"
+    df.loc[1, "Month"] = "2026-05"
+    seed = rsp._build_ro_seed(df, {"2026-07"}, _log())
+    subset = seed.loc[seed["Item #"].astype(str) == "900"]
+    assert len(subset) == 1, "expected one carried-forward row per business key"
+    assert float(subset["Lbs./yr"].iloc[0]) == -9000.0, "newest snapshot wins"
+
+
+def test_build_ro_seed_current_snapshot_wins_over_carry_forward():
+    """When the current snapshot ALREADY has a row for a business key, the
+    fresh Tracker value is authoritative — no carried-over copy is added."""
+    df = pd.DataFrame([
+        _seed_row("900", -1000.0, 1.0, "Declined"),  # current snapshot value
+        _seed_row("900", -8000.0, 1.0, "Declined"),  # prior snapshot (must not stack)
+    ])
+    df.loc[0, "Month"] = "2026-07"
+    df.loc[1, "Month"] = "2026-06"
+    seed = rsp._build_ro_seed(df, {"2026-07"}, _log())
+    subset = seed.loc[seed["Item #"].astype(str) == "900"]
+    assert len(subset) == 1
+    assert float(subset["Lbs./yr"].iloc[0]) == -1000.0, "current snapshot wins"
+
+
+def test_build_ro_seed_does_not_carry_forward_prior_opportunities():
+    """Opportunities are NOT carried forward — the current snapshot is the
+    source of truth for positive lines.  Only risks travel across cycles."""
+    df = pd.DataFrame([
+        _seed_row("100", 1000.0, 1.0, "Open"),   # current snapshot opportunity
+        _seed_row("800", 4000.0, 1.0, "Open"),   # prior snapshot opportunity — must NOT carry
+    ])
+    # Factory default Month is 2026-06 — pin row 0 to the current snapshot.
+    df.loc[0, "Month"] = "2026-07"
+    df.loc[1, "Month"] = "2026-06"
+    seed = rsp._build_ro_seed(df, {"2026-07"}, _log())
+    items = set(seed["Item #"].astype(str))
+    assert "100" in items
+    assert "800" not in items, "stale opportunity from prior snapshot must not carry forward"
+
+
+def test_build_ro_seed_config_can_widen_opportunity_probability_threshold():
+    """Setting min_opp_probability = 0.5 drops all lines below 50%."""
+    from data_sources.ro_rules_config import RoRulesConfig
+    df = pd.DataFrame([
+        _seed_row("LOW",  1000.0, 0.30, "Open"),   # below new 50% threshold → dropped
+        _seed_row("HIGH", 1000.0, 0.60, "Open"),   # above 50% → kept
+    ])
+    cfg = RoRulesConfig.default().with_updates(min_opp_probability=0.5)
+    seed = rsp._build_ro_seed(df, {"2026-06"}, _log(), config=cfg)
+    items = set(seed["Item #"].astype(str))
+    assert "LOW" not in items
+    assert "HIGH" in items

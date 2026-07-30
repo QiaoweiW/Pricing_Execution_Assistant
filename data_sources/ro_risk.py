@@ -1,12 +1,16 @@
 """Canonical definition of an R&O *risk* line — the single source of truth.
 
-A **risk** is a demand **loss the planner is committed to**.  A line qualifies
+A **risk** is a demand **loss the planner is likely to see**.  A line qualifies
 only when it clears ALL THREE conditions:
 
     1. Reflected in APS = "NO"        — not yet baked into the APS base plan,
                                          so it is still *incremental* R&O.
     2. Anticipated annual volume < 0  — a negative volume is a loss / de-list.
-    3. Probability = 100%             — a committed loss, not a maybe.
+    3. Probability ≥ 50%              — likely enough to plan around.
+
+The 50% threshold is the planner default; the RO rules panel in the Demand
+Planner Analytics view lets it be overridden at runtime (see
+``data_sources/ro_rules_config.py``).
 
 The identical rule is applied everywhere R&O is captured, so the stages stay
 reconciled:
@@ -34,8 +38,10 @@ from typing import Optional
 
 import pandas as pd
 
-# Probability (0–1 fraction) a loss must carry to count as a *committed* risk.
-RISK_PROBABILITY: float = 1.0
+# Probability (0–1 fraction) a loss must clear to count as a *likely* risk.
+# 0.5 = 50%.  The Demand Planner Analytics rules panel can raise/lower this
+# per-session by passing an explicit ``min_probability`` to :func:`risk_mask`.
+RISK_PROBABILITY: float = 0.5
 # The "Reflected in APS" value that marks a line as still incremental R&O.
 _REFLECTED_NOT_IN_APS: str = "no"
 
@@ -53,10 +59,13 @@ def risk_mask(
     volume_col: str,
     probability_col: str,
     reflected_col: Optional[str] = None,
+    min_probability: Optional[float] = None,
+    require_negative_volume: bool = True,
 ) -> pd.Series:
     """Return a boolean Series (aligned to ``df.index``) of the R&O risk rows.
 
-    A row is a risk when **volume < 0** AND **probability ≥ 100%** AND — when a
+    A row is a risk when **volume < 0** (unless ``require_negative_volume`` is
+    disabled) AND **probability ≥ min_probability** AND — when a
     ``reflected_col`` is supplied — **Reflected in APS == "no"**.  A missing
     volume or probability column yields an all-``False`` mask (a risk we can't
     confirm is not a risk), so partial or synthetic frames never raise.
@@ -71,13 +80,25 @@ def risk_mask(
         "Reflected in APS" column.  ``None`` when it has already been filtered
         upstream (e.g. in ``RO_Comparison_Output``) — condition 1 is then taken
         as satisfied.
+    min_probability
+        Threshold that probability must clear.  ``None`` → :data:`RISK_PROBABILITY`
+        (the planner default, 0.5 == 50%).  The Demand Planner Analytics rules
+        panel passes an explicit value here to override at runtime without
+        mutating the module-level default.
+    require_negative_volume
+        When ``True`` (default) the volume-is-negative gate applies.  Kept
+        exposed so a user rule can widen the definition of Risk to any
+        probable line, not only losses.
     """
     if volume_col not in df.columns or probability_col not in df.columns:
         return pd.Series(False, index=df.index)
 
+    threshold = RISK_PROBABILITY if min_probability is None else float(min_probability)
     volume = _numeric(df[volume_col]).fillna(0.0)
     probability = _numeric(df[probability_col]).fillna(0.0)
-    mask = (volume < 0) & (probability >= RISK_PROBABILITY)
+    mask = probability >= threshold
+    if require_negative_volume:
+        mask = mask & (volume < 0)
 
     if reflected_col is not None and reflected_col in df.columns:
         reflected = (

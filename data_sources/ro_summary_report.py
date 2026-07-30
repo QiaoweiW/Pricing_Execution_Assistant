@@ -124,6 +124,7 @@ from data_sources.ro_comparison import (
     YEAR1_PROB_PRIOR,
 )
 from data_sources.ro_risk import risk_mask
+from data_sources.ro_rules_config import RoRulesConfig
 
 
 logger = logging.getLogger(__name__)
@@ -737,27 +738,39 @@ def _zero_values() -> dict[str, float]:
     return {col: 0.0 for col in DATA_COLS}
 
 
-def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
+def _compute_leaf_values(
+    sub: pd.DataFrame,
+    *,
+    config: Optional[RoRulesConfig] = None,
+) -> dict[str, float]:
     """Compute the 8 data column values for one already-filtered leaf slice.
 
     Pure aggregation — no template knowledge, no scaling to millions
     (that happens in :func:`build_summary_report` as a final pass so
     we don't accidentally double-scale subtotals).
+
+    ``config`` (defaults to canonical rules) tunes the Risk carve-out only:
+    Reflected-in-APS is already guaranteed upstream (RO_Seed filtered it),
+    so the reflected column is not re-applied here.
     """
     if sub.empty:
         return _zero_values()
 
-    # "Risk" = a committed demand loss — the one canonical rule in
-    # data_sources.ro_risk: LE Annual Opportunity < 0 AND LE Probability = 100%
-    # (Reflected-in-APS = no is already guaranteed here — RO_Seed filtered it
-    # upstream, so reflected_col is omitted).  Whatever its New/Exit/Change
-    # Driver, a risk line's probabilized change is reported under Risk instead,
-    # so New/Exit/Change EXCLUDE risk lines and New + Exit + Change + Risk ==
-    # Total Delta (unchanged) — Prior Plan / Current Plan / Total Delta, the
-    # columns other sections read, are untouched; only the Delta Breakdown
-    # split changes.
+    # "Risk" = a probable demand loss — one canonical rule in data_sources.ro_risk:
+    # LE Annual Opportunity < 0 AND LE Probability ≥ threshold.  Whatever its
+    # New/Exit/Change Driver, a risk line's probabilized change is reported
+    # under Risk instead, so New/Exit/Change EXCLUDE risk lines and
+    # New + Exit + Change + Risk == Total Delta (unchanged).  Prior/Current
+    # Plan and Total Delta are untouched; only the Delta Breakdown split shifts
+    # with the user's Risk threshold.
+    cfg = config
     is_risk = risk_mask(
-        sub, volume_col=ANNUAL_OPP_LE, probability_col="LE Probability")
+        sub, volume_col=ANNUAL_OPP_LE, probability_col="LE Probability",
+        min_probability=cfg.min_risk_probability if cfg is not None else None,
+        require_negative_volume=(
+            cfg.risk_requires_negative_volume if cfg is not None else True
+        ),
+    )
     risk_val   = float(sub.loc[is_risk, CUR_FISCAL_PROB_CHANGE].sum())
     new_val    = float(sub.loc[(sub["Driver"] == "New")    & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())
     exit_val   = float(sub.loc[(sub["Driver"] == "Exit")   & ~is_risk, CUR_FISCAL_PROB_CHANGE].sum())
@@ -791,6 +804,8 @@ def _compute_leaf_values(sub: pd.DataFrame) -> dict[str, float]:
 
 def build_summary_report(
     comp_output_df: pd.DataFrame,
+    *,
+    config: Optional[RoRulesConfig] = None,
 ) -> tuple[pd.DataFrame, list[str], tuple[TemplateRow, ...]]:
     """Build the summary report DataFrame from RO_Comparison_Output.
 
@@ -801,6 +816,13 @@ def build_summary_report(
         :func:`fetch_ro_comparison_output_df`.  Must contain the
         column names produced by
         :data:`ro_comparison.OUTPUT_COLUMNS`.
+    config
+        Optional :class:`RoRulesConfig` overriding the canonical Risk
+        classification rules for the ``Delta Breakdown | Risk`` column.
+        ``None`` → planner defaults.  This is a **view-time filter**: the
+        Opportunity gate (Reflected-in-APS, Pipeline Status, probability
+        threshold) already applied upstream when RO_Seed was built, so the
+        only thing tunable at this stage is the Risk carve-out.
 
     Returns
     -------
@@ -882,7 +904,7 @@ def build_summary_report(
         if tpl.is_subtotal:
             continue
         sub = _filter_for_leaf(df, tpl)
-        leaf_vals[tpl.row_id] = _compute_leaf_values(sub)
+        leaf_vals[tpl.row_id] = _compute_leaf_values(sub, config=config)
 
     # ── Roll up subtotals (memoised recursion) ────────────────────
     rollup: dict[str, dict[str, float]] = dict(leaf_vals)

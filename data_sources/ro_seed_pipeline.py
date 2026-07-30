@@ -46,6 +46,7 @@ import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
 from .ro_risk import risk_mask
+from .ro_rules_config import RoRulesConfig
 from .fabric_lakehouse_io import (
     LakehouseIOError,
     archive_bytes,
@@ -208,8 +209,15 @@ def _merge_history_and_build_seed(
     df_new: pd.DataFrame,
     df_history: pd.DataFrame,
     log: _Log,
+    *,
+    config: Optional[RoRulesConfig] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Return ``(combined_history, ro_seed_filtered, snapshot_months)``."""
+    """Return ``(combined_history, ro_seed_filtered, snapshot_months)``.
+
+    ``config`` (defaults to the canonical rules when ``None``) is threaded
+    into :func:`_build_ro_seed` so a user rules override propagates through
+    the pipeline entrypoint.
+    """
     df_new = _scrub_headers(df_new)
     df_history = _scrub_headers(df_history)
     log.info(f"New file: {df_new.shape[0]:,} rows, {df_new.shape[1]} cols")
@@ -265,7 +273,7 @@ def _merge_history_and_build_seed(
              f"{len(df_combined):,} rows ({removed:,} identical rows removed)")
 
     # 5. Build RO_Seed from the current snapshot.
-    ro_seed = _build_ro_seed(df_combined, new_months, log)
+    ro_seed = _build_ro_seed(df_combined, new_months, log, config=config)
     return df_combined, ro_seed, snapshot_months
 
 
@@ -310,45 +318,170 @@ def _clean_combined_types(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _carry_forward_historical_risks(
+    prior_df: pd.DataFrame,
+    current_snapshot_df: pd.DataFrame,
+    cfg: RoRulesConfig,
+    log: _Log,
+) -> pd.DataFrame:
+    """Return risk rows from earlier snapshots not yet in the current snapshot.
+
+    Used by :func:`_build_ro_seed` to guarantee RO_Seed reconciles with the RO
+    Summary Report: a risk carried in RO_History_Tracker across snapshots must
+    still be a first-class row in RO_Seed even when the latest Distribution
+    Tracker upload dropped it — otherwise the demand-plan ETL under-reports
+    R&O relative to what the Summary Report shows.
+
+    Selection rule
+    --------------
+    1. Apply the SAME :func:`data_sources.ro_risk.risk_mask` rule the RO
+       Summary uses to *prior_df* under the given *cfg*.
+    2. Deduplicate to the LATEST ``Month`` per business key
+       ``(Format, Customer, Taxonomy, Brand, Item #)`` so a re-run never
+       stacks multiple historical snapshots of the same RO into RO_Seed.
+    3. Drop business keys whose row is already present in the current
+       snapshot — the fresh Tracker value wins over a stale carried-over one.
+
+    Empty inputs (or a prior slice with no qualifying risks) return an empty
+    frame so the caller's ``concat`` is a no-op.
+    """
+    if prior_df is None or prior_df.empty:
+        return prior_df.iloc[0:0].copy() if prior_df is not None else pd.DataFrame()
+
+    reflected_col = (
+        "Reflected in APS"
+        if cfg.reflected_in_aps_only and "Reflected in APS" in prior_df.columns
+        else None
+    )
+    is_risk = risk_mask(
+        prior_df,
+        volume_col="Lbs./yr",
+        probability_col="Probability",
+        reflected_col=reflected_col,
+        min_probability=cfg.min_risk_probability,
+        require_negative_volume=cfg.risk_requires_negative_volume,
+    )
+    candidates = prior_df.loc[is_risk]
+    if candidates.empty:
+        return candidates
+
+    # Pick the latest-Month row per business key.  Parsing Month here (rather
+    # than string-sorting) tolerates the mixed date shapes _canon_date already
+    # copes with elsewhere in the pipeline.
+    working = candidates.copy()
+    working["__month_ts"] = _canon_date(working[_DATE_COLUMN])
+    working = working.sort_values(
+        by="__month_ts", kind="stable", na_position="first",
+    )
+    latest = (
+        working.drop_duplicates(subset=_MATCH_COLS, keep="last")
+        .drop(columns="__month_ts")
+    )
+
+    # Exclude business keys already covered by the current snapshot — the
+    # fresh Tracker row is authoritative for that key.
+    if not current_snapshot_df.empty:
+        snapshot_keys = set(
+            current_snapshot_df[_MATCH_COLS]
+            .astype(str).apply(tuple, axis=1)
+        )
+        latest_keys = latest[_MATCH_COLS].astype(str).apply(tuple, axis=1)
+        latest = latest.loc[~latest_keys.isin(snapshot_keys)]
+
+    if not latest.empty:
+        log.info(
+            f"Carried forward {len(latest):,} historical risk row(s) from prior "
+            f"snapshots (latest-Month copy per business key, current-snapshot "
+            f"rows take precedence)."
+        )
+    return latest
+
+
 def _build_ro_seed(
     df_combined: pd.DataFrame,
     new_months: set,
     log: _Log,
+    *,
+    config: Optional[RoRulesConfig] = None,
 ) -> pd.DataFrame:
-    """Filter the combined history to the seed extract (section 7)."""
+    """Filter the combined history to the seed extract (section 7).
+
+    ``config`` (canonical defaults when ``None``) drives every user-tunable
+    gate — the Reflected-in-APS whitelist, the Pipeline Status excludes and
+    the Opportunity probability threshold — and the Risk carve-out that
+    bypasses them.  All three gates are logged so a planner reviewing the run
+    can see exactly which rules the seed was built under.
+    """
+    cfg = config or RoRulesConfig.default()
     if _DATE_COLUMN in df_combined.columns and new_months:
-        df = df_combined[df_combined[_DATE_COLUMN].isin(new_months)].copy()
+        in_snapshot = df_combined[_DATE_COLUMN].isin(new_months)
+        df = df_combined.loc[in_snapshot].copy()
         log.info(f"RO_Seed snapshot rows (Month in {sorted(str(m) for m in new_months)}): "
                  f"{len(df):,}")
+        # Carry forward risks captured in EARLIER snapshots.
+        #
+        # A row that still satisfies the risk criteria today but was captured
+        # in a prior snapshot (and dropped from this cycle's Distribution
+        # Tracker upload) would otherwise vanish from RO_Seed — even though it
+        # persists in RO_History_Tracker → RO_Comparison_Output and shows up
+        # in the RO Summary Report.  That silent divergence is the reason
+        # qry_mgmt_plan_full can under-report R&O compared to the Summary
+        # (see data_sources.ro_risk_reconcile for the diagnostic view).
+        #
+        # We only bring forward RISK rows (a positive Opportunity from a stale
+        # cycle is properly forgotten — the current snapshot is the source of
+        # truth for Opportunities), and only ONE copy per business key: the
+        # most-recent Month wins so we never stack multiple historical
+        # snapshots of the same RO into RO_Seed.  Rows whose business key is
+        # already in the current snapshot are skipped — the fresh Tracker
+        # value always beats a carried-over one.
+        carried = _carry_forward_historical_risks(
+            df_combined.loc[~in_snapshot], df, cfg, log,
+        )
+        if not carried.empty:
+            df = pd.concat([df, carried], ignore_index=True)
     else:
         df = df_combined.copy()
         log.warn(f"Date column '{_DATE_COLUMN}' missing or no snapshot dates — "
                  f"seeding from all {len(df):,} combined rows.")
 
     # R&O "risk" lines (see data_sources.ro_risk for the one canonical rule:
-    # Reflected-in-APS = no AND Lbs./yr < 0 AND Probability = 100%) bypass the
-    # pipeline-status gate — a committed loss is a risk even if its pipeline
-    # status is declined — so it still reaches RO_Seed → the mgmt plan / history
-    # / APS.  A risk is Reflected-in-APS=no by definition (so it survives that
-    # gate) and Probability=100% (so it clears the Probability>0 gate); the only
-    # gate it needs to skip is the declined filter.
+    # Reflected-in-APS = no AND Lbs./yr < 0 AND Probability ≥ threshold) bypass
+    # the Pipeline-Status + Probability gates so a probable loss still reaches
+    # RO_Seed → the mgmt plan / history / APS even when its status is declined
+    # or its probability sits below the Opportunity threshold.
     is_risk = risk_mask(
         df, volume_col="Lbs./yr", probability_col="Probability",
-        reflected_col="Reflected in APS",
+        reflected_col="Reflected in APS" if cfg.reflected_in_aps_only else None,
+        min_probability=cfg.min_risk_probability,
+        require_negative_volume=cfg.risk_requires_negative_volume,
     )
-    if "Reflected in APS" in df.columns:
+    if cfg.reflected_in_aps_only and "Reflected in APS" in df.columns:
         df = df[df["Reflected in APS"].astype(str).str.strip().str.lower() == "no"]
         is_risk = is_risk.loc[df.index]
         log.info(f"After 'Reflected in APS = no': {len(df):,} rows")
-    if "Pipeline Status" in df.columns:
-        ok = ~df["Pipeline Status"].astype(str).str.lower().str.contains("declined", na=False)
-        df = df[ok | is_risk]
+
+    excludes = cfg.normalised_excludes()
+    if excludes and "Pipeline Status" in df.columns:
+        status_l = df["Pipeline Status"].astype(str).str.lower()
+        drop_mask = pd.Series(False, index=df.index)
+        for tok in excludes:
+            drop_mask = drop_mask | status_l.str.contains(tok, na=False)
+        # Risk lines bypass the Pipeline Status gate (committed loss > status).
+        df = df[(~drop_mask) | is_risk]
         is_risk = is_risk.loc[df.index]
-        log.info(f"After 'Pipeline Status != declined' (risk-exempt): {len(df):,} rows")
+        log.info(
+            f"After 'Pipeline Status ∉ {list(cfg.pipeline_status_excludes)}' "
+            f"(risk-exempt): {len(df):,} rows"
+        )
+
     if "Probability" in df.columns:
-        ok = pd.to_numeric(df["Probability"], errors="coerce").fillna(0.0) > 0
+        prob_threshold = float(cfg.min_opp_probability)
+        ok = pd.to_numeric(df["Probability"], errors="coerce").fillna(0.0) > prob_threshold
         df = df[ok | is_risk]
-        log.info(f"After 'Probability > 0' (risk-exempt): {len(df):,} rows")
+        log.info(
+            f"After 'Probability > {prob_threshold:g}' (risk-exempt): {len(df):,} rows"
+        )
 
     # Aggregate duplicate source rows: sum the metric columns per business key.
     agg_keys = [c for c in _AGG_KEYS if c in df.columns]
@@ -529,6 +662,7 @@ def run_distribution_tracker_pipeline(
     new_file_bytes: bytes,
     *,
     anchor_date: date,
+    config: Optional[RoRulesConfig] = None,
 ) -> PipelineResult:
     """Run the full Distribution Tracker → RO_History_Tracker pipeline.
 
@@ -538,6 +672,12 @@ def run_distribution_tracker_pipeline(
         Raw bytes of the uploaded ``Distribution_Tracker.csv``.
     anchor_date:
         Fiscal year-end anchor (``Analysis!$B$3``) driving ``Days in Year``.
+    config:
+        Optional :class:`RoRulesConfig` overriding the canonical Opportunity /
+        Risk rules for this run (``None`` → planner defaults).  The rules
+        panel in the Streamlit view passes the user's current selection here
+        so a "Regenerate RO_Seed with current rules" click actually applies
+        the on-screen configuration.
 
     All three Fabric outputs are computed in memory first and only written once
     every stage succeeds, so a logic error never leaves a partial update. On a
@@ -547,6 +687,7 @@ def run_distribution_tracker_pipeline(
     with ``ok=False`` so the caller can render it.
     """
     log = _Log()
+    cfg = config or RoRulesConfig.default()
     result = PipelineResult(ok=False, log=log.entries)
     anchor_ts = pd.Timestamp(anchor_date)
     log.info(f"Fiscal year-end anchor: {anchor_ts:%m/%d/%Y}")
@@ -592,8 +733,16 @@ def run_distribution_tracker_pipeline(
                 df_ro_hist.columns.str.replace(r"\s+", " ", regex=True).str.strip())
 
         # ---- Compute (all in memory) ----------------------------------------
+        log.info(
+            "RO rules — "
+            f"APS-only={cfg.reflected_in_aps_only}, "
+            f"Pipeline excludes={list(cfg.pipeline_status_excludes)}, "
+            f"Opp Prob>{cfg.min_opp_probability:g}, "
+            f"Risk Prob≥{cfg.min_risk_probability:g}, "
+            f"Risk requires Vol<0={cfg.risk_requires_negative_volume}"
+        )
         dist_history, ro_seed, snapshot_months = _merge_history_and_build_seed(
-            df_new, df_history, log)
+            df_new, df_history, log, config=cfg)
         result.snapshot_months = snapshot_months
 
         # Stamp the run with the upload's snapshot month (not today's date).
@@ -642,6 +791,102 @@ def run_distribution_tracker_pipeline(
         return result
     except Exception as exc:  # noqa: BLE001 - surface any unexpected failure
         log.err(f"Pipeline failed: {exc}")
+        return result
+
+
+# ── Rebuild-without-upload: reapply current rules to published history ──────
+
+def rebuild_ro_seed_from_published_history(
+    *,
+    anchor_date: date,
+    config: RoRulesConfig,
+) -> PipelineResult:
+    """Rebuild ``RO_Seed.csv`` (+ downstream) from published history + rules.
+
+    Same output contract as :func:`run_distribution_tracker_pipeline` — three
+    files are written to Fabric in-memory-first — but the *input* is the
+    already-published ``Distribution_Tracker_History.csv`` rather than a new
+    upload.  Used by the Streamlit rules panel's **Regenerate RO_Seed with
+    current rules** button so a planner tuning the Opportunity / Risk gates
+    doesn't need to re-upload the distribution tracker to see the pipeline
+    react.
+
+    The snapshot month(s) used to select seed rows are the latest month(s)
+    present in the history — matches the notebook's "seed from the most
+    recent snapshot" contract.
+    """
+    log = _Log()
+    result = PipelineResult(ok=False, log=log.entries)
+    anchor_ts = pd.Timestamp(anchor_date)
+    log.info(f"Fiscal year-end anchor: {anchor_ts:%m/%d/%Y}")
+    log.info(
+        "RO rules — "
+        f"APS-only={config.reflected_in_aps_only}, "
+        f"Pipeline excludes={list(config.pipeline_status_excludes)}, "
+        f"Opp Prob>{config.min_opp_probability:g}, "
+        f"Risk Prob≥{config.min_risk_probability:g}, "
+        f"Risk requires Vol<0={config.risk_requires_negative_volume}"
+    )
+
+    try:
+        df_history, _ = read_csv(_SECRETS_SECTION, _DIST_HISTORY_BLOB_PATH,
+                                 read_csv_kwargs=_STR_READ_KW)
+        if df_history is None or df_history.empty:
+            log.err(f"'Files/{_DIST_HISTORY_BLOB_PATH}' not found or empty — "
+                    "cannot rebuild the seed without a published history.")
+            return result
+        df_history = _scrub_headers(df_history)
+        df_history = _clean_combined_types(df_history)
+
+        df_ro_hist, _ = read_csv(_SECRETS_SECTION, _RO_HISTORY_TRACKER_BLOB_PATH,
+                                 read_csv_kwargs=_STR_READ_KW)
+        if df_ro_hist is None:
+            log.warn(f"'Files/{_RO_HISTORY_TRACKER_BLOB_PATH}' not found — it will be "
+                     "created from this rebuild's seed.")
+            df_ro_hist = pd.DataFrame()
+        else:
+            df_ro_hist = df_ro_hist.copy()
+            df_ro_hist.columns = (
+                df_ro_hist.columns.str.replace(r"\s+", " ", regex=True).str.strip())
+
+        # Seed off the latest snapshot month(s) already in history — matches the
+        # notebook's contract and the upload path's "seed = current snapshot".
+        if _DATE_COLUMN in df_history.columns:
+            months = sorted(str(m) for m in df_history[_DATE_COLUMN].dropna().unique())
+            new_months = {months[-1]} if months else set()
+        else:
+            new_months = set()
+        snapshot_months = sorted(str(m) for m in new_months)
+        result.snapshot_months = snapshot_months
+        log.info(f"Seeding from latest snapshot month(s) in history: "
+                 f"{snapshot_months or 'NONE FOUND'}")
+
+        ro_seed = _build_ro_seed(df_history, new_months, log, config=config)
+        seed_month = _resolve_seed_month(snapshot_months, log)
+        log.info(f"RO_History Month stamp: {seed_month}")
+        seed_expanded, new_keys = _expand_seed(
+            ro_seed, df_ro_hist, anchor_ts, seed_month, log)
+        ro_history_combined = _merge_into_ro_history(seed_expanded, df_ro_hist, log)
+
+        write_csv(_SECRETS_SECTION, _RO_SEED_BLOB_PATH, seed_expanded, etag=None)
+        log.ok(f"RO_Seed.csv rebuilt — {len(seed_expanded):,} rows")
+        write_csv(_SECRETS_SECTION, _RO_HISTORY_TRACKER_BLOB_PATH,
+                  ro_history_combined, etag=None)
+        log.ok(f"RO_History_Tracker.csv updated — {len(ro_history_combined):,} rows")
+
+        result.ro_seed_rows = len(seed_expanded)
+        result.ro_history_rows = len(ro_history_combined)
+        result.new_ro_keys = new_keys
+        if "Lbs./yr" in seed_expanded.columns:
+            result.ro_seed_total_lbs = float(
+                pd.to_numeric(seed_expanded["Lbs./yr"], errors="coerce").fillna(0).sum())
+        result.ok = True
+        return result
+    except LakehouseIOError as exc:
+        log.err(f"Fabric I/O error during rebuild — {exc}")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        log.err(f"Rebuild failed: {exc}")
         return result
 
 

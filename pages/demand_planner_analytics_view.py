@@ -942,19 +942,19 @@ def _render_bh_lever_a(cat, labels: list[str], order: list[str]) -> None:
             marker=dict(color=color, size=8, line=dict(color="white", width=1)),
             text=labels_1dp, customdata=labels_1dp,
             textposition="top center" if src == "Orders" else "bottom center",
-            textfont=dict(size=10, color=color),
+            textfont=dict(size=14, color=color),
             # Hover reuses the pre-rounded 1-dp string (no raw floats on hover).
             hovertemplate=f"{src} %{{x}} YoY: %{{customdata}}<extra></extra>",
         )
     fig.update_layout(
         height=200, margin=dict(l=8, r=8, t=8, b=8),
-        font=dict(color=_BH_FONT_COLOR, size=11),
-        xaxis=dict(tickfont=dict(size=10)),
+        font=dict(color=_BH_FONT_COLOR, size=15),
+        xaxis=dict(tickfont=dict(size=14)),
         yaxis=dict(ticksuffix="%", rangemode="tozero", zeroline=True,
                    zerolinecolor="#9ca3af", showgrid=True, gridcolor="#eeeeee",
-                   tickfont=dict(size=10)),
+                   tickfont=dict(size=14)),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0,
-                    font=dict(size=10)),
+                    font=dict(size=13)),
         showlegend=True, plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_la_{cat.row_id}")
@@ -993,7 +993,7 @@ def _render_bh_lever_b(cat) -> None:
         )
         body += f"<tr><td style='text-align:left'><b>{name}</b></td>{cells}</tr>"
     st.markdown(
-        f"<table style='font-size:0.85rem;border-collapse:collapse'>"
+        f"<table style='font-size:1.25rem;border-collapse:collapse'>"
         f"{head}{body}</table>",
         unsafe_allow_html=True,
     )
@@ -1032,13 +1032,13 @@ def _render_bh_lever_c_chart(cat) -> None:
                     hovertemplate="GP%% 3-mo: %{y:.1f}%%<extra></extra>")
     fig.update_layout(
         height=240, margin=dict(l=8, r=8, t=8, b=8), barmode="group", bargap=0.2,
-        font=dict(color=_BH_FONT_COLOR, size=11),
-        xaxis=dict(tickfont=dict(size=9), tickangle=-45),
-        yaxis=dict(title=dict(text="GP %", font=dict(size=10)), ticksuffix="%",
-                   showgrid=True, gridcolor="#eeeeee", tickfont=dict(size=9)),
-        yaxis2=dict(title=dict(text="M lbs", font=dict(size=10)), overlaying="y",
-                    side="right", rangemode="tozero", showgrid=False, tickfont=dict(size=9)),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=9)),
+        font=dict(color=_BH_FONT_COLOR, size=15),
+        xaxis=dict(tickfont=dict(size=13), tickangle=-45),
+        yaxis=dict(title=dict(text="GP %", font=dict(size=13)), ticksuffix="%",
+                   showgrid=True, gridcolor="#eeeeee", tickfont=dict(size=13)),
+        yaxis2=dict(title=dict(text="M lbs", font=dict(size=13)), overlaying="y",
+                    side="right", rangemode="tozero", showgrid=False, tickfont=dict(size=13)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=13)),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key=f"bh_lc_chart_{cat.row_id}")
@@ -1082,7 +1082,7 @@ def _render_bh_lever_c(cat) -> None:
             + "</tr><tr><td></td>"
             + "".join(
                 "<td style='text-align:right;padding-left:12px;font-weight:normal;"
-                f"font-size:0.7rem;color:#6b7280'>{_esc_html(gl.get(p, '—'))}</td>"
+                f"font-size:1.0rem;color:#6b7280'>{_esc_html(gl.get(p, '—'))}</td>"
                 for p in periods)
             + "</tr>"
         )
@@ -1100,7 +1100,7 @@ def _render_bh_lever_c(cat) -> None:
             for name, vals in rows
         )
         st.markdown(
-            f"<table style='font-size:0.85rem;border-collapse:collapse'>{head}{body}</table>",
+            f"<table style='font-size:1.25rem;border-collapse:collapse'>{head}{body}</table>",
             unsafe_allow_html=True,
         )
     # Monthly GP% (faint) + 3-mo rolling avg (bold) + order/ship lbs bars.
@@ -1178,7 +1178,7 @@ def _render_bh_lever_c_recon(cat) -> None:
                     for p in periods)
                 body += f"<tr><td style='text-align:left'>{label}</td>{cells}</tr>"
         st.markdown(
-            f"<table style='font-size:0.8rem;border-collapse:collapse'>{head}{body}</table>",
+            f"<table style='font-size:1.2rem;border-collapse:collapse'>{head}{body}</table>",
             unsafe_allow_html=True,
         )
         if recon.drivers:
@@ -1215,7 +1215,7 @@ def _render_bh_lever_d(cat) -> None:
         orientation="h",
         marker=dict(color=[_BH_SEG_COLOR[seg.kind] for seg in movers]),
         text=[f"{seg.share * 100:.0f}%" for seg in movers],
-        textposition="outside", textfont=dict(size=11, color=_BH_FONT_COLOR),
+        textposition="outside", textfont=dict(size=15, color=_BH_FONT_COLOR),
         customdata=["—" if seg.yoy_pct is None else f"{seg.yoy_pct * 100:+.1f}%"
                     for seg in movers],
         hovertemplate=("%{y}<br>Δ %{x:+.2f}M lbs · YoY %{customdata}"
@@ -1225,8 +1225,8 @@ def _render_bh_lever_d(cat) -> None:
         height=max(150, 34 * len(movers) + 60),
         margin=dict(l=6, r=6, t=6, b=8),
         showlegend=False, plot_bgcolor="white",
-        font=dict(color=_BH_FONT_COLOR, size=11),
-        xaxis=dict(title=dict(text="L3M order Δ (M lbs)", font=dict(size=11)),
+        font=dict(color=_BH_FONT_COLOR, size=15),
+        xaxis=dict(title=dict(text="L3M order Δ (M lbs)", font=dict(size=15)),
                    ticksuffix="M", zeroline=True, zerolinecolor="#9ca3af",
                    zerolinewidth=1, showgrid=True, gridcolor="#eeeeee"),
         yaxis=dict(automargin=True, autorange="reversed"),
@@ -1284,7 +1284,7 @@ def _render_bh_lever_d_allmovers(cat) -> None:
                     f"<td style='text-align:right;padding-left:12px'>{seg.share * 100:.0f}%</td>"
                     "</tr>")
         st.markdown(
-            f"<table style='font-size:0.82rem;border-collapse:collapse;width:100%'>"
+            f"<table style='font-size:1.2rem;border-collapse:collapse;width:100%'>"
             f"{head}{body}</table>", unsafe_allow_html=True)
 
 
@@ -1416,8 +1416,8 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
     order = ["L12M", "L6M", "L3M"]                    # widest → narrowest
     labels = [_bh_window_display(w) for w in order]   # Run-Rate (L12M) …
     axis_title = dict(size=15, color=_BH_FONT_COLOR)
-    tick_font = dict(size=14, color=_BH_FONT_COLOR)
-    label_font = dict(size=15, color=_BH_FONT_COLOR)
+    tick_font = dict(size=19, color=_BH_FONT_COLOR)
+    label_font = dict(size=20, color=_BH_FONT_COLOR)
 
     # Which YoY lines to draw — lets the planner remove any line (incl. Net Sales).
     options = list(_bh_line_options(result))
@@ -1448,20 +1448,20 @@ def _render_business_health_chart(result: "BusinessHealthResult") -> None:
             line=dict(color=color, dash="dot", width=3),
             marker=dict(color=color, size=11, line=dict(color="white", width=1.5)),
             text=labels_1dp, customdata=labels_1dp,
-            textposition="top center", textfont=dict(size=14, color=color),
+            textposition="top center", textfont=dict(size=19, color=color),
             # Hover reuses the pre-rounded 1-dp string (no raw floats on hover).
             hovertemplate=f"{src} %{{x}} YoY: %{{customdata}}<extra></extra>",
         )
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=44, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=14),   # base font: dark gray, bigger
+        font=dict(color=_BH_FONT_COLOR, size=19),   # base font: dark gray, bigger
         xaxis=dict(tickfont=label_font),
         # Single YoY axis, zero-based so 0 is the reference line.
         yaxis=dict(title=dict(text="YoY %", font=axis_title), ticksuffix="%",
                    rangemode="tozero", zeroline=True, zerolinecolor="#9ca3af",
                    showgrid=True, gridcolor="#eeeeee", tickfont=tick_font),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=15, color=_BH_FONT_COLOR)),
+                    font=dict(size=20, color=_BH_FONT_COLOR)),
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True, key="business_health_chart")
@@ -3440,10 +3440,10 @@ def _render_ro_urgency_chart(comp_df: pd.DataFrame, *, key_suffix: str = "") -> 
     fig.update_layout(
         barmode="stack", height=max(260, 30 * len(cats) + 100),
         margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_RO_CHART_FONT, size=12),
+        font=dict(color=_RO_CHART_FONT, size=16),
         xaxis=dict(title=dict(text=f"{rpa.FY_CURRENT_LABEL} In-Year Probabilized (M lbs)"),
                    showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
-        yaxis=dict(autorange="reversed", tickfont=dict(size=11)),  # largest on top
+        yaxis=dict(autorange="reversed", tickfont=dict(size=15)),  # largest on top
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         plot_bgcolor="white",
     )
@@ -3644,8 +3644,8 @@ def _render_ro_buildup_chart(comp_df: pd.DataFrame, *, key_suffix: str = "") -> 
     fig.update_layout(
         barmode="stack", height=max(260, 30 * len(cats) + 100),
         margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_RO_CHART_FONT, size=12),
-        xaxis=dict(tickfont=dict(size=11)),
+        font=dict(color=_RO_CHART_FONT, size=16),
+        xaxis=dict(tickfont=dict(size=15)),
         yaxis=dict(title=dict(text="Pipeline (M lbs)"),
                    showgrid=True, gridcolor="#eeeeee", rangemode="tozero"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
@@ -4117,7 +4117,7 @@ _RO_SR_CSS: str = """
 <style>
 .ro-sr {overflow-x:auto; margin:0.25rem 0 0.75rem;}
 .ro-sr table {border-collapse:collapse; width:100%;
-  font-size:0.95rem; background:#ffffff; color:#1a1a1a;}
+  font-size:1.4rem; background:#ffffff; color:#1a1a1a;}
 .ro-sr th, .ro-sr td {padding:4px 10px; white-space:nowrap;}
 .ro-sr thead th {background:#1f3864; color:#ffffff; font-weight:700;
   text-align:center; border:1px solid #2f4a7a;}
@@ -5642,7 +5642,7 @@ def _render_mom_pivot_html(result: DemandMomResult, *, show_budget: bool) -> Non
         return str(label).replace(" ", " ").strip()
 
     # Header row.
-    head = [f'<div class="lbl">Row Labels</div>']
+    head = ['<div class="lbl">Row Labels</div>']
     for c in data_cols:
         head.append(f'<div>{_esc_html(c)}</div>')
     parts = [f'<div class="r hdr">{"".join(head)}</div>']
@@ -5686,7 +5686,7 @@ def _render_mom_pivot_html(result: DemandMomResult, *, show_budget: bool) -> Non
 
     css = f"""
 <style>
-.mom {{overflow-x:auto; margin:.25rem 0 .5rem; font-size:.8rem;
+.mom {{overflow-x:auto; margin:.25rem 0 .5rem; font-size:1.18rem;
   color:#1a1a1a;}}
 .mom .tbl {{min-width:{min_w}px;}}
 .mom .r {{display:grid; grid-template-columns:{grid}; align-items:center;}}
@@ -7191,23 +7191,23 @@ _DPC_KPI_CSS = """
 <style>
 .dpc-kpis {display:flex; gap:14px; flex-wrap:wrap; margin:.15rem 0 1rem;}
 .dpc-kpis + .dpc-kpis {margin-top:-.35rem;}  /* tighten walk → YoY gap */
-.dpc-kpi {flex:1 1 180px; min-width:165px; background:#ffffff;
+.dpc-kpi {flex:1 1 220px; min-width:200px; background:#ffffff;
   border:1px solid #e4e0d8; border-top:3px solid #1f4e79; border-radius:10px;
   padding:12px 16px 11px; box-shadow:0 1px 3px rgba(40,50,70,.07);}
 /* Walk-row tiles wear a slightly heavier accent so the plan-vs-plan story
    reads first; totals use the deep accent, variances share it. */
 .dpc-kpi--walk {border-top-color:#0f3d63;}
-.dpc-kpi .k-label {font-size:.72rem; font-weight:700; letter-spacing:.04em;
+.dpc-kpi .k-label {font-size:.9rem; font-weight:700; letter-spacing:.04em;
   text-transform:uppercase; color:#5a6472;}
-.dpc-kpi .k-value {font-size:1.85rem; font-weight:800; line-height:1.15;
+.dpc-kpi .k-value {font-size:2.7rem; font-weight:800; line-height:1.12;
   margin:.12rem 0 .12rem; color:#1f4e79;}
 .dpc-kpi .k-value.up {color:#1b7f3a;}
 .dpc-kpi .k-value.down {color:#c0392b;}
 .dpc-kpi .k-value.flat {color:#5a6472;}
-.dpc-kpi .k-desc {font-size:.7rem; font-style:italic; color:#8a8f98;}
+.dpc-kpi .k-desc {font-size:.88rem; font-style:italic; color:#8a8f98;}
 /* Sub-label sits under the value on the walk tiles — cycle labels + a
    plain-English descriptor.  Small enough not to compete with the value. */
-.dpc-kpi .k-sub {display:block; font-size:.68rem; font-style:italic;
+.dpc-kpi .k-sub {display:block; font-size:.84rem; font-style:italic;
   color:#8a8f98; margin-top:.1rem; line-height:1.25;}
 </style>
 """
@@ -7385,7 +7385,7 @@ def _render_comparison_kpis_walk(
 _DPC_TREE_CSS: str = """
 <style>
 .dpc-tree {overflow-x:auto; margin:0.35rem 0 0.75rem;}
-.dpc-tree-in {min-width:920px; background:#ffffff; color:#1a1a1a; font-size:0.95rem;}
+.dpc-tree-in {min-width:920px; background:#ffffff; color:#1a1a1a; font-size:1.34rem;}
 .dpc-tree details {margin:0;}
 .dpc-tree .rw {display:flex; align-items:center; border-bottom:1px solid #e8e8e8;}
 .dpc-tree .rw > span {flex:1 1 70px; padding:4px 10px; white-space:nowrap;
@@ -7422,9 +7422,9 @@ _DPC_LITE_CSS: str = """
 <style>
 .dpc-lite {overflow-x:auto; margin:0.3rem 0 0.8rem;}
 .dpc-lite table {border-collapse:collapse; width:100%; background:transparent;
-  color:#1f2430; font-size:0.98rem;}
+  color:#1f2430; font-size:1.42rem;}
 .dpc-lite th, .dpc-lite td {padding:7px 14px; white-space:nowrap; text-align:right;}
-.dpc-lite thead th {color:#6b7280; font-weight:600; font-size:0.9rem;
+.dpc-lite thead th {color:#6b7280; font-weight:600; font-size:1.12rem;
   border-bottom:2px solid #e5e7eb;}
 /* 2nd header line: the month range a column covers. */
 .dpc-lite thead th .per {display:block; font-weight:400; font-size:0.8em;
@@ -7443,9 +7443,9 @@ _DPC_LITE_CSS: str = """
 .dpc-mixbar {display:flex; width:100%; height:26px; border-radius:5px;
   overflow:hidden; margin:0.15rem 0 0.5rem;}
 .dpc-mixbar .seg {display:flex; align-items:center; justify-content:center;
-  color:#ffffff; font-size:0.72rem; font-weight:700; min-width:0;}
+  color:#ffffff; font-size:0.98rem; font-weight:700; min-width:0;}
 .dpc-mixlegend {display:flex; flex-wrap:wrap; gap:14px; margin:0 0 0.6rem;
-  font-size:0.76rem; color:#4b5563;}
+  font-size:1.02rem; color:#4b5563;}
 .dpc-mixlegend span {display:inline-flex; align-items:center; gap:6px;}
 .dpc-mixlegend i {width:11px; height:11px; border-radius:2px; display:inline-block;}
 </style>
@@ -8057,7 +8057,7 @@ def _render_comparison_mix_table(result) -> None:
 _BIAS_CSS: str = """
 <style>
 .bias {overflow-x:auto; margin:.3rem 0 .6rem;}
-.bias-in {min-width:960px; background:#ffffff; color:#1f2430; font-size:0.9rem;}
+.bias-in {min-width:960px; background:#ffffff; color:#1f2430; font-size:1.3rem;}
 .bias details {margin:0;}
 .bias .rw {display:flex; align-items:center; border-bottom:1px solid #f1f2f4;}
 .bias .rw > span {flex:1 1 60px; padding:6px 10px; white-space:nowrap;
@@ -8065,7 +8065,7 @@ _BIAS_CSS: str = """
 .bias .rw > span.lbl {flex:0 0 240px; text-align:left; display:flex;
   align-items:center; gap:2px;}
 .bias .rw > span.wide {flex:1.4 1 74px;}
-.bias .hdr {background:#fafafa; color:#6b7280; font-weight:600; font-size:0.72rem;
+.bias .hdr {background:#fafafa; color:#6b7280; font-weight:600; font-size:1.0rem;
   text-transform:uppercase; letter-spacing:.02em; border-bottom:2px solid #e5e7eb;}
 .bias .hdr > span {text-align:right;}
 .bias .hdr > span.lbl {text-align:left;}
@@ -8084,10 +8084,10 @@ _BIAS_CSS: str = """
   justify-content:flex-end;}
 .bias .spark i {width:4px; display:inline-block; border-radius:1px;}
 .bias .trend {display:inline-flex; align-items:center; gap:8px;}
-.bias .trend b {font-size:.8rem; white-space:nowrap;}
-.bias .flagmsg {font-size:.82rem; color:#334155;}
+.bias .trend b {font-size:1.15rem; white-space:nowrap;}
+.bias .flagmsg {font-size:1.15rem; color:#334155;}
 .bias .chip {display:inline-block; padding:1px 7px; border-radius:9px;
-  font-size:.7rem; font-weight:700; margin-right:6px;}
+  font-size:.95rem; font-weight:700; margin-right:6px;}
 .bias .chip.pri {background:#fde2e1; color:#c0392b;}
 .bias .chip.mon {background:#fdf0d5; color:#9a6a00;}
 .bias .chip.dir {background:#eef1f4; color:#55606e; font-weight:600; margin-left:4px;}
@@ -9936,7 +9936,7 @@ def _maybe_autosave_ro_summary_report(*, trigger: str) -> None:
         # transient Fabric blips don't make the rest of the page look broken.
         logger.warning("Auto-save of RO_Summary_Report failed: %s", exc)
         return
-    except Exception as exc:  # noqa: BLE001 — last-resort safety net
+    except Exception:  # noqa: BLE001 — last-resort safety net
         logger.exception("Unexpected error auto-saving RO_Summary_Report.")
         return
 
@@ -9981,7 +9981,7 @@ def _maybe_autosave_ro_comparison_output(*, trigger: str) -> None:
     except RoComparisonError as exc:
         logger.warning("Auto-save of RO_Comparison_Output failed: %s", exc)
         return
-    except Exception as exc:  # noqa: BLE001 — last-resort safety net
+    except Exception:  # noqa: BLE001 — last-resort safety net
         logger.exception("Unexpected error auto-saving RO_Comparison_Output.")
         return
 
@@ -10769,7 +10769,7 @@ def _render_plr_chart_for_pm(
     fig.update_layout(
         title=dict(
             text="<b>Total Plan LE in Lbs</b>",
-            x=0.02, xanchor="left", font=dict(size=14),
+            x=0.02, xanchor="left", font=dict(size=18),
         ),
         # Larger top margin so the legend sits cleanly ABOVE the plot
         # area where it's always visible (the prior below-chart position
@@ -10780,7 +10780,7 @@ def _render_plr_chart_for_pm(
             orientation="h",
             yanchor="bottom", y=1.02,   # sits above the plotting area
             xanchor="left", x=0.0,
-            font=dict(size=13),         # bumped from default ~10
+            font=dict(size=17),         # bumped from default ~10
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="#cccccc",
             borderwidth=1,
@@ -10788,7 +10788,7 @@ def _render_plr_chart_for_pm(
         xaxis=dict(title=None, tickangle=0, tickfont=dict(size=12)),
         yaxis=dict(
             title="Lbs", rangemode="tozero",
-            tickformat=",", tickfont=dict(size=11),
+            tickformat=",", tickfont=dict(size=15),
         ),
         hovermode="x unified",
     )
@@ -11167,7 +11167,7 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None, iri_file: str = "") -
     fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
     fig.update_layout(
         height=420, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13),
+        font=dict(color=_BH_FONT_COLOR, size=18),
         xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
                    tickvals=weeks, tickformat="%b %d", tickangle=-45,
                    showgrid=True, gridcolor="#eeeeee"),
@@ -11229,7 +11229,7 @@ def _render_volume_chart(disp: pd.DataFrame) -> None:
                     hovertemplate="Fill: %{y:.0f}%<extra></extra>")
     fig.update_layout(
         height=360, margin=dict(l=10, r=10, t=40, b=10), barmode="group", bargap=0.2,
-        font=dict(color=_BH_FONT_COLOR, size=13),
+        font=dict(color=_BH_FONT_COLOR, size=18),
         xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
                    tickvals=weeks, tickformat="%b %d", tickangle=-45, showgrid=False),
         yaxis=dict(title=dict(text="Lbs"), showgrid=True, gridcolor="#eeeeee",
@@ -11316,7 +11316,7 @@ def _render_base_health(qd: pd.DataFrame) -> None:
     fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13),
+        font=dict(color=_BH_FONT_COLOR, size=18),
         xaxis=dict(title=dict(text="Week"), type="date", tickmode="array", tickvals=x,
                    tickformat="%b %d", tickangle=-45, showgrid=False),
         yaxis=dict(title=dict(text="Velocity index (100 = normal)"),
@@ -11362,7 +11362,7 @@ def _render_promo_economics(qd: pd.DataFrame) -> None:
                     hovertemplate="ACV: %{y:.1f}%<extra></extra>")
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13),
+        font=dict(color=_BH_FONT_COLOR, size=18),
         xaxis=dict(title=dict(text="Week"), type="date", tickmode="array", tickvals=x,
                    tickformat="%b %d", tickangle=-45, showgrid=False),
         yaxis=dict(title=dict(text="%"), showgrid=True, gridcolor="#eeeeee",
@@ -11388,7 +11388,7 @@ def _render_promo_economics(qd: pd.DataFrame) -> None:
                          line=dict(color="#c0392b", width=2))
         fig2.update_layout(
             height=300, margin=dict(l=10, r=10, t=20, b=10),
-            font=dict(color=_BH_FONT_COLOR, size=13),
+            font=dict(color=_BH_FONT_COLOR, size=18),
             xaxis=dict(title=dict(text="Discount depth %"), showgrid=True, gridcolor="#eeeeee"),
             yaxis=dict(title=dict(text="Lift %"), showgrid=True, gridcolor="#eeeeee",
                        rangemode="tozero"),
@@ -11434,7 +11434,7 @@ def _render_promo_cohort(cohort) -> None:
     fig.add_vline(x=0, line=dict(color="#f4b400", width=2))
     fig.update_layout(
         height=340, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13),
+        font=dict(color=_BH_FONT_COLOR, size=18),
         xaxis=dict(title=dict(text="Weeks relative to promo start"), tickmode="array",
                    tickvals=list(c["offset"]), showgrid=True, gridcolor="#eeeeee"),
         yaxis=dict(title=dict(text="Velocity index (100 = normal)"),
@@ -11607,7 +11607,7 @@ def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple
                      showgrid=True, gridcolor="#eeeeee")
     fig.update_layout(
         height=380, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=13),
+        font=dict(color=_BH_FONT_COLOR, size=18),
         xaxis=dict(title=dict(text="Week"), tickmode="array", tickvals=weeks,
                    tickformat="%b %d", tickangle=-45, showgrid=False),
         yaxis=yaxis,
@@ -11839,11 +11839,6 @@ def render() -> None:
     _render_velocity_analysis()
     st.markdown("---")
 
-    # Business Health (trailing-window order momentum) sits directly ABOVE RO
-    # Comparison, separated by a divider — a self-contained read-only view.
-    _render_business_health()
-    st.markdown("---")
-
     _render_ro_comparison()
     st.markdown("---")
 
@@ -11854,6 +11849,12 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
+    st.markdown("---")
+
+    # Business Health (trailing-window order momentum) — a self-contained
+    # read-only view — now sits BELOW the Demand Summary (YoY Comparison) table
+    # rather than above it, per the planner's requested order.
+    _render_business_health()
     st.markdown("---")
 
     _render_product_line_review()

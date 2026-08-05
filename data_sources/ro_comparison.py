@@ -957,6 +957,11 @@ def _sort_summary(df: pd.DataFrame) -> pd.DataFrame:
 # widths without re-typing the literal strings.
 PER_FORMAT_FORMAT_COL: str = "Format"
 PER_FORMAT_DELTA_COL: str = "Δ " + CUR_FISCAL_PROB_CHANGE.removeprefix("Change ")
+# Annualized (Year-1) equivalent used by the "Annualized Probabilized
+# Driver" diagnostic — same layout as the FY27 per-format summary but
+# the delta is ``LE Year1 − Prior Year1`` per row (steady-state run-rate
+# impact, insensitive to First Ship Date phasing).
+PER_FORMAT_ANNUAL_DELTA_COL: str = "Δ " + YEAR1_PROB_CHANGE.removeprefix("Change ")
 PER_FORMAT_DRIVER_COLS: tuple[str, str, str] = (
     "#1 Driver", "#2 Driver", "#3 Driver",
 )
@@ -1018,9 +1023,57 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
     Pure function — no I/O, no Streamlit dependencies — safe to
     unit-test and to call inside an ``st.fragment``.
     """
+    return _compute_per_format_summary_impl(
+        view_df,
+        delta_source_col=CUR_FISCAL_PROB_CHANGE,
+        delta_display_col=PER_FORMAT_DELTA_COL,
+    )
+
+
+def compute_per_format_summary_annualized(view_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-Format roll-up of the ANNUALIZED (Year-1) probabilized delta.
+
+    Same layout, sorting, driver-bucketing and TOTAL semantics as
+    :func:`compute_per_format_summary`, but the per-row delta is the
+    annualized swing ``LE Year1 − Prior Year1`` (i.e. steady-state
+    run-rate impact) instead of the FY-pro-rated
+    ``Change Current Fiscal Probabilized Lbs``.
+
+    Rationale — the FY27 per-format table answers *"what lands this
+    fiscal year?"*; this one answers *"what's the run-rate hit next
+    year and beyond?"*.  Committed risks, phasing-only shifts, and
+    genuine volume moves separate cleanly here because Days-in-Year
+    proration is out of the picture.
+
+    Pure function — safe to unit-test and to call inside an
+    ``st.fragment``.
+    """
+    return _compute_per_format_summary_impl(
+        view_df,
+        delta_source_col=YEAR1_PROB_CHANGE,
+        delta_display_col=PER_FORMAT_ANNUAL_DELTA_COL,
+    )
+
+
+def _compute_per_format_summary_impl(
+    view_df: pd.DataFrame,
+    *,
+    delta_source_col: str,
+    delta_display_col: str,
+) -> pd.DataFrame:
+    """Shared implementation for the per-Format driver diagnostics.
+
+    Both the FY27 (current-fiscal) and FY28 (annualized) variants
+    differ only in *which column supplies the per-row delta* and
+    *what the output delta column is called*; every other rule
+    (grouping by Format, top-3 (Customer, PMinor) buckets, ``|Δ|``
+    sort, TOTAL footer, blank-sentinel normalisation) is identical.
+    Extracting the shared core here keeps the two public entry points
+    thin and guarantees they never drift apart.
+    """
     columns = [
         PER_FORMAT_FORMAT_COL,
-        PER_FORMAT_DELTA_COL,
+        delta_display_col,
         *PER_FORMAT_DRIVER_COLS,
     ]
 
@@ -1034,9 +1087,15 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
         work[PER_FORMAT_FORMAT_COL].astype(str).str.strip()
         .replace({"": "(Unspecified)", "nan": "(Unspecified)"})
     )
-    work["_delta"] = pd.to_numeric(
-        work[CUR_FISCAL_PROB_CHANGE], errors="coerce",
-    ).fillna(0.0)
+    # Tolerate a missing source column (e.g. a legacy frame lacking
+    # the Year-1 change) — treat as zero so the diagnostic still
+    # renders instead of surfacing a KeyError.
+    if delta_source_col in work.columns:
+        work["_delta"] = pd.to_numeric(
+            work[delta_source_col], errors="coerce",
+        ).fillna(0.0)
+    else:
+        work["_delta"] = 0.0
     # Canonical (Customer, Portfolio Minor) bucket keys.  Coerce both
     # to stripped strings and replace blank/NaN with the same sentinel
     # the drill-down API understands, so empty values aren't silently
@@ -1077,7 +1136,7 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
 
         rows.append({
             PER_FORMAT_FORMAT_COL: fmt,
-            PER_FORMAT_DELTA_COL: round(net_delta, 1),
+            delta_display_col: round(net_delta, 1),
             PER_FORMAT_DRIVER_COLS[0]: drivers[0],
             PER_FORMAT_DRIVER_COLS[1]: drivers[1],
             PER_FORMAT_DRIVER_COLS[2]: drivers[2],
@@ -1086,7 +1145,7 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(rows, columns=columns)
 
     # ── 2. Sort Formats by |Δ| desc, Format asc ──────────────────────
-    out = out.assign(_abs=out[PER_FORMAT_DELTA_COL].abs()).sort_values(
+    out = out.assign(_abs=out[delta_display_col].abs()).sort_values(
         by=["_abs", PER_FORMAT_FORMAT_COL],
         ascending=[False, True],
         kind="mergesort",
@@ -1095,7 +1154,7 @@ def compute_per_format_summary(view_df: pd.DataFrame) -> pd.DataFrame:
     # ── 3. TOTAL footer row ──────────────────────────────────────────
     total_row = {
         PER_FORMAT_FORMAT_COL: PER_FORMAT_TOTAL_LABEL,
-        PER_FORMAT_DELTA_COL: round(float(out[PER_FORMAT_DELTA_COL].sum()), 1),
+        delta_display_col: round(float(out[delta_display_col].sum()), 1),
         PER_FORMAT_DRIVER_COLS[0]: "",
         PER_FORMAT_DRIVER_COLS[1]: "",
         PER_FORMAT_DRIVER_COLS[2]: "",
@@ -1937,9 +1996,11 @@ __all__ = [
     "CUR_FISCAL_PROB_PRIOR", "CUR_FISCAL_PROB_LE", "CUR_FISCAL_PROB_CHANGE",
     # Per-Format summary surface.
     "PER_FORMAT_FORMAT_COL", "PER_FORMAT_DELTA_COL",
+    "PER_FORMAT_ANNUAL_DELTA_COL",
     "PER_FORMAT_DRIVER_COLS", "PER_FORMAT_TOTAL_LABEL",
     "PER_FORMAT_DRIVER_BLANK_LABEL",
     "compute_per_format_summary",
+    "compute_per_format_summary_annualized",
     "compute_driver_items",
     # Value objects + errors.
     "ComparisonWarnings",

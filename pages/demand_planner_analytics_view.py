@@ -304,6 +304,7 @@ from data_sources.ro_comparison import (
     CUR_FISCAL_PROB_CHANGE,
     CUR_FISCAL_PROB_LE,
     CUR_FISCAL_PROB_PRIOR,
+    PER_FORMAT_ANNUAL_DELTA_COL,
     PER_FORMAT_DELTA_COL,
     PER_FORMAT_DRIVER_COLS,
     PER_FORMAT_DRIVER_BLANK_LABEL,
@@ -320,6 +321,7 @@ from data_sources.ro_comparison import (
     build_ro_comparison,
     compute_driver_items,
     compute_per_format_summary,
+    compute_per_format_summary_annualized,
     detect_history_change,
     fetch_dimitems_df,
     fetch_ro_history_df,
@@ -346,6 +348,10 @@ from data_sources.ro_summary_report import (
     COL_ROW_ID as SR_COL_ROW_ID,
     COL_TOTAL_DELTA as SR_COL_TOTAL_DELTA,
     COL_Y1_CHANGE as SR_COL_Y1_CHANGE,
+    COL_Y1_DELTA_CHANGE as SR_COL_Y1_DELTA_CHANGE,
+    COL_Y1_DELTA_EXIT as SR_COL_Y1_DELTA_EXIT,
+    COL_Y1_DELTA_NEW as SR_COL_Y1_DELTA_NEW,
+    COL_Y1_DELTA_RISK as SR_COL_Y1_DELTA_RISK,
     COL_Y1_LATEST as SR_COL_Y1_LATEST,
     COL_Y1_PRIOR as SR_COL_Y1_PRIOR,
     RoSummaryReportError,
@@ -2988,6 +2994,15 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     # filters at the top of the section.
     _render_per_format_summary(summary_df)
 
+    # Companion diagnostic — same shape, but on the ANNUALIZED (Year-1)
+    # probabilized delta.  Answers the "run-rate hit" question that the
+    # FY27 table above (pro-rated to the current fiscal year) can't:
+    # committed risks and steady-state volume changes show up here at
+    # full magnitude regardless of ship-date phasing.  Read-only — no
+    # drill-down — to keep this bloc tight; the FY27 drill-down above
+    # already surfaces the underlying SKUs for either horizon.
+    _render_per_format_summary_annualized(summary_df)
+
     # Manual Save button — republishes the in-memory comparison frame
     # (including any planner cell edits) to
     # ``Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv``.  Sits
@@ -3295,6 +3310,81 @@ def _render_per_format_summary(view_df: pd.DataFrame) -> None:
     # at the top of the section — same "portfolio-wide diagnostic"
     # contract as the summary table itself.
     _render_driver_drill_down(view_df, summary)
+
+
+def _render_per_format_summary_annualized(view_df: pd.DataFrame) -> None:
+    """Annualized (Year-1) per-Format Δ + top-3 driver buckets — companion
+    to :func:`_render_per_format_summary`.
+
+    Mirrors the FY27 diagnostic (same one-row-per-Format shape, same
+    ``|Δ|``-desc sort, same top-3 ``(Customer, Portfolio Minor)`` buckets,
+    same TOTAL footer, same red/green signed-Δ styling), but the delta
+    is the annualized ``LE Year1 − Prior Year1`` per row.  Purpose is
+    attribution symmetry with the FY28 Delta Breakdown group in the RO
+    Summary Report above: planners can see WHICH Format × Customer ×
+    Portfolio Minor cells drove the run-rate hit, without ship-date
+    proration muddying the picture.
+
+    Read-only — no drill-down.  The FY27 drill-down above already
+    exposes the underlying SKUs, and re-rendering it here would
+    duplicate widgets.  Kept out of a Streamlit fragment for the same
+    reason as its sibling: it lives inside the RO Comparison editor
+    fragment and rebuilds naturally on every edit / filter change.
+    """
+    summary = compute_per_format_summary_annualized(view_df)
+    if summary.empty:
+        return
+
+    st.markdown(
+        "**Δ Annualized Probabilized Lbs — by Format**  \n"
+        "_Same New / Exit / Change / Risk story as the FY27 table above, "
+        "but on the **annualized (Year-1)** delta — the steady-state "
+        "run-rate hit that isn't diluted by First Ship Date phasing.  "
+        "Compare against the FY27 diagnostic above: identical drivers "
+        "and comparable magnitudes = a genuine run-rate move; large FY27 "
+        "gap with a flat annualized row = a phasing shift, not a "
+        "structural change._"
+    )
+
+    def _color_signed(v):
+        """Signed-value colour (mirrors the FY27 diagnostic exactly)."""
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if x > 0:
+            return "color: #1b7f3a; font-weight: 600"
+        if x < 0:
+            return "color: #c0392b; font-weight: 600"
+        return ""
+
+    def _bold_total(row):
+        if row[PER_FORMAT_FORMAT_COL] == PER_FORMAT_TOTAL_LABEL:
+            return ["font-weight: 700"] * len(row)
+        return [""] * len(row)
+
+    styler = (
+        summary.style
+        .map(_color_signed, subset=[PER_FORMAT_ANNUAL_DELTA_COL])
+        .apply(_bold_total, axis=1)
+    )
+
+    cc = st.column_config
+    column_config = {
+        PER_FORMAT_FORMAT_COL:        cc.TextColumn("Format", width="small"),
+        PER_FORMAT_ANNUAL_DELTA_COL:  cc.NumberColumn(format="accounting"),
+        PER_FORMAT_DRIVER_COLS[0]:    cc.TextColumn(PER_FORMAT_DRIVER_COLS[0], width="large"),
+        PER_FORMAT_DRIVER_COLS[1]:    cc.TextColumn(PER_FORMAT_DRIVER_COLS[1], width="large"),
+        PER_FORMAT_DRIVER_COLS[2]:    cc.TextColumn(PER_FORMAT_DRIVER_COLS[2], width="large"),
+    }
+
+    st.dataframe(
+        styler,
+        use_container_width=True,
+        height=min(36 * (len(summary) + 1) + 38, 480),
+        hide_index=True,
+        column_config=column_config,
+    )
 
 
 def _render_driver_drill_down(
@@ -4450,6 +4540,18 @@ _RO_SR_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (SR_COL_Y1_PRIOR, "Prior"),
         (SR_COL_Y1_LATEST, "Latest"),
         (SR_COL_Y1_CHANGE, "Change"),
+    )),
+    # FY28 Delta Breakdown mirrors the FY27 Delta Breakdown (same
+    # New / Exit / Change / Risk buckets, same Risk-first carve-out) but
+    # on the annualized Year-1 delta.  Placed AFTER the FY28 Probabilized
+    # trio so the planner reads: where FY28 stood → where it lands → the
+    # swing → what drove the swing.  The four cells sum to
+    # ``FY28 Probabilized | Change`` for every row.
+    ("FY28 Delta Breakdown", (
+        (SR_COL_Y1_DELTA_NEW, "New"),
+        (SR_COL_Y1_DELTA_EXIT, "Exit"),
+        (SR_COL_Y1_DELTA_CHANGE, "Change"),
+        (SR_COL_Y1_DELTA_RISK, "Risk"),
     )),
 )
 # First metric column of each group carries the vertical divider.

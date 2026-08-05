@@ -67,6 +67,9 @@ Data columns (8)
 * ``FY28 Probabilized | Prior``            — Σ ``Prior Year1 Probabilized Lbs``
 * ``FY28 Probabilized | Change``           — ``Latest − Prior``  (recomputed)
 * ``FY28 Probabilized | Latest``           — Σ ``LE Year1 Probabilized Lbs``
+* ``FY28 Delta Breakdown | New/Exit/Change/Risk`` — same Risk-first bucketing
+  as the FY27 Delta Breakdown, but on the ANNUALIZED (Year-1) delta
+  ``LE Year1 − Prior Year1`` per row.  Sums to ``FY28 Probabilized | Change``.
 
 Numbers are stored in **millions of lbs** (raw ÷ 1,000,000, rounded
 to 1 decimal) — both for display and for the saved CSV — so the
@@ -166,11 +169,23 @@ COL_DELTA_RISK: str   = "_delta_risk"
 COL_Y1_PRIOR: str     = "_y1_prior"
 COL_Y1_CHANGE: str    = "_y1_change"
 COL_Y1_LATEST: str    = "_y1_latest"
+# FY28 Delta Breakdown — same New / Exit / Change / Risk buckets as the
+# FY27 Delta Breakdown, but bucketed on the ANNUALIZED (Year-1) probabilized
+# delta (``YEAR1_PROB_LE − YEAR1_PROB_PRIOR``) instead of the pro-rated FY27
+# change.  Gives the planner attribution symmetry across the two horizons:
+# how much of the FY28 swing is committed risk vs new opportunities vs
+# volume changes, at the same run-rate scale.  New + Exit + Change + Risk
+# reconciles exactly to :data:`COL_Y1_CHANGE` (Latest − Prior) by construction.
+COL_Y1_DELTA_NEW: str    = "_y1_delta_new"
+COL_Y1_DELTA_EXIT: str   = "_y1_delta_exit"
+COL_Y1_DELTA_CHANGE: str = "_y1_delta_change"
+COL_Y1_DELTA_RISK: str   = "_y1_delta_risk"
 
 DATA_COLS: tuple[str, ...] = (
     COL_PRIOR_PLAN, COL_CURRENT_PLAN, COL_TOTAL_DELTA,
     COL_DELTA_NEW, COL_DELTA_EXIT, COL_DELTA_CHANGE, COL_DELTA_RISK,
     COL_Y1_PRIOR, COL_Y1_CHANGE, COL_Y1_LATEST,
+    COL_Y1_DELTA_NEW, COL_Y1_DELTA_EXIT, COL_Y1_DELTA_CHANGE, COL_Y1_DELTA_RISK,
 )
 
 # Display labels for the saved CSV — the planner / downstream
@@ -186,6 +201,10 @@ SAVED_COLUMN_LABELS: dict[str, str] = {
     COL_Y1_PRIOR:     "FY28 Probabilized | Prior",
     COL_Y1_CHANGE:    "FY28 Probabilized | Change",
     COL_Y1_LATEST:    "FY28 Probabilized | Latest",
+    COL_Y1_DELTA_NEW:    "FY28 Delta Breakdown | New",
+    COL_Y1_DELTA_EXIT:   "FY28 Delta Breakdown | Exit",
+    COL_Y1_DELTA_CHANGE: "FY28 Delta Breakdown | Change",
+    COL_Y1_DELTA_RISK:   "FY28 Delta Breakdown | Risk",
 }
 
 # Structural / display columns kept alongside the data columns.
@@ -779,6 +798,18 @@ def _compute_leaf_values(
     prior_y1  = float(sub[YEAR1_PROB_PRIOR].sum())
     latest_y1 = float(sub[YEAR1_PROB_LE].sum())
 
+    # FY28 Delta Breakdown — same Risk-first bucketing as FY27, but on the
+    # ANNUALIZED delta (LE Year-1 Probabilized − Prior Year-1 Probabilized).
+    # Every row lands in exactly one bucket, so
+    # ``y1_new + y1_exit + y1_change + y1_risk == latest_y1 − prior_y1`` by
+    # construction — the FY28 Change column stays consistent with its
+    # breakdown across subtotals just like FY27's does.
+    y1_delta = sub[YEAR1_PROB_LE] - sub[YEAR1_PROB_PRIOR]
+    y1_risk_val   = float(y1_delta[is_risk].sum())
+    y1_new_val    = float(y1_delta[(sub["Driver"] == "New")    & ~is_risk].sum())
+    y1_exit_val   = float(y1_delta[(sub["Driver"] == "Exit")   & ~is_risk].sum())
+    y1_change_val = float(y1_delta[(sub["Driver"] == "Change") & ~is_risk].sum())
+
     current_plan = float(sub[CUR_FISCAL_PROB_LE].sum())
     total_delta  = new_val + exit_val + change_val + risk_val
 
@@ -797,6 +828,10 @@ def _compute_leaf_values(
         COL_Y1_PRIOR:     prior_y1,
         COL_Y1_CHANGE:    latest_y1 - prior_y1,
         COL_Y1_LATEST:    latest_y1,
+        COL_Y1_DELTA_NEW:    y1_new_val,
+        COL_Y1_DELTA_EXIT:   y1_exit_val,
+        COL_Y1_DELTA_CHANGE: y1_change_val,
+        COL_Y1_DELTA_RISK:   y1_risk_val,
     }
 
 
@@ -1243,6 +1278,8 @@ __all__ = [
     "COL_PRIOR_PLAN", "COL_CURRENT_PLAN", "COL_TOTAL_DELTA",
     "COL_DELTA_NEW", "COL_DELTA_EXIT", "COL_DELTA_CHANGE",
     "COL_Y1_PRIOR", "COL_Y1_CHANGE", "COL_Y1_LATEST",
+    "COL_Y1_DELTA_NEW", "COL_Y1_DELTA_EXIT",
+    "COL_Y1_DELTA_CHANGE", "COL_Y1_DELTA_RISK",
     "COL_LABEL",
     "COL_DIM_PMAJ", "COL_DIM_SFMT", "COL_DIM_PMINOR", "COL_DIM_BCAT",
     "COL_ROW_ID", "COL_INDENT", "COL_IS_SUBTOTAL",

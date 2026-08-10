@@ -1013,3 +1013,162 @@ def test_ibp_ro_volume_and_variance_tie_to_ro_summary():
     assert cell("esl", "Current Plan (R&O)") == 3.0 and cell("esl", "R&O Var.") == -0.5
     assert cell("total_b2c", "Current Plan (R&O)") == 3.0
     assert cell("total_b2c", "R&O Var.") == -0.5
+
+
+# ── Cultured PortfolioMinor memo rows (Cottage Cheese / Sour Cream) ─────────
+#
+# These verify the dedicated post-pass that fills R&O Volume and R&O Var. on
+# the memo rows from the RO Summary Report's own SupplyFormat × PortfolioMinor
+# rollup, and that the reconciliation validator surfaces a warning when the
+# two memo values don't sum to the Cultured total.
+
+def _cultured_ro_paths(
+    *,
+    lt_cc: float = 0.0, st_cc: float = 0.0, to_cc: float = 0.0,
+    lt_sc: float = 0.0, st_sc: float = 0.0, to_sc: float = 0.0,
+    cultured_total: float,
+) -> dict[tuple[str, ...], float]:
+    """Return a minimal RO Summary path map with a Cultured subtotal + the
+    SFmt × PMinor leaves the memo aggregation walks.  Non-Cultured entries
+    are omitted — the demand-plan comparison only reads what it needs."""
+    return {
+        ("Total B2C",):                                            cultured_total,
+        ("Total B2C", "Cultured"):                                 cultured_total,
+        ("Total B2C", "Cultured", "Large Tub", "Cottage Cheese"):  lt_cc,
+        ("Total B2C", "Cultured", "Small Tub", "Cottage Cheese"):  st_cc,
+        ("Total B2C", "Cultured", "Totes",     "Cottage Cheese"):  to_cc,
+        ("Total B2C", "Cultured", "Large Tub", "Sour Cream"):      lt_sc,
+        ("Total B2C", "Cultured", "Small Tub", "Sour Cream"):      st_sc,
+        ("Total B2C", "Cultured", "Totes",     "Sour Cream"):      to_sc,
+    }
+
+
+def test_cultured_memo_rows_populated_from_ro_summary_in_ibp():
+    """CC / SC memo rows sum every Cultured SupplyFormat × PMinor RO path.
+
+    RO Summary provides three format-scoped leaves per Portfolio Minor; the
+    IBP YoY Comparison memo row for that PMinor should equal the sum of
+    those three (0.6 for Cottage Cheese, 0.4 for Sour Cream in this fixture).
+    The Cultured subtotal itself continues to come from the RO Summary's own
+    Cultured subtotal path so it ties to the RO Summary Report headline.
+    """
+    filters = _filters_apr_jun_actual()
+    # Any single non-Cultured leaf is enough to build a valid table shape.
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL,
+         "cycle": "C4", "pounds": 1e6},
+    ])
+    ibp = _enriched_ibp([])
+
+    cp = _cultured_ro_paths(
+        lt_cc=0.3, st_cc=0.2, to_cc=0.1,        # CC ⇒ 0.6
+        lt_sc=0.2, st_sc=0.1, to_sc=0.1,        # SC ⇒ 0.4
+        cultured_total=1.0,                     # CC + SC = 1.0 → ties, no warning
+    )
+    td = {k: v * -1.0 for k, v in cp.items()}   # sign-flipped Total Delta
+
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path=td, ro_current_plan_by_path=cp)
+    t = res.table
+
+    def cell(rid, col):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0][col]), 3)
+
+    assert cell("cult_cottage_cheese", "Current Plan (R&O)") == 0.6
+    assert cell("cult_sour_cream",     "Current Plan (R&O)") == 0.4
+    assert cell("cult_cottage_cheese", "R&O Var.") == -0.6
+    assert cell("cult_sour_cream",     "R&O Var.") == -0.4
+    # Cultured subtotal ties to the RO Summary Cultured path (1.0).
+    assert cell("cultured", "Current Plan (R&O)") == 1.0
+    # Memo sum reconciles → no warning about Cultured memo rows.
+    assert not any("Cultured memo" in w for w in res.warnings)
+
+
+def test_cultured_memo_rows_populated_in_aps_mirror_of_ibp():
+    """APS view (``ro_var_from_tracker=True``) applies the SAME memo fill.
+
+    Even though APS sources parent Cultured R&O from the tracker, the memo
+    rows keep pointing at the RO Summary rollup so the PortfolioMinor view is
+    identical across IBP and APS.  When the two sources disagree the
+    reconciliation warning surfaces the divergence — asserted separately
+    below.
+    """
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL,
+         "cycle": "C4", "pounds": 1e6},
+    ])
+    ibp = _enriched_ibp([])
+
+    cp = _cultured_ro_paths(
+        lt_cc=0.3, st_cc=0.2, to_cc=0.1,
+        lt_sc=0.2, st_sc=0.1, to_sc=0.1,
+        cultured_total=1.0,
+    )
+
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={}, ro_current_plan_by_path=cp,
+        ro_var_from_tracker=True,   # APS mode
+    )
+    t = res.table
+
+    def cell(rid, col):
+        return round(float(t.loc[t["_row_id"] == rid].iloc[0][col]), 3)
+
+    # Memo rows in APS still equal the RO Summary rollup → mirrored contract.
+    assert cell("cult_cottage_cheese", "Current Plan (R&O)") == 0.6
+    assert cell("cult_sour_cream",     "Current Plan (R&O)") == 0.4
+
+
+def test_cultured_memo_mismatch_surfaces_warning():
+    """When memo rows don't sum to the Cultured total, a warning is emitted."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL,
+         "cycle": "C4", "pounds": 1e6},
+    ])
+    ibp = _enriched_ibp([])
+
+    # CC + SC = 0.6 + 0.4 = 1.0, but Cultured total = 1.5 → 0.5 M gap.
+    cp = _cultured_ro_paths(
+        lt_cc=0.3, st_cc=0.2, to_cc=0.1,
+        lt_sc=0.2, st_sc=0.1, to_sc=0.1,
+        cultured_total=1.5,
+    )
+
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={}, ro_current_plan_by_path=cp,
+    )
+    assert any(
+        "Cultured memo rows do not reconcile on R&O Volume" in w
+        for w in res.warnings
+    ), res.warnings
+
+
+def test_cultured_memo_no_warning_when_ro_summary_missing():
+    """When RO Summary data is unavailable, the memo post-pass is a no-op and
+    no reconciliation warning is added on top of the pre-existing "R&O column
+    is zero" advisory (memo rows stay at 0, Cultured stays at 0 → tie)."""
+    filters = _filters_apr_jun_actual()
+    esl = dict(item_key="100", item_desc="DG Milk", party_site="1",
+               pmaj="ESL", sfmt="Large Carton", pminor="", brand="Branded")
+    trk = _enriched_trk([
+        {**esl, "forecast_type": FORECAST_BASE_PLAN, "month": _JUL,
+         "cycle": "C4", "pounds": 1e6},
+    ])
+    ibp = _enriched_ibp([])
+
+    res = build_demand_plan_comparison(
+        None, None, None, filters, enriched=_enriched_sources(trk, ibp),
+        ro_total_delta_by_path={}, ro_current_plan_by_path={},
+    )
+    assert not any("Cultured memo" in w for w in res.warnings)

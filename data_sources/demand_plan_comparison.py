@@ -459,6 +459,24 @@ _RO_SUMMARY_SUBTOTAL_PATH_BY_ROW_ID: dict[str, tuple[str, ...]] = {
 }
 
 
+# Cultured Portfolio-Minor memo rows and the RO Summary label they map to.
+# The comparison template uses **Supply Format** as the primary Cultured split
+# (Large Tub / Small Tub / Pail), so the PMinor rows Cottage Cheese / Sour
+# Cream are ``is_memo=True`` leaves with no ``ro_summary_path`` (a single path
+# doesn't cover a memo that spans all formats).  The RO Summary Report by
+# contrast splits Cultured as SupplyFormat × PortfolioMinor with paths like
+# ``("Total B2C", "Cultured", "Large Tub", "Cottage Cheese")``.  This map is
+# the bridge:  memo ``row_id`` → the RO Summary leaf label to sum across all
+# Cultured formats.  Consumed by
+# :func:`_apply_cultured_memo_ro_from_ro_summary` — the dedicated post-pass
+# that fills R&O Volume and R&O Var. on the memo rows independently of the
+# main YoY-comparison automation.
+_CULTURED_MEMO_TO_RO_SUMMARY_LABEL: dict[str, str] = {
+    "cult_cottage_cheese": "Cottage Cheese",
+    "cult_sour_cream":     "Sour Cream",
+}
+
+
 # The reporting template.  Declaration order == display order.  Subtotals
 # are declared before their children (top-down, screenshot order); the
 # recompute pass walks children via the id graph so declaration order has
@@ -1627,6 +1645,139 @@ def fetch_ro_summary_total_delta_by_path() -> dict[tuple[str, ...], float]:
     return _fetch_ro_summary_metric_by_path(_RO_SUMMARY_TOTAL_DELTA_CANDIDATES)
 
 
+def _sum_ro_summary_by_cultured_pminor(
+    ro_by_path: dict[tuple[str, ...], float],
+    pminor_label: str,
+) -> float:
+    """Sum RO Summary values across every Cultured Supply Format for one PMinor.
+
+    The RO Summary Report models Cultured as SupplyFormat × PortfolioMinor
+    (paths like ``("Total B2C", "Cultured", "Large Tub", "Cottage Cheese")``),
+    while the demand-plan comparison template renders one memo row per
+    Portfolio Minor spanning all Cultured formats.  This helper reconciles
+    the two shapes: pick every 4-element path anchored at Cultured whose
+    leaf label matches *pminor_label*, and sum the values.
+
+    Returns ``0.0`` when *ro_by_path* is empty or no matching paths exist —
+    the caller decides whether to surface that as a warning.
+
+    Pure and cheap (linear scan of the paths dict); intended to be reused by
+    both R&O Volume and R&O Var. lookups, and by the reconciliation validator.
+    """
+    if not ro_by_path:
+        return 0.0
+    total = 0.0
+    for path, value in ro_by_path.items():
+        if (
+            len(path) == 4
+            and path[0] == _RO_TOTAL
+            and path[1] == _RO_CULTURED
+            and path[3] == pminor_label
+        ):
+            total += float(value)
+    return total
+
+
+def _apply_cultured_memo_ro_from_ro_summary(
+    measures: dict[str, dict[str, float]],
+    ro_current_plan_by_path: Optional[dict[tuple[str, ...], float]],
+    ro_total_delta_by_path: Optional[dict[tuple[str, ...], float]],
+) -> dict[str, dict[str, float]]:
+    """Fill R&O Volume + R&O Var. on the Cottage Cheese / Sour Cream memo rows.
+
+    Runs as a **dedicated post-pass** — independent of the main leaf-compute
+    loop and of the R&O subtotal override — so the memo rows always reflect
+    the RO Summary Report's own PortfolioMinor rollup, whether the caller is
+    the IBP view (R&O sourced from RO Summary) or the APS view (R&O sourced
+    from the tracker for parent rows).  The memo view therefore stays
+    consistent across both surfaces of the YoY Comparison table.
+
+    Contract
+    --------
+    * No-op when *measures* has no matching memo row (nothing to fill).
+    * No-op when both RO Summary maps are empty (the fetch upstream failed;
+      leaving the memo values at their prior defaults is the intended fallback,
+      and the "R&O column is zero" warning already surfaces the cause).
+    * Otherwise, for each memo row in :data:`_CULTURED_MEMO_TO_RO_SUMMARY_LABEL`
+      that is present in *measures*, overwrite ``COL_CURRENT_PLAN_RO`` and
+      ``COL_R_AND_O`` with the cross-format sum from RO Summary.
+
+    Returns *measures* (mutated in place) for call-site chaining / testability.
+    """
+    if not measures:
+        return measures
+    if not (ro_current_plan_by_path or ro_total_delta_by_path):
+        return measures
+
+    vol_map = ro_current_plan_by_path or {}
+    var_map = ro_total_delta_by_path or {}
+
+    for row_id, pminor_label in _CULTURED_MEMO_TO_RO_SUMMARY_LABEL.items():
+        if row_id not in measures:
+            continue
+        if vol_map:
+            measures[row_id][COL_CURRENT_PLAN_RO] = _sum_ro_summary_by_cultured_pminor(
+                vol_map, pminor_label,
+            )
+        if var_map:
+            measures[row_id][COL_R_AND_O] = _sum_ro_summary_by_cultured_pminor(
+                var_map, pminor_label,
+            )
+    return measures
+
+
+def _validate_cultured_memo_reconciliation(
+    measures: dict[str, dict[str, float]],
+    *,
+    tolerance_millions: float = 0.05,
+) -> list[str]:
+    """Return advisory warnings when memo rows don't tie to the Cultured total.
+
+    Business invariant: the two Portfolio-Minor memo rows (Cottage Cheese +
+    Sour Cream) should sum to the Cultured subtotal's R&O columns.  When they
+    don't, either (a) the RO Summary Report has Cultured rows whose Portfolio
+    Minor is neither Cottage Cheese nor Sour Cream (a classification gap
+    worth surfacing), or (b) the parent Cultured R&O was sourced from a
+    different pipeline than the memos (e.g. APS reads Cultured R&O from the
+    tracker while the memos here come from the RO Summary) — a divergence
+    the planner needs to see explicitly.
+
+    Emits one warning per column (Volume, Var.) that fails to reconcile so a
+    partial mismatch is still actionable.  Tolerance defaults to 0.05 M lbs
+    (half the display precision) so pure rounding drift is not flagged.
+
+    Returns an empty list when the Cultured subtotal is missing from
+    *measures* (nothing to validate against) or when both columns tie.
+    """
+    warnings: list[str] = []
+    parent = measures.get("cultured")
+    if not parent:
+        return warnings
+
+    cc = measures.get("cult_cottage_cheese", {})
+    sc = measures.get("cult_sour_cream", {})
+
+    checks = (
+        (COL_CURRENT_PLAN_RO, "R&O Volume"),
+        (COL_R_AND_O,         "R&O Var."),
+    )
+    for col, label in checks:
+        memo_sum = float(cc.get(col, 0.0)) + float(sc.get(col, 0.0))
+        parent_val = float(parent.get(col, 0.0))
+        gap = parent_val - memo_sum
+        if abs(gap) > tolerance_millions:
+            warnings.append(
+                f"Cultured memo rows do not reconcile on {label}: "
+                f"Cottage Cheese + Sour Cream = {memo_sum:.2f}M, but the "
+                f"Cultured total is {parent_val:.2f}M (gap {gap:+.2f}M).  "
+                "Likely cause: RO Summary Cultured rows with a Portfolio "
+                "Minor other than Cottage Cheese or Sour Cream, or a source "
+                "mismatch between the memo view (RO Summary) and the "
+                "Cultured total (tracker in the APS view)."
+            )
+    return warnings
+
+
 def fetch_ro_summary_metrics_by_path() -> tuple[
     dict[tuple[str, ...], float], dict[tuple[str, ...], float],
 ]:
@@ -2520,6 +2671,21 @@ def _build_runtime_artifacts(
             if ro_path in ro_current_plan_by_path:
                 measures[tpl.row_id][COL_CURRENT_PLAN_RO] = float(
                     ro_current_plan_by_path[ro_path])
+
+    # ── Cultured PortfolioMinor memo rows (IBP + APS) ────────────────────
+    # Dedicated post-pass, decoupled from the leaf compute above: fill R&O
+    # Volume + R&O Var. on the Cottage Cheese / Sour Cream memo rows from the
+    # RO Summary Report's own SupplyFormat × PortfolioMinor rollup.  Applied
+    # in BOTH modes so the PMinor view of Cultured is consistent between the
+    # IBP YoY Comparison and its APS mirror.  Memo rows are excluded from the
+    # Cultured subtotal by design (declared with is_memo=True), so running
+    # AFTER the subtotal roll-up above is safe — no double-counting risk.
+    # Followed by a reconciliation check so the planner is warned in-page
+    # when Cottage Cheese + Sour Cream fail to sum to the Cultured total.
+    _apply_cultured_memo_ro_from_ro_summary(
+        measures, ro_current_plan_by_path, ro_total_delta_by_path,
+    )
+    warnings.extend(_validate_cultured_memo_reconciliation(measures))
 
     return _RuntimeBuildArtifacts(
         template=runtime_template,

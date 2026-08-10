@@ -5446,6 +5446,10 @@ def build_forecast_bias_corp_sku_drivers(
     to the chosen segment's leaves, resolves corporate group on both legs, then
     groups by (corporate group × SKU) and ranks cells by **pound-error**
     (Impact) — the materiality-consistent "what's actually moving the miss".
+
+    ``top_n=0`` (or negative) returns **every** cell, still impact-ranked — the
+    filtered-list view slices it itself, so it needs the full universe to build
+    its Brand / Corporate group / SKU filter options from.
     """
     bi = _prepare_bias_inputs(
         tracker_df, ibp_actuals_df, ibp_naive_df, pdh_df, filters,
@@ -5533,6 +5537,14 @@ def build_forecast_bias_corp_sku_drivers(
             for k, d in zip(src["item_key"], src["item_desc"]):
                 if k and d and k not in desc_map:
                     desc_map[k] = d
+    # Brand is an item attribute (PDH "DG" prefix → Branded), so it rides along
+    # the SKU leg — the drivers view filters on it without a second join.
+    brand_map: dict[str, str] = {}
+    for src in (trk, act):
+        if "brand" in src.columns:
+            for k, b in zip(src["item_key"], src["brand"]):
+                if k and b and k not in brand_map:
+                    brand_map[k] = str(b)
     soft_corps = set(act.loc[act["_soft"], "corp"])
 
     records = []
@@ -5547,6 +5559,7 @@ def build_forecast_bias_corp_sku_drivers(
             "corp_group": corp,
             "item_key": item_key,
             "item_desc": desc_map.get(item_key, ""),
+            "brand": brand_map.get(item_key, ""),
             "soft": (corp in soft_corps) and (corp != CORP_UNATTRIBUTED),
             "unattributed": corp == CORP_UNATTRIBUTED,
             "_driver_id": f"{corp}␟{item_key}",
@@ -5569,9 +5582,10 @@ def build_forecast_bias_corp_sku_drivers(
     drivers = (
         pd.DataFrame.from_records(records)
         .sort_values("_abs_error", ascending=False)
-        .head(top_n)
-        .reset_index(drop=True)
     )
+    if top_n > 0:
+        drivers = drivers.head(top_n)
+    drivers = drivers.reset_index(drop=True)
     return CorpSkuDriversResult(
         drivers=drivers, months=month_keys, segment_label=segment_label,
         segment_volume=seg_volume, attributed_share=attributed_share,

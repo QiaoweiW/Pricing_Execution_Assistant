@@ -9127,7 +9127,10 @@ def _bias_driver_by_segment(
 # ── Corporate group × SKU drivers (opt-in drill under the bias tree) ─────────
 _BIAS_DRIVERS_LOADED_KEY: str = "bias_corp_sku_drivers_loaded"
 _BIAS_DRIVERS_SEG_KEY: str = "bias_corp_sku_drivers_segment"
-_BIAS_DRIVER_PICK_KEY: str = "bias_corp_sku_driver_pick"
+# Default Impact% floor for the driver list — anything rounding to 0.0% is
+# noise, so the list opens on the cells that actually move the segment.  The
+# planner can drag the slider to 0 to see everything.
+_BIAS_DRIVERS_MIN_IMPACT_PCT: float = 0.1
 # Below this forecast-side attribution the party_site→corporate_group join
 # isn't reconciling, so a corp split would be misleading — show a diagnostic
 # instead of fabricated drivers (the view auto-enables once the dims are fixed).
@@ -9153,7 +9156,7 @@ def _cached_corp_sku_drivers(
         _tracker_df, _actuals_df, _naive_df, _pdh_df, filters,
         segment_row_id=segment_row_id,
         shiptosites_df=_shiptosites_df, plantosites_df=_plantosites_df,
-        customernames_df=_customernames_df, item_master_df=_item_master_df, top_n=3)
+        customernames_df=_customernames_df, item_master_df=_item_master_df, top_n=0)
     return (res.drivers, res.months, res.segment_label, res.segment_volume,
             res.attributed_share, res.forecast_attributed_share, res.available)
 
@@ -9211,13 +9214,17 @@ def _render_bias_corp_sku_drivers(
 
     Lazy by design: nothing computes and no corp-group dims are read until the
     planner clicks *Load*, so the high-level report above never pays for it.
+    The builder returns the segment's FULL cell list (``top_n=0``); filtering
+    and chart fan-out happen in :func:`_render_corp_sku_driver_list`.
     """
     with st.expander("🔎 Forecast Bias Corporate × SKU Drivers", expanded=False):
         st.caption(
             "Drill into the **Corporate group × SKU** cells driving a segment's "
             "lag-1 base-plan miss — ranked by **pounds of error (impact)**, the "
-            "cells actually moving the number.  Loads on demand so it never "
-            "slows the report above."
+            "cells actually moving the number.  Filter by brand / corporate "
+            "group / SKU / impact; every listed cell gets its own monthly "
+            "chart, so **narrow the filters before widening the list**.  Loads "
+            "on demand so it never slows the report above."
         )
         with st.expander("ℹ️ How corporate group is derived", expanded=False):
             st.markdown(
@@ -9261,8 +9268,8 @@ def _render_bias_corp_sku_drivers(
         seg = st.selectbox(
             "Segment", options=seg_ids, key=_BIAS_DRIVERS_SEG_KEY,
             format_func=lambda s: labels.get(s, s),
-            help="Pick a node from the accuracy table; its top-3 Corporate × SKU "
-                 "drivers show below.",
+            help="Pick a node from the accuracy table; every Corporate × SKU "
+                 "cell inside it is listed below (narrow it with the filters).",
         )
 
         sig = (
@@ -9298,19 +9305,126 @@ def _render_bias_corp_sku_drivers(
             )
             return
 
-        _render_corp_sku_driver_rows(drivers, months, seg_label, seg_vol, attr, fcst_attr)
+        _render_corp_sku_driver_list(
+            drivers, months, seg, seg_label, seg_vol, attr, fcst_attr)
 
 
-def _render_corp_sku_driver_rows(
-    drivers: pd.DataFrame, months: tuple, seg_label: str,
+def _bias_driver_multiselect(
+    label: str, options: list, key: str, help_txt: str,
+    fmt=None,
+) -> list:
+    """Multiselect where an empty pick means **All**, with stale picks pruned.
+
+    The three pickers cascade (Brand → Corporate group → SKU), so a selected
+    value can stop being an option when an upstream filter narrows.  Streamlit
+    raises on a session_state value that is no longer in *options*, so prune
+    first.  Empty-means-all keeps the default state honest: nothing is hidden
+    until the planner hides it.
+    """
+    prev = st.session_state.get(key)
+    if isinstance(prev, list):
+        kept = [v for v in prev if v in options]
+        if len(kept) != len(prev):
+            st.session_state[key] = kept
+    return st.multiselect(
+        label, options=options, key=key, help=help_txt,
+        placeholder="All", format_func=fmt or (lambda v: str(v)),
+    )
+
+
+def _bias_driver_impact_bounds(drivers: pd.DataFrame) -> tuple[float, float]:
+    """Slider bounds (percent) for Impact — derived from the WHOLE segment.
+
+    Taken from the unfiltered frame on purpose: bounds that moved with the
+    Brand / Corp / SKU picks would make the slider jump under the planner's
+    hand (and invalidate its stored value on every cascade).
+    """
+    vals = pd.to_numeric(drivers.get(BIAS_COL_IMPACT), errors="coerce").dropna()
+    top = float(vals.max()) * 100.0 if not vals.empty else 0.0
+    hi = round(top, 1)
+    if hi < top:                      # never clip the biggest cell off the slider
+        hi = round(hi + 0.1, 1)
+    return 0.0, max(hi, _BIAS_DRIVERS_MIN_IMPACT_PCT)
+
+
+def _filter_corp_sku_drivers(
+    drivers: pd.DataFrame, seg: str,
+) -> tuple[pd.DataFrame, float, float]:
+    """Render the Brand / Corp / SKU / Impact filters → (frame, impact lo, hi).
+
+    Widget keys are namespaced by *segment* so switching segments starts from a
+    clean, all-inclusive filter set instead of carrying picks that no longer
+    exist in the new segment.
+    """
+    out = drivers
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        brands = sorted({b for b in drivers.get("brand", pd.Series(dtype=object))
+                         .astype(str) if b and b != "nan"})
+        picked = _bias_driver_multiselect(
+            "Brand", brands, f"bias_drv_brand_{seg}",
+            "Branded vs Private label (from the PDH item description).  "
+            "A brand-level segment will only offer its own brand.")
+        if picked:
+            out = out[out["brand"].astype(str).isin(picked)]
+    with c2:
+        corps = sorted({str(c) for c in out.get("corp_group", pd.Series(dtype=object))})
+        picked = _bias_driver_multiselect(
+            "Corporate group", corps, f"bias_drv_corp_{seg}",
+            "Corporate groups present in this segment (after the Brand pick).")
+        if picked:
+            out = out[out["corp_group"].astype(str).isin(picked)]
+
+    sku_labels = {
+        str(r["item_key"]): f"{r['item_key']} · {r.get('item_desc', '')}".strip(" ·")
+        for _, r in out.iterrows()
+    }
+    picked = _bias_driver_multiselect(
+        "SKU", sorted(sku_labels), f"bias_drv_sku_{seg}",
+        "SKUs surviving the Brand / Corporate group picks.",
+        fmt=lambda k: sku_labels.get(k, k))
+    if picked:
+        out = out[out["item_key"].astype(str).isin(picked)]
+
+    lo_b, hi_b = _bias_driver_impact_bounds(drivers)
+    lo, hi = st.slider(
+        "Impact % range", min_value=lo_b, max_value=hi_b,
+        value=(min(_BIAS_DRIVERS_MIN_IMPACT_PCT, hi_b), hi_b), step=0.1,
+        key=f"bias_drv_impact_{seg}",
+        help="Impact = the cell's pounds of error as a share of the segment's "
+             "orders.  Opens at 0.1% so cells rounding to 0.0% stay out; drag "
+             "to 0.0 to include them.")
+    imp = pd.to_numeric(out.get(BIAS_COL_IMPACT), errors="coerce").fillna(0.0) * 100.0
+    return out[(imp >= lo - 1e-9) & (imp <= hi + 1e-9)], lo, hi
+
+
+# Internal driver-frame columns that must never reach the CSV export.
+_BIAS_DRIVER_EXPORT_DROP: tuple[str, ...] = (
+    "_driver_id", "_abs_error", "_fcst", "_act", "soft", "unattributed")
+_BIAS_DRIVER_EXPORT_RENAME: dict[str, str] = {
+    "corp_group": "Corporate Group", "brand": "Brand",
+    "item_key": "SKU", "item_desc": "Item Description",
+}
+
+
+def _render_corp_sku_driver_list(
+    drivers: pd.DataFrame, months: tuple, seg: str, seg_label: str,
     seg_vol: float, attr: float, fcst_attr: float,
 ) -> None:
-    """Top-3 driver rows (sparkline + severity-coloured WMAPE) + a drill chart."""
-    def _make_row(i: int, _foldable: bool) -> tuple[str, str]:
-        row = drivers.iloc[i]
-        corp = _corp_driver_label(row)
+    """Filters → the full filtered driver list → one monthly chart per row.
+
+    No top-N cut and no chart cap: the filters are the throttle, so the list
+    and the charts always agree — three rows listed means three charts.
+    """
+    shown, imp_lo, imp_hi = _filter_corp_sku_drivers(drivers, seg)
+    if shown.empty:
+        st.info("No Corporate × SKU cells match these filters.")
+        return
+
+    def _row_html(row: pd.Series) -> str:
         sku = f"{row.get('item_key', '')} · {row.get('item_desc', '')}".strip(" ·")
-        parts = [f'<span class="lbl">{_esc_html(corp)}</span>',
+        parts = [f'<span class="lbl">{_esc_html(_corp_driver_label(row))}</span>',
+                 f'<span>{_esc_html(str(row.get("brand", "") or "—"))}</span>',
                  f'<span class="wide">{_esc_html(sku)}</span>',
                  f'<span>{_esc_html(_dpc_fmt_m(row.get(BIAS_COL_VOLUME)))}</span>']
         wcls = _wmape_severity_cls(row.get(BIAS_COL_FLAG_SEV))
@@ -9320,56 +9434,78 @@ def _render_corp_sku_driver_rows(
         parts.append(f'<span>{row.get(BIAS_COL_IMPACT, float("nan"))*100:.1f}%</span>'
                      if not pd.isna(row.get(BIAS_COL_IMPACT)) else "<span>—</span>")
         parts.append(f'<span class="wide">{_bias_spark([row.get(m) for m in months])}</span>')
-        return "", "".join(parts)
+        return "".join(parts)
 
     head = ('<div class="rw hdr"><span class="lbl">Corporate group</span>'
-            '<span class="wide">SKU</span><span>Vol (M)</span><span>WMAPE</span>'
-            '<span>Avg Bias</span><span>Impact</span><span class="wide">Trend</span></div>')
-    body = "".join(
-        f'<div class="rw">{_make_row(i, False)[1]}</div>' for i in range(len(drivers)))
+            '<span>Brand</span><span class="wide">SKU</span><span>Vol (M)</span>'
+            '<span>WMAPE</span><span>Avg Bias</span><span>Impact</span>'
+            '<span class="wide">Trend</span></div>')
+    body = "".join(f'<div class="rw">{_row_html(r)}</div>' for _, r in shown.iterrows())
     st.markdown(
         _BIAS_CSS + '<div class="bias"><div class="bias-in">' + head + body + "</div></div>",
         unsafe_allow_html=True,
     )
+
+    # How much of the segment's miss the filtered list actually accounts for —
+    # so a narrow filter never reads as "this is the whole story".
+    covered = float(pd.to_numeric(shown.get(BIAS_COL_IMPACT), errors="coerce")
+                    .fillna(0.0).sum()) * 100.0
     st.caption(
-        f"Ranked by pound-error within **{seg_label}** (segment orders "
-        f"{seg_vol:,.1f}M lbs).  Forecast attributed {fcst_attr:.0%} · orders "
-        f"attributed {attr:.0%} to a corporate group.  `~name` = softer "
-        "customer-name fallback; **Unattributed** = unmapped pounds."
+        f"**{len(shown)}** of {len(drivers)} Corporate × SKU cells "
+        f"(Impact {imp_lo:.1f}–{imp_hi:.1f}%), covering **{covered:.1f}%** of "
+        f"**{seg_label}**'s orders in pound-error.  Ranked by pound-error "
+        f"(segment orders {seg_vol:,.1f}M lbs).  Forecast attributed "
+        f"{fcst_attr:.0%} · orders attributed {attr:.0%} to a corporate group.  "
+        "`~name` = softer customer-name fallback; **Unattributed** = unmapped "
+        "pounds."
     )
+    st.download_button(
+        "⬇️ Download filtered drivers (CSV)",
+        data=(shown.drop(columns=[c for c in _BIAS_DRIVER_EXPORT_DROP
+                                  if c in shown.columns])
+              .rename(columns=_BIAS_DRIVER_EXPORT_RENAME)
+              .to_csv(index=False).encode("utf-8")),
+        file_name=f"forecast_bias_corp_sku_{seg}_"
+                  f"{pd.Timestamp.utcnow().strftime('%Y%m%d')}.csv",
+        mime="text/csv", key=f"bias_drv_dl_{seg}", use_container_width=True)
 
-    # Drill: pick one driver → monthly forecast-vs-actual + bias% chart.
-    idx = list(range(len(drivers)))
-    st.session_state.setdefault(_BIAS_DRIVER_PICK_KEY, 0)
-    pick = st.selectbox(
-        "Monthly trend for driver", options=idx, key=_BIAS_DRIVER_PICK_KEY,
-        format_func=lambda i: f"{_corp_driver_label(drivers.iloc[i])} · "
-                              f"{drivers.iloc[i].get('item_desc') or drivers.iloc[i].get('item_key')}",
-    )
-    _render_corp_sku_driver_chart(drivers.iloc[pick], months)
+    for i, (_, row) in enumerate(shown.iterrows()):
+        _render_corp_sku_driver_chart(row, months, key=f"bias_drv_chart_{seg}_{i}")
 
 
-def _render_corp_sku_driver_chart(row: pd.Series, months: tuple) -> None:
-    """Grouped monthly base-plan vs orders bars + a bias% line (secondary axis)."""
+def _render_corp_sku_driver_chart(row: pd.Series, months: tuple, *, key: str) -> None:
+    """Grouped monthly base-plan vs orders bars + a labelled bias% line.
+
+    The bias% line carries a printed value per month — with one chart per
+    listed SKU the point is scanning the numbers, not hovering for them.
+    """
     fcst = list(row.get("_fcst", ())) or [0.0] * len(months)
     act = list(row.get("_act", ())) or [0.0] * len(months)
     bias_pct = [
         (row.get(m) * 100.0 if row.get(m) is not None and not pd.isna(row.get(m)) else None)
         for m in months
     ]
+    sku = f"{row.get('item_key', '')} · {row.get('item_desc', '')}".strip(" ·")
+    # Header lives outside the figure: the legend already occupies the top
+    # margin, so an in-figure title would sit on top of it.
+    st.markdown(f"**{_corp_driver_label(row)} · {sku}**")
     fig = go.Figure()
     fig.add_bar(name="Base plan", x=list(months), y=fcst, marker_color="#9aa7b8")
     fig.add_bar(name="Orders (actual)", x=list(months), y=act, marker_color="#2f5d8a")
     fig.add_trace(go.Scatter(
         name="Bias %", x=list(months), y=bias_pct, yaxis="y2",
-        mode="lines+markers", line=dict(color="#c0392b", width=2)))
+        mode="lines+markers+text",
+        text=["" if v is None else f"{v:+.1f}%" for v in bias_pct],
+        textposition="top center", textfont=dict(size=10, color="#c0392b"),
+        cliponaxis=False,
+        line=dict(color="#c0392b", width=2)))
     fig.update_layout(
-        barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10),
+        barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10),
         yaxis=dict(title="M lbs"),
         yaxis2=dict(title="Bias %", overlaying="y", side="right", zeroline=False),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0.0),
     )
-    st.plotly_chart(fig, use_container_width=True, theme=None)
+    st.plotly_chart(fig, use_container_width=True, theme=None, key=key)
 
 
 def _render_demand_comparison_table(

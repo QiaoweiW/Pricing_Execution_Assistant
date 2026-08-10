@@ -219,6 +219,34 @@ def test_corp_sku_drivers_join_and_rank():
     assert acme[BIAS_COL_IMPACT] == pytest.approx(1.2 / 10.2, abs=1e-3)
 
 
+def test_corp_sku_drivers_top_n_zero_returns_every_cell():
+    """``top_n=0`` = no cut — the filtered-list view needs the full universe to
+    build its Brand / Corporate group / SKU options from."""
+    kwargs = dict(
+        segment_row_id="fresh_milk",
+        shiptosites_df=_shiptosites(), plantosites_df=_plantosites(),
+        customernames_df=_customernames())
+    capped = build_forecast_bias_corp_sku_drivers(
+        _tracker(), _orders(), None, None, _filters(), top_n=1, **kwargs)
+    full = build_forecast_bias_corp_sku_drivers(
+        _tracker(), _orders(), None, None, _filters(), top_n=0, **kwargs)
+    assert len(capped.drivers) == 1 and len(full.drivers) == 2
+    # Still impact-ranked, and the cap is just the head of the full list.
+    assert (full.drivers.iloc[0]["_driver_id"]
+            == capped.drivers.iloc[0]["_driver_id"])
+
+
+def test_corp_sku_drivers_carry_brand():
+    """Brand rides along the SKU leg so the list can filter Branded/Private."""
+    res = build_forecast_bias_corp_sku_drivers(
+        _tracker(), _orders(), None, None, _filters(),
+        segment_row_id="fresh_milk",
+        shiptosites_df=_shiptosites(), plantosites_df=_plantosites(),
+        customernames_df=_customernames(), top_n=0)
+    # Both fixture items are "DG …" descriptions → Branded.
+    assert set(res.drivers["brand"]) == {"Branded"}
+
+
 def test_corp_sku_drivers_no_bridge_flags_zero_forecast_attribution():
     """Without the dp_dimplantosites bridge the forecast can't reach a corp
     group — the guard signal (forecast_attributed_share≈0) must fire so the UI

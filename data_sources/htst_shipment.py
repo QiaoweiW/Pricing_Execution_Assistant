@@ -11,9 +11,15 @@ fetch_htst_shipment_df(force_refresh=False) -> tuple[DataFrame, SnapshotMeta]
     Returns the latest Delta-table snapshot as an in-memory DataFrame, along
     with metadata (Delta version, last-modified UTC timestamp, row count,
     source URI) used by the page for cache-keying and the "data as of"
-    caption.  The DataFrame is pre-filtered to ``PRODUCTGROUP == 'HTST'``
-    via DuckDB predicate pushdown so callers do not pay the network +
-    Parquet-decode cost for rows they are about to drop in pandas anyway.
+    caption.  The DataFrame is narrowed in DuckDB along BOTH axes before it
+    is ever materialised in pandas:
+
+      * rows    — ``PRODUCTGROUP == 'HTST'`` predicate pushdown;
+      * columns — projection to :data:`ANALYSIS_COLUMNS`, the set the
+                  Activity Monitor actually consumes.
+
+    The column projection is what keeps this page alive on Streamlit
+    Community Cloud — see :data:`ANALYSIS_COLUMNS` for the measurements.
     Streamlit-cached for 60 minutes; force_refresh=True bypasses the cache
     for the explicit "Refresh from Lakehouse" button.
 
@@ -140,6 +146,50 @@ _CACHE_TTL_SECONDS = 60 * 60
 # after the read — which is now an idempotent no-op for healthy data and a
 # safety net for the rare case where pushdown fell back to a full read.
 _PRODUCT_GROUP_FILTER: str = "HTST"
+
+# Columns the HTST Activity Monitor actually consumes.  Everything else in
+# the lakehouse table is read, decoded and materialised for nothing.
+#
+# Why this exists — measured against dbo/Shipments at Delta v97
+# -------------------------------------------------------------
+# The source table is 629 403 rows × 75 columns, of which 435 773 rows
+# (69 %, NOT the ~1/7 the original design assumed — HTST dominates this
+# table) survive the PRODUCTGROUP filter.  Materialising all 75 columns
+# costs 1 409 MB in pandas and peaks the process at ~1 457 MB; a Streamlit
+# Community Cloud container has ~1 GB, so the kernel OOM-killed the app
+# mid-``.df()``.  That kill is a SIGKILL, which is why the MemoryError
+# branch in _read_delta_table never got a chance to report it.
+#
+# Projecting to the 10 columns below:  1 409 MB → 202 MB, 21.6 s → 5.4 s.
+#
+# KEEP IN SYNC with pages/htst_activity_monitor_view.py.  Every column here
+# is load-bearing for the enrichment pipeline:
+#   PRODUCTGROUP          filter predicate + the page's own safety-net re-filter
+#   Customer, SHIPTONAME  grouping keys for site/customer roll-ups
+#   Shipping Warehouse    join key → Plant Tracker → 'Sourcing Plant'
+#   PRODUCTDESC           join key → Demantra (pallet/weight/Format) + Pricing
+#   Party Site Number     join key → Delivered-vs-FOB Pricing Tracker
+#   Order Number          drop-count distinct (drop-size metrics)
+#   Ordered LBS           volume basis for every fee and bracket
+#   Ordered Secondary QTY gallons basis for annualised volume
+#   Order Date            trailing-window slicing + the page's date slicer
+#
+# Adding a column to the page means adding it here too; the test
+# ``test_analysis_columns_cover_pipeline_inputs`` fails loudly if the two
+# drift apart.  A column named here but absent from the lakehouse is
+# skipped with a warning rather than failing the read.
+ANALYSIS_COLUMNS: tuple[str, ...] = (
+    "PRODUCTGROUP",
+    "Customer",
+    "SHIPTONAME",
+    "Shipping Warehouse",
+    "PRODUCTDESC",
+    "Party Site Number",
+    "Order Number",
+    "Ordered LBS",
+    "Ordered Secondary QTY",
+    "Order Date",
+)
 
 # Timeout for the best-effort delta-rs metadata fetch.  Runs in parallel with
 # the (much slower) DuckDB read, so this only adds visible latency if the data
@@ -314,8 +364,8 @@ def _shrink_for_memory(df: pd.DataFrame) -> pd.DataFrame:
 
     Why
     ---
-    The HTST shipment snapshot is roughly 445 K rows × ~50 columns. Half of
-    those columns are short, highly-repeated strings (``SHIPTONAME``,
+    The HTST shipment snapshot is ~436 K rows.  Most of the projected
+    columns are short, highly-repeated strings (``SHIPTONAME``,
     ``PRODUCTDESC``, warehouse codes, product groups, customer names) where
     the same handful of values occurs over and over.  In ``object`` dtype
     pandas stores one Python ``str`` per cell — on the order of ~50 bytes
@@ -324,8 +374,12 @@ def _shrink_for_memory(df: pd.DataFrame) -> pd.DataFrame:
     cell + one shared dictionary of unique values, typically shrinking the
     column by 5–10× and the whole frame by 30–60 %.
 
-    This is the difference between a frame that fits comfortably in a
-    1 GB Streamlit Cloud container and one that gets OOM-killed mid-render.
+    This runs AFTER the frame exists, so it lowers the steady-state
+    footprint but not the peak — the peak is controlled upstream by the
+    column projection in :func:`_scan_htst_subset` (see
+    :data:`ANALYSIS_COLUMNS`).  Both matter: the projection keeps the read
+    from being OOM-killed, this keeps the cached frame small enough that
+    the page's enrichment copies still fit alongside it.
 
     Heuristic
     ---------
@@ -365,32 +419,96 @@ def _shrink_for_memory(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _quote_ident(name: str) -> str:
+    """Quote *name* as a SQL identifier, escaping embedded double quotes.
+
+    Lakehouse column names routinely contain spaces ("Ordered LBS") and
+    dots ("Savannah.Key"), so every projected name must be quoted.
+    """
+    escaped = name.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _resolve_projection(con, table_uri: str) -> tuple[str, list[str]]:
+    """Return ``(select_list_sql, missing_columns)`` for :data:`ANALYSIS_COLUMNS`.
+
+    Probes the Delta schema with a ``LIMIT 0`` scan (~1 s, no data transfer)
+    and intersects it with the columns the page needs, preserving the
+    declared order.  Intersecting rather than blindly projecting means an
+    upstream schema change that drops or renames a column degrades to the
+    page's existing "column not found" guards instead of failing the whole
+    read with a SQL binder error.
+
+    Falls back to ``"*"`` when the probe itself fails — at that point the
+    table is unreadable for reasons the caller's error path reports far
+    better than we could here.
+    """
+    try:
+        described = con.execute(f"SELECT * FROM delta_scan('{table_uri}') LIMIT 0")
+        available = {d[0] for d in described.description}
+    except Exception as probe_exc:  # noqa: BLE001 — degrade, don't fail
+        logger.warning(
+            "Could not probe the Delta schema at %s (%s) — falling back to "
+            "SELECT *.  Expect a much larger in-memory frame.",
+            table_uri, probe_exc,
+        )
+        return "*", []
+
+    wanted = [c for c in ANALYSIS_COLUMNS if c in available]
+    missing = [c for c in ANALYSIS_COLUMNS if c not in available]
+    if not wanted:
+        logger.warning(
+            "None of the expected analysis columns exist in %s (table exposes "
+            "%d columns) — falling back to SELECT *.",
+            table_uri, len(available),
+        )
+        return "*", missing
+    return ", ".join(_quote_ident(c) for c in wanted), missing
+
+
 def _scan_htst_subset(con, table_uri: str) -> pd.DataFrame:
     """Read the HTST-filtered subset of *table_uri* via DuckDB's Delta extension.
 
-    Pushes the ``PRODUCTGROUP == 'HTST'`` predicate into ``delta_scan`` so
-    DuckDB never materialises the ~6/7 of rows the page is going to drop in
-    pandas anyway.  The whitespace + case-insensitive form
-    (``upper(trim(...))``) preserves the exact semantic of the historical
-    pandas filter in :func:`pages.htst_activity_monitor_view._filter_to_htst`
-    so the connector behaves identically on data that has stray casing or
-    padding — a real concern with Fabric Dataflows that occasionally inherit
-    raw values from upstream ERP exports.
+    Narrows the scan on both axes before anything reaches pandas:
 
-    On any failure in the pushdown path (most plausibly a column-name
-    mismatch — e.g., the lakehouse schema renames PRODUCTGROUP) we
-    transparently fall back to ``SELECT *``.  The page's downstream
+    * Columns — projected to :data:`ANALYSIS_COLUMNS`.  This is the change
+      that keeps the page inside a Streamlit Cloud container; the table is
+      75 columns wide and the page reads 10 of them.
+    * Rows — ``PRODUCTGROUP == 'HTST'`` pushed into ``delta_scan``.  The
+      whitespace + case-insensitive form (``upper(trim(...))``) preserves
+      the exact semantic of the historical pandas filter in
+      :func:`pages.htst_activity_monitor_view._filter_to_htst` so the
+      connector behaves identically on data with stray casing or padding —
+      a real concern with Fabric Dataflows that inherit raw values from
+      upstream ERP exports.  Note this filter removes far less than the
+      original design assumed (HTST is ~69 % of this table), which is
+      exactly why the column projection carries the memory win.
+
+    If the predicate fails to bind (most plausibly a renamed PRODUCTGROUP
+    column) we retry unfiltered but still projected; the page's downstream
     :func:`_filter_to_htst` then applies the same filter in pandas, so the
-    user observes only a perf regression, not a functional one.
+    user observes a perf regression, not a functional one.
 
     Caller is responsible for holding :func:`duckdb_lock` around the call.
     """
+    select_list, missing = _resolve_projection(con, table_uri)
+    if missing:
+        # Not fatal: the page guards every optional column with an
+        # `if "X" in df.columns` check.  Log loudly so a silent upstream
+        # rename surfaces in the Cloud logs rather than as a blank chart.
+        logger.warning(
+            "Delta table %s is missing expected analysis column(s): %s.  "
+            "Reading without them — dependent metrics on the page will be "
+            "blank or degraded.",
+            table_uri, ", ".join(missing),
+        )
+
     # The literal value is hard-coded in this codebase (see
     # _PRODUCT_GROUP_FILTER), so the parameterized query is purely a
     # style/safety nicety; the URL itself is inlined because DuckDB's
     # delta_scan takes a literal path, not a parameter.
     pushdown_sql = (
-        f"SELECT * FROM delta_scan('{table_uri}') "
+        f"SELECT {select_list} FROM delta_scan('{table_uri}') "
         f"WHERE upper(trim(CAST(\"PRODUCTGROUP\" AS VARCHAR))) = ?"
     )
     t0 = time.monotonic()
@@ -398,21 +516,22 @@ def _scan_htst_subset(con, table_uri: str) -> pd.DataFrame:
         df = con.execute(pushdown_sql, [_PRODUCT_GROUP_FILTER]).df()
     except Exception as pushdown_exc:  # noqa: BLE001 — fall back, not error path
         logger.warning(
-            "HTST predicate pushdown failed (%s) — falling back to "
-            "SELECT * and applying the filter in pandas downstream.  "
-            "Verify the Delta table exposes a 'PRODUCTGROUP' column.",
+            "HTST predicate pushdown failed (%s) — falling back to an "
+            "unfiltered (but still projected) read and applying the filter "
+            "in pandas downstream.  Verify the Delta table exposes a "
+            "'PRODUCTGROUP' column.",
             pushdown_exc,
         )
-        df = con.execute(f"SELECT * FROM delta_scan('{table_uri}')").df()
+        df = con.execute(f"SELECT {select_list} FROM delta_scan('{table_uri}')").df()
         logger.info(
-            "DuckDB SELECT * delta_scan returned %d rows in %.2f s",
-            len(df), time.monotonic() - t0,
+            "DuckDB unfiltered delta_scan returned %d rows × %d cols in %.2f s",
+            len(df), len(df.columns), time.monotonic() - t0,
         )
         return df
 
     logger.info(
-        "DuckDB pushdown delta_scan returned %d HTST rows in %.2f s",
-        len(df), time.monotonic() - t0,
+        "DuckDB delta_scan returned %d HTST rows × %d cols in %.2f s",
+        len(df), len(df.columns), time.monotonic() - t0,
     )
     return df
 
@@ -421,8 +540,9 @@ def _read_delta_table(table_uri: str, token: str, cfg: dict[str, str]) -> tuple[
     """Materialise the HTST subset of *table_uri* into a pandas DataFrame.
 
     Returns (df, version, last_modified_utc).  The DataFrame is already
-    filtered to ``PRODUCTGROUP == 'HTST'`` via predicate pushdown — callers
-    that re-apply the page-side filter see it as a no-op.  Version and
+    filtered to ``PRODUCTGROUP == 'HTST'`` via predicate pushdown and
+    narrowed to :data:`ANALYSIS_COLUMNS` via projection — callers that
+    re-apply the page-side filter see it as a no-op.  Version and
     last_modified come from a parallel delta-rs metadata probe; both
     degrade gracefully (-1 / None) when delta-rs cannot read the table.
 
@@ -447,8 +567,10 @@ def _read_delta_table(table_uri: str, token: str, cfg: dict[str, str]) -> tuple[
        :func:`bind_storage_token` (``CREATE OR REPLACE SECRET``), so the
        connection always sees a fresh, non-expired token.
     4. DuckDB's delta extension does delta_scan → arrow → pandas in a single
-       SQL query, with the HTST filter pushed into the scan (see
-       :func:`_scan_htst_subset`).
+       SQL query, with both the column projection and the HTST row filter
+       pushed into the scan (see :func:`_scan_htst_subset`).  Doing the
+       narrowing in DuckDB rather than in pandas is the whole ballgame for
+       memory: pandas can only drop a column after paying to build it.
     5. After the scan returns, we wait up to
        :data:`_METADATA_TAIL_TIMEOUT_SECONDS` for the metadata thread.
        The metadata is informational (powering the caption); we refuse to
@@ -503,19 +625,21 @@ def _read_delta_table(table_uri: str, token: str, cfg: dict[str, str]) -> tuple[
     except FabricAuthError as exc:
         raise HTSTShipmentSourceError(str(exc)) from exc
     except MemoryError as exc:
-        # Distinct path because a MemoryError here is almost always a
-        # Streamlit Cloud container running out of RAM during the
-        # arrow → pandas materialisation (~445 K rows × ~50 columns can
-        # spike to 1.5–2 GB transiently).  Surface a Cloud-specific
-        # remediation hint instead of dumping a generic OOM trace.
+        # Best-effort only.  Note that the failure mode this connector
+        # actually hit in production was NOT a MemoryError: a Streamlit
+        # Cloud container that exceeds its cgroup limit is SIGKILLed by the
+        # kernel, so Python never unwinds and this handler never runs — the
+        # user just sees the app restart.  Keeping the branch is still worth
+        # it for the cases Python *can* report (32-bit address-space limits,
+        # allocator refusals), and the remediation advice is identical.
         raise HTSTShipmentSourceError(
             "Out of memory while materialising the HTST shipment snapshot.  "
-            "This typically happens on Streamlit Community Cloud (≈1 GB RAM) "
-            "when the lakehouse table grows past ~400 K rows.  Mitigations: "
-            "(1) bump the container's memory tier, (2) request the upstream "
-            "Dataflow Gen2 to publish a pre-filtered HTST-only table so the "
-            "scan returns 1/7 of the rows, or (3) run the page on a local "
-            "workstation where memory is abundant."
+            "The read is already projected to the analysis columns and "
+            "filtered to HTST, so if this fires the table has grown well "
+            "beyond its measured size.  Mitigations: (1) bump the "
+            "container's memory tier, (2) narrow ANALYSIS_COLUMNS further "
+            "in data_sources/htst_shipment.py, or (3) request the upstream "
+            "Dataflow Gen2 to publish a pre-filtered HTST-only table."
         ) from exc
     except Exception as exc:  # noqa: BLE001
         msg = str(exc)
@@ -618,9 +742,10 @@ def _cached_fetch(_cache_token: str) -> tuple[pd.DataFrame, SnapshotMeta]:
         source_uri=table_uri,
     )
     logger.info(
-        "Loaded HTST Shipment snapshot v%s (%s rows) from %s "
+        "Loaded HTST Shipment snapshot v%s (%s rows × %s cols, %.0f MB) from %s "
         "(auth %.2fs, total %.2fs)",
-        version, len(df), table_uri,
+        version, len(df), len(df.columns),
+        df.memory_usage(deep=True).sum() / (1024 * 1024), table_uri,
         auth_elapsed, time.monotonic() - fetch_start,
     )
     return df, meta
@@ -652,4 +777,9 @@ def fetch_htst_shipment_df(*, force_refresh: bool = False) -> tuple[pd.DataFrame
     return _cached_fetch("default")
 
 
-__all__ = ["SnapshotMeta", "HTSTShipmentSourceError", "fetch_htst_shipment_df"]
+__all__ = [
+    "ANALYSIS_COLUMNS",
+    "SnapshotMeta",
+    "HTSTShipmentSourceError",
+    "fetch_htst_shipment_df",
+]

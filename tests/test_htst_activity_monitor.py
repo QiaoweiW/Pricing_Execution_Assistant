@@ -30,6 +30,7 @@ sys.modules.setdefault("streamlit.components", MagicMock())
 sys.modules.setdefault("streamlit.components.v1", MagicMock())
 
 import pages.htst_activity_monitor_view as page       # noqa: E402
+import data_sources.htst_shipment as shipment_mod     # noqa: E402
 import data_sources.htst_shipment_lookups as lookups_mod  # noqa: E402
 
 
@@ -80,6 +81,122 @@ def _enriched() -> pd.DataFrame:
     enr = page._process_shipment_data(_shipment(), _lookups())
     enr["Order Date"] = pd.to_datetime(enr["Order Date"])
     return enr
+
+
+# ── Column projection contract ───────────────────────────────────────────────
+
+def test_analysis_columns_cover_pipeline_inputs():
+    """The connector projects the lakehouse read down to ANALYSIS_COLUMNS.
+
+    That projection is what keeps the page inside a Streamlit Cloud memory
+    budget (1 409 MB -> 202 MB measured), but it means a column the pipeline
+    needs and the connector does not request is simply absent at runtime —
+    a silent blank metric rather than a loud failure.
+
+    _shipment() is the minimal frame the whole enrichment + requote pipeline
+    is proven to run on by the tests below, so it doubles as the authoritative
+    statement of what the page consumes.  If someone teaches the page to read
+    a new source column, this test fails until the connector asks for it too.
+    """
+    needed = set(_shipment().columns)
+    projected = set(shipment_mod.ANALYSIS_COLUMNS)
+    assert needed <= projected, (
+        f"pipeline reads columns the connector never projects: "
+        f"{sorted(needed - projected)}"
+    )
+
+
+def test_analysis_columns_include_the_filter_predicate():
+    """PRODUCTGROUP must survive projection — it is the pushdown predicate
+    and the page's own safety-net re-filter both depend on it."""
+    assert "PRODUCTGROUP" in shipment_mod.ANALYSIS_COLUMNS
+
+
+def test_resolve_projection_skips_columns_absent_upstream():
+    """A renamed/dropped upstream column degrades to a warning, not a crash."""
+    class _Con:
+        def execute(self, sql, *a):
+            assert "LIMIT 0" in sql
+            return SimpleNamespace(description=[
+                ("PRODUCTGROUP",), ("SHIPTONAME",), ("Ordered LBS",)])
+
+    select_list, missing = shipment_mod._resolve_projection(_Con(), "abfss://x")
+    assert select_list == '"PRODUCTGROUP", "SHIPTONAME", "Ordered LBS"'
+    assert "Customer" in missing and "Order Date" in missing
+
+
+def test_resolve_projection_falls_back_to_star_when_probe_fails():
+    class _Con:
+        def execute(self, sql, *a):
+            raise RuntimeError("delta_scan exploded")
+
+    select_list, missing = shipment_mod._resolve_projection(_Con(), "abfss://x")
+    assert select_list == "*" and missing == []
+
+
+def test_quote_ident_escapes_embedded_quotes():
+    """Column names carry spaces and dots ('Ordered LBS', 'Savannah.Key');
+    quoting them is mandatory and must not be defeatable."""
+    assert shipment_mod._quote_ident("Ordered LBS") == '"Ordered LBS"'
+    assert shipment_mod._quote_ident('we"ird') == '"we""ird"'
+
+
+# ── Lazy CSV export identity ─────────────────────────────────────────────────
+
+def test_frame_identity_tracks_filter_changes():
+    """A prepared CSV must not be offered after the filter moves under it."""
+    enr = _enriched()
+    base = page._frame_identity(enr)
+    assert page._frame_identity(enr) == base                    # stable
+    subset = enr[enr["SHIPTONAME"] == "S1"]
+    assert page._frame_identity(subset) != base                 # rows changed
+    dropped = enr.drop(columns=["Mileage"])
+    assert page._frame_identity(dropped) != base                # columns changed
+
+
+def test_frame_identity_handles_empty_frame():
+    enr = _enriched()
+    assert page._frame_identity(enr.iloc[0:0])                  # must not raise
+
+
+def test_lazy_download_caches_payload_and_expires_it_on_identity_change():
+    """The prepare→download handshake must never serve a stale CSV.
+
+    Rebuild once on the prepare click, reuse it for free while the data is
+    unchanged, and withdraw the download button the moment the underlying
+    selection moves — otherwise a user downloads a file that disagrees with
+    the table they are looking at.
+    """
+    calls = []
+
+    def _build():
+        calls.append(1)
+        return b"col\n1\n"
+
+    _ST.session_state.clear()
+    _ST.download_button.reset_mock()
+
+    # 1. First render: nothing prepared, user clicks "Prepare" -> builds once.
+    _ST.button.return_value = True
+    page._lazy_csv_download(label="X", key="k", file_name="f.csv",
+                            identity="id-1", build=_build)
+    assert calls == [1]
+    assert _ST.download_button.call_count == 0        # revealed on the rerun
+
+    # 2. Rerun with the same data: served from session_state, no rebuild.
+    _ST.button.return_value = False
+    page._lazy_csv_download(label="X", key="k", file_name="f.csv",
+                            identity="id-1", build=_build)
+    assert calls == [1]
+    assert _ST.download_button.call_count == 1
+    assert _ST.download_button.call_args.kwargs["data"] == b"col\n1\n"
+
+    # 3. Filter moved: the stale payload must NOT be offered for download.
+    page._lazy_csv_download(label="X", key="k", file_name="f.csv",
+                            identity="id-2", build=_build)
+    assert calls == [1]
+    assert _ST.download_button.call_count == 1        # still just the one
+    _ST.button.return_value = False
 
 
 # ── Enrichment ───────────────────────────────────────────────────────────────

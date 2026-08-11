@@ -106,7 +106,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -166,11 +166,13 @@ _SHIPMENT_PATTERN: _FilePattern = _FilePattern(
 # Product-group filter applied in _process_shipment_data BEFORE any merge or
 # aggregation runs.  The Fabric Shipments table contains every product group
 # Darigold ships (HTST, Cheese, Powder, etc.); only HTST rows belong on this
-# page.  Filtering early shrinks the working set ~7× (matters for memory and
-# for every downstream operation), and is more correct than filtering at the
-# UI layer because incorrect rows would otherwise contaminate site-level
-# aggregates (e.g. Site-level Sell-to Volume sums).  Comparison is uppercase
-# + stripped to absorb minor formatting drift in the source data.
+# page.  Filtering early is primarily a CORRECTNESS requirement — non-HTST
+# rows would otherwise contaminate site-level aggregates (e.g. Site-level
+# Sell-to Volume sums).  It is a weak memory lever: measured against
+# dbo/Shipments at Delta v97, HTST is 435 773 of 629 403 rows (69 %), not
+# the ~1/7 an earlier revision of this page assumed.  The memory win comes
+# from the column projection in data_sources/htst_shipment.py instead.
+# Comparison is uppercase + stripped to absorb formatting drift in the source.
 _PRODUCT_GROUP_FILTER: str = "HTST"
 
 # Columns to remove from the enriched output — not needed downstream.
@@ -383,8 +385,84 @@ def _to_csv_bytes(df: pd.DataFrame) -> bytes:
 
     st.download_button streams this payload via HTTP (not WebSocket), so
     there is no Streamlit message-size constraint on the output size.
+
+    Row-level frames on this page are ~436 K rows; prefer
+    :func:`_lazy_csv_download` over calling this inline so the encode does
+    not run on every rerun.
     """
     return df.to_csv(index=False).encode("utf-8")
+
+
+def _frame_identity(df: pd.DataFrame) -> str:
+    """Return a cheap, collision-resistant identity string for *df*.
+
+    Used to decide whether an already-prepared CSV payload still matches
+    what is on screen.  Every row-level frame here is an index-preserving
+    boolean-mask subset of the enriched frame, so hashing the *index* (plus
+    shape and column names) identifies the exact subset without touching
+    the values.  ``hash_pandas_object`` is a vectorised C loop — ~2 ms on
+    436 K rows, against the ~2-4 s the CSV encode it guards would cost.
+    """
+    idx_hash = (
+        int(pd.util.hash_pandas_object(df.index, index=False).sum()) if len(df) else 0
+    )
+    cols_hash = hashlib.md5("\x00".join(map(str, df.columns)).encode()).hexdigest()[:8]
+    return f"{len(df)}:{cols_hash}:{idx_hash & 0xFFFF_FFFF_FFFF}"
+
+
+def _lazy_csv_download(
+    *,
+    label: str,
+    key: str,
+    file_name: str,
+    identity: str,
+    build: Callable[[], bytes],
+    help_text: Optional[str] = None,
+) -> None:
+    """Render a prepare→download pair instead of encoding CSV on every rerun.
+
+    Why not a plain ``st.download_button``
+    -------------------------------------
+    ``st.download_button`` needs its full payload up front, so rendering one
+    directly means serialising the entire frame to CSV on EVERY script rerun
+    — every filter change, every widget click — even though almost nobody
+    clicks download.  At ~436 K rows that is seconds of CPU and tens of MB
+    of transient allocation per interaction, on a container with ~1 GB.
+
+    So the encode is deferred behind an explicit "Prepare" click and the
+    bytes are parked in ``session_state`` under *key*.
+
+    Staleness
+    ---------
+    A prepared payload is only offered while *identity* still matches the
+    data on screen; change a filter and the download button disappears in
+    favour of the prepare button again.  This is the whole reason the
+    helper takes an identity rather than just caching blindly — handing a
+    user a CSV that silently disagrees with the table above it would be a
+    worse bug than the one this function exists to fix.
+    """
+    slot = f"{key}__prepared"
+    prepared = st.session_state.get(slot)
+
+    if prepared is not None and prepared[0] == identity:
+        st.download_button(
+            label=f"⬇️ Download {label}",
+            data=prepared[1],
+            file_name=file_name,
+            mime="text/csv",
+            key=key,
+            help=help_text,
+        )
+        return
+
+    if st.button(
+        f"🧾 Prepare {label}",
+        key=f"{key}__prepare",
+        help=help_text or "Builds the CSV, then reveals the download button.",
+    ):
+        with st.spinner(f"Building {label}…"):
+            st.session_state[slot] = (identity, build())
+        st.rerun()
 
 
 def _load_optional_lookup(file_obj, label: str) -> Optional[pd.DataFrame]:
@@ -437,18 +515,19 @@ def _filter_to_htst(df: pd.DataFrame) -> pd.DataFrame:
     return df[mask]
 
 
-@st.cache_data(show_spinner=False)
-def _htst_filtered_csv_bytes(_df: pd.DataFrame, snapshot_sig: str) -> bytes:
-    """Serialize the HTST-filtered subset of *_df* to UTF-8 CSV bytes (cached).
+def _htst_filtered_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Serialize the HTST-filtered subset of *df* to UTF-8 CSV bytes.
 
-    The leading underscore on *_df* tells Streamlit not to hash the DataFrame
-    (which would be wasteful on a 400 K-row table); cache identity is keyed on
-    *snapshot_sig*, which already encodes the dataflow Delta version + last-
-    modified timestamp.  As a result the filter + CSV-encode pass runs at
-    most once per dataflow snapshot, even though Streamlit reruns the page on
-    every widget interaction.
+    The connector already applies the HTST filter in DuckDB, so
+    :func:`_filter_to_htst` here is an idempotent safety net that also
+    covers the manual-upload path.
+
+    Not cached: this is invoked only from :func:`_lazy_csv_download`, which
+    parks the finished bytes in ``session_state`` keyed by snapshot
+    identity.  Caching here as well would keep a second copy of a
+    multi-tens-of-MB payload resident for no benefit.
     """
-    return _filter_to_htst(_df).to_csv(index=False).encode("utf-8")
+    return _filter_to_htst(df).to_csv(index=False).encode("utf-8")
 
 
 # ── 3. DataFrame utilities ────────────────────────────────────────────────────
@@ -502,8 +581,10 @@ def _process_shipment_data(
     ----------------
     0a. Normalise column names (strip whitespace).
     0b. Filter to PRODUCTGROUP == _PRODUCT_GROUP_FILTER ("HTST").  Done first
-        so all downstream merges and aggregations operate on the ~1/7 row
-        subset rather than the full Shipments table.
+        so all downstream merges and aggregations operate on the HTST subset
+        rather than the full Shipments table.  In lakehouse mode the
+        connector has already applied this in DuckDB, so it is an idempotent
+        no-op there and load-bearing only on the manual-upload path.
     0c. Defensive copy + drop noise columns (_DROP_COLS).
     0d. Pre-parse 'Order Date' once into datetime64.  _render_filters then
         skips its own O(n) parse on every widget interaction.
@@ -1353,7 +1434,7 @@ def _render_shipment_source() -> _ShipmentSourceResult:
     refresh_clicked = st.button(
         "🔄 Refresh from Lakehouse",
         key="htst_shipment_refresh",
-        help="Bypass the 15-minute cache and re-read the latest lakehouse snapshot.",
+        help="Bypass the 60-minute cache and re-read the latest lakehouse snapshot.",
     )
     # Why st.status (and not st.spinner)
     # ----------------------------------
@@ -1397,32 +1478,34 @@ def _render_shipment_source() -> _ShipmentSourceResult:
     )
 
     # ── HTST-only raw download button ─────────────────────────────────────────
-    # Available in both local and Streamlit Cloud sessions because
-    # st.download_button streams over HTTP, not the WebSocket — there is no
-    # client-side limit on the payload size.  CSV bytes are produced lazily
-    # and cached by snapshot signature inside _htst_filtered_csv_bytes, so
-    # the filter + CSV-encode pass runs at most once per lakehouse refresh.
-    try:
-        csv_bytes = _htst_filtered_csv_bytes(df, meta.cache_key)
-    except KeyError:
+    # st.download_button streams over HTTP, not the WebSocket, so payload size
+    # is not a client-side constraint — but building the payload is a server-
+    # side cost, so it is deferred behind a "Prepare" click (see
+    # _lazy_csv_download).  Keyed on meta.cache_key, i.e. the Delta version,
+    # so a lakehouse refresh invalidates a previously prepared file.
+    # Whitespace-stripped membership test, matching _filter_to_htst's own
+    # rename(columns=str.strip) — the build callback runs later (on click),
+    # so the precondition has to be checked here rather than caught there.
+    if "PRODUCTGROUP" not in {str(c).strip() for c in df.columns}:
         st.warning(
             "HTST-only download unavailable: the lakehouse table is missing "
             "the 'PRODUCTGROUP' column."
         )
     else:
-        if csv_bytes:
-            today = datetime.now().strftime("%Y%m%d")
-            st.download_button(
-                label="⬇️ Download HTST-Only Shipment Data (CSV)",
-                data=csv_bytes,
-                file_name=f"HTST_Shipment_{today}.csv",
-                mime="text/csv",
-                key="htst_dataflow_raw_download",
-                help=(
-                    "HTST-filtered raw shipment table from the lakehouse, "
-                    "before any lookup merges or enrichment."
-                ),
-            )
+        today = datetime.now().strftime("%Y%m%d")
+        _lazy_csv_download(
+            label="HTST-Only Shipment Data (CSV)",
+            key="htst_dataflow_raw_download",
+            file_name=f"HTST_Shipment_{today}.csv",
+            identity=meta.cache_key,
+            build=lambda: _htst_filtered_csv_bytes(df),
+            help_text=(
+                "HTST-filtered shipment table from the lakehouse, before any "
+                f"lookup merges or enrichment ({len(df.columns)} analysis "
+                "columns — see ANALYSIS_COLUMNS in data_sources/htst_shipment.py; "
+                "the full-width table lives in the lakehouse itself)."
+            ),
+        )
 
     return _ShipmentSourceResult(df, meta, meta.cache_key, None)
 
@@ -1784,10 +1867,19 @@ def _render_output_section(filtered_df: pd.DataFrame) -> None:
         n_no_plant = int(filtered_df["Sourcing Plant"].isna().sum()) if "Sourcing Plant" in filtered_df.columns else 0
         m4.metric("Rows with Unmatched Plant", f"{n_no_plant:,}")
         today = datetime.now().strftime("%Y%m%d")
-        st.download_button(
-            "⬇️ Download Full Enriched Report (CSV)", data=_to_csv_bytes(filtered_df),
-            file_name=f"HTST_Shipment_Enriched_{today}.csv", mime="text/csv",
+        # Deferred: this frame is ~436 K rows, and an inline download_button
+        # would re-encode all of it on every rerun of the page.
+        _lazy_csv_download(
+            label="Full Enriched Report (CSV)",
             key="htst_download_output",
+            file_name=f"HTST_Shipment_Enriched_{today}.csv",
+            identity=_frame_identity(filtered_df),
+            build=lambda: _to_csv_bytes(filtered_df),
+            help_text=(
+                "Row-level enriched report for the current filter selection. "
+                "Change a filter and you'll be asked to prepare it again, so "
+                "the file always matches what's on screen."
+            ),
         )
         st.caption(
             f"Preview: first {min(_PREVIEW_ROWS, len(filtered_df)):,} of "

@@ -5,18 +5,21 @@ Strategy
 --------
 When the user clicks **🔄 USDA refresh** (or a routine tick fires for
 the first time in the session), the orchestrator scrapes the headline
-values from ``dymadvancedprices.pdf`` and asks: **"is the PDF's page-1
-banner announcing the month that is already the latest in the file?"**.
-Only when the announced month equals ``max(file)`` do we ingest a new
-month, labelled ``max(file) + 1 calendar month`` per the operator
-contract.  Existing rows are NEVER mutated by this path (May-2026-late
-contract: "no change to existing data").
+values from ``dymadvancedprices.pdf`` and asks: **"is the month the
+PDF announces newer than the latest month in the file?"**.  USDA
+announces exactly one month per publication — the upcoming one — and
+the headline values belong to that month, so the announced month is
+both the gate and the row label.  With the file current this is the
+operator contract "label the month = ``max(file) + 1 calendar month``"
+verbatim (latest = Aug 2026, banner announces September 2026 -> write
+Sep 2026).  Existing rows are NEVER mutated by this path
+(May-2026-late contract: "no change to existing data").
 
-Anchoring the write to the announced month IS the dedup guard: a month
-is only appended when USDA has "caught up" to the file's latest month,
-so the label counter cannot run past the real month (it will not write
-September while the PDF still announces July) and an identical month
-cannot be appended twice.
+Labelling the row with the announced month IS the dedup guard, and a
+stricter one than a calendar counter: the label cannot run past USDA
+because the label is what USDA published, and re-ticking the same
+publication appends nothing because that month is already covered.
+A month label is therefore never paired with another month's prices.
 
 Class II Butterfat is published in a separate file (page-2 history of
 ``dymclassprices.pdf``) and lags advance-prices by ~1 month at the USDA
@@ -51,15 +54,16 @@ Workflow on each invocation
     the data (bfat lag, transient error, legacy-buggy write), which
     used to leave the file stale forever even after the operator
     explicitly clicked refresh.
-5.  **New-month gate (rewired).**  Append the next calendar month
-    (``max(file) + 1``) ONLY when the advanced-prices PDF page-1
-    banner announces the month that is already the latest in the file
-    (e.g. latest = Jul 2026 AND banner = "ADVANCED PRICES FOR JULY
-    2026" -> write Aug 2026).  A different or unreadable announced
-    month writes nothing.  This is the hardened dedup guard: it stops
-    the label counter from running past the real month and cannot be
-    bypassed by a missing latest-month lookup.  Class II Butterfat
-    never gates the write (sourced as the latest page-2 row, step 6).
+5.  **New-month gate.**  Append the month the advanced-prices PDF
+    page-1 banner announces, ONLY when it is newer than the latest
+    month in the file (e.g. latest = Aug 2026 AND banner announces
+    "September 2026" -> write Sep 2026 from the September headline).
+    An already-covered or unreadable announced month writes nothing.
+    A jump of more than one month still writes the announced month and
+    surfaces ``month_gap_warning`` naming the months USDA published
+    while nobody was ingesting — the headline block cannot recover
+    them.  Class II Butterfat never gates the write (sourced as the
+    latest page-2 row, step 6).
 6.  **Source Class II Butterfat** by taking the LATEST published row
     from :func:`pdf.parse_class_ii_butterfat_history` regardless of
     target month — the operator-facing contract is "Class II
@@ -159,10 +163,16 @@ class AutoUpdateResult:
     # repair pass (May-2026 contract: Culture II skim/bfat mirror ESL
     # II).
     culture_rows_repaired:  int               = 0
-    # The month label the orchestrator chose for this tick, derived as
-    # ``store.latest_month() + 1`` per the operator-facing contract.
+    # The month label the orchestrator chose for this tick: the month the
+    # advanced-prices PDF announces, which equals ``store.latest_month() + 1``
+    # per the operator-facing contract whenever the file is current.
     # Surfaced to the UI so the operator can sanity-check the labelling.
     target_month:      Optional[pd.Timestamp] = None
+    # Non-empty when the announced month is MORE than one month past the
+    # file's latest month — i.e. one or more USDA publications were never
+    # ingested and cannot be recovered from the current PDF.  The announced
+    # month is still written; this names the months left missing.
+    month_gap_warning: Optional[str]          = None
     # Non-empty when the class-prices PDF was unreachable or unparseable,
     # so the Class II Butterfat cell on the new month landed as ``None``.
     # The orchestrator STILL inserts the new-month row (per the
@@ -212,6 +222,11 @@ class AutoUpdateResult:
                 "manually when class-prices PDF publishes"
             )
 
+        # Same treatment for a skipped-publication hole: the operator needs to
+        # know which months will never arrive on their own.
+        if self.month_gap_warning:
+            parts.append(f"⚠️ {self.month_gap_warning}")
+
         if self.skipped_reason and not parts:
             return f"✅ Auto-update at {when}: {self.skipped_reason}"
         if not parts:
@@ -223,10 +238,14 @@ class AutoUpdateResult:
     def is_warning(self) -> bool:
         """True when callers should render the caption as ``st.warning``.
 
-        Used by the page so the bfat-lag soft warning gets the amber
-        banner treatment instead of being buried in a small caption.
+        Used by the page so the bfat-lag / missing-month soft warnings get
+        the amber banner treatment instead of being buried in a small caption.
         """
-        return bool(self.errors) or bool(self.class_ii_bfat_lag_target)
+        return (
+            bool(self.errors)
+            or bool(self.class_ii_bfat_lag_target)
+            or bool(self.month_gap_warning)
+        )
 
 
 # ── Pure helpers (no IO) ─────────────────────────────────────────────────────
@@ -258,9 +277,9 @@ def _derive_rows_for_target(
     """Build the canonical five-row set for ``month`` from headline values.
 
     All five rows share the same first-of-month ``month`` label; the
-    label is supplied by the caller (typically ``store.latest_month() +
-    1 calendar month``) and is INTENTIONALLY decoupled from any
-    text-mined month name on the PDF.
+    label is supplied by the caller (the month the advanced-prices PDF
+    announces, which is ``store.latest_month() + 1 calendar month``
+    whenever the file is current).
 
     Parameters
     ----------
@@ -362,28 +381,39 @@ def _new_month_skip_reason(
 ) -> Optional[str]:
     """Return why a new month must NOT be written, or ``None`` when it should.
 
-    Rewired new-month gate: we only append ``file_max + 1`` when the
-    advanced-prices PDF's page-1 banner is announcing the month that is already
-    the latest in the file (``announced_month == file_max``).  This ties each
-    appended month to a genuine USDA publication and is the hardened dedup guard
-    — the label counter can't run past the real month, and an unreadable /
-    mismatched banner writes nothing.  ``file_max is None`` (empty pre-seed
-    file) returns ``None`` so the bootstrap write can proceed.
+    New-month gate: the advanced-prices PDF announces exactly ONE month — the
+    upcoming one — and the headline values belong to that month, so the write
+    is gated on the announced month being NEWER than everything already in the
+    file (``announced_month > file_max``).  The caller then labels the row with
+    ``announced_month`` itself, which is the same thing as ``file_max + 1``
+    whenever the file is current (the normal case) — so the operator-facing
+    "next calendar month" contract is preserved without ever pairing a month
+    label with another month's prices.
+
+    This is also the dedup guard, and a tighter one than a calendar counter:
+    the label can never run past USDA, because the label IS what USDA
+    published.  Once September is stored, the September announcement no longer
+    passes the gate and nothing is appended until USDA publishes October's
+    advance prices.
+
+    An unreadable banner writes nothing — without it we cannot tell which
+    month the headline values describe.  ``file_max is None`` (empty pre-seed
+    file) still bootstraps, provided the banner parsed.
     """
-    if file_max is None:
-        return None
     if announced_month is None:
         return (
             "Could not read the announced month from the advanced-prices "
             "PDF banner - no new month written."
         )
-    if (announced_month.year, announced_month.month) != (
+    if file_max is None:
+        return None
+    if (announced_month.year, announced_month.month) <= (
         file_max.year, file_max.month
     ):
         return (
-            f"Advanced-prices PDF announces {announced_month:%b %Y}, but "
-            f"the latest stored month is {file_max:%b %Y} - no new month "
-            "written (only advance when the two match)."
+            f"Advanced-prices PDF announces {announced_month:%b %Y}, which is "
+            f"already covered by the file (latest stored month is "
+            f"{file_max:%b %Y}) - no new month written."
         )
     return None
 
@@ -579,24 +609,12 @@ def maybe_update_from_pdfs(
         )
         return result
 
-    # ── 3. Derive target_month from FILE STATE ──────────────────────────────
+    # ── 3. Read the file's latest month ─────────────────────────────────────
     #
-    # Operator-facing contract: "label the month = existing month in the
-    # file + 1".  We read the persisted max BEFORE any write so a
-    # re-tick on the same PDF doesn't drift the target forward.
+    # Dedup input for the new-month gate (step 6) and the fallback anchor
+    # for the target label when the PDF banner can't be read.  Read BEFORE
+    # any write so a re-tick on the same PDF can't drift the target forward.
     file_max = store.latest_month()
-    if file_max is None:
-        # Defensive fallback — should be unreachable after
-        # ``store.seed_from_csv_if_empty()`` above.  Anchor on today's
-        # calendar month + 1 so the orchestrator can still make
-        # forward progress without a seed.
-        from datetime import date as _date
-        target_month = _next_calendar_month(
-            pd.Timestamp(_date.today().replace(day=1))
-        )
-    else:
-        target_month = _next_calendar_month(file_max)
-    result.target_month = target_month
 
     # ── 4. Pull PDFs ─────────────────────────────────────────────────────────
     #
@@ -655,45 +673,75 @@ def maybe_update_from_pdfs(
             latest_key = max(bfat_history.keys())
             class_ii_butterfat = bfat_history.get(latest_key)
 
+    # ── 6. New-month gate ─────────────────────────────────────────────────
+    #
+    # The PDF announces exactly one month (the upcoming one) and the headline
+    # values belong to THAT month, so the announced month is both the gate and
+    # the row label: append it when it is newer than everything in the file
+    # (e.g. latest stored = Aug 2026 AND the banner announces September 2026 ->
+    # write Sep 2026 from the September headline).  When the file is current
+    # this is exactly the operator-facing "max(file) + 1 calendar month"
+    # contract, and it can never run past USDA because the label IS what USDA
+    # published.  A month already covered, or an unreadable banner, writes
+    # nothing.
+    announced_month = pdf.parse_advanced_prices_month(adv_bytes)
+    skip_reason = _new_month_skip_reason(file_max, announced_month)
+
+    # Label resolution.  ``announced_month`` is authoritative; the
+    # ``file_max + 1`` / today + 1 fallbacks only ever feed the status
+    # caption, because a missing banner is itself a hard skip above.
+    if announced_month is not None:
+        target_month = pd.Timestamp(announced_month)
+    elif file_max is not None:
+        target_month = _next_calendar_month(file_max)
+    else:
+        target_month = _next_calendar_month(
+            pd.Timestamp(date.today().replace(day=1))
+        )
+    result.target_month = target_month
+
+    target_rows_to_insert: list[dict] = []
+    if skip_reason:
+        result.skipped_reason = skip_reason
+    else:
+        # The announced month is normally file_max + 1.  A wider jump means
+        # nobody ran the updater while USDA published one or more months and
+        # those months can NOT be recovered from this PDF (the headline block
+        # only carries the announced month), so we write the announced month
+        # and name the hole instead of leaving it silent.
+        if file_max is not None and target_month != _next_calendar_month(file_max):
+            gap = pd.date_range(
+                _next_calendar_month(file_max),
+                target_month - pd.DateOffset(months=1),
+                freq="MS",
+            )
+            result.month_gap_warning = (
+                "no advance-prices publication was ingested for "
+                + ", ".join(m.strftime("%b %Y") for m in gap)
+                + " — those month(s) stay missing from `fmmo_tracker.json` "
+                "until they are filled in manually"
+            )
+        try:
+            target_rows_to_insert = _derive_rows_for_target(
+                month               = target_month,
+                headline            = advanced_headline,
+                class_ii_butterfat  = class_ii_butterfat,
+            )
+        except KeyError as exc:
+            result.errors.append(
+                f"advanced-prices headline is missing required label {exc!s}; "
+                "skipping write."
+            )
+            return result
+
     # When the class-prices PDF wasn't reachable / parseable we still
     # proceed with bfat=None.  The cell will land as ``None`` in the
     # JSON; surface the actionable warning so the operator knows to
     # fill it in.  The label points at ``target_month`` so the operator
-    # knows exactly which row needs the manual fill.
-    if class_ii_butterfat is None:
+    # knows exactly which row needs the manual fill.  Only raised when we
+    # are actually writing that month — a skipped tick has no null cell.
+    if target_rows_to_insert and class_ii_butterfat is None:
         result.class_ii_bfat_lag_target = target_month.strftime("%b %Y")
-
-    # ── 6. New-month gate ─────────────────────────────────────────────────
-    #
-    # Rewired rule: append the NEXT calendar month (target_month =
-    # file_max + 1) ONLY when the advanced-prices PDF page-1 banner is
-    # announcing the month that is already the latest in the file.  Both
-    # must line up - e.g. latest stored month = Jul 2026 AND the banner
-    # says "ADVANCED PRICES FOR JULY 2026" -> write Aug 2026.  This ties
-    # every appended month to a genuine USDA publication and is the
-    # hardened dedup guard: once Aug is written, file_max = Aug while the
-    # PDF still announces Jul, so Sep is NOT written until USDA publishes
-    # August's advance prices.
-    try:
-        candidate_rows = _derive_rows_for_target(
-            month               = target_month,
-            headline            = advanced_headline,
-            class_ii_butterfat  = class_ii_butterfat,
-        )
-    except KeyError as exc:
-        result.errors.append(
-            f"advanced-prices headline is missing required label {exc!s}; "
-            "skipping write."
-        )
-        return result
-
-    announced_month = pdf.parse_advanced_prices_month(adv_bytes)
-    skip_reason = _new_month_skip_reason(file_max, announced_month)
-    if skip_reason:
-        result.skipped_reason = skip_reason
-        target_rows_to_insert: list[dict] = []
-    else:
-        target_rows_to_insert = candidate_rows
 
     # ── 7. Append the new-month rows (existing rows untouched) ─────────────
     #

@@ -12,11 +12,12 @@ HTTP I/O and ``pdfplumber`` text-extraction primitives:
 2. **Parsing**
 
    * :func:`parse_advanced_prices` — pull the five headline values
-     ("ADVANCED PRICES FOR <MONTH YYYY>" summary at the top of page 1
-     of ``dymadvancedprices.pdf``).  All five values describe the SAME
-     upcoming month — the orchestrator labels the resulting row with
-     ``store.latest_month() + 1`` rather than mining the headline text
-     for a month name, so a USDA layout shift cannot mis-label a row.
+     ("Announcement of Advanced Prices and Pricing Factors for
+     <MONTH YYYY>" summary at the top of page 1 of
+     ``dymadvancedprices.pdf``).  All five values describe the SAME
+     upcoming month, which :func:`parse_advanced_prices_month` reads off
+     the same page so the orchestrator can label the row with the month
+     the values actually belong to.
    * :func:`parse_class_ii_butterfat_history` — page-2 per-year monthly
      tables of ``dymclassprices.pdf``, returned as a dict keyed by
      ``(year, month)``.  Class II Butterfat is published in the table
@@ -242,22 +243,53 @@ def parse_advanced_prices(pdf_bytes: bytes) -> dict[str, float]:
     return out
 
 
-# Page-1 headline banner, e.g. "ADVANCED PRICES FOR JULY 2026".  Read only to
-# VALIDATE which month USDA is currently announcing (a gate in the orchestrator)
-# — the mover row is still LABELLED ``store.latest_month() + 1``, never mined
-# from this text, so a USDA layout shift cannot mis-label a row.
-_ADVANCED_MONTH_RE: re.Pattern[str] = re.compile(
-    r"ADVANCED\s+PRICES\s+FOR\s+([A-Za-z]+)\s+(\d{4})", re.IGNORECASE
+# Page-1 banner patterns naming the month USDA is announcing, tried in order
+# (first match wins).  Each must capture ``(month_word, year)``.
+#
+# The live PDF (verified Aug-2026) carries the month in two places, both on
+# page 1 and in agreement:
+#
+#     September 2026 Highlights
+#     Announcement of Advanced Prices and Pricing Factors for September 2026
+#
+# The historical ``"ADVANCED PRICES FOR <MONTH> <YYYY>"`` spelling this parser
+# was originally written against does NOT appear anywhere in the document, so
+# it is kept only as a tolerated legacy/alternate layout.  Reading BOTH real
+# lines means a wording tweak to either one alone cannot blind the gate.
+#
+# Anchoring notes:
+#   * the announcement pattern requires the literal " for <Month> <Year>", so
+#     it cannot match the per-year history-table headers ("… Advanced Prices
+#     and Pricing Factors, 2026") or the methodology prose;
+#   * the "Highlights" pattern is line-anchored so it only matches the
+#     section heading.
+_ADVANCED_MONTH_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"Advanced\s+Prices\s+and\s+Pricing\s+Factors\s+for\s+([A-Za-z]+)\s+(\d{4})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*([A-Za-z]+)\s+(\d{4})\s+Highlights\b",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # Legacy / alternate wording — retained so an older captured fixture or a
+    # future USDA revert still parses.
+    re.compile(r"ADVANCED\s+PRICES\s+FOR\s+([A-Za-z]+)\s+(\d{4})", re.IGNORECASE),
 )
 
 
 def parse_advanced_prices_month(pdf_bytes: bytes) -> Optional[date]:
     """Return the month the advanced-prices PDF announces, as first-of-month.
 
-    Reads the page-1 "ADVANCED PRICES FOR <MONTH> <YYYY>" banner and maps it to
-    ``date(YYYY, MM, 1)``.  Returns ``None`` when the banner can't be located or
+    Reads the page-1 banner that names the announced month — e.g.
+    "Announcement of Advanced Prices and Pricing Factors for September 2026"
+    (or the "September 2026 Highlights" heading) — and maps it to
+    ``date(YYYY, MM, 1)``.  Returns ``None`` when no banner can be located or
     the month word isn't recognised, so the orchestrator can treat an
     unverifiable announcement conservatively (no new-month write).
+
+    Every pattern in :data:`_ADVANCED_MONTH_RES` is tried in order and the
+    first hit wins; see that constant for why more than one real line is read.
 
     The month word is matched by its first three letters against the canonical
     :data:`_MONTH_NAME_TO_INT` map, so full names ("JULY") and abbreviations
@@ -265,13 +297,17 @@ def parse_advanced_prices_month(pdf_bytes: bytes) -> Optional[date]:
     """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         text = "\n".join((page.extract_text() or "") for page in pdf.pages)
-    m = _ADVANCED_MONTH_RE.search(text)
-    if not m:
-        return None
-    month_int = _MONTH_NAME_TO_INT.get(m.group(1)[:3].title())
-    if month_int is None:
-        return None
-    return date(int(m.group(2)), month_int, 1)
+    for pattern in _ADVANCED_MONTH_RES:
+        m = pattern.search(text)
+        if not m:
+            continue
+        month_int = _MONTH_NAME_TO_INT.get(m.group(1)[:3].title())
+        if month_int is None:
+            # Matched the shape but not a real month name (e.g. a stray
+            # "Highlights" line) — keep trying the remaining patterns.
+            continue
+        return date(int(m.group(2)), month_int, 1)
+    return None
 
 
 # ── Class Prices parser (dymclassprices.pdf, page 2) ────────────────────────

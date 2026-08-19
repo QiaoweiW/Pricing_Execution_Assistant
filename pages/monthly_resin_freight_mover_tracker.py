@@ -3477,9 +3477,9 @@ def _render_monthly_sop_and_upload_intro() -> None:
     the workflow expander below for the per-file gates.
   - Click **🔄 USDA refresh** (above the Milk Commodity chart) to
     check USDA for a new advance-prices PDF outside the 1-hour
-    cooldown.  A new month is appended to `fmmo_tracker.json` ONLY
-    when the freshly-scraped rates actually differ from the latest
-    month already in the file.
+    cooldown.  The month that PDF announces is appended to
+    `fmmo_tracker.json` ONLY when it is newer than the latest month
+    already in the file.
 
 _Files are matched automatically by filename keyword after upload._
         """.strip()
@@ -3569,9 +3569,9 @@ write, and the gate conditions that must hold before the write lands.
 Two buttons partition the work:
 
 * **🔄 USDA refresh** (above the Milk Commodity chart) checks the
-  USDA advanced-prices PDF for a new month and appends `fmmo_tracker.json`
-  ONLY when the freshly-scraped rates differ from the latest month
-  already in the file.  Existing rows are never mutated.
+  USDA advanced-prices PDF and appends the month that PDF announces to
+  `fmmo_tracker.json` ONLY when that month is newer than the latest
+  month already in the file.  Existing rows are never mutated.
 * **🔄 Refresh** (below the NMT) updates every downstream artefact
   under its own gate (see rows 2–5 below).
 
@@ -3579,7 +3579,7 @@ Two buttons partition the work:
 
 | # | Lakehouse file | Trigger | Conditions that must hold |
 |---|---|---|---|
-| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System scrapes all rates from the advance-prices PDF and compares them against the matching cells of the latest month already in `fmmo_tracker.json`.**  A new month row is appended (labelled `max(file) + 1 calendar month`, always first-of-month) ONLY when at least one of the **six canonical advance-prices-driven cells** differs — HTST I Skim & Bfat, HTST II Skim, ESL I Skim, Culture II Protein, Culture II Other Solids.  HTST II / ESL II / Culture II Butterfat are sourced from [dymclassprices.pdf](https://www.ams.usda.gov/mnreports/dymclassprices.pdf) (always the latest published row on page 2) but do NOT gate writes — only the advance-prices PDF triggers a new month.  All other cells are derived by spec (ESL II / Culture II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the class-prices PDF is unreachable / unparseable the new row still writes with Class II Bfat = NULL and a warning banner asks the operator to fill the cell into the lakehouse manually. |
+| 1 | `Files/Milk_cost_tracker/fmmo_tracker.json` | USDA publishes a new [Advanced Prices PDF](https://www.ams.usda.gov/mnreports/dymadvancedprices.pdf), or user clicks **🔄 USDA refresh** | **System reads the month the advance-prices PDF announces (page-1 banner) plus that month's headline rates.**  The five-row set is appended under the **announced month** (always first-of-month) ONLY when that month is newer than `max(file)` — with the file current this is `max(file) + 1 calendar month`, and re-reading the same publication appends nothing.  An unreadable banner writes nothing; a jump of more than one month writes the announced month and warns which month(s) USDA published while nobody was ingesting (the PDF cannot recover them).  HTST II / ESL II / Culture II Butterfat are sourced from [dymclassprices.pdf](https://www.ams.usda.gov/mnreports/dymclassprices.pdf) (always the latest published row on page 2) but do NOT gate writes — only the advance-prices PDF triggers a new month.  All other cells are derived by spec (ESL II / Culture II Skim+Bfat mirror HTST II, ESL I Bfat mirrors HTST I).  **No change is ever made to existing rows.**  If the class-prices PDF is unreachable / unparseable the new row still writes with Class II Bfat = NULL and a warning banner asks the operator to fill the cell into the lakehouse manually. |
 | 2 | `Files/Monthly_Pricing_Execution/milk_mover.csv` | User clicks **🔄 Refresh** | Authoritative replace on every Refresh — no month gate.  When the slicer's End Month has no rows in `fmmo_tracker.json`, rates collapse to zero (silent `$0` cost) so the published file structure stays stable. |
 | 3 | `Files/Activity_Model/Product_Milk Base Cost.csv` (column `Base Milk Cost per Gallon`) | User clicks **🔄 Refresh** | Slicer's **End Month ≥ file's max Month + 1 calendar month**.  Update is by Item match (left-merge); unmatched rows are stale-stamped. |
 | 4 | `Files/Monthly_Mover_Reporting/mover_details_table.csv` | User clicks **🔄 Refresh** | A **new row was inserted** into the Movers Non-Milk Tracker since the last successful publish (row-count delta).  Edit-in-place on the existing last row does NOT qualify.  **Existing months may be overwritten** when the gate is open — the upsert wins for the current editing month. |
@@ -3811,8 +3811,8 @@ def _render_milk_autoupdate_status() -> None:
             key=f"{_SS_PREFIX}_milk_force_refresh",
             help=(
                 "Bypass the 1-hour cooldown and check the USDA "
-                "advanced-prices PDF right now. Inserts a new row when a "
-                "change is detected."
+                "advanced-prices PDF right now. Appends the month that PDF "
+                "announces when it is newer than the latest month in the file."
             ),
             use_container_width=True,
         ):

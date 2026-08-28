@@ -8,9 +8,12 @@ only when it clears ALL THREE conditions:
     2. Anticipated annual volume < 0  — a negative volume is a loss / de-list.
     3. Probability ≥ 50%              — likely enough to plan around.
 
-The 50% threshold is the planner default; the RO rules panel in the Demand
-Planner Analytics view lets it be overridden at runtime (see
-``data_sources/ro_rules_config.py``).
+All three are planner defaults that the RO rules panel in the Demand Planner
+Analytics view can override at runtime (see ``data_sources/ro_rules_config.py``
+— ``risk_requires_not_reflected_in_aps``, ``risk_requires_negative_volume`` and
+``min_risk_probability`` respectively).  Condition 1 is gated per call site by
+``RoRulesConfig.risk_reflected_col``, which resolves both the planner's choice
+and whether the frame even carries the column.
 
 The identical rule is applied everywhere R&O is captured, so the stages stay
 reconciled:

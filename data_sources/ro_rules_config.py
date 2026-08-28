@@ -39,6 +39,12 @@ DEFAULT_MIN_OPP_PROBABILITY: float = 0.0
 # Risk carve-out — Delta Breakdown | Risk column and the RO_Seed risk exemption.
 DEFAULT_MIN_RISK_PROBABILITY: float = 0.5   # 50%
 DEFAULT_RISK_REQUIRES_NEGATIVE_VOLUME: bool = True
+DEFAULT_RISK_REQUIRES_NOT_REFLECTED_IN_APS: bool = True
+
+# The Distribution-Tracker / RO_Seed column carrying the APS flag.  Named once
+# here so the pipeline, the reconciliation diagnostic and the rules panel all
+# spell it the same way.
+REFLECTED_IN_APS_COLUMN: str = "Reflected in APS"
 
 
 @dataclass(frozen=True)
@@ -49,8 +55,8 @@ class RoRulesConfig:
     starting point and every field is independently overridable — the rules
     panel writes only the widgets the user touched and inherits the rest.
 
-    * ``reflected_in_aps_only`` — restrict Opportunity + Risk to rows tagged
-      "Reflected in APS = no".  Turn off to include APS-reflected wins/losses.
+    * ``reflected_in_aps_only`` — restrict the **Opportunity** gate to rows
+      tagged "Reflected in APS = no".  Turn off to include APS-reflected wins.
     * ``pipeline_status_excludes`` — case-insensitive substrings dropped from
       the Opportunity inclusion.  A row is dropped when its Pipeline Status
       contains ANY listed token (Risk lines bypass this gate).
@@ -61,6 +67,14 @@ class RoRulesConfig:
     * ``risk_requires_negative_volume`` — when ``True`` (default) Risk requires
       a negative Anticipated Annual Vol; disable to widen Risk to any probable
       line.
+    * ``risk_requires_not_reflected_in_aps`` — when ``True`` (default) a line
+      qualifies as Risk only while it is tagged "Reflected in APS = no", i.e.
+      the loss is not yet baked into the APS base plan and is therefore still
+      incremental R&O.  This is the Risk-side counterpart of
+      ``reflected_in_aps_only`` and is deliberately **independent** of it: the
+      Opportunity gate decides what reaches RO_Seed at all, while this decides
+      what earns the Risk exemption from the Pipeline-Status / probability
+      gates.  Disable to let an already-reflected loss still count as Risk.
     """
 
     reflected_in_aps_only: bool = DEFAULT_REFLECTED_IN_APS_ONLY
@@ -70,6 +84,9 @@ class RoRulesConfig:
     min_opp_probability: float = DEFAULT_MIN_OPP_PROBABILITY
     min_risk_probability: float = DEFAULT_MIN_RISK_PROBABILITY
     risk_requires_negative_volume: bool = DEFAULT_RISK_REQUIRES_NEGATIVE_VOLUME
+    risk_requires_not_reflected_in_aps: bool = (
+        DEFAULT_RISK_REQUIRES_NOT_REFLECTED_IN_APS
+    )
 
     # ── Convenience constructors + views ────────────────────────────────
 
@@ -90,6 +107,25 @@ class RoRulesConfig:
             t.strip().lower() for t in self.pipeline_status_excludes if t and t.strip()
         )
 
+    def risk_reflected_col(
+        self, columns, column: str = REFLECTED_IN_APS_COLUMN,
+    ) -> Optional[str]:
+        """Return the reflected-in-APS column to gate Risk on, or ``None``.
+
+        ``None`` means "don't apply the gate" — either the planner disabled it
+        or the frame has no such column (``RO_Comparison_Output`` and legacy
+        seed files don't carry one).  Returning the *column name* rather than a
+        bool is deliberate: that is exactly the shape
+        :func:`data_sources.ro_risk.risk_mask` takes, so every call site is a
+        one-liner and the "when does the gate apply" rule lives only here.
+
+        *columns* is any container of column names (a DataFrame's ``.columns``
+        works), keeping this module free of a pandas import.
+        """
+        if not self.risk_requires_not_reflected_in_aps:
+            return None
+        return column if column in columns else None
+
     def signature(self) -> tuple:
         """Return a hashable snapshot of the rules for cache keys / diffing."""
         return (
@@ -98,6 +134,7 @@ class RoRulesConfig:
             float(self.min_opp_probability),
             float(self.min_risk_probability),
             bool(self.risk_requires_negative_volume),
+            bool(self.risk_requires_not_reflected_in_aps),
         )
 
 

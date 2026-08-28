@@ -2097,7 +2097,7 @@ def _render_ro_seed_summary_reconcile_result(result) -> None:
     rules_caption = (
         f"Rules: Risk Prob ≥ {cfg.min_risk_probability * 100:.0f}%, "
         f"Vol<0 required = {cfg.risk_requires_negative_volume}, "
-        f"Reflected-in-APS only = {cfg.reflected_in_aps_only}"
+        f"Reflected-in-APS=No required = {cfg.risk_requires_not_reflected_in_aps}"
     )
 
     if result.is_aligned:
@@ -3969,14 +3969,20 @@ def _render_ro_rules_panel() -> None:
         ", ".join(current.pipeline_status_excludes)
         if current.pipeline_status_excludes else "∅"
     )
-    _aps_txt = "APS=NO" if current.reflected_in_aps_only else "APS ignored"
+    # Opportunity and Risk each carry their OWN Reflected-in-APS gate, so the
+    # summary spells them out separately — one shared label would hide the case
+    # where a planner turns one off and leaves the other on.
+    _opp_aps_txt = "APS=NO" if current.reflected_in_aps_only else "APS ignored"
+    _risk_aps_txt = (
+        "APS=NO" if current.risk_requires_not_reflected_in_aps else "APS ignored"
+    )
     _neg_txt = "Vol<0" if current.risk_requires_negative_volume else "any volume"
     st.markdown(
         f"**Active RO rules** — "
-        f"**Opportunity**: {_aps_txt} · Prob > "
+        f"**Opportunity**: {_opp_aps_txt} · Prob > "
         f"{current.min_opp_probability * 100:.0f}% · "
         f"Pipeline Status ∉ ({_excludes_txt}).  "
-        f"**Risk**: {_aps_txt} · Prob ≥ "
+        f"**Risk**: {_risk_aps_txt} · Prob ≥ "
         f"{current.min_risk_probability * 100:.0f}% · {_neg_txt}.  "
         "_(Change below.)_"
     )
@@ -4044,6 +4050,20 @@ def _render_ro_rules_panel() -> None:
                 key="ro_rules_risk_neg_only",
                 help="Turn off to widen Risk to any probable line, including gains.",
             )
+            # Risk-side counterpart of the Opportunity toggle above, and
+            # deliberately independent of it: that one decides what reaches
+            # RO_Seed at all, this one decides what earns the Risk exemption
+            # from the Pipeline-Status / Opportunity-probability gates.
+            new_risk_aps = st.toggle(
+                "Risk requires Reflected in APS = No",
+                value=current.risk_requires_not_reflected_in_aps,
+                key="ro_rules_risk_reflected_no",
+                help="A loss counts as Risk only while it is NOT yet baked into "
+                     "the APS base plan — i.e. still incremental R&O.  Turn off "
+                     "to let an already-reflected loss count as Risk too.  "
+                     "Applies where the source carries the column (Distribution "
+                     "Tracker / RO_Seed), so it takes effect on Regenerate.",
+            )
 
         # Rebuild the config from the current widget values, then push into
         # session state.  Frozen dataclass keeps callers immutable.
@@ -4053,6 +4073,7 @@ def _render_ro_rules_panel() -> None:
             min_opp_probability=new_min_opp / 100.0,
             min_risk_probability=new_min_risk / 100.0,
             risk_requires_negative_volume=new_neg_only,
+            risk_requires_not_reflected_in_aps=new_risk_aps,
         )
         st.session_state[RO_RULES_SESSION_KEY] = updated
 

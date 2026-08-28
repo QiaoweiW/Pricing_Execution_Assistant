@@ -46,7 +46,7 @@ import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
 from .ro_risk import risk_mask
-from .ro_rules_config import RoRulesConfig
+from .ro_rules_config import REFLECTED_IN_APS_COLUMN, RoRulesConfig
 from .fabric_lakehouse_io import (
     LakehouseIOError,
     archive_bytes,
@@ -409,16 +409,11 @@ def _carry_forward_historical_risks(
     if prior_df is None or prior_df.empty:
         return prior_df.iloc[0:0].copy() if prior_df is not None else pd.DataFrame()
 
-    reflected_col = (
-        "Reflected in APS"
-        if cfg.reflected_in_aps_only and "Reflected in APS" in prior_df.columns
-        else None
-    )
     is_risk = risk_mask(
         prior_df,
         volume_col="Lbs./yr",
         probability_col="Probability",
-        reflected_col=reflected_col,
+        reflected_col=cfg.risk_reflected_col(prior_df.columns),
         min_probability=cfg.min_risk_probability,
         require_negative_volume=cfg.risk_requires_negative_volume,
     )
@@ -513,12 +508,12 @@ def _build_ro_seed(
     # or its probability sits below the Opportunity threshold.
     is_risk = risk_mask(
         df, volume_col="Lbs./yr", probability_col="Probability",
-        reflected_col="Reflected in APS" if cfg.reflected_in_aps_only else None,
+        reflected_col=cfg.risk_reflected_col(df.columns),
         min_probability=cfg.min_risk_probability,
         require_negative_volume=cfg.risk_requires_negative_volume,
     )
-    if cfg.reflected_in_aps_only and "Reflected in APS" in df.columns:
-        df = df[df["Reflected in APS"].astype(str).str.strip().str.lower() == "no"]
+    if cfg.reflected_in_aps_only and REFLECTED_IN_APS_COLUMN in df.columns:
+        df = df[df[REFLECTED_IN_APS_COLUMN].astype(str).str.strip().str.lower() == "no"]
         is_risk = is_risk.loc[df.index]
         log.info(f"After 'Reflected in APS = no': {len(df):,} rows")
 

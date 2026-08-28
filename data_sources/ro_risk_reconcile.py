@@ -171,20 +171,17 @@ def _mask_seed_risk(df: pd.DataFrame, cfg: RoRulesConfig) -> pd.Series:
 
     Uses the raw Distribution-Tracker columns.  Reflected-in-APS is enforced
     only when the config asks for it AND the column is present — a legacy seed
-    file without the column falls through cleanly instead of raising.
+    file without the column falls through cleanly instead of raising.  Gating
+    is delegated to :meth:`RoRulesConfig.risk_reflected_col` so this diagnostic
+    can never drift from the rule the seed pipeline actually applied.
     """
     if df.empty:
         return pd.Series([], dtype=bool)
-    reflected_col = (
-        SEED_REFLECTED_COL
-        if cfg.reflected_in_aps_only and SEED_REFLECTED_COL in df.columns
-        else None
-    )
     return risk_mask(
         df,
         volume_col=SEED_VOLUME_COL,
         probability_col=SEED_PROBABILITY_COL,
-        reflected_col=reflected_col,
+        reflected_col=cfg.risk_reflected_col(df.columns, SEED_REFLECTED_COL),
         min_probability=cfg.min_risk_probability,
         require_negative_volume=cfg.risk_requires_negative_volume,
     )

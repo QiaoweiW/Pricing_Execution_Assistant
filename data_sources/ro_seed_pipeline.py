@@ -147,6 +147,67 @@ class _Log:
         self.entries.append(LogEntry("error", text))
 
 
+# ── Probability parsing (shared with demand_plan_pipeline) ───────────────────
+
+def _parse_probability(series: pd.Series, log: Optional["_Log"] = None) -> pd.Series:
+    """Parse the seed's ``Probability`` column to a FRACTION in ``[0, 1]``.
+
+    Probability drives every probabilized volume in the RO chain
+    (``Lbs./yr Exp`` → ``FY Lbs. Exp`` → ``FY27 Probabilized | Current Plan``),
+    so a scale error here silently multiplies the whole R&O pipeline.  The
+    generic ``[^\\d.-]`` strip used for the other numeric columns is wrong for
+    this one: it turns ``"50%"`` into ``50.0`` rather than ``0.5``.
+
+    Accepted forms, in order:
+
+    * ``"50%"`` / ``"50 %"``  → 0.50 (explicit percent marker wins).
+    * ``0.5``                 → 0.50 (already a fraction — the expected form,
+      matching the ``ro_rules_config`` gates, which compare against 0.0 / 0.5).
+    * ``50``                  → 0.50 (bare value > 1 and ≤ 100: unambiguously a
+      percent, since a probability cannot exceed 1.  Logged as a warning so the
+      upstream export gets fixed rather than silently normalised forever.)
+    * anything else (blank, text, > 100, negative) → ``NaN``, logged.
+
+    ``NaN`` is deliberate rather than 0.0: a row with an unreadable probability
+    should surface as missing data, not as a silent zero-volume opportunity.
+    """
+    raw = series.astype("string").str.strip()
+    is_pct = raw.str.endswith("%", na=False)
+    num = pd.to_numeric(
+        raw.str.replace(r"[^\d.-]", "", regex=True), errors="coerce",
+    ).astype(float)
+
+    out = num.where(~is_pct, num / 100.0)
+
+    # Bare values > 1 can only be percents (a probability is at most certainty).
+    bare_pct = (~is_pct) & out.notna() & (out > 1.0) & (out <= 100.0)
+    if bool(bare_pct.any()) and log is not None:
+        log.warn(
+            f"Probability: {int(bare_pct.sum()):,} row(s) carried a value > 1 "
+            "with no '%' marker (e.g. 50 meaning 50%) — divided by 100.  Fix "
+            "the source export to store probabilities as fractions (0.5)."
+        )
+    out = out.where(~bare_pct, out / 100.0)
+
+    bad = out.notna() & ((out < 0.0) | (out > 1.0))
+    if bool(bad.any()):
+        if log is not None:
+            log.warn(
+                f"Probability: {int(bad.sum()):,} row(s) fell outside [0, 1] "
+                "after parsing and were set to NaN (their probabilized volume "
+                "will be blank, not zero) — check the source export."
+            )
+        out = out.where(~bad, float("nan"))
+
+    unreadable = raw.notna() & (raw.str.len() > 0) & out.isna()
+    if bool(unreadable.any()) and log is not None:
+        log.warn(
+            f"Probability: {int(unreadable.sum()):,} row(s) were non-blank but "
+            "unparseable → NaN."
+        )
+    return out
+
+
 # ── Date canonicalisation (shared by both stages) ────────────────────────────
 
 def _canon_date(series: pd.Series) -> pd.Series:
@@ -551,11 +612,14 @@ def _expand_seed(
         log.info(f"Expansion: removed {before - len(df_seed):,} exact-duplicate seed rows "
                  f"({before:,} → {len(df_seed):,})")
 
-    # Numeric conversions for the maths.
-    for col in ["Probability", "Lbs./yr", "PC$/yr", "Slotting"]:
+    # Numeric conversions for the maths.  Probability is parsed separately —
+    # it is a FRACTION and the generic strip below would turn "50%" into 50.0
+    # (a 50× overstatement of every probabilized volume).  See _parse_probability.
+    for col in ["Lbs./yr", "PC$/yr", "Slotting"]:
         df_seed[col] = pd.to_numeric(
             df_seed[col].astype(str).str.replace(r"[^\d.-]", "", regex=True),
             errors="coerce").astype(float)
+    df_seed["Probability"] = _parse_probability(df_seed["Probability"], log)
     df_seed["Item #"] = pd.to_numeric(
         df_seed["Item #"].astype(str).str.replace(r"[^\d.-]", "", regex=True),
         errors="coerce").astype("Int64")

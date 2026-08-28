@@ -43,8 +43,9 @@ from typing import Optional
 
 import pandas as pd
 
-# Reuse the RO pipeline's trivial run-log types — no duplicate boilerplate.
-from .ro_seed_pipeline import LogEntry, _Log
+# Reuse the RO pipeline's trivial run-log types + the shared Probability parser
+# (that pipeline writes RO_Seed.csv, so it owns the column's contract).
+from .ro_seed_pipeline import LogEntry, _Log, _parse_probability
 from .fabric_lakehouse_io import (
     LakehouseIOError,
     archive_bytes,
@@ -282,8 +283,14 @@ def _build_tbl_ro_input(
         raise ValueError(f"RO_Seed.csv is missing required column(s): {missing}")
 
     s = seed_df.copy()
-    for c in ("Probability", "Lbs./yr", "PC$/yr", "Slotting"):
+    for c in ("Lbs./yr", "PC$/yr", "Slotting"):
         s[c] = pd.to_numeric(s[c], errors="coerce")
+    # Probability shares ONE parser with the RO seed pipeline (which writes this
+    # column) so the two never disagree on scale.  A bare to_numeric here turned
+    # "50%" into NaN → the row's R&O silently vanished from the demand plan,
+    # while ro_seed_pipeline's [^\d.-] strip turned the same cell into 50.0 →
+    # a 50x overstatement.  Same input, opposite failures.
+    s["Probability"] = _parse_probability(s["Probability"], log)
     s["First Ship Date"] = pd.to_datetime(s["First Ship Date"], errors="coerce").dt.normalize()
     s["Prob. Lbs/m"] = s["Lbs./yr"] * s["Probability"] / 12
 
@@ -581,6 +588,76 @@ def _build_total_item_level_demand(
 
 # ── Stage 4: append this run into the cycle-over-cycle history tracker ────────
 
+# Tracker grain: every column EXCEPT the measure.  Two rows that agree on all of
+# these are the same plan line as far as the tracker can express, so their
+# pounds ADD — see _collapse_to_grain.
+_TRACKER_GRAIN: list[str] = [c for c in _TRACKER_COLUMNS if c != "Demand Plan Pounds"]
+
+
+def _tracker_text(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalise an all-text tracker frame: trim every cell, ``<NA>`` → ``""``.
+
+    The tracker is written and read as raw strings, so grain comparisons are
+    only meaningful after this pass (``"7516"`` and ``" 7516"`` are one site).
+    """
+    return df.apply(lambda c: c.astype("string").str.strip().fillna(""))
+
+
+def _collapse_to_grain(rows: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Collapse *rows* to :data:`_TRACKER_GRAIN`, **summing** Demand Plan Pounds.
+
+    Returns ``(collapsed, rows_absorbed)``.
+
+    Why sum rather than drop
+    ------------------------
+    ``qry_mgmt_plan_full`` is keyed on Item × Month × Party Site, but the base
+    plan's true grain also includes **Corporate Group**, which the mgmt-plan
+    schema does not carry.  Two genuinely distinct plan lines — different
+    customers, same item, month, site and quantity — therefore arrive here as
+    byte-identical rows.  The previous ``drop_duplicates`` read that as a data
+    artefact and deleted one, silently losing real demand: cycle C6 lost
+    1.03 M lbs across 76 rows, 0.62 M of it a single Costco line on item 342065
+    that repeated in all seven forecast months.
+
+    Summing is the only volume-preserving reading, and it is safe for the case
+    the old dedupe was actually defending against — a re-run of the same cycle
+    — because the caller drops that cycle's rows wholesale before appending, so
+    a re-run never sees its own prior output.
+
+    The trade-off is explicit: a genuine upstream repeat inside ONE cycle's
+    upload is now added rather than discarded.  That is the correct default
+    (a demand plan must not lose volume to a schema limitation), and the
+    caller's reconciliation check makes any such repeat visible as a mismatch
+    against ``qry_mgmt_plan_full`` rather than a silent adjustment.
+    """
+    if rows.empty:
+        return rows, 0
+    before = len(rows)
+    lbs = pd.to_numeric(rows["Demand Plan Pounds"], errors="coerce").fillna(0.0)
+    collapsed = (
+        rows.assign(**{"Demand Plan Pounds": lbs})
+            .groupby(_TRACKER_GRAIN, as_index=False, dropna=False, sort=False)
+            .agg(**{"Demand Plan Pounds": ("Demand Plan Pounds", "sum")})
+    )
+    # Back to the tracker's on-disk text style (whole pounds carry no ".0").
+    collapsed["Demand Plan Pounds"] = (
+        collapsed["Demand Plan Pounds"].map(_fmt_pounds).astype("string"))
+    return collapsed[_TRACKER_COLUMNS], before - len(collapsed)
+
+
+def _fmt_pounds(value: float) -> str:
+    """Format a pounds figure the way the tracker stores it (no trailing ``.0``).
+
+    Rounds to 4dp first so a float sum can't leak ``…0000000004`` into the CSV,
+    then trims trailing zeros — ``88143.0 → "88143"``, ``3950.5 → "3950.5"``.
+    (``:g`` is deliberately not used: it switches to scientific notation past
+    six significant figures, which these volumes routinely exceed.)
+    """
+    if pd.isna(value):
+        return ""
+    return f"{round(float(value), 4):.4f}".rstrip("0").rstrip(".") or "0"
+
+
 def _append_history_tracker(
     mgmt_full: pd.DataFrame, cycle_label: str, log: _Log,
 ) -> pd.DataFrame:
@@ -590,6 +667,19 @@ def _append_history_tracker(
     other cycles are preserved verbatim. New rows match the tracker's on-disk
     text style: Start of Month ``M/D/YYYY``, a trailing ``.0`` stripped from
     whole pounds.
+
+    Duplicate handling differs by provenance, because the two cases are not the
+    same thing:
+
+    * **This cycle's rows** are freshly computed demand — collapsed to the
+      tracker grain with their pounds **summed** (:func:`_collapse_to_grain`),
+      so no volume is lost to the missing Corporate Group column.
+    * **Other cycles' rows** are read back off disk and are already at grain;
+      fully-identical rows there can only be file-level accumulation, so they
+      are dropped as hygiene.  This cannot touch the incoming cycle.
+
+    Raises ``ValueError`` when the cycle's tracker volume does not tie back to
+    ``mgmt_full`` — see the reconciliation check below.
     """
     existing, _ = read_csv(_SECRETS_SECTION, _HISTORY_TRACKER_BLOB, read_csv_kwargs=_STR_READ_KW)
     if existing is None:
@@ -605,7 +695,9 @@ def _append_history_tracker(
         "Item":               _norm_item(mgmt_full["Item"]).to_numpy(),
         "Item Description":   mgmt_full["Item Description"].astype("string").to_numpy(),
         "Party Site Number":  mgmt_full["Party Site Number"].astype("string").str.strip().to_numpy(),
-        "Demand Plan Pounds": mgmt_full["Demand Plan Pounds"].astype("string").str.replace(r"\.0$", "", regex=True).to_numpy(),
+        # Left as-is here; _collapse_to_grain re-formats via _fmt_pounds after
+        # summing, so this is the only place the on-disk number style is set.
+        "Demand Plan Pounds": mgmt_full["Demand Plan Pounds"].astype("string").to_numpy(),
         "Forecast Type":      mgmt_full["Forecast Type"].astype("string").str.strip().to_numpy(),
         "Business Unit":      mgmt_full["Business Unit"].astype("string").str.strip().to_numpy(),
         # Portfolio Major / Supply Format carried through from mgmt_full so the
@@ -618,24 +710,57 @@ def _append_history_tracker(
         "Cycle":              cycle_label,
     })[_TRACKER_COLUMNS]
 
-    keep = existing["Cycle"].astype(str).str.strip() != cycle_label
+    # ── This cycle: collapse to grain, SUMMING pounds (never dropping) ──────
+    new_rows, absorbed = _collapse_to_grain(_tracker_text(new_rows))
+    if absorbed:
+        log.info(f"History tracker: {absorbed:,} row(s) for cycle {cycle_label} shared "
+                 "the tracker grain and were summed (Corporate Group is not carried "
+                 "on the mgmt-plan schema, so same-item/month/site lines collide).")
+
+    # ── Other cycles: replace this cycle wholesale, de-dupe the rest ────────
+    existing = _tracker_text(existing)
+    keep = existing["Cycle"] != cycle_label
     replaced = int((~keep).sum())
     if replaced:
         log.info(f"History tracker: replacing {replaced:,} existing rows for cycle {cycle_label}.")
-    combined = pd.concat([existing[keep], new_rows], ignore_index=True)[_TRACKER_COLUMNS]
+    prior = existing[keep]
+    before = len(prior)
+    # Fully-identical rows in already-published cycles are file-level
+    # accumulation (a re-run can't cause them — that cycle is dropped above),
+    # so removing them is safe and keeps the CSV from growing without bound.
+    prior = prior.drop_duplicates(ignore_index=True)
+    stale = before - len(prior)
+    if stale:
+        log.info(f"History tracker: removed {stale:,} duplicate row(s) from "
+                 "previously-published cycles.")
 
-    # De-duplicate: the tracker is an all-text frame, so normalise every
-    # column (trim whitespace, <NA> → "") and drop fully-identical rows.
-    # This stops duplicates accumulating in the published CSV from repeated
-    # runs, upstream repeats, or a prior file that already carried them.
-    combined = combined.apply(lambda c: c.astype("string").str.strip().fillna(""))
-    before = len(combined)
-    combined = combined.drop_duplicates(ignore_index=True)[_TRACKER_COLUMNS]
-    deduped = before - len(combined)
-    if deduped:
-        log.info(f"History tracker: removed {deduped:,} duplicate row(s).")
+    # Skip empty legs: concatenating an all-NA frame lets pandas infer dtypes
+    # from it (deprecated, and it would demote these text columns to object).
+    legs = [f for f in (prior, new_rows) if not f.empty]
+    combined = (
+        pd.concat(legs, ignore_index=True)[_TRACKER_COLUMNS] if legs
+        else pd.DataFrame(columns=_TRACKER_COLUMNS)
+    )
+
+    # ── Reconciliation: the cycle must tie to mgmt_full, to the pound ───────
+    # This is the invariant the old dedupe broke.  Asserting it here makes the
+    # whole class of bug impossible to ship: the pipeline writes nothing (the
+    # caller computes every output before any write) rather than publishing a
+    # tracker that silently disagrees with the plan it was built from.
+    src_lbs = float(pd.to_numeric(
+        mgmt_full["Demand Plan Pounds"], errors="coerce").fillna(0.0).sum())
+    trk_lbs = float(pd.to_numeric(
+        new_rows["Demand Plan Pounds"], errors="coerce").fillna(0.0).sum())
+    if abs(src_lbs - trk_lbs) > 1.0:           # 1 lb — float noise only
+        raise ValueError(
+            f"History tracker does not reconcile to qry_mgmt_plan_full for cycle "
+            f"{cycle_label}: plan {src_lbs:,.0f} lbs vs tracker {trk_lbs:,.0f} lbs "
+            f"(gap {src_lbs - trk_lbs:+,.0f}).  Nothing was written."
+        )
+
     log.ok(f"qry_mgmt_plan_history_tracker → cycle {cycle_label} "
-           f"(+{len(new_rows):,} rows, {len(combined):,} total)")
+           f"(+{len(new_rows):,} rows, {len(combined):,} total, "
+           f"{trk_lbs / 1_000_000:,.1f} M lbs — ties to the plan)")
     return combined
 
 

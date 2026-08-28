@@ -77,6 +77,7 @@ from __future__ import annotations
 import io
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Optional
@@ -853,19 +854,87 @@ class ComparisonResult:
 # Filter discovery + validation (consumed by the page widgets)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def list_tracker_cycles(tracker_df: pd.DataFrame) -> list[str]:
-    """Return the distinct, sorted ``Cycle`` values in the tracker.
+def cycle_sort_key(label: str) -> tuple:
+    """Natural-order sort key for a cycle label — ``C2`` before ``C10``.
 
-    Empty / NaN cycles are dropped.  Sorting is lexicographic, which
-    keeps ``C1, C2, C3 …`` in natural order for the typical labelling.
+    A *fallback* ordering, used only when a cycle's plan horizon is unknown
+    (see :func:`order_cycles_by_horizon`, which is what the listers below
+    actually rank on).  Lexicographic ordering puts ``C12`` before ``C2``;
+    splitting each label into its text and numeric runs fixes that much.
+
+    Note this cannot fix label WRAP — a plan that runs ``C1…C12`` and then
+    restarts at ``C1`` next fiscal year has no total order by label alone.
+    That is precisely why horizon ordering is preferred.
+    """
+    parts = re.split(r"(\d+)", str(label).strip())
+    # (0, int) for numeric runs, (1, casefolded text) for the rest — the leading
+    # flag keeps the tuple comparable when two labels differ in shape.
+    return tuple(
+        (0, int(p), "") if p.isdigit() else (1, 0, p.casefold())
+        for p in parts if p != ""
+    )
+
+
+def order_cycles_by_horizon(
+    cycles: pd.Series, months: Optional[pd.Series] = None,
+) -> list[str]:
+    """Distinct cycle labels ordered **oldest → newest** by plan horizon.
+
+    The demand plan is reviewed monthly and each cycle's horizon starts at its
+    review month, so a cycle's earliest planned month is a monotonic, self-
+    describing age signal:  C1 → Mar 2026, C2 → May 2026, … C6 → Aug 2026.
+
+    Why not order by the label
+    --------------------------
+    Cycle labels are user-authored free text and they **wrap**: the live
+    tracker holds ``C11`` (horizon from Jan 2026) and ``C12`` (Feb 2026) from
+    the PRIOR fiscal year alongside ``C1``–``C6`` of the current one.  Ranking
+    those by label — lexicographically OR naturally — puts a prior-year cycle
+    last and silently hands the page a stale plan as "current" (callers take
+    ``[-1]`` as the current cycle, ``[-2]`` as the prior).  Horizon ordering is
+    immune to the wrap because it reads the data rather than the naming
+    convention.
+
+    *months* may be omitted (or carry no parseable dates) — cycles with no
+    known horizon fall back to :func:`cycle_sort_key` and sort BEFORE any dated
+    cycle, so an unlabelled straggler can never masquerade as the newest.
+    """
+    labels = cycles.dropna().astype(str).str.strip()
+    valid = labels[labels != ""]
+    if valid.empty:
+        return []
+    if months is None:
+        return sorted(set(valid), key=cycle_sort_key)
+
+    starts = (
+        pd.DataFrame({"__c": valid, "__m": months.reindex(valid.index)})
+        .dropna(subset=["__m"])
+        .groupby("__c")["__m"].min()
+    )
+    # (0, …) undated → first;  (1, horizon, label) dated → by review month.
+    return sorted(
+        set(valid),
+        key=lambda c: (
+            (1, starts[c], cycle_sort_key(c)) if c in starts.index
+            else (0, date.min, cycle_sort_key(c))
+        ),
+    )
+
+
+def list_tracker_cycles(tracker_df: pd.DataFrame) -> list[str]:
+    """Return the distinct ``Cycle`` values in the tracker, oldest → newest.
+
+    Empty / NaN cycles are dropped.  Ordering is by plan horizon — see
+    :func:`order_cycles_by_horizon` — so ``[-1]`` is genuinely the newest
+    cycle even though the labels wrap at the fiscal-year boundary.
     """
     if tracker_df is None or TRK_CYCLE not in tracker_df.columns:
         return []
-    cycles = (
-        tracker_df[TRK_CYCLE]
-        .dropna().astype(str).str.strip()
+    months = (
+        _vectorised_start_of_month(tracker_df[TRK_START_OF_MONTH])
+        if TRK_START_OF_MONTH in tracker_df.columns else None
     )
-    return sorted({c for c in cycles if c})
+    return order_cycles_by_horizon(tracker_df[TRK_CYCLE], months)
 
 
 def list_tracker_months(tracker_df: pd.DataFrame) -> list[date]:
@@ -6942,6 +7011,8 @@ __all__ = [
     "budget_by_row_id_from_workbook",
     "Fy27BudgetLoadResult",
     "COL_LABEL",
+    "cycle_sort_key",
+    "order_cycles_by_horizon",
     "list_tracker_cycles",
     "list_tracker_months",
     "validate_filters",

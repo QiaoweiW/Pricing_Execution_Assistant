@@ -69,6 +69,7 @@ from data_sources.holistic_demand_plan_aps import (
 from data_sources.demand_plan_comparison import (
     build_item_dim_frame_cascade,
     build_plan_to_corp_group,
+    order_cycles_by_horizon,
     _vectorised_clean_str,
     _vectorised_item_key,
     _vectorised_start_of_month,
@@ -694,10 +695,19 @@ def fetch_aps_history_df() -> Optional[pd.DataFrame]:
 
 
 def list_aps_history_cycles(history_df: Optional[pd.DataFrame]) -> list[str]:
-    """Distinct Cycle labels present in the APS history tracker (sorted)."""
+    """Distinct Cycle labels in the APS history tracker, oldest → newest.
+
+    Shares :func:`~data_sources.demand_plan_comparison.order_cycles_by_horizon`
+    with the IBP tracker so both sections agree on which cycle is newest — the
+    page pairs the two lists in one filter widget (APS = current, IBP = prior).
+    """
     if history_df is None or history_df.empty or COL_CYCLE not in history_df.columns:
         return []
-    return sorted(history_df[COL_CYCLE].astype(str).str.strip().replace("", pd.NA).dropna().unique())
+    months = (
+        _vectorised_start_of_month(history_df[COL_MONTH])
+        if COL_MONTH in history_df.columns else None
+    )
+    return order_cycles_by_horizon(history_df[COL_CYCLE], months)
 
 
 def list_aps_history_forecast_types(history_df: Optional[pd.DataFrame]) -> list[str]:

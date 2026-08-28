@@ -48,6 +48,7 @@ from data_sources.demand_plan_comparison import (
     _vectorised_item_key,
     _vectorised_start_of_month,
     build_item_dim_frame,
+    cycle_sort_key,
     months_in_range,
 )
 from data_sources.demand_summary import (
@@ -391,9 +392,13 @@ def prepare_ibp_base_plan_long(
     if cycle_col:
         cycles = work[cycle_col].dropna().astype(str).str.strip()
         if not cycles.empty:
-            work = work.loc[
-                work[cycle_col].astype(str).str.strip() == cycles.max()
-            ]
+            # Newest cycle by NATURAL order — a plain str max() would rank
+            # "C6" above "C12" and silently chart a stale cycle.
+            latest = max(set(cycles) - {""}, key=cycle_sort_key, default=None)
+            if latest is not None:
+                work = work.loc[
+                    work[cycle_col].astype(str).str.strip() == latest
+                ]
     # CRITICAL — see docstring.  After this point every per-column Series
     # is positionally aligned with the others.
     work = work.reset_index(drop=True)

@@ -6,8 +6,7 @@ Sections
 2. Section renderers              (_render_instructions,
                                    _render_ibp_supporting_files,
                                    _render_ro_comparison,
-                                   _render_demand_summary,
-                                   _render_product_line_review)
+                                   _render_demand_summary)
 3. Entry point                    (render)
 
 Page layout
@@ -18,20 +17,9 @@ Page layout
    "RO Comparison & Drivers & Start Date Validation" (Customer Input
    upload, editor, drivers, Early-Start programs) + RO Summary Report.
 4. ── divider ──
-5. Foldable: "Demand Summary" — Demand Plan CSV previews + hierarchical
-   Demand Pivot Summary + Demand Plan Comparison (drivers in nested
-   foldable) + Base + RO chart.
-6. ── divider ──
-7. Foldable: "Product Line Review" — one table + chart per Portfolio
-   Major (Bulk Fluid / Cheese / Milk Powders / Whey Powders last).
-8. ── divider ──
-9. Foldable: "🚚 Sales Distribution Tracker (RO Details)" — SharePoint
-   Excel workbook in Office-Online read-mode; sits after PLR and before
-   the BI dashboard so operational Fabric sections load first.
-10. ── divider ──
-11. Foldable: "Demand Planning BI Dashboard" — last on the page; embeds
-    the SharePoint ``.pbix`` file so the user can interact with the live
-    model without slowing the operational sections above.
+5. Foldable: "Demand Summary" — Withdraw tool + Base Plan upload +
+   Demand Plan CSV previews + Demand Plan Comparison (drivers in a
+   nested foldable).
 
 Why every external resource gets its own foldable section
 ---------------------------------------------------------
@@ -57,17 +45,9 @@ import streamlit as st
 logger = logging.getLogger(__name__)
 
 from data_sources.demand_summary import (
-    BudgetLookup,
     DemandSummaryError,
     DemandSummarySnapshot,
-    FORECAST_BASE_PLAN,
-    FORECAST_R_AND_O,
-    MonthlyBudgetLookup,
     PackagedButterBudget,
-    TOTAL_BUDGET_COLUMN_LABEL,
-    TOTAL_COLUMN_LABEL,
-    build_budget_lookup,
-    build_monthly_budget_lookup,
     build_packaged_butter_budget,
     fetch_mgmt_plan_full,
     fetch_mgmt_plan_history_tracker,
@@ -75,11 +55,8 @@ from data_sources.demand_summary import (
     fetch_raw_bytes as fetch_demand_summary_raw_bytes,
     save_demand_plan_comparison,
     fetch_static_budget_base,
-    fetch_static_budget_monthly,
-    fetch_static_budget_ro,
     fetch_total_item_level_demand,
     mgmt_plan_full_blob_path,
-    pivot_for_download,
     total_item_level_demand_blob_path,
 )
 from data_sources.finance_data import (
@@ -205,63 +182,15 @@ from data_sources.demand_plan_comparison import (
     list_tracker_months,
     tracker_has_dim_columns,
     validate_filters,
-    # Shared month-window helpers (one definition, in the data layer).
     months_in_range,
     shift_year_back,
     last_n_months,
-    # Demand MOM Summary (actuals-stitched-onto-forecast pivot).
-    DemandMomFilters,
-    DemandMomResult,
-    DemandPlanComparisonError,
-    SERIES_ACTUAL,
-    MOM_ROW_PMAJ,
-    MOM_ROW_FORECAST,
-    MOM_ROW_SFMT,
-    NC_COL_ITEM,
-    build_demand_mom_pivot,
-    list_mom_filter_values,
-    validate_mom_filters,
 )
 from data_sources.ibp_official import (
     IBPOfficialSourceError,
     fetch_ibp_orders_slim_df,
     fetch_ibp_shipments_months,
     fetch_ibp_shipments_slim_df,
-)
-from data_sources.product_line_review import (
-    BRAND_BRANDED,
-    BRAND_PRIVATE,
-    COL_INDENT,
-    COL_IS_CUSTOMER,
-    COL_ROW_LABEL,
-    FullYearChartData,
-    ProductLineReviewCommonFilters,
-    ProductLineReviewFilters,
-    ProductLineReviewResult,
-    ProductLineReviewSubFilters,
-    add_months,
-    aggregate_base_plan_for_plr,
-    aggregate_orders_for_plr,
-    aggregate_total_demand_for_plr,
-    build_display_groups,
-    build_full_year_chart_data,
-    build_product_line_review_table,
-    collect_ibp_months_for_common,
-    eligible_cy_begin_months,
-    list_pdh_filter_values_for_pmaj,
-    resolve_filters,
-    validate_common_filters,
-)
-from data_sources.demand_item_customer import (
-    DemandItemCustomerError,
-    attach_corporate_group_to_orders,
-    build_demand_order_item_customer,
-    compute_cy_actual_months,
-    fetch_demand_item_customer_detail,
-    list_filter_values_for_pmaj_from_demand,
-    list_filter_values_from_demand,
-    prepare_demand_long_for_plr,
-    save_demand_order_item_customer,
 )
 from data_sources.customer_dims import (
     CustomerDimsError,
@@ -293,9 +222,6 @@ from data_sources.aps_upload_pipeline import (
     list_aps_history_cycles,
     parse_corp_override_csv,
     patch_history_corp,
-)
-from data_sources.product_line_review import (
-    cy_full_year_months as _plr_cy_full_year_months,
 )
 from data_sources.ro_comparison import (
     ANNUAL_OPP_CHANGE,
@@ -387,8 +313,11 @@ from data_sources.ro_rules_config import (
 )
 from data_sources.demand_plan_pipeline import (
     DemandPlanResult,
+    WithdrawResult,
     backfill_plan_attribute_columns,
+    list_history_tracker_cycles,
     run_demand_plan_pipeline,
+    withdraw_cycles,
 )
 from data_sources.fabric_lakehouse_io import LakehouseIOError
 from utils import fabric_signin_widget
@@ -2700,7 +2629,7 @@ def _ensure_summary_in_session(
     st.session_state[_SS_MONTHS_SIG] = months_sig
     st.session_state[_SS_DIMITEMS_ERROR] = dimitems_err
     # Republish the freshly built comparison to Fabric.  This keeps the
-    # downstream consumers (Summary Report, PLR R&O, drill-downs) reading
+    # downstream consumers (Summary Report, drill-downs) reading
     # the CURRENT (Prior, LE) view rather than whatever the last
     # ``RO_History_Tracker.csv`` change-detect path wrote.  Idempotent via
     # signature guard — repeat reruns within the same session don't write.
@@ -3012,7 +2941,6 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     #   * Auto-save on every Prior/LE rebuild           → see
     #     :func:`_maybe_autosave_ro_comparison_output` in
     #     :func:`_ensure_summary_in_session`.
-    #   * Auto-save at the end of every PLR render     → see PLR fragment.
     # The button is the explicit escape hatch for planner edits, which the
     # other paths cannot detect on their own.
     _render_ro_comparison_save_button(summary_df)
@@ -4248,8 +4176,8 @@ def _render_summary_report_fragment() -> None:
         st.session_state[_SS_SUMMARY_REPORT_SIG]       = build_sig
         # Republish the freshly built template to Fabric.  The manual Save
         # button below remains available; this auto-save is the planner's
-        # safety net so downstream consumers (PLR R&O, Demand Plan
-        # Comparison) always read the CURRENT in-memory view.
+        # safety net so downstream consumers (the Demand Plan Comparison)
+        # always read the CURRENT in-memory view.
         _maybe_autosave_ro_summary_report(trigger="RO Summary rebuild")
 
     # ── Toolbar: status + Show-empty-rows toggle ──────────────────
@@ -4978,8 +4906,8 @@ def _render_base_plan_uploader() -> None:
             st.session_state[_SS_DEMAND_PIPELINE_RESULT] = result
             if result.ok:
                 # The pipeline just rewrote every demand-plan file. Flush ALL
-                # @st.cache_data so the Demand Summary, Comparison (shape-signature
-                # build caches) and PLR re-read fresh, then rerun.
+                # @st.cache_data so the Demand Summary and Comparison
+                # (shape-signature build caches) re-read fresh, then rerun.
                 st.cache_data.clear()
                 st.rerun()
 
@@ -5037,6 +4965,145 @@ def _render_demand_plan_pipeline_summary(result: DemandPlanResult) -> None:
                 st.markdown(f"{icon} {entry.text}")
 
 
+# Session key holding the last withdraw result so it survives the rerun the
+# button triggers (same pattern as the pipeline / cleanup results above).
+_SS_WITHDRAW_RESULT: str = "demand_withdraw_result"
+
+
+def _render_withdraw_cycle_tool() -> None:
+    """Render the one-click 'withdraw a base-plan upload' tool.
+
+    Sits at the TOP of the IBP section because it is the *undo* for the upload
+    directly below it: a planner who has just realised a base plan was wrong
+    needs to clear it before re-uploading, and hunting for the control at the
+    bottom of a long section is exactly when a destructive action gets
+    mis-clicked.
+
+    Guarded behind a cycle selection AND a confirmation checkbox (matching
+    :func:`_render_month_cleanup`, the page's other destructive tool) so it
+    cannot fire by accident.  All the work lives in
+    :func:`~data_sources.demand_plan_pipeline.withdraw_cycles`; this function
+    only collects the choice and renders the outcome.
+    """
+    with st.expander("↩️ Withdraw a Base Plan upload (start over)", expanded=False):
+        st.markdown(
+            "**Use this to undo a base-plan upload before re-uploading.**  "
+            "Pick the cycle(s) you want to pull, tick the confirmation, and "
+            "click once — the app will:\n\n"
+            "1. Remove those cycles' rows from "
+            "**`qry_mgmt_plan_history_tracker.csv`** (every other cycle is left "
+            "untouched).\n"
+            "2. Delete the four single-cycle files the last run produced — "
+            "**`qry_mgmt_plan_full.csv`**, "
+            "**`qry_demand_item_customer_detail.csv`**, "
+            "**`qry_total_item_level_demand.csv`** and "
+            "**`Append New Plan/ibp_base_plan_current.csv`**.\n\n"
+            "Then upload the corrected plan in **⬆️ Upload a new Base Plan** "
+            "below and all four files are rebuilt."
+        )
+        st.caption(
+            "🛟 **Every file is archived first** (`Demand Plan/Archive/` and "
+            "`Append New Plan/Archive/`, timestamped), so a withdraw can be "
+            "undone by re-uploading the archived copy.  The four files above "
+            "always describe the **most recent run only**, so they are cleared "
+            "whichever cycle you withdraw — the tracker is the only file that "
+            "keeps history.  `tbl_ro_input.csv` is left alone (it comes from "
+            "RO_Seed, not from your upload)."
+        )
+
+        try:
+            cycles = list_history_tracker_cycles()
+        except LakehouseIOError as exc:
+            st.error(f"❌ Could not read the history tracker.\n\n{exc}")
+            return
+        if not cycles:
+            st.info(
+                "ℹ️ The history tracker has no cycles yet — nothing to withdraw."
+            )
+            return
+
+        # Newest last (horizon order), so the most likely pick is the default.
+        picked = st.multiselect(
+            "Cycle(s) to withdraw",
+            options=cycles,
+            default=[cycles[-1]],
+            key="demand_withdraw_cycles",
+            help="Cycles currently in the history tracker, oldest → newest. "
+                 "The newest is pre-selected — that is the one the four files "
+                 "above describe.",
+        )
+        confirm = st.checkbox(
+            "Yes — remove the selected cycle(s) from the tracker and delete the "
+            "four files listed above.",
+            key="demand_withdraw_confirm",
+        )
+        withdraw_clicked = st.button(
+            "↩️ Withdraw & clear files",
+            type="primary",
+            disabled=(not picked or not confirm),
+            key="demand_withdraw_btn",
+            help="Enabled once you pick at least one cycle and tick the "
+                 "confirmation.",
+        )
+
+        if withdraw_clicked:
+            with st.spinner(
+                f"Withdrawing {', '.join(picked)} — archiving, rewriting the "
+                "tracker, clearing the snapshot files…"
+            ):
+                result = withdraw_cycles(picked)
+            st.session_state[_SS_WITHDRAW_RESULT] = result
+            if result.ok:
+                # Every demand-plan file just changed. Flush ALL @st.cache_data
+                # for the same reason the pipeline run does — the section's
+                # build caches are keyed on a cheap shape signature and would
+                # otherwise serve a stale build. Then rerun.
+                st.cache_data.clear()
+                st.rerun()
+
+        # Result persists across the rerun the button triggers.
+        result: Optional[WithdrawResult] = st.session_state.get(_SS_WITHDRAW_RESULT)
+        if result is not None:
+            _render_withdraw_summary(result)
+
+
+def _render_withdraw_summary(result: WithdrawResult) -> None:
+    """Render the foldable summary for the last withdraw."""
+    title = ("↩️ Withdraw — last run "
+             + ("✅ success" if result.ok else "❌ failed"))
+    with st.expander(title, expanded=True):
+        if result.ok:
+            st.success(
+                f"Withdrew **{', '.join(result.cycles)}** — "
+                f"{result.rows_removed:,} tracker row(s) removed, "
+                f"{result.rows_remaining:,} remain.  Upload the corrected plan "
+                "below to rebuild the demand-plan files."
+            )
+        else:
+            st.error(
+                "Withdraw did **not** complete — nothing was changed unless a "
+                "specific write is listed in the log below."
+            )
+
+        for err in result.errors:
+            st.error(f"❌ {err}")
+        if result.warnings:
+            st.warning("**Please review these warnings:**\n\n"
+                       + "\n".join(f"- {w}" for w in result.warnings))
+
+        if result.ok:
+            if result.files_deleted:
+                st.caption("🗑️ Deleted: " + ", ".join(f"`{f}`" for f in result.files_deleted))
+            if result.files_absent:
+                st.caption("• Already absent: "
+                           + ", ".join(f"`{f}`" for f in result.files_absent))
+
+        with st.expander("Full run log", expanded=not result.ok):
+            for entry in result.log:
+                icon = _LOG_LEVEL_ICON.get(entry.level, "•")
+                st.markdown(f"{icon} {entry.text}")
+
+
 def _render_demand_summary() -> None:
     """Render the Demand Summary section end-to-end inside a foldable expander.
 
@@ -5082,34 +5149,36 @@ def _render_demand_summary() -> None:
             )
             return
 
+        # Withdraw sits FIRST — it is the undo for the uploader directly below,
+        # so the recover-then-re-upload flow reads top-to-bottom.
+        _render_withdraw_cycle_tool()
+
         # Upload a new Base Plan → run the in-app Demand Plan pipeline.
         # The history tracker is appended (with the upload's authored Cycle)
         # by that pipeline, so this Refresh button only re-reads.
         _render_base_plan_uploader()
 
         # Consolidated "Refresh from Fabric" button.  One click re-reads the
-        # ENTIRE section from the lakehouse — not just the two demand summary
-        # CSVs, but the Demand Plan Comparison summary and the Product Line
-        # Review below it.
+        # ENTIRE section from the lakehouse — the demand summary CSVs and the
+        # Demand Plan Comparison summary below them.
         #
         # Why a full ``st.cache_data.clear()`` and not just
-        # ``clear_demand_summary_cache()``: the comparison + PLR pull
-        # several *other* Fabric sources (IBP Shipments/Orders, the PDH /
-        # customer / ship-to dims, the RO Summary delta, the FY27 budget
-        # workbook) behind their own caches, and their build outputs are
-        # keyed on a cheap ``(rows, cols)`` shape signature — so a content
-        # change that leaves the shape intact would otherwise serve a
-        # stale build even after the raw reads refresh.  Flushing every
-        # ``@st.cache_data`` slot (the same primitive the Market Barometer
-        # "Refresh from Fabric" uses) is the only way to guarantee all
-        # three sub-sections move together on one click.
+        # ``clear_demand_summary_cache()``: the comparison pulls several
+        # *other* Fabric sources (IBP Shipments/Orders, the PDH / customer /
+        # ship-to dims, the RO Summary delta, the FY27 budget workbook)
+        # behind their own caches, and its build outputs are keyed on a cheap
+        # ``(rows, cols)`` shape signature — so a content change that leaves
+        # the shape intact would otherwise serve a stale build even after the
+        # raw reads refresh.  Flushing every ``@st.cache_data`` slot (the same
+        # primitive the Market Barometer "Refresh from Fabric" uses) is the
+        # only way to guarantee both sub-sections move together on one click.
         if st.button(
             "🔄 Refresh from Fabric",
             key="demand_summary_refresh_from_fabric",
             help=(
                 "Re-read this whole section from Microsoft Fabric — the Demand "
-                "Summary CSVs, the Demand Plan Comparison summary, and the "
-                "Product Line Review — bypassing every data cache."
+                "Summary CSVs and the Demand Plan Comparison summary — "
+                "bypassing every data cache."
             ),
         ):
             st.cache_data.clear()
@@ -5139,20 +5208,11 @@ def _render_demand_summary() -> None:
             download_button_key="demand_summary_dl_total_item_level_demand",
         )
 
-        # ── Demand Pivot Summary (hierarchical roll-up) ─────────────
-        #
-        # Lives below the two raw-CSV previews because it's a derived
-        # view of the second file (qry_total_item_level_demand.csv).
-        # The horizontal rule keeps the visual separation crisp so
-        # planners don't conflate the raw preview with the roll-up.
-        st.markdown("---")
-        _render_demand_pivot_section()
-
         # ── Demand Plan Comparison Summary (cycle-over-cycle) ───────
         #
-        # Sits directly below the MOM roll-up.  Pulls plan numbers from
-        # the plan-history tracker, actuals from IBP Shipments, and
-        # dimensions/brand from PDH — see ``demand_plan_comparison``.
+        # Pulls plan numbers from the plan-history tracker, actuals from
+        # IBP Shipments, and dimensions/brand from PDH — see
+        # ``demand_plan_comparison``.
         st.markdown("---")
         _render_demand_plan_comparison_section()
 
@@ -5525,34 +5585,6 @@ def _render_demand_summary_file(
     )
 
 
-# ── Demand Pivot Summary (hierarchical roll-up) ─────────────────────────────
-#
-# Mirrors the Excel pivot the planner pasted in the chat:
-#   Rows:  Portfolio Major → Forecast Type ("Base Plan" / "R&O") → Supply Format
-#   Cols:  one per month + a trailing "Total" column
-#   Vals:  Sum of Demand Plan Pounds, in millions, rounded to 1 decimal
-#
-# Source: ``Files/RO Tracking/Demand Plan/qry_total_item_level_demand.csv``
-# (loaded via the same cached fetcher the raw preview above uses, so the
-# pivot benefits from the same freshness guarantees — a refresh of the
-# source CSV in Fabric automatically propagates to this section on the
-# next page render).
-#
-# Filter widget keys — separated from the rest of the page's keys with a
-# distinct ``ro_dp_`` prefix so a key collision can't accidentally
-# reset a planner's selection in another section.
-
-_SS_DP_PMAJ_FILTER:   str = "ro_dp_pmaj_filter"
-_SS_DP_SFMT_FILTER:   str = "ro_dp_sfmt_filter"
-_SS_DP_CYCLE_FILTER:  str = "ro_dp_cycle_filter"
-# Forecast window (tracker) and actual window (IBP Shipments) pickers.
-# Distinct key strings from the retired single date-range so a stale
-# session value from an older build can't collide with the new widgets.
-_SS_DP_FC_START_FILTER:  str = "ro_dp_forecast_start_filter"
-_SS_DP_FC_END_FILTER:    str = "ro_dp_forecast_end_filter"
-_SS_DP_ACT_START_FILTER: str = "ro_dp_actual_start_filter"
-_SS_DP_ACT_END_FILTER:   str = "ro_dp_actual_end_filter"
-
 # Hidden columns owned by the pivot builder — kept in sync with
 # ``data_sources/demand_summary._HIDDEN_COLS``.  Listed locally so the
 # page doesn't need to reach into the private module surface to know
@@ -5560,337 +5592,9 @@ _SS_DP_ACT_END_FILTER:   str = "ro_dp_actual_end_filter"
 _DP_HIDDEN_COLS: tuple[str, ...] = ("_row_id", "_indent", "_is_subtotal")
 
 
-def _build_demand_pivot_budget_lookup() -> BudgetLookup:
-    """Annual leaf budget for the hierarchical pivot table only."""
-    try:
-        base_df = fetch_static_budget_base().df
-    except DemandSummaryError as exc:
-        logger.info(
-            "Static_Budget_Base_Lbs.csv unavailable (pivot Total Budget): %s",
-            exc,
-        )
-        base_df = None
-    try:
-        ro_df = fetch_static_budget_ro().df
-    except DemandSummaryError as exc:
-        logger.info(
-            "Static_Budget_RO_Lbs.csv unavailable (pivot Total Budget): %s",
-            exc,
-        )
-        ro_df = None
-    return build_budget_lookup(base_df, ro_df)
-
-
-def _load_demand_pivot_monthly_budget() -> MonthlyBudgetLookup:
-    """Load bundled monthly budget for footer Total Budget + chart.
-
-    Reads ``Static_Budget_Base&RO_by_Month.csv`` from Fabric and parses
-    it via :func:`build_monthly_budget_lookup`.  A missing file yields
-    an empty lookup; the page suppresses the footer Total Budget row
-    and the chart overlay without blocking the rest of the pivot.
-    """
-    try:
-        snapshot = fetch_static_budget_monthly()
-        budget_df = snapshot.df
-    except DemandSummaryError as exc:
-        logger.info(
-            "Static_Budget_Base&RO_by_Month.csv unavailable for Demand "
-            "Pivot budget (footer + chart suppressed): %s",
-            exc,
-        )
-        budget_df = None
-
-    return build_monthly_budget_lookup(budget_df)
-
-
-def _render_demand_pivot_section() -> None:
-    """Render the Demand MOM Summary header + delegate to the fragment.
-
-    The header (title + caption) stays OUTSIDE the fragment because
-    it's static text — the fragment owns only the interactive widgets
-    + table + chart so filter / date-range changes rerun only the
-    MOM view, not the surrounding headers.
-    """
-    st.markdown("### 📊 Demand MOM Summary")
-    st.caption(
-        "Month-over-month roll-up (Portfolio Major → Forecast Type → "
-        "Supply Format), monthly columns in **millions of pounds**.  The "
-        "**Actual month range** pulls actuals from **`dbo.IBP Shipments`**; "
-        "the remaining **Forecast month range** pulls the plan for the "
-        "selected **Cycle** from **`qry_mgmt_plan_history_tracker.csv`** — "
-        "stitched onto one month axis (actuals for the closed months, "
-        "forecast beyond).  Auto-refreshes when the sources change in "
-        "Fabric.  The footer subtotals and the chart below update live; "
-        "**double-click a pivot row to drill into its SKUs**."
-    )
-    _render_demand_pivot_fragment()
-
-
-@st.fragment
-def _render_demand_pivot_fragment() -> None:
-    """Render the filters, not-captured log, MOM pivot, footer, and chart.
-
-    Why this is a ``@st.fragment``
-    -------------------------------
-    The widget set (Cycle + PMaj / SFmt multiselects + the two month-
-    range pickers + the pivot's row-select) is interactive, but the
-    surrounding page sections have nothing to do with the MOM Summary.
-    Wrapping this block in a fragment scopes each interaction to a rerun
-    of just this function — no upstream Fabric reads for the rest of the
-    page, no RO Comparison rebuild.
-
-    Sourcing model
-    --------------
-    * **Forecast** — ``qry_mgmt_plan_history_tracker.csv`` via
-      :func:`fetch_mgmt_plan_history_tracker` (cached, blob-keyed).
-    * **Actuals**  — ``dbo.IBP Shipments`` via
-      :func:`fetch_ibp_shipments_slim_df`, projected to just the actual
-      window so OneLake returns the minimum rows.
-    * **Dims**     — ``qry_pdh.csv`` supplies Portfolio Major / Supply
-      Format (the tracker + shipments carry neither).
-    Any refresh of a source in Fabric invalidates its cache and the MOM
-    view reflects the fresh data on the next render — no manual refresh.
-    """
-    # 1. Forecast source (tracker) + dims (PDH) + budgets.
-    try:
-        with st.spinner("Reading qry_mgmt_plan_history_tracker.csv from Microsoft Fabric…"):
-            tracker = fetch_mgmt_plan_history_tracker()
-    except DemandSummaryError as exc:
-        st.error(
-            "❌ Could not load **qry_mgmt_plan_history_tracker.csv** for "
-            f"the Demand MOM Summary.\n\n{exc}"
-        )
-        return
-    if tracker.df.empty:
-        st.info(
-            "ℹ️ `qry_mgmt_plan_history_tracker.csv` is empty — nothing to "
-            "roll up.  Check the upstream Fabric pipeline."
-        )
-        return
-
-    pdh_df = _load_demand_comparison_pdh()          # primary dims (non-fatal)
-    item_master_df = _load_mom_item_master()        # fallback dims (non-fatal)
-    budget_lookup = _build_demand_pivot_budget_lookup()
-    monthly_budget = _load_demand_pivot_monthly_budget()
-
-    # 2. Discover filter option lists.
-    cycles = list_tracker_cycles(tracker.df)
-    if not cycles:
-        st.warning(
-            "⚠️ The tracker carries no `Cycle` values — cannot pick a "
-            "forecast cycle.  Check the upstream export."
-        )
-        return
-    tracker_months = list_tracker_months(tracker.df)
-    try:
-        actual_months = list(fetch_ibp_shipments_months())
-    except IBPOfficialSourceError as exc:
-        actual_months = []
-        st.warning(
-            "⚠️ Could not read the IBP Shipments month list "
-            f"({exc}) — falling back to the tracker's months for the "
-            "actual-range picker."
-        )
-    if not actual_months:
-        actual_months = tracker_months
-
-    field_options = list_mom_filter_values(tracker.df, pdh_df, item_master_df)
-
-    # 3. Render the filters (Cycle + Actual/Forecast ranges + PMaj/SFmt).
-    filters = _render_demand_mom_filters(
-        cycles, tracker_months, actual_months, field_options,
-    )
-
-    # 4. Validate the windows (disjoint + start ≤ end) before any read.
-    errors = validate_mom_filters(filters)
-    if errors:
-        for err in errors:
-            st.warning(f"⚠️ {err}")
-        return
-
-    # 5. Load actuals for the actual window only (predicate-pushed slim read).
-    actual_window = tuple(sorted(
-        months_in_range(filters.actual_start, filters.actual_end)
-    ))
-    ibp_df: Optional[pd.DataFrame] = None
-    try:
-        with st.spinner("Reading dbo.IBP Shipments actuals from Microsoft Fabric…"):
-            if actual_window:
-                ibp_df = fetch_ibp_shipments_slim_df(months=actual_window)
-    except IBPOfficialSourceError as exc:
-        st.warning(
-            "⚠️ Could not read IBP Shipments actuals "
-            f"({exc}) — the MOM view will show forecast months only."
-        )
-
-    # 6. Build the stitched MOM pivot.
-    try:
-        with st.spinner("Building Demand MOM Summary…"):
-            result = build_demand_mom_pivot(
-                tracker.df, ibp_df, pdh_df, filters,
-                item_master_df=item_master_df,
-                budget_lookup=budget_lookup,
-                monthly_budget=monthly_budget,
-            )
-    except DemandPlanComparisonError as exc:
-        st.error(f"❌ Could not build the Demand MOM Summary.\n\n{exc}")
-        return
-
-    # 7. Reconciliation log — surfaced at the TOP of the results so a
-    #    planner sees "what's missing" before reading the numbers.
-    _render_mom_not_captured_log(result.not_captured_items)
-
-    # 8. Empty-after-filter case — hint instead of a degenerate table/chart.
-    if result.pivot.empty:
-        st.info(
-            "No rows match the current Cycle / Portfolio Major / Supply "
-            "Format / month-range selection.  Widen one of the filters "
-            "above to see data."
-        )
-        return
-
-    # 9. Pivot table + footer totals + download + SKU drill-down.
-    _render_demand_pivot_table(result)
-
-    # 10. Stitched month-over-month chart (Actual → Base + R&O).
-    st.markdown("---")
-    _render_base_ro_summary_chart(result)
-
-
-def _render_demand_mom_filters(
-    cycles: list[str],
-    tracker_months: list[date],
-    actual_months: list[date],
-    field_options: dict[str, list[str]],
-) -> DemandMomFilters:
-    """Render the MOM filter widgets and return a :class:`DemandMomFilters`.
-
-    Layout
-    ------
-    Row 1 — Portfolio Major / Supply Format multiselects + the Cycle
-    picker.  Row 2 — the **Actual month range** (IBP Shipments).  Row 3 —
-    the **Forecast month range** (tracker, selected Cycle).  Month pickers
-    are ``selectbox``es over the discrete month lists (mirrors the sibling
-    Demand Plan Comparison section rather than free-form date inputs).
-
-    Defaults
-    --------
-    * PMaj / SFmt start EMPTY → "include every value".
-    * Cycle defaults to the newest (``cycles`` is in natural order).
-    * The month windows default to the planner's usual split — recent
-      closed months as actuals, the following months as forecast — and
-      fall back to a computed disjoint split when those exact months are
-      absent, so the two ranges never overlap on first render.
-    """
-    pmaj_opts: list[str] = field_options.get("portfolio_majors", [])
-    sfmt_opts: list[str] = field_options.get("supply_formats", [])
-
-    # Spell the month out ("Apr 2026") — the bare "4/2026" form is hard to
-    # scan.  Identity formatter for the cycle labels.
-    fmt_month = lambda d: d.strftime("%b %Y")  # noqa: E731
-    fmt_cycle = lambda c: c                     # noqa: E731
-
-    # ── Default indices ────────────────────────────────────────────────
-    n_fc = len(tracker_months)
-    last_fc_idx = max(0, n_fc - 1)
-
-    def _fc_idx(target: date, fallback: int) -> int:
-        return tracker_months.index(target) if target in tracker_months else fallback
-
-    def _act_idx(target: date, fallback: int) -> int:
-        return actual_months.index(target) if target in actual_months else fallback
-
-    last_actual_idx = max(0, len(actual_months) - 1)
-    # Preferred windows (match the sibling comparison section); fall back
-    # to a self-adjusting disjoint split when those months are absent.
-    fc_fallback_start = min(max(0, n_fc // 2), last_fc_idx)
-    act_start_idx = _act_idx(date(2026, 4, 1), 0)
-    act_end_idx = _act_idx(date(2026, 5, 1), last_actual_idx)
-    fc_start_idx = _fc_idx(date(2026, 6, 1), fc_fallback_start)
-    fc_end_idx = _fc_idx(date(2027, 3, 1), last_fc_idx)
-
-    with st.expander("🔍 Filters", expanded=True):
-        row1 = st.columns([2, 2, 1.4])
-        with row1[0]:
-            selected_pmaj = st.multiselect(
-                "Portfolio Major", options=pmaj_opts, key=_SS_DP_PMAJ_FILTER,
-                help=(
-                    "Limit the pivot to specific Portfolio Major value(s).  "
-                    "Empty = include every Portfolio Major."
-                ),
-            )
-        with row1[1]:
-            selected_sfmt = st.multiselect(
-                "Supply Format", options=sfmt_opts, key=_SS_DP_SFMT_FILTER,
-                help=(
-                    "Limit the pivot to specific Supply Format value(s).  "
-                    "Empty = include every Supply Format."
-                ),
-            )
-        with row1[2]:
-            cycle = st.selectbox(
-                "Cycle (forecast)", options=cycles,
-                index=len(cycles) - 1, key=_SS_DP_CYCLE_FILTER,
-                format_func=fmt_cycle,
-                help=(
-                    "Planning cycle whose forecast the MOM Summary pulls "
-                    "from `qry_mgmt_plan_history_tracker.csv`."
-                ),
-            )
-
-        st.markdown("**Actual month range** (pulled from `dbo.IBP Shipments`)")
-        row2 = st.columns(2)
-        with row2[0]:
-            actual_start = st.selectbox(
-                "Actual month — start", options=actual_months,
-                index=act_start_idx, key=_SS_DP_ACT_START_FILTER,
-                format_func=fmt_month,
-            )
-        with row2[1]:
-            actual_end = st.selectbox(
-                "Actual month — end", options=actual_months,
-                index=act_end_idx, key=_SS_DP_ACT_END_FILTER,
-                format_func=fmt_month,
-            )
-
-        st.markdown(
-            "**Forecast month range** (pulled from the tracker; must not "
-            "overlap the actual range)"
-        )
-        row3 = st.columns(2)
-        with row3[0]:
-            forecast_start = st.selectbox(
-                "Forecast month — start", options=tracker_months,
-                index=fc_start_idx, key=_SS_DP_FC_START_FILTER,
-                format_func=fmt_month,
-            )
-        with row3[1]:
-            forecast_end = st.selectbox(
-                "Forecast month — end", options=tracker_months,
-                index=fc_end_idx, key=_SS_DP_FC_END_FILTER,
-                format_func=fmt_month,
-            )
-
-        st.caption(
-            f"📌 **Actual** {fmt_month(actual_start)} – {fmt_month(actual_end)} "
-            f"(IBP Shipments)  ·  **Forecast** {fmt_month(forecast_start)} – "
-            f"{fmt_month(forecast_end)} (tracker, cycle **{cycle}**)"
-        )
-
-    return DemandMomFilters(
-        cycle=cycle,
-        actual_start=actual_start,
-        actual_end=actual_end,
-        forecast_start=forecast_start,
-        forecast_end=forecast_end,
-        portfolio_majors=tuple(selected_pmaj) or None,
-        supply_formats=tuple(selected_sfmt) or None,
-    )
-
-
 # Deep link to the RO_Item_Master.csv file in the Fabric lakehouse — the
 # authoritative place to look up / add a Portfolio Major + Supply Format for
-# items the MOM dim cascade (PDH → RO_Item_Master) still can't classify.
+# items the dim cascade (PDH → RO_Item_Master) still can't classify.
 _RO_ITEM_MASTER_FABRIC_URL: str = (
     "https://app.fabric.microsoft.com/groups/"
     "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
@@ -5900,558 +5604,11 @@ _RO_ITEM_MASTER_FABRIC_URL: str = (
 )
 
 
-def _render_mom_not_captured_log(not_captured: pd.DataFrame) -> None:
-    """Render the "in tracker but not captured in the MOM Summary" log.
-
-    Sits at the top of the results.  When every tracker item (selected
-    cycle, forecast window) made it into the pivot, a compact success
-    note confirms the reconciliation ran; otherwise an expanded warning
-    lists the missing items + reason, a CSV download, a one-click copy of
-    the item numbers, and a jump link to ``RO_Item_Master.csv`` in Fabric
-    so the planner can classify the stragglers at source.
-    """
-    if not_captured is None or not_captured.empty:
-        st.caption(
-            "✅ Every tracker item in the forecast window is captured in "
-            "the MOM Summary below."
-        )
-        return
-
-    n = len(not_captured)
-    with st.expander(
-        f"⚠️ {n:,} tracker item(s) NOT captured in the MOM Summary",
-        expanded=True,
-    ):
-        st.caption(
-            "Items present in `qry_mgmt_plan_history_tracker.csv` for the "
-            "selected cycle + forecast window that do **not** appear in the "
-            "pivot below — with the reason (no Portfolio Major / Supply "
-            "Format mapping in **PDH or RO_Item_Master**, excluded by an "
-            "active filter, or zero forecast pounds).  Reconcile these "
-            "before trusting the totals."
-        )
-        st.dataframe(not_captured, use_container_width=True, hide_index=True)
-
-        # Reconciliation aids: jump to the fallback source in Fabric, copy
-        # the item list to paste into it, and download the full log.
-        col_link, col_dl = st.columns([1, 1])
-        with col_link:
-            st.link_button(
-                "🔎 Open RO_Item_Master.csv in Fabric",
-                _RO_ITEM_MASTER_FABRIC_URL,
-                use_container_width=True,
-                help=(
-                    "Add a Portfolio Major + Supply Format for these items "
-                    "here; the MOM Summary picks them up on the next refresh."
-                ),
-            )
-        with col_dl:
-            today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-            st.download_button(
-                label="⬇️ Download not-captured items (CSV)",
-                data=not_captured.to_csv(index=False).encode("utf-8"),
-                file_name=f"demand_mom_not_captured_{today}.csv",
-                mime="text/csv",
-                key="demand_mom_not_captured_download",
-                use_container_width=True,
-            )
-
-        # ``st.code`` renders a built-in copy button — the fastest way to
-        # lift the item numbers and search for them in RO_Item_Master.
-        items = (
-            not_captured[NC_COL_ITEM].astype(str).str.strip().tolist()
-            if NC_COL_ITEM in not_captured.columns else []
-        )
-        if items:
-            st.caption("Item numbers to look up (copy →):")
-            st.code(", ".join(items), language="text")
-
-
-def _render_mom_sku_drilldown(result: DemandMomResult, row: pd.Series) -> None:
-    """Render the SKU-level detail behind a selected pivot row + download.
-
-    Resolves the clicked row to its (Portfolio Major, Forecast Type,
-    Supply Format) breadcrumb via the hidden dimension columns and asks
-    the result for the matching item-level slice.  A Grand Total / header
-    row (blank breadcrumb) drills into everything beneath it.
-    """
-    pmaj = str(row.get(MOM_ROW_PMAJ, "") or "")
-    forecast = str(row.get(MOM_ROW_FORECAST, "") or "")
-    sfmt = str(row.get(MOM_ROW_SFMT, "") or "")
-    label = str(row.get("Row Label", "")).strip() or "selection"
-
-    sku = result.sku_detail_for(pmaj, forecast, sfmt)
-    st.markdown(f"**🔬 SKU detail — {label}**")
-    if sku.empty:
-        st.info("No SKU-level rows for this selection.")
-        return
-    st.dataframe(sku, use_container_width=True, hide_index=True)
-    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    st.download_button(
-        label="⬇️ Download SKU detail (CSV)",
-        data=sku.to_csv(index=False).encode("utf-8"),
-        file_name=f"demand_mom_sku_detail_{today}.csv",
-        mime="text/csv",
-        key="demand_mom_sku_detail_download",
-    )
-    st.caption(
-        "Values in millions of pounds.  Select a different row to drill "
-        "into it."
-    )
-
-
-def _demand_pivot_column_config(
-    month_columns: tuple[str, ...], *, include_budget: bool,
-) -> dict:
-    """Return the ``column_config`` mapping for the pivot editor.
-
-    All month columns + the Total column use ``format="%.1f"`` to
-    match the screenshot's "47.8 M lb" display precision (one
-    decimal place).  ``Row Label`` is wide enough to fit the deepest
-    indent without truncation.  The Total Budget column is included
-    only when *include_budget* is True (the page passes ``False`` if
-    both static-budget CSVs were unavailable, so the column doesn't
-    render as a misleading all-zero strip).
-    """
-    cc = st.column_config
-    num_fmt = "%.1f"
-
-    config: dict = {
-        "Row Label": cc.TextColumn("Row Labels", width="large", disabled=True),
-    }
-    for c in month_columns:
-        config[c] = cc.NumberColumn(c, format=num_fmt, disabled=True)
-    config[TOTAL_COLUMN_LABEL] = cc.NumberColumn(
-        TOTAL_COLUMN_LABEL, format=num_fmt, disabled=True,
-    )
-    if include_budget:
-        config[TOTAL_BUDGET_COLUMN_LABEL] = cc.NumberColumn(
-            TOTAL_BUDGET_COLUMN_LABEL,
-            format=num_fmt,
-            disabled=True,
-            help=(
-                "Annual budget (millions of lbs) for this pivot row, "
-                "from `Static_Budget_Base_Lbs.csv` / "
-                "`Static_Budget_RO_Lbs.csv`.  The footer Total Budget "
-                "row uses monthly data from "
-                "`Static_Budget_Base&RO_by_Month.csv`."
-            ),
-        )
-    return config
-
-
-def _fmt_mom_num(value: object) -> str:
-    """Format a millions value to 1 dp; blank/NaN → '-'."""
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return "-"
-    if pd.isna(num):
-        return "-"
-    return f"{num:,.1f}"
-
-
-def _render_mom_pivot_html(result: DemandMomResult, *, show_budget: bool) -> None:
-    """Render the MOM pivot as a foldable, dark-styled, read-only HTML table.
-
-    Matches the planner's target layout: a dark-gray/white header, dark-gray
-    layer-1 (Portfolio Major) rows, and dark-gray Total + Total Budget columns
-    on every row.  Layer-1 and layer-2 (Forecast Type) rows are
-    ``<details>/<summary>`` disclosures so the planner can fold a whole
-    Portfolio Major — or one Forecast-Type branch — down to a single row.
-    Columns are a fixed CSS grid so every row (summary or leaf) stays aligned.
-    """
-    pivot = result.pivot
-    months = list(result.month_columns)
-    data_cols = [*months, TOTAL_COLUMN_LABEL]
-    if show_budget:
-        data_cols.append(TOTAL_BUDGET_COLUMN_LABEL)
-    # Fixed column widths → identical across every <details> block, so the
-    # grid lines up even though rows live in separate disclosure elements.
-    # Months are 66px so a full "2026-04" label fits without truncation;
-    # Total Budget is 96px so its header reads in full.
-    _month_w, _tot_w, _bud_w = 66, 62, 96
-    grid = ("230px " + " ".join([f"{_month_w}px"] * len(months))
-            + f" {_tot_w}px" + (f" {_bud_w}px" if show_budget else ""))
-    min_w = 230 + _month_w * len(months) + _tot_w + (_bud_w if show_budget else 0)
-
-    tot_cols = {TOTAL_COLUMN_LABEL, TOTAL_BUDGET_COLUMN_LABEL}
-
-    def _cells(row: pd.Series, *, indent: int, foldable: bool) -> str:
-        label = str(row.get("Row Label", "")).replace(" ", "").strip()
-        tri = '<span class="tri"></span>' if foldable else ""
-        pad = 8 + indent * 16
-        out = [f'<div class="lbl" style="padding-left:{pad}px">{tri}{_esc_html(label)}</div>']
-        for c in data_cols:
-            klass = "cell tot" if c in tot_cols else "cell"
-            out.append(f'<div class="{klass}">{_fmt_mom_num(row.get(c))}</div>')
-        return "".join(out)
-
-    def _norm(label: object) -> str:
-        return str(label).replace(" ", " ").strip()
-
-    # Header row.
-    head = ['<div class="lbl">Row Labels</div>']
-    for c in data_cols:
-        head.append(f'<div>{_esc_html(c)}</div>')
-    parts = [f'<div class="r hdr">{"".join(head)}</div>']
-
-    rows = [r for _, r in pivot.iterrows()]
-    n = len(rows)
-    i = 0
-    while i < n:
-        row = rows[i]
-        indent = int(row.get("_indent", 0) or 0)
-        is_sub = bool(row.get("_is_subtotal", False))
-        if _norm(row.get("Row Label")) == "Grand Total":
-            parts.append(f'<div class="r grand">{_cells(row, indent=0, foldable=False)}</div>')
-            i += 1
-            continue
-        if indent == 0 and is_sub:
-            # Layer-1 Portfolio Major → foldable, dark row.
-            parts.append(f'<details class="g1" open><summary class="r l1">'
-                         f'{_cells(row, indent=0, foldable=True)}</summary>')
-            i += 1
-            while i < n and int(rows[i].get("_indent", 0) or 0) > 0 \
-                    and _norm(rows[i].get("Row Label")) != "Grand Total":
-                r2 = rows[i]
-                if int(r2.get("_indent", 0) or 0) == 1 and bool(r2.get("_is_subtotal", False)):
-                    # Layer-2 Forecast Type → foldable.
-                    parts.append(f'<details class="g2" open><summary class="r l2">'
-                                 f'{_cells(r2, indent=1, foldable=True)}</summary>')
-                    i += 1
-                    while i < n and int(rows[i].get("_indent", 0) or 0) >= 2:
-                        parts.append(f'<div class="r">{_cells(rows[i], indent=2, foldable=False)}</div>')
-                        i += 1
-                    parts.append("</details>")
-                else:
-                    # A layer-1 with no forecast-type subtotal (rare) → plain row.
-                    parts.append(f'<div class="r">{_cells(r2, indent=1, foldable=False)}</div>')
-                    i += 1
-            parts.append("</details>")
-        else:
-            parts.append(f'<div class="r">{_cells(row, indent=indent, foldable=False)}</div>')
-            i += 1
-
-    css = f"""
-<style>
-.mom {{overflow-x:auto; margin:.25rem 0 .5rem; font-size:1.18rem;
-  color:#1a1a1a;}}
-.mom .tbl {{min-width:{min_w}px;}}
-.mom .r {{display:grid; grid-template-columns:{grid}; align-items:center;}}
-.mom .r > div {{padding:3px 6px; white-space:nowrap; text-align:right;
-  border-bottom:1px solid #ededed; overflow:hidden; text-overflow:ellipsis;
-  background:#ffffff;}}
-.mom .r > .lbl {{text-align:left;}}
-.mom .r > .tot {{background:#404040; color:#ffffff;}}
-.mom .hdr > div {{background:#404040; color:#ffffff; font-weight:700;
-  border-bottom:1px solid #2b2b2b;
-  white-space:normal; overflow:visible; text-overflow:clip; line-height:1.15;}}
-.mom .l1 > div {{background:#404040; color:#ffffff; font-weight:700;}}
-.mom .l2 > div {{font-weight:600;}}
-.mom .grand > div {{background:#2b2b2b; color:#ffffff; font-weight:700;}}
-.mom details {{border:0; margin:0;}}
-.mom summary {{list-style:none;}}
-.mom summary.r {{cursor:pointer;}}
-.mom summary::-webkit-details-marker {{display:none;}}
-.mom .tri::before {{content:'\\25B8\\00a0';}}
-.mom details[open] > summary .tri::before {{content:'\\25BE\\00a0';}}
-</style>
-"""
-    html = css + f'<div class="mom"><div class="tbl">{"".join(parts)}</div></div>'
-    st.markdown(html, unsafe_allow_html=True)
-
-
-def _render_demand_pivot_table(result: DemandMomResult) -> None:
-    """Render the MOM pivot + dynamic footer subtotals + download + drill-down.
-
-    The pivot is rendered with :func:`st.dataframe` in single-row
-    ``on_select`` mode: it's read-only (a pure roll-up, not an editor),
-    but selecting a row reveals the SKU-level detail behind it.
-    ``column_order`` pins the Row Label first, then every month in
-    ascending order, then the Total column, then Total Budget when annual
-    budget data is available.
-    """
-    # ── Download button (above the table — "easy to find") ──────────
-    #
-    # Hand the planner a clean CSV (internal _row_id / _indent /
-    # _is_subtotal columns stripped) so the file they hand off
-    # downstream looks identical to what's on screen.
-    download_df = pivot_for_download(result.pivot)
-    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    st.download_button(
-        label="⬇️ Download Demand Pivot Summary (CSV)",
-        data=download_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"demand_pivot_summary_{today}.csv",
-        mime="text/csv",
-        key="demand_pivot_summary_download",
-        type="primary",
-        help=(
-            "Downloads the current pivot view as a CSV — preserves "
-            "the indented Row Label hierarchy so the file mirrors the "
-            "on-screen layout, including the Total Budget column when "
-            "annual budget data is available.  Honours your active filters."
-        ),
-    )
-
-    column_order: list[str] = [
-        "Row Label", *result.month_columns, TOTAL_COLUMN_LABEL,
-    ]
-    show_budget_col = result.has_pivot_budget_data or result.has_budget_data
-    if show_budget_col:
-        column_order.append(TOTAL_BUDGET_COLUMN_LABEL)
-
-    pivot_column_config = _demand_pivot_column_config(
-        result.month_columns, include_budget=result.has_pivot_budget_data,
-    )
-    # Footer uses the same columns; monthly Total Budget row fills month cells.
-    footer_column_config = pivot_column_config
-
-    # Pivot table — a read-only, FOLDABLE, dark-styled HTML table (Streamlit's
-    # st.dataframe can render neither a dark header/row band nor collapsible
-    # hierarchy).  Layer-1 (Portfolio Major) and layer-2 (Forecast Type) rows
-    # are <details>/<summary> disclosures, so a click folds e.g. Butter — or
-    # Butter → Actual — down to a single row.
-    _render_mom_pivot_html(result, show_budget=show_budget_col)
-
-    # ── Dynamic subtotals (Base Plan / R&O / bundled Total Budget) ───
-    #
-    # Per the planner's spec, these are SEPARATE from the Grand Total
-    # row inside the pivot above — they make the Base/R&O split
-    # explicit at a glance, regardless of which Portfolio Major
-    # rows ended up visible (e.g. R&O total is non-zero even when the
-    # planner filtered to PMaj that have only Base-Plan leaves).
-    #
-    # The bundled Total Budget row is appended at the bottom so a
-    # single glance answers "what's the budget across both Base and
-    # R&O for the current filter window?" — same number that drives
-    # the dotted line on the chart below.
-    # Footer order mirrors the row hierarchy: Actual first, then the two
-    # forecast branches, then the static bundled budget.
-    st.markdown("**Dynamic subtotals** (live: reflects current filters)")
-    footer_parts = [
-        result.actual_totals, result.base_plan_totals, result.r_and_o_totals,
-    ]
-    if result.has_budget_data:
-        footer_parts.append(result.budget_totals)
-    footer_df = pd.concat(
-        [p for p in footer_parts if p is not None and not p.empty],
-        ignore_index=True,
-    )
-    st.dataframe(
-        footer_df,
-        use_container_width=True,
-        hide_index=True,
-        height=35 * (len(footer_df) + 1) + 38,
-        column_order=column_order,
-        column_config=footer_column_config,
-    )
-    if result.has_budget_data:
-        st.caption(
-            f"💰 **Bundled Total Budget (Base + R&O):** "
-            f"**{result.budget_total_m:,.1f} M lbs** "
-            "for the visible month window (from "
-            "`Static_Budget_Base&RO_by_Month.csv`; green line on the "
-            "chart below)."
-        )
-
-    # ── SKU drill-down (picker) ─────────────────────────────────────────
-    # The foldable HTML table can't post a row click back to Python, so the
-    # drill-down is driven by a compact picker of the pivot's rows.
-    pivot = result.pivot
-    if not pivot.empty:
-        def _breadcrumb(idx: int) -> str:
-            r = pivot.iloc[idx]
-            parts = [str(r.get(c, "") or "").strip()
-                     for c in (MOM_ROW_PMAJ, MOM_ROW_FORECAST, MOM_ROW_SFMT)]
-            parts = [p for p in parts if p]
-            return " › ".join(parts) or str(r.get("Row Label", "")).strip() or "Grand Total"
-
-        options = [-1, *range(len(pivot))]
-        sel = st.selectbox(
-            "🔬 Drill into a row (SKU-level detail)",
-            options=options,
-            index=0,
-            format_func=lambda i: "— none —" if i < 0 else _breadcrumb(i),
-            key="ro_dp_pivot_drill_select",
-            help="Pick a Portfolio Major / Forecast Type / Supply Format row to "
-                 "see the SKUs behind it.",
-        )
-        if sel is not None and sel >= 0:
-            _render_mom_sku_drilldown(result, pivot.iloc[sel])
-        else:
-            st.caption("💡 Pick a row above to drill into its SKU-level values.")
-
-
-def _render_base_ro_summary_chart(result: DemandMomResult) -> None:
-    """Render the stitched month-over-month chart (Actual → Base + R&O).
-
-    Actual months (IBP Shipments) render as the ``Actual`` area; the
-    forecast months render as the Base Plan (dark blue) + R&O (orange)
-    stack — and because the two windows are disjoint on the month axis,
-    each month is populated by exactly one branch, giving one continuous
-    month-over-month view.  When monthly budget data is available (see
-    :attr:`DemandMomResult.has_budget_data`), a green dotted line plots
-    the bundled budget per month from ``Static_Budget_Base&RO_by_Month.csv``.
-
-    Why Plotly (not ``st.area_chart``)
-    -----------------------------------
-    ``st.area_chart`` produces a stacked area by default but does
-    NOT expose colour overrides per series, and cannot overlay an
-    arbitrary reference line.  The planner explicitly wants the
-    Base/R&O colours from the reference screenshot (dark blue /
-    orange) AND the dotted budget line, so we drive the chart
-    directly through a Plotly figure.  This module already lists
-    ``plotly`` as a required dependency (see ``requirements.txt``).
-    """
-    chart_df = result.chart_long
-    if chart_df.empty:
-        # Already handled upstream (empty pivot returns early), but
-        # double-guard so the chart helper is safe to call from
-        # anywhere in the future.
-        return
-
-    st.markdown("**Month-over-Month: Actual → Forecast**")
-    if result.has_budget_data:
-        st.caption(
-            "Stitched monthly area in millions of pounds — **Actual** "
-            "(IBP Shipments) for the actual months, **Base Plan** + **R&O** "
-            "(tracker) for the forecast months — with a **green** dotted "
-            "**Total Budget** line from `Static_Budget_Base&RO_by_Month.csv`.  "
-            "Updates live with the filters above; the budget line is static "
-            "per month."
-        )
-    else:
-        st.caption(
-            "Stitched monthly area in millions of pounds — **Actual** "
-            "(IBP Shipments) for the actual months, **Base Plan** + **R&O** "
-            "(tracker) for the forecast months.  Updates live with the "
-            "filters above.  _Total Budget line unavailable — "
-            "`Static_Budget_Base&RO_by_Month.csv` could not be read "
-            "from Fabric._"
-        )
-
-    # Pivot the long frame into one column per series so each ``go.Scatter``
-    # trace can read its full y-vector in one indexer call — cleaner than
-    # filtering the long frame twice.
-    wide = chart_df.pivot_table(
-        index="Month",
-        columns="Forecast Type",
-        values="Pounds_M",
-        aggfunc="sum",
-        fill_value=0.0,
-        observed=True,
-    ).sort_index()
-
-    # Format x-axis ticks as ``M/YY`` — the screenshot uses that short
-    # form so the labels don't crowd at typical chart widths.  We build
-    # the label manually (rather than via the POSIX-only ``%-m``
-    # strftime token) so the formatter works on Windows AND POSIX
-    # without an OS-specific branch.
-    x_labels = [
-        f"{pd.Timestamp(d).month}/{pd.Timestamp(d).strftime('%y')}"
-        for d in wide.index
-    ]
-
-    fig = go.Figure()
-
-    # Actual trace — teal, drawn first (bottom of the stack).  Actual
-    # months carry shipment pounds while Base/R&O are zero there (and
-    # vice-versa for forecast months), so sharing ``stackgroup="one"``
-    # across all three series yields a single continuous month-over-month
-    # area: actuals on the left, forecast on the right, no double-count.
-    if SERIES_ACTUAL in wide.columns:
-        fig.add_trace(go.Scatter(
-            x=x_labels,
-            y=wide[SERIES_ACTUAL].tolist(),
-            name=SERIES_ACTUAL,
-            mode="lines",
-            stackgroup="one",
-            fillcolor="#2ca6a4",         # teal — distinct from Base/R&O
-            line=dict(width=0.5, color="#2ca6a4"),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                f"{SERIES_ACTUAL} (Shipments): "
-                "%{y:.1f} M lbs<extra></extra>"
-            ),
-        ))
-
-    # Base Plan trace — dark blue, drawn next.  ``stackgroup`` ties traces
-    # into the same stack; sharing one group across the series gives us
-    # the stitched stacked-area look the planner expects.
-    if FORECAST_BASE_PLAN in wide.columns:
-        fig.add_trace(go.Scatter(
-            x=x_labels,
-            y=wide[FORECAST_BASE_PLAN].tolist(),
-            name=FORECAST_BASE_PLAN,
-            mode="lines",
-            stackgroup="one",
-            fillcolor="#1f4e79",         # dark blue (matches screenshot)
-            line=dict(width=0.5, color="#1f4e79"),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                f"{FORECAST_BASE_PLAN}: "
-                "%{y:.1f} M lbs<extra></extra>"
-            ),
-        ))
-
-    # R&O trace — orange, drawn on top of Base Plan.
-    if FORECAST_R_AND_O in wide.columns:
-        fig.add_trace(go.Scatter(
-            x=x_labels,
-            y=wide[FORECAST_R_AND_O].tolist(),
-            name=FORECAST_R_AND_O,
-            mode="lines",
-            stackgroup="one",
-            fillcolor="#ed7d31",         # orange (matches screenshot)
-            line=dict(width=0.5, color="#ed7d31"),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                f"{FORECAST_R_AND_O}: "
-                "%{y:.1f} M lbs<extra></extra>"
-            ),
-        ))
-
-    # Total Budget overlay — green dotted line per month from Fabric.
-    if result.has_budget_data and len(wide.index) > 0:
-        budget_y: list[float] = []
-        for month_date in wide.index:
-            # Keys match pivot month columns (%Y-%m).
-            month_label = pd.Timestamp(month_date).strftime("%Y-%m")
-            budget_y.append(float(result.budget_by_month.get(month_label, float("nan"))))
-
-        fig.add_trace(go.Scatter(
-            x=x_labels,
-            y=budget_y,
-            name="Total Budget (Base + R&O)",
-            mode="lines",
-            line=dict(color="#2ca02c", width=3, dash="dot"),
-            hovertemplate=(
-                "<b>%{x}</b><br>"
-                "Total Budget: %{y:.1f} M lbs<extra></extra>"
-            ),
-        ))
-
-    fig.update_layout(
-        height=360,
-        margin=dict(l=40, r=20, t=10, b=40),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom", y=-0.25,
-            xanchor="center", x=0.5,
-        ),
-        xaxis=dict(title=None, tickangle=0),
-        yaxis=dict(title="Millions of lbs.", rangemode="tozero"),
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig, use_container_width=True, theme=None)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Demand Plan Comparison Summary (cycle-over-cycle)
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# Renders below the Demand MOM Summary.  Pulls plan numbers from
+# Pulls plan numbers from
 # ``qry_mgmt_plan_history_tracker.csv``, actuals from ``dbo.IBP
 # Shipments``, dimensions/brand from ``qry_pdh.csv``, and the R&O column
 # from the saved RO Summary Report.  All heavy lifting lives in
@@ -7560,7 +6717,7 @@ def _load_business_health_finance() -> tuple[Optional[pd.DataFrame], Optional[st
 def _load_mom_item_master() -> Optional[pd.DataFrame]:
     """Return ``RO_Item_Master.csv`` for the MOM dim fallback, or ``None``.
 
-    Non-fatal: if RO_Item_Master can't be read the Demand MOM Summary just
+    Non-fatal: if RO_Item_Master can't be read the comparison just
     degrades to PDH-only dimensions (more items land in the not-captured
     log), rather than breaking the section.
     """
@@ -7568,7 +6725,7 @@ def _load_mom_item_master() -> Optional[pd.DataFrame]:
         return fetch_ro_item_master_df()
     except RoComparisonError as exc:
         logger.info(
-            "RO_Item_Master.csv unavailable for Demand MOM dim fallback: %s", exc,
+            "RO_Item_Master.csv unavailable for comparison dim fallback: %s", exc,
         )
         return None
 
@@ -7623,14 +6780,6 @@ def _load_demand_comparison_dim() -> tuple[Optional[pd.DataFrame], Optional[str]
             "Ship-to-site dimension (dp_dimshiptosites) could not be read, so "
             f"driver customer names may be blank.  ({exc})"
         )
-
-
-# Row-highlight styles for the Product Line Review Styler tables (the Demand
-# Plan Comparison tables render as HTML \u2014 see _DPC_TREE_CSS / _DPC_LITE_CSS \u2014
-# and no longer use these pandas-Styler strings).
-_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD = "background-color: #ffcc80; font-weight: 700"
-_ROW_STYLE_PLR_CUSTOMER = "background-color: #e3f2fd"
-_PLR_HIGHLIGHT_LABELS: frozenset[str] = frozenset({"Branded", "Private", "Grand Total"})
 
 
 # Executive KPI strip shown above the Demand Plan Comparison table.  Four
@@ -10611,8 +9760,8 @@ def _render_demand_comparison_driver_tables_cached(
 # Two soft, idempotent helpers that republish the in-memory RO Summary
 # Report and RO Comparison Output to Fabric.  Wired into BOTH the relevant
 # build sites (Summary Report fragment rebuild, ``_ensure_summary_in_session``
-# rebuild) AND the Product Line Review fragment, so the saved CSVs always
-# reflect what the planner is currently seeing.  Idempotent — the signature
+# rebuild), so the saved CSVs always reflect what the planner is currently
+# seeing.  Idempotent — the signature
 # guard skips the Fabric write when the in-memory frame hasn't changed.
 #
 # Each helper soft-fails (warning log, no UI banner) so the manual Save
@@ -10635,8 +9784,6 @@ def _maybe_autosave_ro_summary_report(*, trigger: str) -> None:
 
     Called from:
       * :func:`_render_summary_report_fragment` — right after each rebuild.
-      * :func:`_render_product_line_review_fragment` — at the end of every
-        PLR render, so PLR's ``R&O`` column reads the *current* report.
     """
     report_df: pd.DataFrame | None = st.session_state.get(_SS_SUMMARY_REPORT_DF)
     if report_df is None or report_df.empty:
@@ -10673,16 +9820,14 @@ def _maybe_autosave_ro_summary_report(*, trigger: str) -> None:
 def _maybe_autosave_ro_comparison_output(*, trigger: str) -> None:
     """Save the in-memory comparison frame to Fabric (idempotent).
 
-    Reads :data:`_SS_SUMMARY_DF` — the comparison summary the editor /
-    Summary Report / PLR all consume.  The history fingerprint sidecar is
+    Reads :data:`_SS_SUMMARY_DF` — the comparison summary the editor and
+    the Summary Report both consume.  The history fingerprint sidecar is
     deliberately NOT touched here (only :func:`regenerate_comparison_output`
     writes that): this hook republishes the **current view**, which may
     differ from RO_History after a Prior/LE month change.
 
     Called from:
       * :func:`_ensure_summary_in_session` — right after each rebuild.
-      * :func:`_render_product_line_review_fragment` — at the end of every
-        PLR render, so downstream consumers see the same frame.
       * The manual "💾 Save" button in the RO Comparison section.
     """
     summary_df: pd.DataFrame | None = st.session_state.get(_SS_SUMMARY_DF)
@@ -10715,813 +9860,11 @@ def _maybe_autosave_ro_comparison_output(*, trigger: str) -> None:
     )
 
 
-# ── Product Line Review ───────────────────────────────────────────────────────
-#
-# Portfolio Majors listed here render last (tables + charts) so the
-# higher-traffic Butter / Cultured / etc. sections stay near the top.
-_PLR_PORTFOLIO_MAJOR_LAST: frozenset[str] = frozenset({
-    "Bulk Fluid",
-    "Cheese",
-    "Milk Powders",
-    "Whey Powders",
-})
-
-
-def _sort_plr_portfolio_majors(pmaj_options: list[str]) -> list[str]:
-    """Return *pmaj_options* with deprioritized Portfolio Majors at the end."""
-    primary = sorted(p for p in pmaj_options if p not in _PLR_PORTFOLIO_MAJOR_LAST)
-    trailing = sorted(p for p in pmaj_options if p in _PLR_PORTFOLIO_MAJOR_LAST)
-    return primary + trailing
-
-
 # Per-Portfolio-Major hierarchical table + Full-Year chart.  The section is
 # available as soon as the underlying Fabric sources exist — there is **no**
 # Generate gate and **no** dependency on the Demand Summary load above.  The
 # planner picks four common date filters once, then each Portfolio Major
 # table gets its own (cascaded, multi-select) Supply Format / Brand picker.
-#
-# Auto-save hooks live further up the file:
-#   * RO Summary Report             — :func:`_maybe_autosave_ro_summary_report`
-#   * RO Comparison Output          — :func:`_maybe_autosave_ro_comparison_output`
-# Both are called whenever their corresponding "table" is rebuilt; both keep
-# their existing manual Save buttons + warnings (planner request).
-
-_PLR_FMT_MONTH = lambda d: d.strftime("%b %Y")  # noqa: E731
-_PLR_CHART_HEIGHT = 320
-_PLR_CY_BEGIN_KEY = "plr_cy_begin_month"
-
-
-def _render_product_line_review() -> None:
-    """Foldable Product Line Review section (bottom of page)."""
-    with st.expander("📋 Product Line Review", expanded=False):
-        st.caption(
-            "**One table + one chart per Portfolio Major.**  "
-            "📌 **Current Cycle Plan = Base Plan + R&O** — both are included "
-            "(closed current-fiscal-year months are shown as **actual "
-            "shipments** instead).  Hierarchical "
-            "**Brand → Portfolio Minor → Supply Format** roll-up with "
-            "customer-detail rows (light blue) aggregated by **Corporate "
-            "Group**; volumes in **millions of lbs**.  Run-rate columns "
-            "still use IBP **Orders** trailing windows ending at **CY "
-            "Month**.  The unified source `demand_order_item_customer.csv` "
-            "is rebuilt on every render by (1) keeping the Base Plan + "
-            "R&O rows from `qry_demand_item_customer_detail.csv` outside "
-            "the CY-Actual months, (2) replacing those CY-Actual months "
-            "with IBP **Shipments** as `Forecast Type = \"Actual\"`, and "
-            "(3) stamping `Customer No` + `Corporate Group` per row: "
-            "Base Plan via `dp_dimshiptosites` → `dp_dimcustomernames`, "
-            "Actual via shipments' Customer No → `dp_dimcustomernames`, "
-            "R&O via fuzzy match against `dp_dimcustomernames`.  The "
-            "rebuilt CSV is re-published to Fabric on every render."
-        )
-        if not fabric_signin_widget.is_fabric_signed_in():
-            fabric_signin_widget.render()
-            return
-        _render_product_line_review_fragment()
-
-
-# Session keys for the demand-order-item-customer auto-save signature guard.
-_SS_AUTOSAVE_DOIC_SIG: str = "_autosave_demand_order_item_customer_sig"
-
-
-def _maybe_autosave_demand_order_item_customer(
-    df: pd.DataFrame, *, trigger: str,
-) -> None:
-    """Save ``demand_order_item_customer.csv`` to Fabric (idempotent).
-
-    Mirrors :func:`_maybe_autosave_ro_summary_report` — the signature
-    guard short-circuits repeated writes of the same enriched frame so
-    a normal filter-click rerun never re-uploads to Fabric.  The save
-    only fires when the in-memory frame's shape signature changes
-    (planner spec: "save whenever a new file is created").
-    """
-    if df is None or df.empty:
-        return
-    sig = _signature_for(df)
-    if st.session_state.get(_SS_AUTOSAVE_DOIC_SIG) == sig:
-        return
-    try:
-        with st.spinner(
-            "Auto-saving `demand_order_item_customer.csv` to Microsoft "
-            f"Fabric ({trigger})…"
-        ):
-            blob_path = save_demand_order_item_customer(df)
-    except DemandItemCustomerError as exc:
-        # Soft fail — same playbook as the other PLR auto-saves so a
-        # transient Fabric blip doesn't make the rest of the page look
-        # broken.  Planners can re-trigger by changing a filter.
-        logger.warning(
-            "Auto-save of demand_order_item_customer.csv failed: %s", exc,
-        )
-        return
-    except Exception:  # noqa: BLE001 — last-resort safety net
-        logger.exception(
-            "Unexpected error auto-saving demand_order_item_customer.csv."
-        )
-        return
-
-    st.session_state[_SS_AUTOSAVE_DOIC_SIG] = sig
-    logger.info(
-        "Auto-saved demand_order_item_customer.csv → Files/%s (trigger=%s)",
-        blob_path, trigger,
-    )
-
-
-@st.fragment
-def _render_product_line_review_fragment() -> None:
-    """Eagerly load Fabric sources + render one table+chart per PM.
-
-    Sourcing model (planner spec, June 2026 cycle)
-    ----------------------------------------------
-    1. ``qry_demand_item_customer_detail.csv``  — wide month × item ×
-       customer detail (Base Plan / R&O / placeholder rows).
-    2. ``qry_pdh.csv``                          — dim attribution
-       (joined on Item No).
-    3. ``dbo.IBP Shipments``                    — Shipped Qty lbs;
-       months derived from the CY Actual Months (months in CY Full
-       Year but outside CY YTG).  These rows REPLACE the detail-CSV
-       rows in the same months and are emitted as
-       ``Forecast Type = "Actual"``.
-    4. ``dbo.IBP Orders``                       — Ordered Qty lbs;
-       months derived from the common filters; feeds the run-rate /
-       PY columns ONLY (not the unified CSV).
-    5. ``dbo.dp_dimshiptosites``                — translates a Base
-       Plan row's Party Site Number into a ``customer_num`` so the
-       Corporate Group attach can hit ``dp_dimcustomernames``.
-    6. ``dbo.dp_dimcustomernames``              — single source of
-       truth for Corporate Group.  Exact ``customer_num`` join for
-       Actual + Base Plan rows; fuzzy ``Customer Name`` match for
-       R&O rows; exact ``customer_num`` join for the IBP Orders
-       run-rate side.
-
-    Output
-    ------
-    The enriched frame is saved to
-    ``Files/RO Tracking/Demand Plan/demand_order_item_customer.csv``
-    on every render (idempotent — only writes when the in-memory frame
-    signature changes).  All filter dropdowns, hierarchy leaves and
-    chart series read from that same in-memory frame.
-
-    Performance contract
-    --------------------
-    * Each fetcher caches at the source layer (TTL + ETag); the repeated
-      calls here are cheap.
-    * Enrichment + fuzzy join + aggregation happen ONCE per render via
-      :func:`_cached_prepare_plr_inputs`, keyed on shape signatures so
-      filter clicks that don't touch the underlying data short-circuit
-      to a microsecond cache hit.
-    * Each Portfolio Major section renders inside its OWN ``@st.fragment``
-      (:func:`_render_plr_pm_section`) so a Supply Format / Brand pick
-      on one PM no longer rebuilds every other PM.
-    """
-    # 1) Load raw sources up-front.  Each fetcher caches at the source
-    #    layer (60 min for CSVs, 15 min for dim tables) so repeat fragment
-    #    runs reuse the cached payloads.
-    try:
-        with st.spinner("Reading PLR sources from Microsoft Fabric…"):
-            detail_df = fetch_demand_item_customer_detail()
-    except DemandItemCustomerError as exc:
-        st.error(f"❌ Could not load Product Line Review sources.\n\n{exc}")
-        return
-
-    if detail_df is None or detail_df.empty:
-        st.info(
-            "ℹ️ `qry_demand_item_customer_detail.csv` is empty — nothing "
-            "to render."
-        )
-        return
-
-    pdh_df = _load_demand_comparison_pdh()
-
-    # Customer-names dim is the single source of truth for Corporate
-    # Group as of the June 2026 planner spec.  Ship-to-sites is the
-    # bridge that lets Base Plan rows (Party Site Number only) reach
-    # that lookup.  Both fetchers are independently cached; failures
-    # are non-fatal — the build helpers fall back to Customer Name
-    # so a temporary auth blip never bricks the section.
-    try:
-        customer_names_dim = fetch_dp_dimcustomernames_df()
-    except CustomerDimsError as exc:
-        logger.warning("dp_dimcustomernames load failed: %s", exc)
-        customer_names_dim = None
-    try:
-        ship_to_sites_dim = fetch_dimshiptosites_df()
-    except ShipToSitesSourceError as exc:
-        logger.warning("dp_dimshiptosites load failed: %s", exc)
-        ship_to_sites_dim = None
-    # dp_dimplantosites bridges party_site's plan_to_code → the customer_num
-    # that actually matches dp_dimcustomernames (dp_dimshiptosites' own
-    # customer_num does not), so Base Plan rows resolve to a real corp group.
-    try:
-        plantosites_dim = fetch_dp_dimplantosites_df()
-    except ShipToSitesSourceError as exc:
-        logger.warning("dp_dimplantosites load failed: %s", exc)
-        plantosites_dim = None
-
-    # 2) Common filters (apply to every PM table & chart).  Months come
-    #    from the detail CSV's ``Start of Month`` so the planner can only
-    #    pick months that actually have rows.
-    common = _render_plr_common_filters(detail_df)
-    errors = validate_common_filters(common)
-    if errors:
-        for msg in errors:
-            st.error(f"❌ {msg}")
-        return
-
-    # 3) IBP pulls — month union covers BOTH the enrichment (CY Actual
-    #    months sourced from SHIPMENTS) AND the table's PY / run-rate /
-    #    FY columns (sourced from ORDERS).  Done ONCE per render;
-    #    cached per month set in the slim fetcher.
-    ibp_months = collect_ibp_months_for_common(common)
-    ibp_orders_df, _warn_o = _load_demand_comparison_ibp_orders(months=ibp_months)
-    ibp_shipments_df, _warn_s = _load_demand_comparison_ibp(months=ibp_months)
-
-    # 4) CY Actual Months (months in CY Full Year but outside CY YTG)
-    #    drive the enrichment swap — these get sourced from IBP
-    #    Shipments instead of the detail CSV.
-    cy_actual_months = compute_cy_actual_months(
-        cy_full_year_months=_plr_cy_full_year_months(common.cy_begin_month),
-        cy_ytg_start=common.cy_ytg_start,
-        cy_ytg_end=common.cy_ytg_end,
-    )
-
-    # 5) Enrich + aggregate the four PLR input frames.  Cached on
-    #    shape-signatures + the CY Actual Months tuple so filter reruns
-    #    that don't touch the underlying data short-circuit to a cache
-    #    hit instead of re-running the fuzzy join.
-    (
-        enriched_df, orders_agg, demand_agg, chart_agg,
-        orders_stats, plr_warnings,
-    ) = _cached_prepare_plr_inputs(
-        _signature_for(detail_df),
-        _signature_for(ibp_orders_df),
-        _signature_for(ibp_shipments_df),
-        _signature_for(pdh_df),
-        _signature_for(customer_names_dim),
-        _signature_for(ship_to_sites_dim),
-        _signature_for(plantosites_dim),
-        cy_actual_months,
-        _detail_df=detail_df,
-        _ibp_orders_df=ibp_orders_df,
-        _ibp_shipments_df=ibp_shipments_df,
-        _pdh_df=pdh_df,
-        _customer_names_dim=customer_names_dim,
-        _ship_to_sites_dim=ship_to_sites_dim,
-        _plantosites_dim=plantosites_dim,
-    )
-
-    for msg in plr_warnings:
-        st.warning(msg)
-
-    # Planner spec: always show how many IBP Orders rows were dropped
-    # during PDH enrichment (variable mismatch / unparseable month) so
-    # data-quality regressions surface immediately.  The banner is
-    # informational when zero rows dropped, otherwise a yellow warning.
-    _render_orders_drop_banner(orders_stats)
-
-    # 6) Auto-save the enriched CSV to Fabric (idempotent — guarded by
-    #    the in-memory frame signature).  Planner spec: "the output
-    #    should always be automatically saved whenever a new file is
-    #    created".
-    _maybe_autosave_demand_order_item_customer(enriched_df, trigger="PLR build")
-
-    # 7) PM dropdown options come from the saved CSV (planner spec).
-    fv = list_filter_values_from_demand(enriched_df)
-    pmaj_options = fv.get("portfolio_major", [])
-    if not pmaj_options:
-        st.warning(
-            "No Portfolio Major values found in "
-            "`demand_order_item_customer.csv` — cannot build any "
-            "Product Line Review section."
-        )
-        return
-
-    # 8) Per-PM render.  Each section is its OWN @st.fragment so changes
-    #    to one PM's sub-filters do not rerun the others.  Bulk Fluid,
-    #    Cheese, Milk Powders, and Whey Powders render last (tables +
-    #    charts) per planner preference.
-    for pmaj in _sort_plr_portfolio_majors(pmaj_options):
-        _render_plr_pm_section(
-            pmaj=pmaj,
-            common=common,
-            pdh_df=pdh_df,
-            enriched_df=enriched_df,
-            orders_agg=orders_agg,
-            demand_agg=demand_agg,
-            chart_agg=chart_agg,
-        )
-
-    # 9) Auto-save the in-memory RO Summary + RO Comparison snapshots to
-    #    Fabric so the freshly rendered PLR tables reference what's
-    #    currently saved.  Idempotent within a session.
-    _maybe_autosave_ro_summary_report(trigger="PLR build")
-    _maybe_autosave_ro_comparison_output(trigger="PLR build")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PLR input prep (enrichment + dim-grain aggregation) — cached
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# The four output frames below are the per-PM loop's only inputs.
-# Caching on shape-signatures means filter clicks (which don't change
-# the underlying data) hit the cache instead of re-running the fuzzy
-# join across the whole frame.  The aggregation step collapses to dim-
-# grain so each per-PM mask + groupby is bound by dim cardinality, not
-# raw shape.
-
-@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
-def _cached_prepare_plr_inputs(
-    detail_sig: tuple,
-    orders_sig: tuple,
-    shipments_sig: tuple,
-    pdh_sig: tuple,
-    customer_names_sig: tuple,
-    ship_to_sites_sig: tuple,
-    plantosites_sig: tuple,
-    cy_actual_months: tuple,
-    *,
-    _detail_df: Optional[pd.DataFrame],
-    _ibp_orders_df: Optional[pd.DataFrame],
-    _ibp_shipments_df: Optional[pd.DataFrame],
-    _pdh_df: Optional[pd.DataFrame],
-    _customer_names_dim: Optional[pd.DataFrame],
-    _ship_to_sites_dim: Optional[pd.DataFrame],
-    _plantosites_dim: Optional[pd.DataFrame],
-) -> tuple[
-    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
-    tuple[int, int], tuple[str, ...],
-]:
-    """Build the enriched demand frame + every aggregated frame the PLR uses.
-
-    Returns
-    -------
-    enriched_df
-        Saved-CSV-shape frame (one row per detail row OR synthesised
-        Actual row), with the per-forecast-type-resolved ``Corporate
-        Group`` column attached.  This is the file written to Fabric.
-    orders_agg
-        IBP Orders + PDH dims + Corporate Group, used for the
-        PY / run-rate columns on the table.  Already grouped to
-        dim-grain.
-    demand_agg
-        The enriched CSV in long shape, grouped to the dim-grain the
-        table builder consumes for the Current-Cycle-Plan columns.
-    chart_agg
-        The same long frame aggregated to ``(pmaj, sfmt, brand, month)``
-        for the Full-Year chart.
-    orders_stats
-        ``(n_orders_in, n_orders_enriched)`` — surfaced as a visible
-        banner so the planner sees drops due to variable mismatches
-        in the IBP Orders enrichment immediately.
-    warnings
-        Soft warnings produced by the enrichment (dim table missing,
-        no fuzzy matches, etc.) — surfaced as captions on the page
-        outside the cached call.
-
-    A plain tuple is returned (not a dataclass) for the same reason
-    the rest of the page uses tuples in ``@st.cache_data`` callers:
-    the cache value is pickled on round-trip, and a custom class can
-    get bound to a stale class object when Streamlit's file watcher
-    reloads the module.
-    """
-    # 1. Enrich the saved-CSV frame.  Flow (planner spec, June 2026
-    #    cycle):
-    #       filter detail (drop CY-Actual months)
-    #         ⊕ synthesise Actual rows from IBP SHIPMENTS
-    #         → back-fill Customer No on Base Plan rows via
-    #           dp_dimshiptosites.plan_to_code → dp_dimplantosites.customer_num
-    #         → resolve Corporate Group per row by Forecast Type
-    #           (exact customer_num for Actual + Base Plan; fuzzy
-    #           Customer Name for R&O).
-    #    This is the file written to Fabric.
-    build = build_demand_order_item_customer(
-        detail_df=_detail_df,
-        shipments_df=_ibp_shipments_df,
-        pdh_df=_pdh_df,
-        customer_names_dim=_customer_names_dim,
-        ship_to_sites_dim=_ship_to_sites_dim,
-        plantosites_df=_plantosites_dim,
-        cy_actual_months=cy_actual_months,
-    )
-
-    # 2. Orders side: PDH-enrich + attach Corporate Group via the
-    #    same dp_dimcustomernames table (planner spec retired the
-    #    legacy dp_dimcorporategroup).  We track row counts before
-    #    and after enrichment so the page can render a visible drop
-    #    banner — `enrich_ibp_orders_df` silently drops rows whose
-    #    Month is unparseable or whose required columns are missing.
-    #
-    #    The canonical map produced by the unified-CSV build is
-    #    passed through so the Orders side ends up with the SAME
-    #    spelling per Corporate Group casefold key as the unified
-    #    frame.  This is what stops the table from splitting
-    #    "Associated Foods" and "ASSOCIATED FOODS" into two customer
-    #    rows that each double-count the same casefold-equivalent
-    #    Orders pounds.
-    n_orders_in = int(len(_ibp_orders_df)) if _ibp_orders_df is not None else 0
-    orders_enriched = enrich_ibp_orders_df(_ibp_orders_df, _pdh_df)
-    n_orders_enriched = int(len(orders_enriched))
-    orders_with_cg = attach_corporate_group_to_orders(
-        orders_enriched, _customer_names_dim,
-        canonical_map=dict(build.canonical_corp_group_map),
-    )
-
-    # 3. Long-format saved-CSV frame for the table builder.
-    demand_long = prepare_demand_long_for_plr(build.df, _pdh_df)
-
-    return (
-        build.df,
-        aggregate_orders_for_plr(orders_with_cg),
-        aggregate_base_plan_for_plr(demand_long),
-        aggregate_total_demand_for_plr(demand_long),
-        (n_orders_in, n_orders_enriched),
-        build.warnings,
-    )
-
-
-def _render_orders_drop_banner(orders_stats: tuple[int, int]) -> None:
-    """Render the always-visible IBP Orders enrichment drop banner.
-
-    *orders_stats* = ``(n_in, n_enriched)``.  Per planner spec (Q3),
-    the banner is shown unconditionally so data-quality regressions
-    surface immediately — yellow when drops > 0, informational caption
-    otherwise.  The most common drop reasons (per the inner
-    ``_enrich_ibp`` helper) are: missing required columns (Item No /
-    Month / Ordered Qty lbs), or rows with an unparseable Month value.
-    """
-    n_in, n_enriched = orders_stats
-    n_dropped = max(0, n_in - n_enriched)
-    if n_in == 0:
-        st.caption("ℹ️ IBP Orders not pulled — run-rate columns will be zero.")
-        return
-    if n_dropped == 0:
-        st.caption(
-            f"ℹ️ IBP Orders enrichment: {n_enriched:,} of {n_in:,} rows "
-            "kept (0 dropped — clean variable match)."
-        )
-        return
-    pct = (n_dropped / n_in) * 100.0 if n_in else 0.0
-    st.warning(
-        f"⚠️ IBP Orders enrichment dropped **{n_dropped:,} of {n_in:,}** rows "
-        f"({pct:.1f}%) due to variable mismatch.  Most common causes: missing "
-        f"`Item No` / `Month` / `Ordered Qty lbs`, or an unparseable `Month` "
-        f"value.  The remaining {n_enriched:,} rows feed the Orders columns."
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-PM section — its own fragment so sub-filter clicks scope tightly
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.fragment
-def _render_plr_pm_section(
-    *,
-    pmaj: str,
-    common: ProductLineReviewCommonFilters,
-    pdh_df: Optional[pd.DataFrame],
-    enriched_df: pd.DataFrame,
-    orders_agg: pd.DataFrame,
-    demand_agg: pd.DataFrame,
-    chart_agg: pd.DataFrame,
-) -> None:
-    """Render one Portfolio Major's header + sub-filters + table + chart.
-
-    Wrapping this in ``@st.fragment`` means a planner toggling the
-    Supply Format multiselect under "Butter" only re-runs **this** call —
-    the other PMs keep their existing renders + filter state.
-    """
-    st.markdown("---")
-    st.markdown(f"### Portfolio Major: {pmaj}")
-    sub = _render_plr_pm_sub_filters(enriched_df, pdh_df, pmaj)
-    filters = resolve_filters(common, pmaj, sub)
-
-    result = build_product_line_review_table(
-        orders_enriched=orders_agg,
-        base_long=demand_agg,
-        filters=filters,
-    )
-    for msg in result.warnings:
-        st.warning(msg)
-    _render_plr_table_for_pm(result, filters)
-
-    chart_data = build_full_year_chart_data(
-        total_demand_long=chart_agg,
-        portfolio_major=pmaj,
-        sub=sub,
-        cy_begin_month=common.cy_begin_month,
-    )
-    _render_plr_chart_for_pm(chart_data, pmaj)
-
-
-# ── PLR common filters ────────────────────────────────────────────────────────
-
-def _render_plr_common_filters(
-    detail_df: pd.DataFrame,
-) -> ProductLineReviewCommonFilters:
-    """Render the four filters shared across every Portfolio Major table.
-
-    *detail_df* is consulted only to seed the dropdown month list — every
-    distinct ``Start of Month`` in the detail CSV is offered, so the
-    planner can pick any month that actually has rows.  PY counterparts
-    are always derived (CY − 12) and never picked.
-    """
-    from data_sources.demand_plan_comparison import _vectorised_start_of_month
-    from data_sources.demand_summary import _resolve_column
-
-    month_col = _resolve_column(
-        detail_df, ("Start of Month", "Start Of Month", "Month"),
-    )
-    if not month_col:
-        st.warning(
-            "Detail file has no parseable **Start of Month** column — "
-            "falling back to today's month for every picker."
-        )
-        return ProductLineReviewCommonFilters(
-            cy_month=date.today().replace(day=1),
-            cy_begin_month=date.today().replace(day=1),
-            cy_ytg_start=date.today().replace(day=1),
-            cy_ytg_end=date.today().replace(day=1),
-        )
-
-    months = sorted({
-        m for m in _vectorised_start_of_month(detail_df[month_col]).tolist()
-        if m is not None
-    })
-    if not months:
-        st.warning("No parseable months in `qry_demand_item_customer_detail.csv`.")
-        return ProductLineReviewCommonFilters(
-            cy_month=date.today().replace(day=1),
-            cy_begin_month=date.today().replace(day=1),
-            cy_ytg_start=date.today().replace(day=1),
-            cy_ytg_end=date.today().replace(day=1),
-        )
-
-    def _idx(target: date, fallback: int) -> int:
-        return months.index(target) if target in months else fallback
-
-    last = len(months) - 1
-    cy_m_idx = _idx(date(2026, 5, 1), last)
-    cy_ytg_s_idx = _idx(date(2026, 5, 1), cy_m_idx)
-    cy_ytg_e_idx = _idx(date(2027, 3, 1), last)
-
-    st.markdown("**Common filters** _(apply to every Portfolio Major table below)_")
-
-    row_a = st.columns(2)
-    with row_a[0]:
-        cy_month = st.selectbox(
-            "CY Month", options=months, index=cy_m_idx,
-            key="plr_cy_month", format_func=_PLR_FMT_MONTH,
-            help="PY Month is derived automatically (CY Month − 12 months).",
-        )
-
-    # CY Begin options derive from CY Month — a 12-month arithmetic window
-    # ``[CY Month − 11, CY Month]`` so the dropdown always has 12 entries.
-    cy_begin_options = eligible_cy_begin_months(cy_month)
-    if (
-        _PLR_CY_BEGIN_KEY in st.session_state
-        and st.session_state[_PLR_CY_BEGIN_KEY] not in cy_begin_options
-    ):
-        # Planner's previous pick fell out of the new window — reset rather
-        # than throw a Streamlit "default not in options" warning.
-        del st.session_state[_PLR_CY_BEGIN_KEY]
-    with row_a[1]:
-        cy_begin = st.selectbox(
-            "CY Begin Month", options=cy_begin_options,
-            index=0,  # oldest month in the window → forward-looking FY view
-            key=_PLR_CY_BEGIN_KEY, format_func=_PLR_FMT_MONTH,
-            help=(
-                f"First month of the 12-month Full Year window — selectable "
-                f"between {_PLR_FMT_MONTH(cy_begin_options[0])} and "
-                f"{_PLR_FMT_MONTH(cy_begin_options[-1])}."
-            ),
-        )
-
-    st.caption("**CY YTG** (base plan; PY YTG is automatically CY YTG − 12 months)")
-    row_b = st.columns(2)
-    with row_b[0]:
-        cy_ytg_start = st.selectbox(
-            "CY YTG Begin", options=months, index=cy_ytg_s_idx,
-            key="plr_cy_ytg_start", format_func=_PLR_FMT_MONTH,
-        )
-    with row_b[1]:
-        cy_ytg_end = st.selectbox(
-            "CY YTG End", options=months, index=cy_ytg_e_idx,
-            key="plr_cy_ytg_end", format_func=_PLR_FMT_MONTH,
-        )
-
-    common = ProductLineReviewCommonFilters(
-        cy_month=cy_month,
-        cy_begin_month=cy_begin,
-        cy_ytg_start=cy_ytg_start,
-        cy_ytg_end=cy_ytg_end,
-    )
-    # Derived caption — gives the planner a one-line confirmation of the
-    # PY windows in play (since they're not pickable).
-    py_month = add_months(cy_month, -12)
-    py_ytg_start = add_months(cy_ytg_start, -12)
-    py_ytg_end = add_months(cy_ytg_end, -12)
-    st.caption(
-        f"📌 Derived · PY Month **{_PLR_FMT_MONTH(py_month)}**  ·  "
-        f"PY YTG **{_PLR_FMT_MONTH(py_ytg_start)} – {_PLR_FMT_MONTH(py_ytg_end)}**"
-    )
-    return common
-
-
-# ── PLR per-PM sub-filters (Supply Format + Brand, multi-select) ─────────────
-
-def _render_plr_pm_sub_filters(
-    enriched_df: pd.DataFrame,
-    pdh_df: Optional[pd.DataFrame],
-    portfolio_major: str,
-) -> ProductLineReviewSubFilters:
-    """Render the two per-PM multiselects.  Empty selection = include all.
-
-    Sources (planner spec, June 2026):
-    * **Supply Format** options come from the enriched
-      ``demand_order_item_customer`` frame, cascaded on Portfolio
-      Major — so the planner only sees formats that actually have rows
-      in the current cycle.
-    * **Brand** options come from PDH (the saved CSV has no Brand
-      column).  Same item-description Branded/Private rule the rest of
-      the page uses.
-    """
-    sfmt_options = list_filter_values_for_pmaj_from_demand(
-        enriched_df, portfolio_major,
-    ).get("supply_format", [])
-    brand_options = (
-        list_pdh_filter_values_for_pmaj(pdh_df, portfolio_major).get("brand", [])
-        or [BRAND_BRANDED, BRAND_PRIVATE]
-    )
-
-    # Per-PM widget keys so each section keeps its OWN selection — picking
-    # "Print" under Butter must not bleed into the Cultured table.
-    pm_key = portfolio_major.lower().replace(" ", "_")
-
-    cols = st.columns(2)
-    with cols[0]:
-        supply_formats = tuple(st.multiselect(
-            "Supply Format",
-            options=sfmt_options,
-            default=[],
-            key=f"plr_sfmt_{pm_key}",
-            help=(
-                "Leave empty to include every Supply Format in this "
-                "Portfolio Major.  Options come from "
-                "`demand_order_item_customer.csv` filtered to "
-                f"**{portfolio_major}**."
-            ),
-        ))
-    with cols[1]:
-        brands = tuple(st.multiselect(
-            "Brand",
-            options=brand_options,
-            default=[],
-            key=f"plr_brand_{pm_key}",
-            help=(
-                "Leave empty to include both Branded and Private.  "
-                "Source: first two characters of `Item Description` "
-                "in `qry_pdh.csv`."
-            ),
-        ))
-
-    return ProductLineReviewSubFilters(
-        supply_formats=supply_formats, brands=brands,
-    )
-
-
-# ── PLR table renderer ────────────────────────────────────────────────────────
-
-def _render_plr_table_for_pm(
-    result: ProductLineReviewResult,
-    filters: ProductLineReviewFilters,
-) -> None:
-    """Render one PM's hierarchical table with dynamic column headers."""
-    table = result.table
-    if table is None or table.empty:
-        st.info(
-            f"No rows for Portfolio Major **{filters.portfolio_major}** "
-            "under the current Supply Format / Brand selection."
-        )
-        return
-
-    indents = table[COL_INDENT].tolist()
-    labels = table[COL_ROW_LABEL].tolist()
-    is_customer = table[COL_IS_CUSTOMER].tolist()
-
-    display = table.drop(columns=[COL_INDENT, COL_IS_CUSTOMER]).copy()
-    display[COL_ROW_LABEL] = [
-        ("\u00a0\u00a0" * indent) + label
-        for indent, label in zip(indents, labels)
-    ]
-
-    # Build the rename map FROM the dynamic display groups so the CM headers
-    # echo the active PY / CY month (e.g. ``Orders – May 2025``).
-    display_groups = build_display_groups(filters)
-    rename: dict[str, str] = {COL_ROW_LABEL: "Pounds in millions"}
-    col_order: list[str] = ["Pounds in millions"]
-    for _group, cols in display_groups:
-        for col_id, label in cols:
-            rename[col_id] = label
-            col_order.append(label)
-    display = display.rename(columns=rename)
-    display = display.loc[:, [c for c in col_order if c in display.columns]]
-    display = display.reset_index(drop=True)
-
-    def _style_row(row: pd.Series) -> list[str]:
-        idx = int(row.name)
-        if labels[idx] in _PLR_HIGHLIGHT_LABELS:
-            return [_ROW_STYLE_HIGHLIGHT_ORANGE_BOLD] * len(row)
-        if is_customer[idx]:
-            return [_ROW_STYLE_PLR_CUSTOMER] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(
-        display.style.apply(_style_row, axis=1),
-        width="stretch",
-        hide_index=True,
-    )
-
-
-# ── PLR Full-Year chart renderer ─────────────────────────────────────────────
-
-def _render_plr_chart_for_pm(
-    data: FullYearChartData, portfolio_major: str,
-) -> None:
-    """Render the CY FY + NY FY Plotly line chart for one Portfolio Major.
-
-    Y-axis units are **raw lbs** (per planner request — matches the
-    ``qry_total_item_level_demand`` viewer the screenshot was taken from).
-    X-axis is the fiscal-year month position (Apr = 1 … Mar = 12) shared
-    by both series so the planner can compare same-month-of-FY YoY.
-    """
-    if not data.series:
-        st.caption(
-            f"_No `qry_total_item_level_demand` rows for "
-            f"**{portfolio_major}** under the current sub-filters._"
-        )
-        return
-
-    fig = go.Figure()
-    # Two-series palette — same dark-blue / orange pairing as the rest of
-    # the Demand Summary chart so the page reads cohesively.
-    palette = ("#1f4e79", "#ed7d31")
-    for series, colour in zip(data.series, palette):
-        # Decorate the legend label with the actual calendar span so the
-        # planner can tell the two fiscal years apart at a glance
-        # (otherwise both legends are just "FY 2027" / "FY 2028").
-        span = ""
-        if series.months:
-            span = (
-                f"  ({series.months[0]:%b %Y} – "
-                f"{series.months[-1]:%b %Y})"
-            )
-        legend_label = f"{series.label}{span}"
-        fig.add_trace(go.Scatter(
-            x=list(data.fy_month_labels),
-            y=list(series.values_lbs),
-            name=legend_label,
-            mode="lines+markers",
-            line=dict(color=colour, width=2.5),
-            marker=dict(size=7),
-            hovertemplate=(
-                "<b>%{x}</b><br>" + series.label
-                + ": %{y:,.0f} lbs<extra></extra>"
-            ),
-        ))
-
-    fig.update_layout(
-        title=dict(
-            text="<b>Total Plan LE in Lbs</b>",
-            x=0.02, xanchor="left", font=dict(size=18),
-        ),
-        # Larger top margin so the legend sits cleanly ABOVE the plot
-        # area where it's always visible (the prior below-chart position
-        # got clipped by the surrounding st.expander on smaller screens).
-        height=_PLR_CHART_HEIGHT,
-        margin=dict(l=50, r=20, t=70, b=40),
-        legend=dict(
-            orientation="h",
-            yanchor="bottom", y=1.02,   # sits above the plotting area
-            xanchor="left", x=0.0,
-            font=dict(size=17),         # bumped from default ~10
-            bgcolor="rgba(255,255,255,0.85)",
-            bordercolor="#cccccc",
-            borderwidth=1,
-        ),
-        xaxis=dict(title=None, tickangle=0, tickfont=dict(size=12)),
-        yaxis=dict(
-            title="Lbs", rangemode="tozero",
-            tickformat=",", tickfont=dict(size=15),
-        ),
-        hovermode="x unified",
-    )
-    st.plotly_chart(
-        fig, use_container_width=True, theme=None,
-        # Stable key so re-renders don't churn the chart widget.
-        key=f"plr_chart_{portfolio_major}",
-    )
-
-
 def _velocity_norm_desc(s: pd.Series) -> pd.Series:
     """Normalise item descriptions for a robust join (strip · collapse spaces ·
     casefold) so ``dbo.Shipments.PRODUCTDESC`` lines up with PDH's Item Description."""
@@ -12650,9 +10993,6 @@ def render() -> None:
     3. Velocity Analysis           (🚀, collapsible, collapsed)
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
-    6. Product Line Review          (collapsible, collapsed by default)
-    7. Sales Distribution Tracker   (🚚, collapsible, collapsed)
-    8. Demand Planning BI Dashboard (collapsible, last — heavy iframe)
     """
     apply_custom_css()
     st.markdown(
@@ -12686,6 +11026,3 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
-    st.markdown("---")
-
-    _render_product_line_review()

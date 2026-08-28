@@ -17,6 +17,14 @@ Pipeline (all computed in memory, written only once every stage succeeds)
    with the upload's **user-authored ``Cycle``** (upsert: re-running a cycle
    replaces that cycle's rows — idempotent)
 
+Withdraw (the inverse of a run)
+-------------------------------
+:func:`withdraw_cycles` undoes an upload so a planner can start over: it drops
+the chosen cycles' rows from the history tracker and deletes the four
+single-cycle snapshots (2, 3 and the raw upload).  Everything is archived first.
+``tbl_ro_input.csv`` is untouched — it derives from ``RO_Seed.csv``, not from
+the base-plan upload.
+
 Differences vs. the original notebook (by design, agreed with the planner)
 --------------------------------------------------------------------------
 * **Cycle** comes from the upload's ``Cycle`` column (e.g. ``C5``) — never
@@ -49,6 +57,7 @@ from .ro_seed_pipeline import LogEntry, _Log, _parse_probability
 from .fabric_lakehouse_io import (
     LakehouseIOError,
     archive_bytes,
+    delete_blob,
     read_bytes,
     read_csv,
     write_bytes,
@@ -1020,7 +1029,192 @@ def backfill_plan_attribute_columns() -> BackfillResult:
         return result
 
 
+# ── Withdraw: undo a base-plan upload's effect on the demand plan ────────────
+#
+# The pipeline writes ONE cycle into the history tracker and overwrites four
+# single-cycle snapshots.  Withdrawing therefore has two halves: drop the
+# chosen cycles' rows from the (multi-cycle) tracker, and delete the four
+# snapshots outright — they only ever describe the most recent run, so once a
+# cycle is pulled they are stale by definition and the next upload rebuilds
+# them.  Everything is archived first, so a withdraw is recoverable.
+
+# Snapshot blobs cleared by a withdraw, as (blob path, archive dir).  The base
+# plan archives beside its own uploads; the three derived files share the plan
+# archive — matching exactly where run_demand_plan_pipeline puts them.
+_WITHDRAW_SNAPSHOTS: tuple[tuple[str, str], ...] = (
+    (_MGMT_PLAN_FULL_BLOB, _DEMAND_PLAN_ARCHIVE_DIR),
+    (_DETAIL_BLOB,         _DEMAND_PLAN_ARCHIVE_DIR),
+    (_TOTAL_ITEM_BLOB,     _DEMAND_PLAN_ARCHIVE_DIR),
+    (_BASE_PLAN_BLOB,      _BASE_PLAN_ARCHIVE_DIR),
+)
+
+
+@dataclass
+class WithdrawResult:
+    """Outcome of one withdraw — the UI renders this verbatim."""
+    ok: bool
+    log: list[LogEntry] = field(default_factory=list)
+    cycles: tuple[str, ...] = ()
+    rows_removed: int = 0
+    rows_remaining: int = 0
+    files_deleted: tuple[str, ...] = ()
+    files_absent: tuple[str, ...] = ()
+
+    @property
+    def warnings(self) -> list[str]:
+        return [e.text for e in self.log if e.level == "warning"]
+
+    @property
+    def errors(self) -> list[str]:
+        return [e.text for e in self.log if e.level == "error"]
+
+
+def list_history_tracker_cycles() -> list[str]:
+    """Cycle labels currently in the history tracker, oldest → newest.
+
+    Reads the tracker directly (no Streamlit cache) so the withdraw picker
+    always reflects what is actually on the lakehouse right now — offering a
+    cycle that a colleague already withdrew would be worse than a slow read.
+
+    Delegates to :func:`~data_sources.demand_plan_comparison.list_tracker_cycles`
+    rather than re-deriving the order here, so the picker cannot drift from the
+    cycle dropdowns elsewhere on the page.  That matters: the tracker stores
+    ``Start of Month`` as a mix of ``M/D/YYYY`` text and Excel day-serials, and
+    only that module's tolerant parser reads both — a plain ``to_datetime``
+    silently mis-dates the serial rows and scrambles the horizon order.
+
+    The import is local to dodge a cycle: ``demand_plan_comparison`` is a
+    consumer of this module's file layout, not the other way round.
+    """
+    from data_sources.demand_plan_comparison import list_tracker_cycles
+
+    df, _etag = read_csv(
+        _SECRETS_SECTION, _HISTORY_TRACKER_BLOB, read_csv_kwargs=_STR_READ_KW)
+    return list_tracker_cycles(df)
+
+
+def withdraw_cycles(cycles: list[str]) -> WithdrawResult:
+    """Remove *cycles* from the history tracker and clear the four snapshots.
+
+    Undoes the effect of one or more ``ibp_base_plan_current.csv`` uploads so a
+    planner can re-upload from a clean slate.
+
+    What it touches
+    ---------------
+    * ``qry_mgmt_plan_history_tracker.csv`` — rows whose ``Cycle`` is in
+      *cycles* are dropped; every other cycle is preserved byte-for-byte.
+    * ``qry_mgmt_plan_full.csv``, ``qry_demand_item_customer_detail.csv``,
+      ``qry_total_item_level_demand.csv``, ``Append New Plan/
+      ibp_base_plan_current.csv`` — deleted.  These are single-cycle snapshots
+      of the latest run, so they are cleared regardless of which cycle was
+      withdrawn; the next upload regenerates all four.
+
+    ``tbl_ro_input.csv`` is deliberately NOT touched: it is derived from
+    ``RO_Seed.csv`` (the RO pipeline's output), not from the base-plan upload,
+    so it is not part of this upload's footprint.
+
+    Safety
+    ------
+    Every file is archived before it is overwritten or deleted — the tracker
+    and the three derived files into ``Demand Plan/Archive``, the base plan
+    into its own ``Append New Plan/Archive`` — so a withdraw is recoverable by
+    re-uploading the archived copy.  The new tracker is computed and validated
+    in memory before any write, mirroring
+    :func:`run_demand_plan_pipeline`'s never-leave-partial-state contract.
+
+    Never raises: failures come back as ``ok=False`` with an error log entry.
+    """
+    log = _Log()
+    result = WithdrawResult(ok=False, log=log.entries)
+
+    wanted = [c for c in (str(c).strip() for c in (cycles or [])) if c]
+    if not wanted:
+        log.err("Pick at least one cycle to withdraw.")
+        return result
+    result.cycles = tuple(wanted)
+
+    try:
+        # ---- Compute the new tracker in memory (no writes yet) -------------
+        existing, _etag = read_csv(
+            _SECRETS_SECTION, _HISTORY_TRACKER_BLOB, read_csv_kwargs=_STR_READ_KW)
+        if existing is None or existing.empty:
+            log.warn(f"'Files/{_HISTORY_TRACKER_BLOB}' is missing or empty — "
+                     "nothing to remove from the tracker.")
+            remaining = None
+        else:
+            if "Cycle" not in existing.columns:
+                log.err(f"'Files/{_HISTORY_TRACKER_BLOB}' has no 'Cycle' column — "
+                        "cannot withdraw by cycle.")
+                return result
+            labels = existing["Cycle"].astype(str).str.strip()
+            drop = labels.isin(set(wanted))
+            result.rows_removed = int(drop.sum())
+            if not result.rows_removed:
+                log.warn("No tracker rows matched "
+                         f"{', '.join(wanted)} — the tracker is unchanged.")
+                remaining = None
+            else:
+                remaining = existing.loc[~drop].reset_index(drop=True)
+                result.rows_remaining = len(remaining)
+                left = sorted(set(labels[~drop]) - {""})
+                log.info(f"Tracker: removing {result.rows_removed:,} row(s) for "
+                         f"{', '.join(wanted)}; {result.rows_remaining:,} row(s) "
+                         f"remain across {len(left)} cycle(s): "
+                         f"{', '.join(left) if left else 'none'}.")
+
+        # ---- Archive + rewrite the tracker ---------------------------------
+        if remaining is not None:
+            _archive_existing(_HISTORY_TRACKER_BLOB, _DEMAND_PLAN_ARCHIVE_DIR, log)
+            write_csv(_SECRETS_SECTION, _HISTORY_TRACKER_BLOB, remaining, etag=None)
+            log.ok(f"qry_mgmt_plan_history_tracker → {result.rows_remaining:,} row(s).")
+
+        # ---- Archive + delete the four single-cycle snapshots ---------------
+        deleted: list[str] = []
+        absent: list[str] = []
+        for blob, archive_dir in _WITHDRAW_SNAPSHOTS:
+            leaf = blob.rsplit("/", 1)[-1]
+            _archive_existing(blob, archive_dir, log)
+            if delete_blob(_SECRETS_SECTION, blob):
+                deleted.append(leaf)
+            else:
+                absent.append(leaf)
+        result.files_deleted = tuple(deleted)
+        result.files_absent = tuple(absent)
+        if deleted:
+            log.ok(f"Deleted {len(deleted)} snapshot file(s): {', '.join(deleted)}.")
+        if absent:
+            log.info(f"Already absent (nothing to delete): {', '.join(absent)}.")
+
+        result.ok = True
+        return result
+
+    except LakehouseIOError as exc:
+        log.err(f"Fabric I/O error during withdraw: {exc}")
+        return result
+    except Exception as exc:  # noqa: BLE001 — surface any unexpected failure
+        log.err(f"Withdraw failed: {exc}")
+        return result
+
+
+def _archive_existing(blob: str, archive_dir: str, log: _Log) -> None:
+    """Best-effort timestamped copy of *blob* into *archive_dir* before it changes.
+
+    Mirrors the archive step in :func:`run_demand_plan_pipeline`: a missing file
+    or an archive hiccup is logged, never fatal — losing the audit copy must not
+    block the operation the planner asked for.
+    """
+    leaf = blob.rsplit("/", 1)[-1]
+    try:
+        prev, _etag = read_bytes(_SECRETS_SECTION, blob)
+        if prev is not None:
+            dest = archive_bytes(_SECRETS_SECTION, archive_dir, leaf, prev)
+            log.info(f"Archived '{leaf}' → 'Files/{dest}'.")
+    except LakehouseIOError as exc:
+        log.warn(f"Could not archive '{leaf}' (continuing): {exc}")
+
+
 __all__ = [
     "DemandPlanResult", "run_demand_plan_pipeline",
     "BackfillResult", "backfill_plan_attribute_columns",
+    "WithdrawResult", "withdraw_cycles", "list_history_tracker_cycles",
 ]

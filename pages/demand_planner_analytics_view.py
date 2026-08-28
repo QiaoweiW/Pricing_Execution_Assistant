@@ -365,6 +365,7 @@ from data_sources.ro_summary_report import (
 )
 from data_sources import ro_pipeline_analytics as rpa
 from data_sources import shipments_velocity as vel
+from data_sources import orders_fill_rate as ofr
 from data_sources import iri_velocity as iri
 from data_sources import velocity_signals as vsig
 from data_sources import trade_spend as tsp
@@ -11621,8 +11622,10 @@ def _render_velocity_analysis() -> None:
     """Foldable 'Velocity Analysis' section — weekly ordered vs shipped lbs.
 
     A collapsed ``st.expander`` matching the other page sections.  Reads
-    ``dbo.Shipments`` (OneLake); the interactive body is fragment-isolated so
-    filter changes rerun only this block.
+    ``dbo.Shipments`` (OneLake) for the index charts, and ``dbo.Orders``
+    (+ Products/Customers dims) for the volume & fill-rate chart, which needs
+    the cancelled quantity that Shipments does not carry.  The interactive
+    body is fragment-isolated so filter changes rerun only this block.
     """
     with st.expander("🚀 Velocity Analysis", expanded=False):
         st.caption(
@@ -11697,6 +11700,39 @@ def _cached_shipment_weekly(portfolios, minors, descs, customers, bus, formats,
         business_units=list(bus) or None, product_formats=list(formats) or None,
         corporate_groups=list(corps) or None, date_range=None)
     return r.weekly
+
+
+@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
+def _cached_orders_fill_enriched() -> pd.DataFrame:
+    """`dbo.Orders` (+ Products/Customers dims) with Corporate Group attached.
+
+    Corporate Group comes from the SAME ship-to lookup the shipment path uses
+    (`_velocity_attach_corp_group`), not from `dbo.Customers`' own column —
+    the section's Corporate Group dropdown is built from that lookup, so
+    borrowing it keeps the two vocabularies identical and the filter working.
+    """
+    return _velocity_attach_corp_group(ofr.fetch_orders_fill_df())
+
+
+@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
+def _cached_orders_fill_weekly(portfolios, minors, descs, customers, bus,
+                               formats, corps, week_lo, week_hi):
+    """Weekly order-book volume + fill rate for the current filter block.
+
+    Returns the plain tuple the chart needs rather than the dataclass, so the
+    cached value stays picklable across a module reload (same reasoning as
+    ``ibp_official._cached_fetch``).
+    """
+    r = ofr.build_weekly_fill_rate(
+        _cached_orders_fill_enriched(),
+        portfolios=list(portfolios) or None, product_minors=list(minors) or None,
+        product_descs=list(descs) or None, customers=list(customers) or None,
+        business_units=list(bus) or None, product_formats=list(formats) or None,
+        corporate_groups=list(corps) or None,
+        date_range=((week_lo, week_hi) if week_lo is not None else None))
+    return (r.weekly, r.total_ordered, r.total_original, r.total_shipped,
+            r.total_cut, r.completed_original, r.completed_shipped,
+            r.open_lines)
 
 
 @st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
@@ -11906,49 +11942,117 @@ def _render_velocity_chart(disp: pd.DataFrame, promo=None, iri_file: str = "") -
             "Our order velocity typically **leads** the on-shelf window.")
 
 
-def _render_volume_chart(disp: pd.DataFrame) -> None:
+def _render_volume_chart(selections: dict, week_range: tuple) -> None:
     """Dedicated absolute-volume chart (title → banner → KPIs → method → chart):
-    weekly Ordered vs Shipped lbs + Fill Rate — the raw pounds a planner ships."""
+    weekly Ordered vs Shipped lbs + Fill Rate — the raw pounds a planner ships.
+
+    Reads the Oracle order book (``dbo.Orders`` + Products/Customers dims) via
+    :mod:`data_sources.orders_fill_rate`, NOT ``dbo.Shipments`` like the rest
+    of the section.  Shipments only holds lines that shipped, so it cannot
+    show a cut — its fill rate is structurally ~99%.  The order book keeps the
+    original ordered quantity next to the cancelled and shipped quantities, so
+    a line that was ordered and then killed lands in the denominator where it
+    belongs.
+
+    Takes the raw filter selections + the Week window rather than the merged
+    shipment frame, because it has to filter its own source.
+    """
     st.markdown("#### 📦 Weekly Ordered vs Shipped lbs — our volume & fill rate")
-    weeks = list(disp[vel.WEEK_START])
-    o = pd.to_numeric(disp.get(vel.COL_ORDERED_LBS), errors="coerce")
-    s = pd.to_numeric(disp.get(vel.COL_SHIPPED_LBS), errors="coerce")
-    if o is None or o.dropna().empty:
-        st.info("No ordered/shipped lbs in the selected window.")
+
+    def _tup(col):
+        return tuple(sorted(selections.get(col) or ()))
+
+    try:
+        (weekly, t_ord, t_orig, t_shp, t_cut, done_orig, done_shp,
+         open_lines) = _cached_orders_fill_weekly(
+            _tup(vel.COL_PORTFOLIO), _tup(vel.COL_PRODUCT_MINOR),
+            _tup(vel.COL_PRODUCT_DESC), _tup(vel.COL_CUSTOMER),
+            _tup(vel.COL_BUSINESS_UNIT), _tup(vel.COL_PRODUCT_FORMAT),
+            _tup(vel.COL_CORP_GROUP), week_range[0], week_range[1])
+    except ofr.OrdersFillRateError as exc:
+        st.error(f"❌ Could not load `dbo.Orders`.\n\n{exc}")
         return
-    to, ts = float(o.fillna(0).sum()), float(s.fillna(0).sum())
-    fillw = (ts / to) if to else None
-    # banner
+    if weekly is None or weekly.empty:
+        st.info("No order lines match the current filters in this window.")
+        return
+
+    weeks = list(weekly[vel.WEEK_START])
+    o = pd.to_numeric(weekly[ofr.COL_ORDERED_LBS], errors="coerce")
+    s = pd.to_numeric(weekly[ofr.COL_SHIPPED_LBS], errors="coerce")
+    # Fill rate is measured on COMPLETED lines only, against the ORIGINAL
+    # ordered quantity — so a cut counts as a miss, and a week whose lines
+    # simply have not shipped yet keeps its true volume in the bars without
+    # dragging the ratio down.
+    fillw = (done_shp / done_orig) if done_orig else None
+    cut_rate = (t_cut / t_orig) if t_orig else None
+
     if fillw is not None:
         lvl = "aligned" if fillw >= 0.99 else ("watch" if fillw >= 0.95 else "alert")
         head = ("Orders and shipments are matched." if fillw >= 0.99
                 else "Shipments are running below orders — a service gap.")
-        _dq_banner({"level": lvl, "headline": head,
-                    "detail": f"Window fill rate {fillw * 100:.1f}% "
-                              f"(shipped {ts:,.0f} ÷ ordered {to:,.0f} lbs).", "drill_in": ""})
-    # metrics
+        detail = (f"Window fill rate {fillw * 100:.1f}% (shipped "
+                  f"{done_shp:,.0f} ÷ originally ordered {done_orig:,.0f} lbs "
+                  f"on completed lines).")
+        if t_cut > 0:
+            detail += (f"  {t_cut:,.0f} lbs were cut after ordering"
+                       + (f" ({cut_rate * 100:.1f}% of demand)."
+                          if cut_rate else "."))
+        _dq_banner({"level": lvl, "headline": head, "detail": detail,
+                    "drill_in": ""})
+
     _dq_kpis([
-        ("Ordered (window)", f"{to:,.0f} lbs", "sum of the displayed weeks"),
-        ("Shipped (window)", f"{ts:,.0f} lbs", "sum of the displayed weeks"),
-        ("Fill rate", f"{fillw * 100:.1f}%" if fillw is not None else "—", "shipped ÷ ordered"),
+        ("Ordered (window)", f"{t_ord:,.0f} lbs", "net of cuts · displayed weeks"),
+        ("Shipped (window)", f"{t_shp:,.0f} lbs", "sum of the displayed weeks"),
+        ("Cut after ordering", f"{t_cut:,.0f} lbs",
+         f"{cut_rate * 100:.1f}% of original demand" if cut_rate is not None
+         else "cancelled on surviving lines"),
+        ("Fill rate", f"{fillw * 100:.1f}%" if fillw is not None else "—",
+         "shipped ÷ original ordered"),
+        ("Open lines", f"{open_lines:,}", "not yet shipped · excluded from fill"),
     ])
-    # explanation
     _chart_method(
-        "- **Formula** — Fill rate = Σ Shipped lbs ÷ Σ Ordered lbs (per week).\n"
-        "- **Method** — weekly sums on the Monday-anchored grid; reacts to the shipment "
-        "filters (Business Unit … Customer, Corporate Group) + the Week window.\n"
-        "- **Source** — `dbo.Shipments` (`Ordered LBS`, `Shipped LBS`).\n"
-        "- **Chart** — grouped bars (ordered vs shipped) + a fill-rate line on the right axis.")
-    # chart
-    fill = (s / o.replace(0, float("nan"))) * 100.0
+        "- **Formula** — Fill rate = Σ Shipped lbs ÷ Σ **Original** Ordered lbs, "
+        "so pounds that were ordered and then cancelled count as a miss.  "
+        "`dbo.Shipments` cannot show this: it only holds lines that shipped, "
+        "which is why the old version of this chart sat near 99%.\n"
+        "- **Completed lines only** — a line enters the fill-rate ratio once it "
+        f"reaches {', '.join(sorted(ofr.COMPLETED_LINE_STATUSES))}.  Lines still "
+        "in flight stay in the volume bars but are left out of the ratio, so the "
+        "newest weeks aren't punished for simply not having shipped yet "
+        "(see the *Open lines* tile).\n"
+        "- **Scope** — sales-order lines (`Line Type Code` = ORA_BUY, "
+        "`Category Code` = ORDER), net of fully-cancelled lines: returns, "
+        "credit-only and bill-only lines are excluded so they can't net "
+        "against real demand.  **Partial** cuts on surviving lines are kept — "
+        "they are the point.\n"
+        "- **Ordered bar** — `Ordered Quantity Pounds` (already net of "
+        "cancellations); the gap to the original demand is the *Cut* tile.\n"
+        "- **Method** — weekly sums on the Monday-anchored grid; reacts to the "
+        "same filters (Business Unit … Customer, Corporate Group) + the Week "
+        "window as the rest of the section.\n"
+        "- **Source** — `dbo.Orders` (`Original Ordered` / `Canceled` / "
+        "`Ordered` / `Shipped Quantity Pounds`), joined to `dbo.Products` on "
+        "Inventory Item ID for the product dimensions and to `dbo.Customers` "
+        "on Party Site ID for the customer.  Both dimensions are deduplicated "
+        "to one row per key before joining, and the join is checked for "
+        "fan-out.\n"
+        "- **Chart** — grouped bars (ordered vs shipped) + a fill-rate line on "
+        "the right axis.")
+
+    fill = pd.to_numeric(weekly[ofr.FILL_RATE_GROSS], errors="coerce") * 100.0
+    cut = pd.to_numeric(weekly[ofr.COL_CANCELED_LBS], errors="coerce")
     fig = go.Figure()
     fig.add_bar(x=weeks, y=o, name="Ordered lbs", marker=dict(color="#e67e22"),
                 hovertemplate="Ordered: %{y:,.0f} lbs<extra></extra>")
     fig.add_bar(x=weeks, y=s, name="Shipped lbs", marker=dict(color="#137d78"),
                 hovertemplate="Shipped: %{y:,.0f} lbs<extra></extra>")
+    if float(cut.fillna(0).sum()) > 0:
+        fig.add_bar(x=weeks, y=cut, name="Cut lbs", marker=dict(color="#8e44ad"),
+                    hovertemplate="Cut after ordering: %{y:,.0f} lbs<extra></extra>")
     fig.add_scatter(x=weeks, y=fill, name="Fill rate %", yaxis="y2", mode="lines+markers",
                     line=dict(color="#c0392b", width=2), marker=dict(size=5),
-                    hovertemplate="Fill: %{y:.0f}%<extra></extra>")
+                    connectgaps=False,
+                    hovertemplate="Fill: %{y:.1f}%<extra></extra>")
     fig.update_layout(
         height=360, margin=dict(l=10, r=10, t=40, b=10), barmode="group", bargap=0.2,
         font=dict(color=_BH_FONT_COLOR, size=18),
@@ -12384,7 +12488,9 @@ def _render_velocity_analysis_body() -> None:
         (vel.COL_CUSTOMER,      "Customer"),
     ]
     selections: dict[str, list[str]] = {}
-    st.markdown("**Our shipments — filters** (`dbo.Shipments`)")
+    st.markdown(
+        "**Our shipments — filters** (`dbo.Shipments`; the volume & fill-rate "
+        "chart applies the same filters to `dbo.Orders`)")
     cols = st.columns(3)
     for i, (canonical, label) in enumerate(dim_specs):
         options = vel.distinct_values(df, canonical)
@@ -12456,7 +12562,9 @@ def _render_velocity_analysis_body() -> None:
         return
 
     # ① Absolute-volume chart FIRST (our ordered vs shipped lbs).
-    _render_volume_chart(disp)
+    # Reads `dbo.Orders` off the same filters + Week window — not `disp`,
+    # which is the shipments/IRI merge the index charts below are built on.
+    _render_volume_chart(selections, week_range)
     st.markdown("---")
 
     # ── Promo overlay controls (drive the velocity index shading + the cohort) ─

@@ -392,11 +392,16 @@ GATE_COL: str = "_gate"
 
 @dataclass(frozen=True)
 class RowGate:
-    """One drop rule, with the planner-facing explanation attached."""
+    """One drop rule and what it means.
+
+    Deliberately carries no remediation text: the right action depends on which
+    leg the row came from (a Base Plan SKU with no Business Unit is a PDH gap;
+    an R&O one is an RO_Item_Master gap), which is a reporting concern.
+    :mod:`data_sources.demand_plan_reconcile` owns that mapping.
+    """
     id: str
     label: str
     reason: str
-    fix: str
 
 
 ROW_GATES: tuple[RowGate, ...] = (
@@ -408,11 +413,6 @@ ROW_GATES: tuple[RowGate, ...] = (
             "Zeros are always dropped; only R&O may be negative (a demand risk "
             "or de-list)."
         ),
-        fix=(
-            "Zero rows are normal padding and need no action.  A NEGATIVE Base "
-            "Plan row is a data error — fix the sign in the upload, or move the "
-            "line into the R&O seed if it really is a loss."
-        ),
     ),
     RowGate(
         id="undated",
@@ -421,10 +421,6 @@ ROW_GATES: tuple[RowGate, ...] = (
             "Start of Month could not be read as a date (blank, text, or an "
             "out-of-range Excel serial), so the row cannot be placed on the "
             "month axis."
-        ),
-        fix=(
-            "Correct Start of Month in ibp_base_plan_current.csv (or tblMonths"
-            ".csv for an R&O row) and re-upload."
         ),
     ),
     RowGate(
@@ -435,10 +431,6 @@ ROW_GATES: tuple[RowGate, ...] = (
             "forward-window months set on the upload form, 24 by default).  "
             "Note there is NO lower bound — earlier months are always kept."
         ),
-        fix=(
-            "Expected for far-horizon rows.  Raise 'Forward window (months)' on "
-            "the upload form if the plan genuinely needs to reach further out."
-        ),
     ),
     RowGate(
         id="business_unit",
@@ -448,11 +440,6 @@ ROW_GATES: tuple[RowGate, ...] = (
             "Resolution order: PDH Business Unit → present in RO_Item_Master → "
             "B2C, with Packaged Butter forced to B2C.  An item in NEITHER PDH "
             "nor RO_Item_Master has no Business Unit and is dropped here."
-        ),
-        fix=(
-            "If the SKU belongs in the B2C demand plan, add it to "
-            "RO_Item_Master.csv (or correct its Business Unit / Portfolio Minor "
-            "in PDH).  Genuinely B2B items are correctly excluded."
         ),
     ),
 )

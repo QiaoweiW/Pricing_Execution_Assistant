@@ -14,8 +14,9 @@ This module makes that gap addressable.  It answers three questions:
 
 1. **Where did the pounds go?**  A waterfall from input lbs to output lbs, one
    step per gate.
-2. **Which SKUs, and why?**  Per-item detail for every dropped row, carrying
-   the gate's reason and the concrete fix.
+2. **Which SKUs, and what to do?**  Per-item detail for every dropped row,
+   carrying the specific issue and the concrete action — including WHICH
+   reference file to fix, which differs by leg.
 3. **Does the published file still match its inputs?**  Recomputing from the
    current inputs and diffing against what is actually on the lakehouse catches
    the other failure mode — a stale or partially-written output.
@@ -71,17 +72,24 @@ from .ro_comparison import CUR_FISCAL_PROB_LE
 # renders them by name without restating string literals.
 COL_ITEM: str = "Item"
 COL_DESC: str = "Item Description"
-COL_FORECAST: str = "Forecast Type"
-COL_GATE: str = "Dropped by"
+COL_FORECAST: str = "Leg"
+COL_GATE: str = "Issue"
 COL_ROWS: str = "Rows"
 COL_LBS: str = "Lbs"
-COL_REASON: str = "Why"
-COL_FIX: str = "How to fix"
+COL_ACTION: str = "Action"
+#: Which reference file to fix, when there is one — the view turns this into a
+#: Fabric deep link.  Empty string when the drop needs no action.
+COL_LINK: str = "_fix_target"
 
 DROP_DETAIL_COLUMNS: tuple[str, ...] = (
     COL_ITEM, COL_DESC, COL_FORECAST, COL_GATE, COL_ROWS, COL_LBS,
-    COL_REASON, COL_FIX,
+    COL_ACTION, COL_LINK,
 )
+
+#: ``COL_LINK`` values.  Stable ids, not URLs — the URLs live in the view.
+LINK_PDH: str = "pdh"
+LINK_RO_ITEM_MASTER: str = "ro_item_master"
+LINK_BASE_PLAN_UPLOAD: str = "base_plan"
 
 # RO bridge columns.
 COL_RO_SUMMARY_LBS: str = "RO Summary FY lbs"
@@ -90,7 +98,7 @@ COL_DELTA: str = "Delta"
 COL_STATUS: str = "Status"
 
 RO_BRIDGE_COLUMNS: tuple[str, ...] = (
-    COL_ITEM, COL_RO_SUMMARY_LBS, COL_PLAN_LBS, COL_DELTA, COL_STATUS, COL_FIX,
+    COL_ITEM, COL_RO_SUMMARY_LBS, COL_PLAN_LBS, COL_DELTA, COL_STATUS, COL_ACTION,
 )
 
 # Lbs below which a delta is treated as pro-ration / rounding noise rather than
@@ -110,7 +118,6 @@ class BridgeStep:
     lbs: float
     items: int
     reason: str
-    fix: str
 
 
 @dataclass(frozen=True)
@@ -218,7 +225,7 @@ def build_demand_plan_bridge(
         output_rows=len(mgmt_full),
         output_lbs=output_lbs,
         steps=steps,
-        dropped_detail=_drop_detail(ledger),
+        dropped_detail=_drop_detail(ledger, window_end),
         rebuilt=mgmt_full,
         published_rows=None if published_mgmt_full is None else len(published_mgmt_full),
         published_lbs=None if published_mgmt_full is None else _sum_lbs(published_mgmt_full),
@@ -255,17 +262,93 @@ def _step(gate_id: str, ledger: pd.DataFrame) -> BridgeStep:
         lbs=_sum_lbs(rows),
         items=int(rows["Item"].nunique()) if not rows.empty else 0,
         reason=gate.reason,
-        fix=gate.fix,
     )
 
 
-def _drop_detail(ledger: pd.DataFrame) -> pd.DataFrame:
-    """Per (Item, Forecast Type, gate) drop detail, biggest loss first.
+def _classify(
+    gate_id: str, leg: str, business_unit: str, negative: bool,
+    window_end: pd.Timestamp,
+) -> tuple[str, str, str]:
+    """Return ``(issue, action, fix_target)`` for one group of dropped rows.
 
-    Aggregated to the grain a planner acts on: one line per SKU per reason,
-    with the row count and pounds behind it.  The reason / fix text comes
-    straight off the gate definition, so the guidance shown here is the same
-    guidance the pipeline's own documentation carries.
+    The gate says *which rule* removed the row; this says *what it means here*
+    and *what to do*, which depends on the leg and on how far the Business-Unit
+    cascade got.  Two distinctions matter and the generic gate label hides both:
+
+    * **Unclassified vs genuinely B2B.**  An item the cascade could not resolve
+      at all (no Business Unit) is a reference-data gap and needs fixing; one
+      that resolved to B2B is a correct exclusion and needs nothing.  Reporting
+      them under one "Not B2C" heading buries the actionable half.
+    * **Which file to fix.**  The Base Plan leg is keyed on PDH, the R&O leg on
+      RO_Item_Master, so the same gate points at different files.
+
+    An empty *action* marks a drop that is working as designed.
+    """
+    is_ro = leg == "R&O"
+
+    if gate_id == "business_unit":
+        if str(business_unit).strip() in ("", "nan", "<NA>", "None"):
+            if is_ro:
+                return (
+                    "Unclassified — not in RO_Item_Master",
+                    "This R&O item has no Business Unit because it is in "
+                    "neither PDH nor RO_Item_Master. Add it to "
+                    "RO_Item_Master.csv (Item #, Business Unit = B2C, "
+                    "Portfolio Major / Minor, Supply Format), then regenerate "
+                    "RO_Seed and re-upload the Base Plan.",
+                    LINK_RO_ITEM_MASTER,
+                )
+            return (
+                "Unclassified — not in PDH",
+                "This Base Plan item has no Business Unit because PDH does not "
+                "carry it. Add the item to qry_pdh.csv with Business Unit = "
+                "B2C and its Portfolio Major / Minor + Supply Format, then "
+                "re-upload the Base Plan. (RO_Item_Master.csv is the fallback "
+                "if the item cannot be added to PDH.)",
+                LINK_PDH,
+            )
+        return (f"Correctly excluded — classified {business_unit}", "", "")
+
+    if gate_id == "forward_window":
+        cut = f"{window_end:%b %Y}"
+        if is_ro:
+            return (
+                f"R&O month on/after {cut}",
+                "",   # expected: the R&O calendar outruns the plan horizon
+            ) + ("",)
+        return (f"Plan month on/after {cut}", "", "")
+
+    if gate_id == "demand_sign":
+        if negative:
+            return (
+                "Negative Base Plan row",
+                "Only R&O may be negative. A negative Base Plan quantity is a "
+                "sign error in the upload — correct it in "
+                "ibp_base_plan_current.csv, or move the line into the R&O seed "
+                "if it really is a loss.",
+                LINK_BASE_PLAN_UPLOAD,
+            )
+        return ("Zero-pound row", "", "")
+
+    if gate_id == "undated":
+        return (
+            "Unreadable Start of Month",
+            "The date could not be parsed (blank, text, or an out-of-range "
+            "Excel serial), so the row has no month to sit on. Fix Start of "
+            "Month in the upload and re-upload.",
+            LINK_BASE_PLAN_UPLOAD,
+        )
+
+    gate = ROW_GATES_BY_ID.get(gate_id)
+    return (gate.label if gate else str(gate_id), "", "")
+
+
+def _drop_detail(ledger: pd.DataFrame, window_end: pd.Timestamp) -> pd.DataFrame:
+    """Per (Item, leg, issue) drop detail, biggest loss first.
+
+    Aggregated to the grain a planner acts on — one line per SKU per issue —
+    and carrying the concrete action for that combination (see
+    :func:`_classify`).  Rows whose ``Action`` is empty are working as designed.
     """
     if ledger is None or ledger.empty:
         return pd.DataFrame(columns=list(DROP_DETAIL_COLUMNS))
@@ -273,21 +356,28 @@ def _drop_detail(ledger: pd.DataFrame) -> pd.DataFrame:
     work = ledger.copy()
     work["Item"] = _norm_item(work["Item"])
     work["__lbs"] = _lbs(work["Demand Plan Pounds"])
-    desc = (work["Item Description"].astype(str)
-            if "Item Description" in work.columns else "")
+    work[COL_DESC] = (work["Item Description"].astype(str)
+                      if "Item Description" in work.columns else "")
+    work["__bu"] = (work["Business Unit"].astype(str)
+                    if "Business Unit" in work.columns else "")
+    # Sign is part of the identity of a demand_sign drop (zero vs negative), so
+    # it has to survive the grouping rather than be inferred from the total.
+    work["__neg"] = work["__lbs"] < 0
 
     grouped = (
-        work.assign(**{COL_DESC: desc})
-        .groupby(["Item", COL_DESC, "Forecast Type", GATE_COL],
-                 as_index=False, dropna=False)
+        work.groupby(["Item", COL_DESC, "Forecast Type", GATE_COL, "__bu", "__neg"],
+                     as_index=False, dropna=False)
         .agg(**{COL_ROWS: ("__lbs", "size"), COL_LBS: ("__lbs", "sum")})
     )
-    grouped[COL_GATE] = grouped[GATE_COL].map(
-        lambda g: ROW_GATES_BY_ID[g].label if g in ROW_GATES_BY_ID else str(g))
-    grouped[COL_REASON] = grouped[GATE_COL].map(
-        lambda g: ROW_GATES_BY_ID[g].reason if g in ROW_GATES_BY_ID else "")
-    grouped[COL_FIX] = grouped[GATE_COL].map(
-        lambda g: ROW_GATES_BY_ID[g].fix if g in ROW_GATES_BY_ID else "")
+    resolved = [
+        _classify(g, leg, bu, neg, window_end)
+        for g, leg, bu, neg in zip(
+            grouped[GATE_COL], grouped["Forecast Type"],
+            grouped["__bu"], grouped["__neg"])
+    ]
+    grouped[COL_GATE] = [r[0] for r in resolved]
+    grouped[COL_ACTION] = [r[1] for r in resolved]
+    grouped[COL_LINK] = [r[2] for r in resolved]
     grouped = grouped.rename(columns={
         "Item": COL_ITEM, "Forecast Type": COL_FORECAST})
 
@@ -384,7 +474,7 @@ def build_ro_fiscal_bridge(
             _classify_ro_gap(ro, plan)
             for ro, plan in zip(detail[COL_RO_SUMMARY_LBS], detail[COL_PLAN_LBS])
         ]
-        detail[COL_FIX] = detail[COL_STATUS].map(_RO_FIXES)
+        detail[COL_ACTION] = detail[COL_STATUS].map(_RO_FIXES)
         detail = detail.reindex(
             detail[COL_DELTA].abs().sort_values(ascending=False).index)
         detail = detail.reset_index().rename(columns={"index": COL_ITEM})
@@ -465,4 +555,5 @@ __all__ = [
     "BridgeStep", "DemandPlanBridge", "build_demand_plan_bridge",
     "RoFiscalBridge", "build_ro_fiscal_bridge",
     "DROP_DETAIL_COLUMNS", "RO_BRIDGE_COLUMNS",
+    "LINK_PDH", "LINK_RO_ITEM_MASTER", "LINK_BASE_PLAN_UPLOAD",
 ]

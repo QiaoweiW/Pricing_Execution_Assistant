@@ -22,8 +22,12 @@ from data_sources.demand_plan_reconcile import (
     COL_DELTA,
     COL_GATE,
     COL_ITEM,
+    COL_ACTION,
     COL_LBS,
+    COL_LINK,
     COL_ROWS,
+    LINK_PDH,
+    LINK_RO_ITEM_MASTER,
     COL_PLAN_LBS,
     COL_RO_SUMMARY_LBS,
     COL_STATUS,
@@ -130,41 +134,72 @@ def test_a_clean_input_drops_nothing():
 
 # ── Each gate is attributed correctly ────────────────────────────────────────
 
-def _gate_labels(bridge) -> set[str]:
+def _issues(bridge) -> set[str]:
+    """The specific issue labels the bridge reported."""
     return set(bridge.dropped_detail[COL_GATE])
 
 
-def test_zero_rows_are_attributed_to_the_demand_sign_gate():
+def _actionable(bridge):
+    d = bridge.dropped_detail
+    return d.loc[d[COL_ACTION].str.len() > 0]
+
+
+def test_zero_rows_are_reported_as_padding_needing_no_action():
     bridge = _bridge(_base_plan({"item": "1", "lbs": "0"}))
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["demand_sign"].label}
+    assert _issues(bridge) == {"Zero-pound row"}
+    assert _actionable(bridge).empty
 
 
-def test_negative_base_plan_rows_are_dropped_and_explained():
+def test_negative_base_plan_rows_are_actionable():
     bridge = _bridge(_base_plan({"item": "1", "lbs": "-500"}))
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["demand_sign"].label}
+    assert _issues(bridge) == {"Negative Base Plan row"}
+    assert not _actionable(bridge).empty
     assert bridge.output_lbs == pytest.approx(0.0)
 
 
-def test_undated_rows_are_attributed_to_the_undated_gate():
+def test_undated_rows_are_actionable():
     bridge = _bridge(_base_plan({"item": "1", "lbs": "100", "month": "not a date"}))
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["undated"].label}
+    assert _issues(bridge) == {"Unreadable Start of Month"}
+    assert not _actionable(bridge).empty
 
 
-def test_far_horizon_rows_are_attributed_to_the_window_gate():
+def test_window_drop_names_the_actual_cutoff_month():
+    # "Beyond the forward window" is useless without the date; the issue text
+    # must say WHICH month the cut falls on.
     bridge = _bridge(_base_plan({"item": "1", "lbs": "100", "month": "9/1/2030"}))
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["forward_window"].label}
+    assert _issues(bridge) == {"Plan month on/after Sep 2028"}
+    assert _actionable(bridge).empty          # working as designed
 
 
-def test_non_b2c_rows_are_attributed_to_the_business_unit_gate():
+def test_a_genuine_b2b_item_is_reported_as_correctly_excluded():
     bridge = _bridge(_base_plan({"item": "1", "lbs": "100"}), pdh=_pdh(("1", "B2B")))
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["business_unit"].label}
+    assert _issues(bridge) == {"Correctly excluded — classified B2B"}
+    assert _actionable(bridge).empty          # nothing to fix
 
 
-def test_an_item_in_neither_pdh_nor_ro_master_is_dropped_as_non_b2c():
-    # The silent-loss case the bridge exists to surface.
+def test_unclassified_base_plan_item_points_at_pdh():
+    # The silent-loss case the bridge exists to surface — and the Base Plan leg
+    # is keyed on PDH, so that is the file to fix.
     bridge = _bridge(_base_plan({"item": "999", "lbs": "100"}), pdh=_pdh(("1", "B2C")))
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["business_unit"].label}
-    assert bridge.dropped_detail[COL_ITEM].tolist() == ["999"]
+    assert _issues(bridge) == {"Unclassified — not in PDH"}
+    row = _actionable(bridge).iloc[0]
+    assert row[COL_ITEM] == "999"
+    assert row[COL_LINK] == LINK_PDH
+    assert "qry_pdh.csv" in row[COL_ACTION]
+
+
+def test_unclassified_ro_item_points_at_ro_item_master():
+    # Same gate, different leg → different file.  R&O is keyed on RO_Item_Master.
+    bridge = _bridge(
+        _base_plan({"item": "1", "lbs": "100"}),
+        seed=_seed({"item": "888", "lbs_yr": "120000", "fsd": "10/1/2026"}),
+        pdh=_pdh(("1", "B2C")),
+    )
+    ro_rows = _actionable(bridge)
+    ro_rows = ro_rows.loc[ro_rows[COL_ITEM] == "888"]
+    assert not ro_rows.empty
+    assert set(ro_rows[COL_LINK]) == {LINK_RO_ITEM_MASTER}
+    assert "RO_Item_Master.csv" in ro_rows[COL_ACTION].iloc[0]
 
 
 def test_only_the_first_failing_gate_is_charged():
@@ -172,20 +207,22 @@ def test_only_the_first_failing_gate_is_charged():
     # that actually removed it, or the waterfall would double-count.
     bridge = _bridge(_base_plan({"item": "1", "lbs": "0", "month": "9/1/2030"}))
     assert len(bridge.dropped_detail) == 1
-    assert _gate_labels(bridge) == {dpp.ROW_GATES_BY_ID["demand_sign"].label}
+    assert _issues(bridge) == {"Zero-pound row"}
 
 
 # ── Detail content ───────────────────────────────────────────────────────────
 
-def test_detail_carries_a_reason_and_a_fix_for_every_row():
+def test_every_row_carries_an_issue_and_only_actionable_ones_carry_an_action():
     bridge = _bridge(_base_plan(
-        {"item": "1", "lbs": "0"},
-        {"item": "1", "lbs": "100", "month": "9/1/2030"},
-        {"item": "999", "lbs": "100"},
+        {"item": "1", "lbs": "0"},                        # expected
+        {"item": "1", "lbs": "100", "month": "9/1/2030"},  # expected
+        {"item": "999", "lbs": "100"},                     # actionable
     ))
-    from data_sources.demand_plan_reconcile import COL_FIX, COL_REASON
-    assert (bridge.dropped_detail[COL_REASON].str.len() > 0).all()
-    assert (bridge.dropped_detail[COL_FIX].str.len() > 0).all()
+    d = bridge.dropped_detail
+    assert (d[COL_GATE].str.len() > 0).all()
+    assert (d[COL_ACTION].str.len() > 0).sum() == 1
+    # An action always names somewhere to go.
+    assert (d.loc[d[COL_ACTION].str.len() > 0, COL_LINK].str.len() > 0).all()
 
 
 def test_detail_is_sorted_by_biggest_loss_first():

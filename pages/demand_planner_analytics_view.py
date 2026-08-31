@@ -323,16 +323,20 @@ from data_sources.demand_plan_pipeline import (
     withdraw_cycles,
 )
 from data_sources.demand_plan_reconcile import (
+    COL_ACTION as RECON_COL_ACTION,
     COL_DELTA as RECON_COL_DELTA,
-    COL_FIX as RECON_COL_FIX,
+    COL_DESC as RECON_COL_DESC,
+    COL_FORECAST as RECON_COL_FORECAST,
     COL_GATE as RECON_COL_GATE,
     COL_ITEM as RECON_COL_ITEM,
     COL_LBS as RECON_COL_LBS,
+    COL_LINK as RECON_COL_LINK,
     COL_PLAN_LBS as RECON_COL_PLAN_LBS,
-    COL_REASON as RECON_COL_REASON,
     COL_RO_SUMMARY_LBS as RECON_COL_RO_SUMMARY_LBS,
     COL_ROWS as RECON_COL_ROWS,
     COL_STATUS as RECON_COL_STATUS,
+    LINK_PDH as RECON_LINK_PDH,
+    LINK_RO_ITEM_MASTER as RECON_LINK_RO_ITEM_MASTER,
     build_demand_plan_bridge,
     build_ro_fiscal_bridge,
 )
@@ -2108,7 +2112,16 @@ def _render_ro_seed_summary_reconcile_result(result) -> None:
         st.error(f"❌ Reconciliation could not run — {result}")
         return
 
-    assert isinstance(result, RiskReconciliationResult)  # narrow the type
+    # Anything else is either a genuine result or a stale session-state object
+    # left by an earlier module load — on Streamlit Cloud a rerun can rebind
+    # the class, so an instance created before the reload fails ``isinstance``
+    # against the new one.  Discard it and ask for a re-run rather than
+    # crashing the whole page on a diagnostic panel.
+    if not isinstance(result, RiskReconciliationResult):
+        st.session_state.pop(_SS_RECONCILE_RESULT, None)
+        st.info("ℹ️ The previous reconciliation result expired — click "
+                "**Reconcile RO_Seed with RO Summary** to run it again.")
+        return
 
     cfg = ro_rules_config_from_session(st.session_state)
     rules_caption = (
@@ -5142,9 +5155,13 @@ def _render_withdraw_summary(result: WithdrawResult) -> None:
                 st.markdown(f"{icon} {entry.text}")
 
 
-# Session key holding the last reconciliation result (survives the reruns the
-# download buttons trigger, so the bridge isn't recomputed on every click).
-_SS_RECONCILE_RESULT: str = "demand_reconcile_result"
+# Session key holding the last demand-plan bridge result (survives the reruns
+# the download buttons trigger, so the bridge isn't recomputed on every click).
+# NOTE the distinct name: _SS_RECONCILE_RESULT above belongs to the RO_Seed ↔
+# RO Summary reconcile in the RO section.  Reusing that constant here silently
+# rebound it for BOTH call sites (last definition wins at import time), so the
+# RO button read this panel's dict and its isinstance check blew up.
+_SS_DEMAND_BRIDGE_RESULT: str = "demand_plan_bridge_result"
 
 # Fiscal year the R&O bridge reconciles.  Named here — not inline — so rolling
 # to a new fiscal year is a one-line edit, matching _DPC_DEFAULT_* above.
@@ -5184,9 +5201,9 @@ def _render_demand_reconciliation() -> None:
                  "plan in memory (nothing is written).  Takes a few seconds.",
         ):
             with st.spinner("Reading inputs and rebuilding the demand plan…"):
-                st.session_state[_SS_RECONCILE_RESULT] = _build_reconciliation()
+                st.session_state[_SS_DEMAND_BRIDGE_RESULT] = _build_reconciliation()
 
-        payload = st.session_state.get(_SS_RECONCILE_RESULT)
+        payload = st.session_state.get(_SS_DEMAND_BRIDGE_RESULT)
         if payload is not None:
             _render_reconciliation_result(payload)
 
@@ -5255,136 +5272,155 @@ def _build_reconciliation() -> dict:
     }
 
 
+def _fix_link(target: str) -> Optional[tuple[str, str]]:
+    """``(label, url)`` for a fix target id, or ``None`` when there's nowhere to go."""
+    return {
+        RECON_LINK_PDH: ("🔗 Open qry_pdh.csv in Fabric", _FABRIC_PDH_URL),
+        RECON_LINK_RO_ITEM_MASTER: ("🔗 Open RO_Item_Master.csv in Fabric",
+                                    _RO_ITEM_MASTER_FABRIC_URL),
+    }.get(target)
+
+
 def _render_reconciliation_result(payload: dict) -> None:
-    """Render both bridges: the waterfall, the SKU drop list, and the RO tie-out."""
+    """Render the bridge: the waterfall, what needs fixing, and the RO tie-out.
+
+    Deliberately asymmetric.  Drops that are working as designed (zero-pound
+    padding, months past the horizon, genuine B2B items) collapse to a single
+    line each — a planner does not need a 300-row table to be told the plan
+    correctly excluded bulk butter.  Only the actionable half gets a table, and
+    the per-SKU list lives in the CSV rather than being duplicated on screen.
+    """
     if payload.get("error"):
         st.warning(payload["error"])
         return
 
     bridge = payload["bridge"]
-    st.caption(
-        f"Cycle meeting month **{payload['meeting_month']:%b %Y}** · forward "
-        f"window ends **{payload['window_end']:%b %Y}**"
-    )
+    detail = bridge.dropped_detail
+    actionable = (detail.loc[detail[RECON_COL_ACTION].str.len() > 0]
+                  if not detail.empty else detail)
+    expected = (detail.loc[detail[RECON_COL_ACTION].str.len() == 0]
+                if not detail.empty else detail)
 
-    # ── 1. The waterfall ────────────────────────────────────────────────
-    st.markdown("**① Where the pounds went**")
-    rows = [{
-        "Step": "Input — Base Plan + R&O",
-        "Rows": bridge.input_rows, "M lbs": bridge.input_lbs / _M_LBS, "SKUs": "",
-    }]
-    rows += [{
-        "Step": f"− {s.label}",
-        "Rows": -s.rows, "M lbs": -s.lbs / _M_LBS, "SKUs": s.items,
-    } for s in bridge.steps if s.rows]
-    rows.append({
-        "Step": "= Demand plan (qry_mgmt_plan_full)",
-        "Rows": bridge.output_rows, "M lbs": bridge.output_lbs / _M_LBS, "SKUs": "",
-    })
+    # ── Headline: does the published file tie to its inputs? ────────────
+    drift = bridge.drift_lbs
+    if drift is None:
+        st.info("ℹ️ Nothing published to compare against — the figures below "
+                "are what the next upload will produce.")
+    elif bridge.ties:
+        st.success(f"✅ The published plan ties to its inputs "
+                   f"({bridge.published_lbs / _M_LBS:,.1f} M lbs).")
+    else:
+        st.error(
+            f"❌ Published **{bridge.published_lbs / _M_LBS:,.1f} M** vs rebuilt "
+            f"**{bridge.output_lbs / _M_LBS:,.1f} M** ({drift / _M_LBS:+,.2f} M). "
+            "The published file was built from **different inputs** than the "
+            "ones on the lakehouse now — usually `RO_Seed.csv` regenerated, or "
+            "the RO rules changed, after the plan was built. Re-upload the Base "
+            "Plan so both come from one source."
+        )
+
+    # ── The waterfall ───────────────────────────────────────────────────
+    rows = [{"Step": "Input — Base Plan + R&O", "Rows": bridge.input_rows,
+             "M lbs": bridge.input_lbs / _M_LBS}]
+    rows += [{"Step": f"− {s.label}", "Rows": -s.rows, "M lbs": -s.lbs / _M_LBS}
+             for s in bridge.steps if s.rows]
+    rows.append({"Step": "= Demand plan", "Rows": bridge.output_rows,
+                 "M lbs": bridge.output_lbs / _M_LBS})
     st.dataframe(
         pd.DataFrame(rows).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.1f}"}),
         use_container_width=True, hide_index=True,
     )
+    st.caption(
+        f"Forward window ends **{payload['window_end']:%b %Y}** "
+        f"(meeting month {payload['meeting_month']:%b %Y} + "
+        f"{_DEFAULT_FORWARD_WINDOW_MONTHS} months) — plan months on or after "
+        "that are cut. The R&O leg is expanded 36 months from the RO calendar "
+        "anchor and then cut at the same point, so its tail drops too."
+    )
 
-    # ── 2. Published vs rebuilt ─────────────────────────────────────────
-    drift = bridge.drift_lbs
-    if drift is None:
-        st.info(
-            "ℹ️ No published `qry_mgmt_plan_full.csv` to compare against — the "
-            "figures above are what the next upload will produce."
-        )
-    elif bridge.ties:
-        st.success(
-            f"✅ The published plan ties to its inputs "
-            f"({bridge.published_lbs / _M_LBS:,.1f} M lbs)."
-        )
+    # ── What needs fixing ───────────────────────────────────────────────
+    st.markdown("**Needs your attention**")
+    if actionable.empty:
+        st.success("✅ Nothing to fix — every dropped row was dropped by design.")
     else:
-        st.error(
-            f"❌ The published plan does **not** tie to its inputs: published "
-            f"**{bridge.published_lbs / _M_LBS:,.1f} M** vs rebuilt "
-            f"**{bridge.output_lbs / _M_LBS:,.1f} M** "
-            f"(**{drift / _M_LBS:+,.2f} M**).\n\n"
-            "The gate reasons below cannot explain this — it means the published "
-            "file was built from **different inputs** than the ones on the "
-            "lakehouse now.  The usual cause is `RO_Seed.csv` being regenerated "
-            "(or the rules changed) after the plan was built.  Re-upload the "
-            "Base Plan to rebuild both from the same source."
-        )
-
-    # ── 3. The SKU-level drop list ──────────────────────────────────────
-    detail = bridge.dropped_detail
-    st.markdown("**② Which SKUs were dropped, and why**")
-    if detail.empty:
-        st.success("✅ Nothing was dropped — every input row reached the plan.")
-    else:
-        by_reason = (
-            detail.groupby(RECON_COL_GATE, as_index=False)
-            .agg(SKUs=(RECON_COL_ITEM, "nunique"),
-                 Rows=(RECON_COL_ROWS, "sum"), Lbs=(RECON_COL_LBS, "sum"))
-            .sort_values("Lbs", key=abs, ascending=False)
-        )
-        by_reason["M lbs"] = by_reason.pop("Lbs") / _M_LBS
-        st.dataframe(
-            by_reason.style.format({"SKUs": "{:,.0f}", "Rows": "{:,.0f}",
-                                    "M lbs": "{:,.1f}"}),
-            use_container_width=True, hide_index=True,
-        )
-        # Reason + fix text once per gate, rather than repeated on every row.
-        for gate_label in by_reason[RECON_COL_GATE]:
-            hit = detail.loc[detail[RECON_COL_GATE] == gate_label].iloc[0]
-            with st.expander(f"What does “{gate_label}” mean?", expanded=False):
-                st.markdown(f"**Why:** {hit[RECON_COL_REASON]}")
-                st.markdown(f"**How to fix:** {hit[RECON_COL_FIX]}")
-
-        show = detail.drop(columns=[RECON_COL_REASON, RECON_COL_FIX]).copy()
+        show = actionable[[RECON_COL_ITEM, RECON_COL_DESC, RECON_COL_FORECAST,
+                           RECON_COL_GATE, RECON_COL_ROWS, RECON_COL_LBS]].copy()
         show[RECON_COL_LBS] = show[RECON_COL_LBS] / _M_LBS
         show = show.rename(columns={RECON_COL_LBS: "M lbs"})
         st.dataframe(
-            show.head(300).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.3f}"}),
+            show.head(50).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.3f}"}),
             use_container_width=True, hide_index=True,
         )
-        if len(show) > 300:
-            st.caption(f"Showing the 300 largest of {len(show):,} SKU × reason "
-                       "rows — download for the full list.")
+        n_items = actionable[RECON_COL_ITEM].nunique()
+        st.caption(
+            f"**{n_items:,} SKU(s)**, "
+            f"{actionable[RECON_COL_LBS].abs().sum() / _M_LBS:,.1f} M lbs"
+            + (f" — showing the 50 largest." if len(show) > 50 else ".")
+        )
+        # One action + one link per distinct issue, not repeated per row.
+        for issue in actionable[RECON_COL_GATE].unique():
+            grp = actionable.loc[actionable[RECON_COL_GATE] == issue]
+            st.markdown(f"**{issue}** — {grp[RECON_COL_ITEM].nunique():,} SKU(s)")
+            st.markdown(grp[RECON_COL_ACTION].iloc[0])
+            link = _fix_link(grp[RECON_COL_LINK].iloc[0])
+            if link:
+                st.link_button(link[0], link[1])
+
+    # ── Expected drops: one line each, no table ─────────────────────────
+    if not expected.empty:
+        summary = (
+            expected.groupby(RECON_COL_GATE)
+            .agg(skus=(RECON_COL_ITEM, "nunique"), lbs=(RECON_COL_LBS, "sum"))
+            .sort_values("lbs", key=abs, ascending=False)
+        )
+        st.markdown("**Dropped by design** _(no action needed)_")
+        st.markdown("\n".join(
+            f"- {issue} — **{int(r.skus):,} SKU(s)**, {r.lbs / _M_LBS:,.1f} M lbs"
+            for issue, r in summary.iterrows()
+        ))
+
+    if not detail.empty:
         st.download_button(
-            "⬇️ Download the full drop list (CSV)",
-            data=detail.to_csv(index=False).encode("utf-8"),
+            "⬇️ Full SKU-level drop list (CSV)",
+            data=detail.drop(columns=[RECON_COL_LINK]).to_csv(index=False).encode("utf-8"),
             file_name=f"demand_plan_dropped_skus_{date.today():%Y%m%d}.csv",
             mime="text/csv", key="demand_reconcile_dl_drops",
         )
 
-    # ── 4. R&O vs the RO Summary ────────────────────────────────────────
+    # ── R&O vs the RO Summary ───────────────────────────────────────────
     ro = payload["ro_bridge"]
-    st.markdown("**③ R&O vs the RO Summary's FY27 probabilized lbs**")
+    st.markdown("**R&O vs the RO Summary (FY27 probabilized)**")
     if not payload.get("ro_available"):
         st.warning(
-            "⚠️ `RO_Comparison_Output.csv` is missing or empty, so there is no "
-            "RO Summary side to reconcile against.  Publish the RO Comparison "
-            "in the **RO Comparison** section above, then re-run."
+            "⚠️ `RO_Comparison_Output.csv` is missing or empty — no RO Summary "
+            "side to reconcile against. Publish the RO Comparison above, then "
+            "re-run."
         )
         return
     c1, c2, c3 = st.columns(3)
-    c1.metric("RO Summary FY27", f"{ro.ro_summary_lbs / _M_LBS:,.2f} M")
-    c2.metric("Plan R&O FY27", f"{ro.plan_lbs / _M_LBS:,.2f} M")
+    c1.metric("RO Summary", f"{ro.ro_summary_lbs / _M_LBS:,.2f} M")
+    c2.metric("Plan R&O", f"{ro.plan_lbs / _M_LBS:,.2f} M")
     c3.metric("Delta", f"{ro.delta_lbs / _M_LBS:+,.2f} M")
     if ro.detail.empty:
         st.success("✅ Every item ties within rounding.")
         return
-    ro_show = ro.detail.drop(columns=[RECON_COL_FIX]).copy()
+    ro_show = ro.detail[[RECON_COL_ITEM, RECON_COL_RO_SUMMARY_LBS,
+                         RECON_COL_PLAN_LBS, RECON_COL_DELTA,
+                         RECON_COL_STATUS]].copy()
     for col in (RECON_COL_RO_SUMMARY_LBS, RECON_COL_PLAN_LBS, RECON_COL_DELTA):
         ro_show[col] = ro_show[col] / _M_LBS
     st.dataframe(
-        ro_show.head(200).style.format(
+        ro_show.head(50).style.format(
             {c: "{:,.3f}" for c in (RECON_COL_RO_SUMMARY_LBS,
                                     RECON_COL_PLAN_LBS, RECON_COL_DELTA)}),
         use_container_width=True, hide_index=True,
     )
     for status in ro.detail[RECON_COL_STATUS].unique():
-        hit = ro.detail.loc[ro.detail[RECON_COL_STATUS] == status].iloc[0]
-        with st.expander(f"What does “{status}” mean?", expanded=False):
-            st.markdown(f"**How to fix:** {hit[RECON_COL_FIX]}")
+        grp = ro.detail.loc[ro.detail[RECON_COL_STATUS] == status]
+        st.markdown(f"**{status}** — {len(grp):,} item(s)")
+        st.markdown(grp[RECON_COL_ACTION].iloc[0])
     st.download_button(
-        "⬇️ Download the R&O bridge (CSV)",
+        "⬇️ Full R&O bridge (CSV)",
         data=ro.detail.to_csv(index=False).encode("utf-8"),
         file_name=f"ro_fy27_bridge_{date.today():%Y%m%d}.csv",
         mime="text/csv", key="demand_reconcile_dl_ro",
@@ -5475,6 +5511,13 @@ def _render_demand_summary() -> None:
         # one source doesn't hide the other (common case: one of the
         # upstream queries is still running and its CSV is missing,
         # while the other is already published).
+        # ── Reconciliation bridge (inputs → the two files below) ────
+        #
+        # Above the previews on purpose: it answers "can I trust these
+        # numbers?", which a planner needs before reading them, not after.
+        _render_demand_reconciliation()
+
+        st.markdown("---")
         st.markdown("")  # vertical breathing room before the first table.
         _render_demand_summary_file(
             title="Management Plan (Full)",
@@ -5494,13 +5537,6 @@ def _render_demand_summary() -> None:
             download_basename="qry_total_item_level_demand",
             download_button_key="demand_summary_dl_total_item_level_demand",
         )
-
-        # ── Reconciliation bridge (inputs → these two files) ────────
-        #
-        # Sits directly under the two previews because it explains THEM: why
-        # the upload's pounds and the published file's pounds differ.
-        st.markdown("---")
-        _render_demand_reconciliation()
 
         # ── Demand Plan Comparison Summary (cycle-over-cycle) ───────
         #

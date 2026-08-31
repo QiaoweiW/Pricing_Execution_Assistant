@@ -377,6 +377,166 @@ def _ro_input_to_long(
     )
 
 
+# ── Row gates: the four filters that decide what reaches the demand plan ─────
+#
+# Every pound that leaves the Base Plan / R&O inputs and never arrives in
+# qry_mgmt_plan_full was removed by exactly one of these, in this order.  The
+# metadata below is the *explanation* half (surfaced by
+# :mod:`data_sources.demand_plan_reconcile`); :func:`apply_row_gates` is the
+# *behaviour* half and is the only place the filtering is written, so a bridge
+# can never disagree with the pipeline about why a SKU vanished.
+
+#: Ledger column naming the gate that dropped a row.
+GATE_COL: str = "_gate"
+
+
+@dataclass(frozen=True)
+class RowGate:
+    """One drop rule, with the planner-facing explanation attached."""
+    id: str
+    label: str
+    reason: str
+    fix: str
+
+
+ROW_GATES: tuple[RowGate, ...] = (
+    RowGate(
+        id="demand_sign",
+        label="Zero pounds, or a negative Base Plan row",
+        reason=(
+            "The row carries 0 lbs, or it is a Base Plan row with negative lbs. "
+            "Zeros are always dropped; only R&O may be negative (a demand risk "
+            "or de-list)."
+        ),
+        fix=(
+            "Zero rows are normal padding and need no action.  A NEGATIVE Base "
+            "Plan row is a data error — fix the sign in the upload, or move the "
+            "line into the R&O seed if it really is a loss."
+        ),
+    ),
+    RowGate(
+        id="undated",
+        label="Unparseable or blank Start of Month",
+        reason=(
+            "Start of Month could not be read as a date (blank, text, or an "
+            "out-of-range Excel serial), so the row cannot be placed on the "
+            "month axis."
+        ),
+        fix=(
+            "Correct Start of Month in ibp_base_plan_current.csv (or tblMonths"
+            ".csv for an R&O row) and re-upload."
+        ),
+    ),
+    RowGate(
+        id="forward_window",
+        label="Beyond the forward window",
+        reason=(
+            "Start of Month falls on or after the cut-off (meeting month + the "
+            "forward-window months set on the upload form, 24 by default).  "
+            "Note there is NO lower bound — earlier months are always kept."
+        ),
+        fix=(
+            "Expected for far-horizon rows.  Raise 'Forward window (months)' on "
+            "the upload form if the plan genuinely needs to reach further out."
+        ),
+    ),
+    RowGate(
+        id="business_unit",
+        label="Not B2C",
+        reason=(
+            "The item resolved to a non-B2C Business Unit, or to none at all.  "
+            "Resolution order: PDH Business Unit → present in RO_Item_Master → "
+            "B2C, with Packaged Butter forced to B2C.  An item in NEITHER PDH "
+            "nor RO_Item_Master has no Business Unit and is dropped here."
+        ),
+        fix=(
+            "If the SKU belongs in the B2C demand plan, add it to "
+            "RO_Item_Master.csv (or correct its Business Unit / Portfolio Minor "
+            "in PDH).  Genuinely B2B items are correctly excluded."
+        ),
+    ),
+)
+
+ROW_GATES_BY_ID: dict[str, RowGate] = {g.id: g for g in ROW_GATES}
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """Rows that survived every gate, plus a ledger of everything dropped.
+
+    ``ledger`` carries the dropped rows verbatim with one extra column
+    (:data:`GATE_COL`) naming the gate that removed them — the FIRST gate a row
+    fails, since the gates run in sequence exactly as the pipeline applies them.
+    Empty when nothing was dropped.
+    """
+    kept: pd.DataFrame
+    ledger: pd.DataFrame
+
+
+def apply_row_gates(
+    combined: pd.DataFrame,
+    *,
+    window_end: pd.Timestamp,
+    business_unit_fn,
+) -> GateResult:
+    """Apply the four row gates in pipeline order, recording every drop.
+
+    This is the pipeline's own filter chain — :func:`_build_mgmt_plan_and_detail`
+    calls it and uses ``kept``.  The reconciliation bridge calls the same
+    function and reads ``ledger``, so the two can never drift.
+
+    *business_unit_fn* resolves the Business Unit column and is invoked on the
+    already-narrowed frame, immediately before the B2C gate — the same point
+    (and therefore the same cost and the same result) as the original inline
+    chain.
+    """
+    ledger: list[pd.DataFrame] = []
+
+    def _gate(df: pd.DataFrame, keep: pd.Series, gate_id: str) -> pd.DataFrame:
+        # Normalise the mask before splitting.  A comparison against a column
+        # holding pd.NA — Business Unit for an item in neither PDH nor
+        # RO_Item_Master — yields NA, which is falsy in BOTH ``keep`` and
+        # ``~keep``: the row would drop out of the kept set AND the ledger, so
+        # the very SKUs this ledger exists to surface would go unrecorded and
+        # the waterfall would silently fail to add up.  NA means "not B2C",
+        # i.e. do not keep.
+        keep = keep.fillna(False).astype(bool)
+        dropped = df.loc[~keep]
+        if not dropped.empty:
+            ledger.append(dropped.assign(**{GATE_COL: gate_id}))
+        return df.loc[keep]
+
+    # 1. Keep positive demand; ALSO keep NEGATIVE R&O (a demand risk / de-list)
+    #    so it flows into qry_mgmt_plan_full, the history tracker and the APS
+    #    mirror.  Base-plan rows stay strictly positive; zeros always go.
+    pounds = combined["Demand Plan Pounds"]
+    combined = _gate(
+        combined,
+        (pounds > 0) | ((pounds < 0) & (combined["Forecast Type"] == "R&O")),
+        "demand_sign",
+    )
+    # 2 + 3. Dated, and inside the forward window (upper bound only).
+    combined = _gate(combined, combined["Start of Month"].notna(), "undated")
+    combined = _gate(
+        combined, combined["Start of Month"] < window_end, "forward_window",
+    ).reset_index(drop=True)
+
+    combined["Start of Month"] = combined["Start of Month"].dt.normalize()
+    combined["Item"] = _norm_item(combined["Item"])
+
+    # 4. B2C only (PDH primary, RO-master fallback, Packaged Butter forced).
+    combined["Business Unit"] = business_unit_fn(combined)
+    combined = _gate(
+        combined, combined["Business Unit"] == "B2C", "business_unit",
+    ).reset_index(drop=True)
+
+    return GateResult(
+        kept=combined,
+        ledger=(pd.concat(ledger, ignore_index=True) if ledger
+                else combined.iloc[0:0].assign(**{GATE_COL: pd.Series(dtype=object)})),
+    )
+
+
 # ── Stage 2: Base Plan + R&O → mgmt_plan_full + item×customer detail ──────────
 
 def _build_mgmt_plan_and_detail(
@@ -388,12 +548,19 @@ def _build_mgmt_plan_and_detail(
     *,
     window_end: pd.Timestamp,
     log: _Log,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Build ``qry_mgmt_plan_full`` and ``qry_demand_item_customer_detail``.
 
     Both outputs share one enrichment pass (B2C resolution + the filtered
     base-plan branch), exactly like the source notebook cell — so the heavy
-    work is done once. Returns ``(mgmt_full, detail)``.
+    work is done once.
+
+    Returns ``(mgmt_full, detail, gate_ledger)``.  The ledger is the by-product
+    of :func:`apply_row_gates` — every input row that did NOT reach
+    ``mgmt_full``, tagged with the gate that removed it.  The pipeline ignores
+    it; :mod:`data_sources.demand_plan_reconcile` turns it into the planner's
+    bridge.  Building it costs nothing extra: the rows are already in hand at
+    the moment they are filtered out.
     """
     # Still needed by the detail branch (_build_detail) below.
     month_cols = [f"Month {i}" for i in range(1, _N_MONTHS + 1)]
@@ -435,23 +602,22 @@ def _build_mgmt_plan_and_detail(
     combined["Party Site Number"] = (
         combined["Party Site Number"].fillna("NA")
         if "Party Site Number" in combined.columns else "NA")
-    # Keep positive demand; ALSO keep NEGATIVE R&O (a demand risk / de-list) so
-    # it flows into qry_mgmt_plan_full, the history tracker and the APS mirror.
-    # Base-plan rows stay strictly positive; zeros are always dropped.
-    _pounds = combined["Demand Plan Pounds"]
-    combined = combined[
-        (_pounds > 0) | ((_pounds < 0) & (combined["Forecast Type"] == "R&O"))
-    ]
-    combined = combined[combined["Start of Month"].notna()]
-    combined = combined[combined["Start of Month"] < window_end].reset_index(drop=True)
-    combined["Start of Month"] = combined["Start of Month"].dt.normalize()
-    combined["Item"] = _norm_item(combined["Item"])
-
-    # --- Business Unit (PDH primary, RO-master fallback, Packaged Butter=B2C) -
+    # --- Row gates (demand sign, dated, forward window, B2C) -----------------
+    # One shared implementation — see apply_row_gates.  ``gated.ledger`` names
+    # the gate that removed each dropped row and is what the reconciliation
+    # bridge reports; the pipeline itself only needs ``kept``.
     ro_items_set = set(_norm_item(ro_master["Item #"]).dropna())
-    combined["Business Unit"] = _resolve_b2c_business_unit(
-        combined, pdh, ro_master, ro_items_set)
-    combined = combined[combined["Business Unit"] == "B2C"].reset_index(drop=True)
+    gated = apply_row_gates(
+        combined,
+        window_end=window_end,
+        business_unit_fn=lambda d: _resolve_b2c_business_unit(
+            d, pdh, ro_master, ro_items_set),
+    )
+    combined = gated.kept
+    for gate in ROW_GATES:
+        n = int((gated.ledger[GATE_COL] == gate.id).sum()) if not gated.ledger.empty else 0
+        if n:
+            log.info(f"Row gate '{gate.label}' dropped {n:,} row(s).")
 
     # Attach Portfolio Major + Supply Format so the file is self-describing and
     # the Demand Plan Comparison no longer re-joins PDH/RO_Item_Master.
@@ -467,7 +633,7 @@ def _build_mgmt_plan_and_detail(
         combined, base_plan, ro_input, qry_months, pdh, ro_master,
         ro_items_set=ro_items_set, window_end=window_end, month_cols=month_cols)
     log.ok(f"qry_demand_item_customer_detail built — {len(detail):,} rows")
-    return mgmt_full, detail
+    return mgmt_full, detail, gated.ledger
 
 
 def _build_detail(
@@ -876,7 +1042,7 @@ def run_demand_plan_pipeline(
 
         # ---- Compute everything in memory -----------------------------------
         tbl_ro_input = _build_tbl_ro_input(seed_df, anchor_month, log)
-        mgmt_full, detail = _build_mgmt_plan_and_detail(
+        mgmt_full, detail, _gate_ledger = _build_mgmt_plan_and_detail(
             base_plan, tbl_ro_input, tbl_months, pdh, ro_master,
             window_end=window_end, log=log)
         if mgmt_full.empty:
@@ -1027,6 +1193,78 @@ def backfill_plan_attribute_columns() -> BackfillResult:
     except Exception as exc:  # noqa: BLE001
         log.err(f"Backfill failed: {exc}")
         return result
+
+
+# ── Reconciliation inputs ────────────────────────────────────────────────────
+
+@dataclass
+class ReconciliationInputs:
+    """Everything the demand-plan bridge needs, read in one pass.
+
+    Lives here rather than in :mod:`data_sources.demand_plan_reconcile` because
+    this module already owns every one of these blob paths and the read
+    conventions that go with them — the reconciler stays pure (frames in,
+    findings out) and no path is spelled twice.
+
+    Any member can be ``None``: the withdraw tool deletes the base plan and the
+    published outputs, and the bridge is exactly the tool a planner reaches for
+    in that state, so a missing file must degrade rather than raise.
+    """
+    base_plan: Optional[pd.DataFrame] = None
+    ro_seed: Optional[pd.DataFrame] = None
+    tbl_months: Optional[pd.DataFrame] = None
+    pdh: Optional[pd.DataFrame] = None
+    ro_master: Optional[pd.DataFrame] = None
+    published_mgmt_full: Optional[pd.DataFrame] = None
+    missing: tuple[str, ...] = ()
+
+    @property
+    def can_rebuild(self) -> bool:
+        """True when the four inputs the pipeline needs are all present."""
+        return all(f is not None and not f.empty for f in (
+            self.base_plan, self.ro_seed, self.tbl_months))
+
+
+def load_reconciliation_inputs() -> ReconciliationInputs:
+    """Read the demand-plan inputs + the published output for the bridge.
+
+    Uses the SAME blob constants and read keywords as
+    :func:`run_demand_plan_pipeline`, so the bridge always reconciles the files
+    the pipeline actually consumes.  Missing blobs are collected in ``missing``
+    for the UI to report instead of failing the whole panel.
+    """
+    wanted = (
+        ("base_plan", _BASE_PLAN_BLOB),
+        ("ro_seed", _RO_SEED_BLOB),
+        ("tbl_months", _TBL_MONTHS_BLOB),
+        ("pdh", _PDH_BLOB),
+        ("ro_master", _RO_ITEMS_BLOB),
+        ("published_mgmt_full", _MGMT_PLAN_FULL_BLOB),
+    )
+    frames: dict[str, Optional[pd.DataFrame]] = {}
+    missing: list[str] = []
+    for attr, blob in wanted:
+        try:
+            df, _etag = read_csv(_SECRETS_SECTION, blob, read_csv_kwargs=_STR_READ_KW)
+        except LakehouseIOError:
+            df = None
+        if df is None or df.empty:
+            missing.append(blob)
+            df = None
+        frames[attr] = df
+    return ReconciliationInputs(missing=tuple(missing), **frames)
+
+
+def meeting_month_of(base_plan: Optional[pd.DataFrame]) -> Optional[pd.Timestamp]:
+    """First-of-month demand-review month carried on a base-plan upload.
+
+    The upload's ``month`` column is the pipeline's forward-window anchor, so
+    the bridge reads it the same way rather than guessing from the data.
+    """
+    if base_plan is None or base_plan.empty or "month" not in base_plan.columns:
+        return None
+    stamp = pd.to_datetime(base_plan["month"].iloc[0], errors="coerce")
+    return None if pd.isna(stamp) else stamp.normalize().replace(day=1)
 
 
 # ── Withdraw: undo a base-plan upload's effect on the demand plan ────────────
@@ -1217,4 +1455,7 @@ __all__ = [
     "DemandPlanResult", "run_demand_plan_pipeline",
     "BackfillResult", "backfill_plan_attribute_columns",
     "WithdrawResult", "withdraw_cycles", "list_history_tracker_cycles",
+    "ReconciliationInputs", "load_reconciliation_inputs", "meeting_month_of",
+    "RowGate", "ROW_GATES", "ROW_GATES_BY_ID", "GateResult", "apply_row_gates",
+    "GATE_COL",
 ]

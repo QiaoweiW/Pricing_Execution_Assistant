@@ -612,6 +612,17 @@ _BH_FLAG_CSS: dict[str, str] = {
 }
 
 
+# Fragment-isolated: a widget interaction anywhere inside this section reruns
+# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
+# the whole script per interaction by default, so without this a filter click
+# here re-executes every other section's Fabric reads and rebuilds.  Writes that
+# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
+# call ``st.rerun(scope="app")``, which escapes the fragment.
+#
+# Safe because this section owns its state: its widgets are namespaced to it and
+# no other section reads them.  (The RO rules panel writes a config that only
+# RO-section consumers read — verified before fragmenting.)
+@st.fragment
 def _render_business_health() -> None:
     """Business Health — trailing-window (L3M/L6M/L12M) order momentum on IBP Orders.
 
@@ -1641,6 +1652,17 @@ def _render_business_health_sku_drilldown(
             key="business_health_sku_download", use_container_width=True)
 
 
+# Fragment-isolated: a widget interaction anywhere inside this section reruns
+# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
+# the whole script per interaction by default, so without this a filter click
+# here re-executes every other section's Fabric reads and rebuilds.  Writes that
+# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
+# call ``st.rerun(scope="app")``, which escapes the fragment.
+#
+# Safe because this section owns its state: its widgets are namespaced to it and
+# no other section reads them.  (The RO rules panel writes a config that only
+# RO-section consumers read — verified before fragmenting.)
+@st.fragment
 def _render_ro_comparison() -> None:
     """Render the RO Comparison section end-to-end inside a foldable expander.
 
@@ -2263,7 +2285,7 @@ def _render_customer_input_uploader() -> None:
             fetch_ro_history_df(force_refresh=True)
             st.session_state.pop("ro_cmp_prior_month", None)
             st.session_state.pop("ro_cmp_le_month", None)
-            st.rerun()
+            st.rerun(scope="app")
 
     # RO Summary — persists across reruns until the next run.
     result: Optional[PipelineResult] = st.session_state.get(_SS_PIPELINE_RESULT)
@@ -2802,7 +2824,7 @@ def _render_ro_comparison_generate_button(
     _invalidate_ro_comparison_downstream()
     st.session_state.pop(_SS_AUTO_REGEN_SIG, None)
     st.session_state[_SS_AUTO_REGEN_BANNER] = result
-    st.rerun()
+    st.rerun(scope="app")
 
 
 def _render_warnings_banner(w: ComparisonWarnings) -> None:
@@ -4146,7 +4168,7 @@ def _render_ro_rules_panel() -> None:
                 fetch_ro_history_df(force_refresh=True)
                 st.session_state.pop("ro_cmp_prior_month", None)
                 st.session_state.pop("ro_cmp_le_month", None)
-                st.rerun()
+                st.rerun(scope="app")
             else:
                 st.error("❌ Regenerate failed — see the log below.")
                 _render_ro_pipeline_summary(result)
@@ -4960,7 +4982,7 @@ def _render_base_plan_uploader() -> None:
                 # @st.cache_data so the Demand Summary and Comparison
                 # (shape-signature build caches) re-read fresh, then rerun.
                 st.cache_data.clear()
-                st.rerun()
+                st.rerun(scope="app")
 
         result: Optional[DemandPlanResult] = st.session_state.get(
             _SS_DEMAND_PIPELINE_RESULT)
@@ -5110,7 +5132,7 @@ def _render_withdraw_cycle_tool() -> None:
                 # build caches are keyed on a cheap shape signature and would
                 # otherwise serve a stale build. Then rerun.
                 st.cache_data.clear()
-                st.rerun()
+                st.rerun(scope="app")
 
         # Result persists across the rerun the button triggers.
         result: Optional[WithdrawResult] = st.session_state.get(_SS_WITHDRAW_RESULT)
@@ -5427,6 +5449,17 @@ def _render_reconciliation_result(payload: dict) -> None:
     )
 
 
+# Fragment-isolated: a widget interaction anywhere inside this section reruns
+# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
+# the whole script per interaction by default, so without this a filter click
+# here re-executes every other section's Fabric reads and rebuilds.  Writes that
+# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
+# call ``st.rerun(scope="app")``, which escapes the fragment.
+#
+# Safe because this section owns its state: its widgets are namespaced to it and
+# no other section reads them.  (The RO rules panel writes a config that only
+# RO-section consumers read — verified before fragmenting.)
+@st.fragment
 def _render_demand_summary() -> None:
     """Render the Demand Summary section end-to-end inside a foldable expander.
 
@@ -5505,7 +5538,7 @@ def _render_demand_summary() -> None:
             ),
         ):
             st.cache_data.clear()
-            st.rerun()
+            st.rerun(scope="app")
 
         # Load both files.  We catch errors PER FILE so a failure on
         # one source doesn't hide the other (common case: one of the
@@ -5652,11 +5685,22 @@ def _render_aps_corp_review(history: Optional[pd.DataFrame]) -> None:
                         "No reviewable rows matched — those customers may already "
                         "be resolved (exact / previously patched)."
                     )
-                st.rerun()
+                st.rerun(scope="app")
             except (ApsUploadError, LakehouseIOError, ValueError) as exc:
                 st.error(f"❌ Could not apply the patch.\n\n{exc}")
 
 
+# Fragment-isolated: a widget interaction anywhere inside this section reruns
+# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
+# the whole script per interaction by default, so without this a filter click
+# here re-executes every other section's Fabric reads and rebuilds.  Writes that
+# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
+# call ``st.rerun(scope="app")``, which escapes the fragment.
+#
+# Safe because this section owns its state: its widgets are namespaced to it and
+# no other section reads them.  (The RO rules panel writes a config that only
+# RO-section consumers read — verified before fragmenting.)
+@st.fragment
 def _render_demand_summary_aps() -> None:
     """Render the Demand Summary (APS / Oracle) section — the upload-driven APS plan.
 
@@ -5925,12 +5969,11 @@ _DP_HIDDEN_COLS: tuple[str, ...] = ("_row_id", "_indent", "_is_subtotal")
 # Deep link to the RO_Item_Master.csv file in the Fabric lakehouse — the
 # authoritative place to look up / add a Portfolio Major + Supply Format for
 # items the dim cascade (PDH → RO_Item_Master) still can't classify.
+# Built from _FABRIC_LAKEHOUSE_BASE like every other deep link on this page, so
+# the workspace / lakehouse GUIDs are spelled exactly once.
 _RO_ITEM_MASTER_FABRIC_URL: str = (
-    "https://app.fabric.microsoft.com/groups/"
-    "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
-    "a01f513d-eee7-41eb-8c15-670bc40e7fc8"
-    "?experience=fabric-developer"
-    "&selectedPath=Files%2FRO%20Tracking%2FRO_Item_Master.csv"
+    _FABRIC_LAKEHOUSE_BASE
+    + "&selectedPath=Files%2FRO%20Tracking%2FRO_Item_Master.csv"
 )
 
 
@@ -8730,7 +8773,7 @@ def _render_bias_corp_sku_drivers(
         if not st.session_state.get(_BIAS_DRIVERS_LOADED_KEY):
             if st.button("📥 Load / refresh drivers", key="bias_drivers_load_btn"):
                 st.session_state[_BIAS_DRIVERS_LOADED_KEY] = True
-                st.rerun()
+                st.rerun(scope="app")
             return
 
         sts, pts, names, dim_warn = _load_corp_group_dims()
@@ -11323,6 +11366,14 @@ def render() -> None:
     3. Velocity Analysis           (🚀, collapsible, collapsed)
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
+
+    Sections 3-5 (plus Business Health and the APS summary) are each an
+    ``@st.fragment``.  Streamlit reruns the entire script on every widget
+    interaction, so without that isolation a single filter click anywhere on
+    this ~11k-line page re-executes every other section's Fabric reads and
+    rebuilds.  Fragmenting scopes an interaction to the section that raised it;
+    the handful of actions that genuinely need a whole-page refresh (a cache
+    flush after an upload or a withdraw) call ``st.rerun(scope="app")``.
     """
     apply_custom_css()
     st.markdown(

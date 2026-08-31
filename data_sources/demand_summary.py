@@ -222,17 +222,41 @@ class DemandSummarySnapshot:
 # but its contents are never hashed by us.
 
 # Per-blob ``read_csv`` overrides.  The plan-history tracker is read as
-# all-strings: the Demand Plan Comparison builder re-parses every column
-# itself (dates, pounds, cycles), and all-string content guarantees a
-# clean, picklable cache payload regardless of how the upstream export
-# typed its columns.
+# **categoricals**: the Demand Plan Comparison builder re-parses every column
+# itself (dates, pounds, cycles), so the stored dtype only has to round-trip
+# its text faithfully — and every column is enormously repetitive.
+#
+# Why this matters more than it looks
+# -----------------------------------
+# The tracker is ~120 MB of CSV over 1.35 M rows, and as plain ``dtype=str`` it
+# occupies **832 MB** resident — one Python str object per cell.  Streamlit
+# Cloud gives the container ~1 GB, and ``st.cache_data`` hands each caller its
+# own copy, so a single page render could exhaust the container on this file
+# alone.  No column has more than ~950 distinct values (most have under 60), so
+# dictionary-encoding collapses the same content to **29 MB** — a 29x cut with
+# no loss of information.
+#
+# Measured equivalence (1.35 M live rows): ``_vectorised_start_of_month``, the
+# item-dim frame, the fully enriched tracker, the cycle / month listers and
+# ``to_csv`` all produce byte-identical output either way.  Consumers coerce
+# with ``.astype("string")`` / ``pd.to_numeric``, both of which accept a
+# categorical, so nothing downstream needed changing.
 _READ_CSV_KWARGS_BY_BLOB: dict[str, dict] = {
-    _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH: {"dtype": str},
+    _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH: {"dtype": "category"},
     _IBP_BASE_PLAN_CURRENT_BLOB_PATH: {"thousands": ","},
 }
 
+# Cache slots for :func:`_cached_fetch`.  The key is ``(blob_path, signature)``
+# and the signature changes whenever a file changes, so WITHOUT a bound every
+# published revision of every blob stays resident until its TTL expires — two
+# generations of the tracker at once is exactly the spike that kills the
+# container.  A handful of slots covers the ~6 demand-plan blobs' current
+# generation while letting superseded ones fall out immediately (LRU).
+_CACHE_MAX_ENTRIES: int = 8
 
-@st.cache_data(ttl=_CACHE_TTL_SECONDS, show_spinner=False)
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS, max_entries=_CACHE_MAX_ENTRIES,
+               show_spinner=False)
 def _cached_fetch(
     blob_path: str, _signature: str,
 ) -> tuple[pd.DataFrame, Optional[str], Optional[int], Optional[datetime]]:

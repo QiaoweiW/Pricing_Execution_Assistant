@@ -246,13 +246,39 @@ _READ_CSV_KWARGS_BY_BLOB: dict[str, dict] = {
     _IBP_BASE_PLAN_CURRENT_BLOB_PATH: {"thousands": ","},
 }
 
+# Every blob served by :func:`_cached_fetch`.  Listed explicitly so the cache
+# bound below is derived from reality instead of a magic number that silently
+# goes stale the day a ninth source is added.
+_CACHED_BLOB_PATHS: tuple[str, ...] = (
+    _MGMT_PLAN_FULL_BLOB_PATH,
+    _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH,
+    _PDH_BLOB_PATH,
+    _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH,
+    _DEMAND_PLAN_COMPARISON_BLOB_PATH,
+    _IBP_BASE_PLAN_CURRENT_BLOB_PATH,
+    _STATIC_BUDGET_BASE_BLOB_PATH,
+    _STATIC_BUDGET_RO_BLOB_PATH,
+    _STATIC_BUDGET_MONTHLY_BLOB_PATH,
+)
+
 # Cache slots for :func:`_cached_fetch`.  The key is ``(blob_path, signature)``
-# and the signature changes whenever a file changes, so WITHOUT a bound every
-# published revision of every blob stays resident until its TTL expires — two
-# generations of the tracker at once is exactly the spike that kills the
-# container.  A handful of slots covers the ~6 demand-plan blobs' current
-# generation while letting superseded ones fall out immediately (LRU).
-_CACHE_MAX_ENTRIES: int = 8
+# and the signature changes whenever a file changes, so without a bound every
+# published revision of every blob stays resident until its TTL expires.  The
+# bound exists to let SUPERSEDED generations fall out; it must never be tight
+# enough to evict a blob that is still current.
+#
+# Sized at 3 generations per blob because a tight bound is far worse than a
+# loose one.  An earlier revision of this file hard-coded 8 — exactly the
+# number of blobs — leaving zero headroom, so the LRU evicted live entries and
+# the 120 MB / 1.35 M-row plan-history tracker was re-downloaded and re-parsed
+# five times in forty minutes, well inside its one-hour TTL.  Each of those is
+# a large transient allocation on a container that is already tight, plus tens
+# of seconds of latency, to re-materialise a frame we had just discarded.
+#
+# The failure mode is asymmetric: too loose costs one extra copy of a
+# superseded frame until the TTL expires; too tight costs a full re-read on
+# every render.  Prefer loose.
+_CACHE_MAX_ENTRIES: int = 3 * len(_CACHED_BLOB_PATHS)
 
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS, max_entries=_CACHE_MAX_ENTRIES,

@@ -612,6 +612,56 @@ _BH_FLAG_CSS: dict[str, str] = {
 }
 
 
+# ── Lazy-load gate for heavy, collapsed-by-default sections ──────────────────
+#
+# Streamlit executes an expander's body even while the expander is COLLAPSED —
+# the widget only hides the rendered output, it does not skip the code.  So a
+# section that reads Fabric inside a closed expander pays for that read on
+# EVERY page render, for work nobody asked to see.  With several such sections
+# on one page that is enough to push the container past its memory ceiling
+# while the planner is looking at something else entirely.
+#
+# This is the same opt-in shape the Demand Plan Comparison already uses (a
+# session flag flipped by a button); factored out here so the sections share
+# one implementation instead of three copies of the idiom.
+def _section_load_gate(
+    state_key: str, *, button_label: str, blurb: str, help_text: str,
+) -> bool:
+    """Return True once the planner has asked for this section's data.
+
+    Renders a short explanation plus a load button while the section is
+    dormant, and returns ``False`` so the caller can bail out before doing any
+    I/O.  The flag is sticky for the session, so once a section is loaded every
+    later interaction inside it behaves exactly as it did before the gate —
+    filters, drill-downs and reruns are all unaffected.
+
+    Returns ``True`` in the SAME run as the click (rather than flipping the
+    flag and forcing a rerun) so the section appears immediately: a button
+    click is already a rerun, and a second one would only re-read what we are
+    trying to avoid re-reading.
+    """
+    if st.session_state.get(state_key, False):
+        return True
+    st.caption(blurb)
+    if st.button(button_label, key=f"{state_key}__load", type="primary",
+                 help=help_text):
+        st.session_state[state_key] = True
+        return True
+    return False
+
+
+# Session flags for the two sections gated above.  Named next to the helper so
+# the set of gated sections is visible in one place.
+# Session flags for every gated section.  Kept together so the set of sections
+# that defer their I/O is visible in one place.  RO Comparison is deliberately
+# ABSENT: it is the one section that opens expanded, so on arrival it IS what
+# the planner is looking at and loading it eagerly is correct.
+_SS_VELOCITY_LOADED: str = "velocity_analysis_loaded"
+_SS_APS_LOADED: str = "demand_summary_aps_loaded"
+_SS_BUSINESS_HEALTH_LOADED: str = "business_health_loaded"
+_SS_DEMAND_SUMMARY_LOADED: str = "demand_summary_loaded"
+
+
 # Fragment-isolated: a widget interaction anywhere inside this section reruns
 # ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
 # the whole script per interaction by default, so without this a filter click
@@ -642,6 +692,19 @@ def _render_business_health() -> None:
         )
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning("🔒 **Microsoft Fabric is not connected.**  Sign in first.")
+            return
+        # Gated: this section reads 24 months of IBP Orders AND Shipments plus
+        # PDH and the finance extract — the heaviest read set on the page, and
+        # it ran on every render while this expander was closed.
+        if not _section_load_gate(
+            _SS_BUSINESS_HEALTH_LOADED,
+            button_label="▶️ Load Business Health",
+            blurb="Reads 24 months of IBP Orders + Shipments (and the finance "
+                  "extract) from OneLake — loaded on request so the rest of "
+                  "the page stays fast.",
+            help_text="Loads the trailing-window sources for this session.  "
+                      "Filters and drill-downs behave normally once loaded.",
+        ):
             return
 
         try:
@@ -1652,17 +1715,13 @@ def _render_business_health_sku_drilldown(
             key="business_health_sku_download", use_container_width=True)
 
 
-# Fragment-isolated: a widget interaction anywhere inside this section reruns
-# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
-# the whole script per interaction by default, so without this a filter click
-# here re-executes every other section's Fabric reads and rebuilds.  Writes that
-# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
-# call ``st.rerun(scope="app")``, which escapes the fragment.
-#
-# Safe because this section owns its state: its widgets are namespaced to it and
-# no other section reads them.  (The RO rules panel writes a config that only
-# RO-section consumers read — verified before fragmenting.)
-@st.fragment
+# NOT an @st.fragment, deliberately.  This section already contains its own
+# fragments (the editor, pipeline-analytics and
+# summary-report fragments), and wrapping a
+# fragment around them made every outer rerun re-create the inner ones — which
+# is what filled the logs with "the fragment with id ... does not exist anymore"
+# after a full-app rerun.  The inner fragments already provide the isolation
+# this outer one was meant to add, so the wrapper was pure risk.
 def _render_ro_comparison() -> None:
     """Render the RO Comparison section end-to-end inside a foldable expander.
 
@@ -5449,17 +5508,12 @@ def _render_reconciliation_result(payload: dict) -> None:
     )
 
 
-# Fragment-isolated: a widget interaction anywhere inside this section reruns
-# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
-# the whole script per interaction by default, so without this a filter click
-# here re-executes every other section's Fabric reads and rebuilds.  Writes that
-# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
-# call ``st.rerun(scope="app")``, which escapes the fragment.
-#
-# Safe because this section owns its state: its widgets are namespaced to it and
-# no other section reads them.  (The RO rules panel writes a config that only
-# RO-section consumers read — verified before fragmenting.)
-@st.fragment
+# NOT an @st.fragment, deliberately.  This section already contains its own
+# fragments (the demand-plan comparison fragment), and wrapping a
+# fragment around them made every outer rerun re-create the inner ones — which
+# is what filled the logs with "the fragment with id ... does not exist anymore"
+# after a full-app rerun.  The inner fragments already provide the isolation
+# this outer one was meant to add, so the wrapper was pure risk.
 def _render_demand_summary() -> None:
     """Render the Demand Summary section end-to-end inside a foldable expander.
 
@@ -5503,6 +5557,23 @@ def _render_demand_summary() -> None:
                 "sign in.  Once signed in, return here — the Demand Summary "
                 "tables will load automatically."
             )
+            return
+
+        # Gated: below this point the section reads the plan-history tracker
+        # (for the withdraw picker) and both published demand-plan CSVs, all of
+        # which ran on every render while this expander was closed.  The whole
+        # section is gated rather than each read, so once loaded the upload /
+        # withdraw / preview / comparison workflow is exactly as it was.
+        if not _section_load_gate(
+            _SS_DEMAND_SUMMARY_LOADED,
+            button_label="▶️ Load Demand Summary",
+            blurb="Reads the plan-history tracker and the published demand-plan "
+                  "CSVs from OneLake — loaded on request so the rest of the "
+                  "page stays fast.",
+            help_text="Loads this section's Fabric sources for the session.  "
+                      "Upload, withdraw, previews and the comparison behave "
+                      "normally once loaded.",
+        ):
             return
 
         # Withdraw sits FIRST — it is the undo for the uploader directly below,
@@ -5731,6 +5802,20 @@ def _render_demand_summary_aps() -> None:
                 "🔒 **Microsoft Fabric is not connected.**  Sign in via "
                 "**Home & Fabric Sign-in** in the sidebar, then return here."
             )
+            return
+
+        # Gated: this section reads the ≈1M-row APS history tracker plus the
+        # plan-to-site / customer-name dimensions, all of which loaded on every
+        # render while the expander was closed.
+        if not _section_load_gate(
+            _SS_APS_LOADED,
+            button_label="▶️ Load APS / Oracle demand plan",
+            blurb="Reads the APS history tracker and the customer / ship-to "
+                  "dimensions from OneLake — loaded on request so the rest of "
+                  "the page stays fast.",
+            help_text="Loads the APS history for this session.  Upload, "
+                      "review and comparison behave normally once loaded.",
+        ):
             return
 
         _render_aps_upload_manage()
@@ -10357,6 +10442,18 @@ def _render_velocity_analysis() -> None:
                 "ℹ️ Sign in via **Home & Fabric Sign-in** to load shipments."
             )
             return
+        # Gated: the body reads dbo.Shipments AND dbo.Orders (+ Products /
+        # Customers dims) — the page's heaviest pair of lakehouse reads, and
+        # they ran on every render even with this expander closed.
+        if not _section_load_gate(
+            _SS_VELOCITY_LOADED,
+            button_label="▶️ Load Velocity Analysis",
+            blurb="Reads `dbo.Shipments` and `dbo.Orders` from OneLake — "
+                  "loaded on request so the rest of the page stays fast.",
+            help_text="Loads shipments + orders for this session.  Filters "
+                      "inside the section behave normally once loaded.",
+        ):
+            return
         _render_velocity_analysis_body()
 
 
@@ -11367,13 +11464,18 @@ def render() -> None:
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
 
-    Sections 3-5 (plus Business Health and the APS summary) are each an
-    ``@st.fragment``.  Streamlit reruns the entire script on every widget
-    interaction, so without that isolation a single filter click anywhere on
-    this ~11k-line page re-executes every other section's Fabric reads and
-    rebuilds.  Fragmenting scopes an interaction to the section that raised it;
-    the handful of actions that genuinely need a whole-page refresh (a cache
-    flush after an upload or a withdraw) call ``st.rerun(scope="app")``.
+    Two mechanisms keep this page from re-doing everything on every click:
+
+    * **Fragments.**  Streamlit reruns the entire script per widget
+      interaction, so Business Health and the APS summary are each an
+      ``@st.fragment`` — an interaction inside one reruns only that section.
+      RO Comparison and Demand Summary are deliberately NOT fragments: they
+      already contain their own, and nesting made outer reruns invalidate the
+      inner fragment ids.  Actions that genuinely need a whole-page refresh (a
+      cache flush after an upload or a withdraw) call ``st.rerun(scope="app")``.
+    * **Lazy-load gates.**  A collapsed ``st.expander`` still EXECUTES its body,
+      so Velocity Analysis and the APS summary sit behind
+      :func:`_section_load_gate` and read Fabric only once asked.
     """
     apply_custom_css()
     st.markdown(

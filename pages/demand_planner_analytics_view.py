@@ -290,14 +290,6 @@ from data_sources.ro_summary_report import (
     summary_to_csv_bytes,
 )
 from data_sources import ro_pipeline_analytics as rpa
-from data_sources import shipments_velocity as vel
-from data_sources import orders_fill_rate as ofr
-from data_sources import iri_velocity as iri
-from data_sources import velocity_signals as vsig
-from data_sources import trade_spend as tsp
-from data_sources import demand_quality as dq
-from data_sources import ship_to_sites as sts
-from data_sources import customer_dims as cd
 from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
@@ -342,6 +334,7 @@ from data_sources.demand_plan_reconcile import (
 )
 from data_sources.fabric_lakehouse_io import LakehouseIOError
 from utils import fabric_signin_widget
+from utils.embed_helpers import render_embedded_resource, to_powerbi_embed_url
 from utils.ui_helpers import apply_custom_css
 
 
@@ -1770,7 +1763,7 @@ def _render_ro_comparison() -> None:
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning(
                 "🔒 **Microsoft Fabric is not connected.**\n\n"
-                "Please visit **Home & Fabric Sign-in** in the sidebar to "
+                "Please visit **Documentation** in the sidebar to "
                 "sign in.  Once signed in, return here — the RO Comparison "
                 "summary will load automatically."
             )
@@ -2016,7 +2009,7 @@ def _render_ro_item_master_download_button() -> None:
     """Render a red download button for ``RO_Item_Master.csv`` from Fabric."""
     if not fabric_signin_widget.is_fabric_signed_in():
         st.caption(
-            "_Sign in via **Home & Fabric Sign-in** to download "
+            "_Sign in via **Documentation** to download "
             "`RO_Item_Master.csv`._"
         )
         return
@@ -3871,7 +3864,7 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
         # Gate on sign-in like the other RO Fabric actions — the write would
         # otherwise only fail at click time.
         st.caption(
-            "_Sign in via **Home & Fabric Sign-in** to archive a snapshot._"
+            "_Sign in via **Documentation** to archive a snapshot._"
         )
     elif st.button("🔄 Refresh & archive snapshot to Fabric",
                    key="ro_wl_archive", use_container_width=True):
@@ -5553,7 +5546,7 @@ def _render_demand_summary() -> None:
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning(
                 "🔒 **Microsoft Fabric is not connected.**\n\n"
-                "Please visit **Home & Fabric Sign-in** in the sidebar to "
+                "Please visit **Documentation** in the sidebar to "
                 "sign in.  Once signed in, return here — the Demand Summary "
                 "tables will load automatically."
             )
@@ -5800,7 +5793,7 @@ def _render_demand_summary_aps() -> None:
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning(
                 "🔒 **Microsoft Fabric is not connected.**  Sign in via "
-                "**Home & Fabric Sign-in** in the sidebar, then return here."
+                "**Documentation** in the sidebar, then return here."
             )
             return
 
@@ -10318,1138 +10311,59 @@ def _maybe_autosave_ro_comparison_output(*, trigger: str) -> None:
     )
 
 
-# Per-Portfolio-Major hierarchical table + Full-Year chart.  The section is
-# available as soon as the underlying Fabric sources exist — there is **no**
-# Generate gate and **no** dependency on the Demand Summary load above.  The
-# planner picks four common date filters once, then each Portfolio Major
-# table gets its own (cascaded, multi-select) Supply Format / Brand picker.
-def _velocity_norm_desc(s: pd.Series) -> pd.Series:
-    """Normalise item descriptions for a robust join (strip · collapse spaces ·
-    casefold) so ``dbo.Shipments.PRODUCTDESC`` lines up with PDH's Item Description."""
-    return (s.astype(str).str.strip()
-            .str.replace(r"\s+", " ", regex=True).str.casefold())
-
-
-def _velocity_attach_portfolio_minor(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure a Portfolio Minor column on the shipments frame.
-
-    Uses the shipments table's own Portfolio Minor when present; otherwise
-    derives it from the **PDH reference by Product Description** — ``dbo.Shipments``
-    carries ``PRODUCTDESC`` (not an item number), so we match it to PDH's Item
-    Description with the same normalisation, then back-fill any residual misses
-    from an item column when one exists.  Best-effort: any PDH load/join failure
-    leaves the frame unchanged, so it never breaks the section.
-    """
-    if df is None or df.empty or vel.COL_PRODUCT_MINOR in df.columns:
-        return df
-    has_desc = vel.COL_PRODUCT_DESC in df.columns
-    has_item = vel.COL_ITEM in df.columns
-    if not (has_desc or has_item):
-        return df
-    try:
-        dim = build_item_dim_frame(_load_demand_comparison_pdh())
-    except Exception:  # noqa: BLE001 — best-effort; keep the section alive
-        return df
-    if dim is None or dim.empty or "pminor" not in dim.columns:
-        return df
-
-    out = df.copy()
-    minor = pd.Series(pd.NA, index=out.index, dtype="object")
-    # Primary: Product Description → PDH Item Description → Portfolio Minor.
-    if has_desc and "desc" in dim.columns:
-        desc_map = dict(zip(_velocity_norm_desc(dim["desc"]), dim["pminor"].astype(str)))
-        minor = _velocity_norm_desc(out[vel.COL_PRODUCT_DESC]).map(desc_map)
-    # Secondary: item-number join fills any rows the description didn't resolve.
-    if has_item:
-        item_map = dict(zip(dim["__item_key"], dim["pminor"].astype(str)))
-        item_minor = _vectorised_item_key(out[vel.COL_ITEM]).map(item_map)
-        blank = minor.isna() | (minor.astype(str).str.strip() == "")
-        minor = minor.where(~blank, item_minor)
-    out[vel.COL_PRODUCT_MINOR] = minor.fillna("").astype(str)
-    return out
-
-
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def _velocity_corp_lookup() -> dict:
-    """``party_site → corporate_group`` via the existing dim chain
-    (dp_dimshiptosites → dp_dimplantosites → dp_dimcustomernames).  Best-effort:
-    any dim read failure returns an empty map (the corp filter simply disables)."""
-    try:
-        party2corp, _cust2corp = build_corp_group_lookups(
-            sts.fetch_dimshiptosites_df(), sts.fetch_dp_dimplantosites_df(),
-            cd.fetch_dp_dimcustomernames_df())
-        return dict(party2corp)
-    except Exception:  # noqa: BLE001 — keep the section alive
-        return {}
-
-
-def _velocity_attach_corp_group(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach a Corporate Group column by resolving the ship-to (Party Site
-    Number) through :func:`_velocity_corp_lookup`.  Unmapped ship-tos stay blank
-    (no synthetic bucket) — the retained Customer filter still slices them."""
-    if df is None or df.empty or vel.COL_SHIP_TO not in df.columns:
-        return df
-    party2corp = _velocity_corp_lookup()
-    if not party2corp:
-        return df
-    out = df.copy()
-    out[vel.COL_CORP_GROUP] = (out[vel.COL_SHIP_TO].astype(str).str.strip()
-                               .map(party2corp).fillna(""))
-    return out
-
-
-def _velocity_item_scope(scoped_df: pd.DataFrame) -> Optional[set]:
-    """Normalised item keys behind the product-filtered shipment frame, via the
-    PDH description bridge (``dbo.Shipments`` has no SKU) — the scope that links
-    the promo overlay to the velocity filters.  ``None`` → no product filter /
-    unresolved (overlay uses all items)."""
-    if scoped_df is None or scoped_df.empty or vel.COL_PRODUCT_DESC not in scoped_df.columns:
-        return None
-    try:
-        pdh = _load_demand_comparison_pdh()
-    except Exception:  # noqa: BLE001
-        return None
-    if pdh is None or pdh.empty or "Item Description" not in pdh.columns \
-            or "Item No" not in pdh.columns:
-        return None
-    descs = set(_velocity_norm_desc(scoped_df[vel.COL_PRODUCT_DESC]).dropna())
-    if not descs:
-        return set()
-    match = _velocity_norm_desc(pdh["Item Description"]).isin(descs)
-    return {tsp.norm_item(x) for x in pdh.loc[match, "Item No"] if str(x).strip()}
+# ── Velocity Analysis (embedded Fabric report) ───────────────────────────────
+#
+# The section used to compute its own weekly velocity indices in-app from
+# ``dbo.Shipments`` + ``dbo.Orders`` + IRI — the page's two heaviest lakehouse
+# reads and ~1.1k lines of chart code.  It is now a single embedded Fabric
+# report: the same analysis, maintained where the semantic model lives, at
+# zero read cost to this page.
+_VELOCITY_REPORT_URL: str = (
+    "https://app.fabric.microsoft.com/groups/"
+    "41da47a8-8733-40a0-9764-826d9d7df90d/reports/"
+    "80cefdf7-9fe4-4f10-8231-6c7a66595a87/"
+    "270796e12490916b5002?experience=fabric-developer"
+)
 
 
 def _render_velocity_analysis() -> None:
-    """Foldable '(Archived) Velocity Analysis' section — ordered vs shipped lbs.
+    """Foldable 'Velocity Analysis' section — the embedded Fabric report.
 
-    A collapsed ``st.expander`` matching the other page sections, rendered LAST
-    on the page: the section is archived, not deleted, so the analysis stays
-    reachable without competing with the live sections for attention.  Reads
-    ``dbo.Shipments`` (OneLake) for the index charts, and ``dbo.Orders``
-    (+ Products/Customers dims) for the volume & fill-rate chart, which needs
-    the cancelled quantity that Shipments does not carry.  The interactive
-    body is fragment-isolated so filter changes rerun only this block.
+    Gated behind :func:`_section_load_gate` for the same reason the other
+    sections are: a collapsed ``st.expander`` still EXECUTES its body, so an
+    ungated ``components.iframe`` would mount — and make the browser fetch —
+    the whole report on every visit to this page, whether or not anyone opens
+    the section.  One click mounts it for the rest of the session.
     """
-    with st.expander("🗄️ (Archived) Velocity Analysis", expanded=False):
+    with st.expander("🚀 Velocity Analysis", expanded=False):
         st.caption(
-            "**Leading-signal view**: consumer **Sell-through (IRI)** vs our "
-            "**Demand** (orders) and **Supply** (shipments) velocity — all rebased "
-            "to an index (100 = a typical week) so a demand planner can see the "
-            "signal chain (shelf leads → orders follow → shipments lag) and get a "
-            "warning when they diverge.  A **Fill Rate** metric (shipped ÷ ordered) "
-            "tracks service.  Slice one **Week** window to watch the indices move."
+            "Consumer **sell-through** vs our **demand** (orders) and "
+            "**supply** (shipments) velocity, maintained in Fabric against "
+            "the live semantic model.  Opens interactive below — or use the "
+            "button to open it full-screen in Fabric."
         )
-        if not fabric_signin_widget.is_fabric_signed_in():
-            st.info(
-                "ℹ️ Sign in via **Home & Fabric Sign-in** to load shipments."
-            )
-            return
-        # Gated: the body reads dbo.Shipments AND dbo.Orders (+ Products /
-        # Customers dims) — the page's heaviest pair of lakehouse reads, and
-        # they ran on every render even with this expander closed.
         if not _section_load_gate(
             _SS_VELOCITY_LOADED,
-            button_label="▶️ Load Velocity Analysis",
-            blurb="Reads `dbo.Shipments` and `dbo.Orders` from OneLake — "
-                  "loaded on request so the rest of the page stays fast.",
-            help_text="Loads shipments + orders for this session.  Filters "
-                      "inside the section behave normally once loaded.",
+            button_label="▶️ Load Velocity Analysis report",
+            blurb="Embeds the live Fabric report — loaded on request so the "
+                  "rest of the page stays fast.",
+            help_text="Mounts the report frame for this session.  Filters "
+                      "and drill-downs inside the report behave normally.",
         ):
             return
-        _render_velocity_analysis_body()
-
-
-# Velocity index chart palette (all rebased to 100 = a typical week).
-_VEL_ST_COLOR: str = "#1f77b4"     # sell-through (IRI) — leads (solid, hero)
-_VEL_DEMAND_COLOR: str = "#e67e22"  # our orders — follows (dashed)
-_VEL_SUPPLY_COLOR: str = "#8e44ad"  # our shipments — lags (dotted)
-_VEL_SIGNAL_STYLE: dict[str, tuple[str, str]] = {
-    vsig.LEVEL_ALIGNED: ("#137d78", "#e8f5f3"),
-    vsig.LEVEL_WATCH:   ("#c05621", "#fdf1e7"),
-    vsig.LEVEL_ALERT:   ("#c0392b", "#fbeaea"),
-}
-
-
-def _velocity_merge(ship_weekly: pd.DataFrame, iri_weekly) -> pd.DataFrame:
-    """Outer-merge the shipment weekly (indexed) and IRI weekly (indexed) on
-    week_start → one full-history frame for the chart / signals."""
-    keep = [c for c in (vel.WEEK_START, vel.COL_ORDERED_LBS, vel.COL_SHIPPED_LBS,
-                        vel.DEMAND_INDEX, vel.SUPPLY_INDEX, vel.FILL_RATE)
-            if c in ship_weekly.columns]
-    ship = ship_weekly[keep].copy()
-    if iri_weekly is not None and not iri_weekly.empty:
-        irw = iri_weekly[[iri.WEEK_START, iri.SELL_THROUGH_INDEX]].rename(
-            columns={iri.WEEK_START: vel.WEEK_START})
-        merged = ship.merge(irw, on=vel.WEEK_START, how="outer")
-    else:
-        merged = ship
-        merged[iri.SELL_THROUGH_INDEX] = float("nan")
-    return merged.sort_values(vel.WEEK_START).reset_index(drop=True)
-
-
-# ── Cached builders — key on the (hashable) filter tuples so a change to ONE
-#    filter block never rebuilds the other side (e.g. an IRI-filter change no
-#    longer re-runs the ~500 ms shipment velocity).  All return NATIVE values
-#    (DataFrames / tuples), never a dataclass, to stay pickle-safe across the
-#    Streamlit file-watcher (same contract as the other cached fetchers). ──────
-_VEL_CACHE_TTL = 15 * 60
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_shipments_enriched() -> pd.DataFrame:
-    """`dbo.Shipments` + Portfolio-Minor + Corporate-Group attached, once."""
-    df = vel.fetch_shipments_df()
-    df = _velocity_attach_portfolio_minor(df)
-    df = _velocity_attach_corp_group(df)
-    return df
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_shipment_weekly(portfolios, minors, descs, customers, bus, formats,
-                            corps) -> pd.DataFrame:
-    """Full-history weekly shipment velocity (indexed) for the shipment filters."""
-    r = vel.build_weekly_velocity(
-        _cached_shipments_enriched(),
-        portfolios=list(portfolios) or None, product_minors=list(minors) or None,
-        product_descs=list(descs) or None, customers=list(customers) or None,
-        business_units=list(bus) or None, product_formats=list(formats) or None,
-        corporate_groups=list(corps) or None, date_range=None)
-    return r.weekly
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_orders_fill_enriched() -> pd.DataFrame:
-    """`dbo.Orders` (+ Products/Customers dims) with Corporate Group attached.
-
-    Corporate Group comes from the SAME ship-to lookup the shipment path uses
-    (`_velocity_attach_corp_group`), not from `dbo.Customers`' own column —
-    the section's Corporate Group dropdown is built from that lookup, so
-    borrowing it keeps the two vocabularies identical and the filter working.
-    """
-    return _velocity_attach_corp_group(ofr.fetch_orders_fill_df())
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_orders_fill_weekly(portfolios, minors, descs, customers, bus,
-                               formats, corps, week_lo, week_hi):
-    """Weekly order-book volume + fill rate for the current filter block.
-
-    Returns the plain tuple the chart needs rather than the dataclass, so the
-    cached value stays picklable across a module reload (same reasoning as
-    ``ibp_official._cached_fetch``).
-    """
-    r = ofr.build_weekly_fill_rate(
-        _cached_orders_fill_enriched(),
-        portfolios=list(portfolios) or None, product_minors=list(minors) or None,
-        product_descs=list(descs) or None, customers=list(customers) or None,
-        business_units=list(bus) or None, product_formats=list(formats) or None,
-        corporate_groups=list(corps) or None,
-        date_range=((week_lo, week_hi) if week_lo is not None else None))
-    return (r.weekly, r.total_ordered, r.total_original, r.total_shipped,
-            r.total_cut, r.completed_original, r.completed_shipped,
-            r.open_lines)
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_iri_weekly(geos, brands, subs, procs, sizes) -> pd.DataFrame:
-    """Full-history IRI sell-through weekly (indexed) for the IRI filters."""
-    raw, _ = iri.fetch_iri_df()
-    return iri.build_iri_weekly(
-        raw, geographies=list(geos) or None, brands=list(brands) or None,
-        subtypes=list(subs) or None, processes=list(procs) or None,
-        sizes=list(sizes) or None).weekly
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_iri_quality(geos, brands, subs, procs, sizes) -> pd.DataFrame:
-    """Full-history IRI base/incremental decomposition for the IRI filters."""
-    raw, _ = iri.fetch_iri_df()
-    return dq.build_iri_quality(
-        raw, geographies=list(geos) or None, brands=list(brands) or None,
-        subtypes=list(subs) or None, processes=list(procs) or None,
-        sizes=list(sizes) or None).weekly
-
-
-@st.cache_data(ttl=_VEL_CACHE_TTL, show_spinner=False)
-def _cached_promo(item_keys, corps, tactics, week_lo, week_hi):
-    """Promo bands for a scope → ``(bands, tactics, max_weight)`` (native)."""
-    pw = tsp.build_promo_windows(
-        tsp.fetch_trade_spend_df(),
-        item_keys=(set(item_keys) if item_keys is not None else None),
-        corporate_groups=list(corps) or None, tactics=list(tactics),
-        week_window=((week_lo, week_hi) if week_lo is not None else None))
-    return pw.bands, pw.tactics, pw.max_weight
-
-
-def _velocity_default_window(merged: pd.DataFrame) -> tuple:
-    """Default Week window = the overlap where BOTH sell-through and demand exist
-    (the tri-line comparison is meaningful there); else the full range."""
-    wk = merged[vel.WEEK_START].dt.date
-    _nan = pd.Series(float("nan"), index=merged.index)
-    both = merged[
-        merged.get(iri.SELL_THROUGH_INDEX, _nan).notna()
-        & merged.get(vel.DEMAND_INDEX, _nan).notna()]
-    if not both.empty:
-        w = both[vel.WEEK_START].dt.date
-        return w.min(), w.max()
-    return wk.min(), wk.max()
-
-
-def _render_velocity_signal(disp: pd.DataFrame) -> None:
-    """Traffic-light divergence banner + lead/lag readout above the chart."""
-    sig = vsig.divergence_signal(
-        disp.get(iri.SELL_THROUGH_INDEX), disp.get(vel.DEMAND_INDEX),
-        disp.get(vel.SUPPLY_INDEX), disp.get(vel.FILL_RATE))
-    fg, bg = _VEL_SIGNAL_STYLE.get(sig["level"], ("#374151", "#f3f4f6"))
-    lag, corr = vsig.cross_correlation_lag(
-        disp.get(iri.SELL_THROUGH_INDEX), disp.get(vel.DEMAND_INDEX))
-    lag_txt = (f"  Orders follow sell-through by ≈ <b>{lag} week{'s' if lag != 1 else ''}</b> "
-               f"(corr {corr:.2f})." if lag is not None else "")
-    st.markdown(
-        f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
-        f"border-radius:6px;font-size:0.95rem'>{sig['icon']} <b style='color:{fg}'>"
-        f"{_esc_html(sig['headline'])}</b><br><span style='color:#374151'>"
-        f"{_esc_html(sig['detail'])}{lag_txt}</span></div>",
-        unsafe_allow_html=True)
-
-
-def _vel_last(series: Optional[pd.Series]) -> Optional[float]:
-    if series is None:
-        return None
-    s = pd.to_numeric(series, errors="coerce").dropna()
-    return float(s.iloc[-1]) if not s.empty else None
-
-
-def _render_velocity_kpis(disp: pd.DataFrame) -> None:
-    """KPI tiles: window fill rate + latest index of each series + sell-in gap."""
-    o = float(pd.to_numeric(disp.get(vel.COL_ORDERED_LBS), errors="coerce").fillna(0).sum())
-    s = float(pd.to_numeric(disp.get(vel.COL_SHIPPED_LBS), errors="coerce").fillna(0).sum())
-    fill = (s / o) if o else None
-    st_last = _vel_last(disp.get(iri.SELL_THROUGH_INDEX))
-    dem_last = _vel_last(disp.get(vel.DEMAND_INDEX))
-    sup_last = _vel_last(disp.get(vel.SUPPLY_INDEX))
-
-    def _idx(v):
-        # Each index is vs its OWN normal (100) — comparable within a series only.
-        return f"{v:.0f}" if v is not None else "—"
-    tiles = [
-        ("Fill Rate", f"{fill * 100:.1f}%" if fill is not None else "—", "shipped ÷ ordered (window)"),
-        ("Sell-through idx", _idx(st_last), "latest · 100 = its own normal"),
-        ("Demand idx", _idx(dem_last), "latest · 100 = its own normal"),
-        ("Supply idx", _idx(sup_last), "latest · 100 = its own normal"),
-    ]
-    cards = "".join(
-        f'<div class="dpc-kpi dpc-kpi--walk"><div class="k-label">{_esc_html(t)}</div>'
-        f'<div class="k-value">{_esc_html(v)}</div><span class="k-sub">{_esc_html(sub)}</span></div>'
-        for t, v, sub in tiles)
-    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
-
-
-def _render_promo_shading(fig: "go.Figure", disp: pd.DataFrame, promo) -> None:
-    """Shade consumer-promo weeks: one ``vrect`` per active week, colour = the
-    dominant tactic, opacity ∝ # SKUs on promo — plus a tactic legend and a
-    hover marker per week carrying the so-what (SKUs, spend, volume, corps)."""
-    if promo is None or getattr(promo, "bands", None) is None or promo.bands.empty:
-        return
-    bands = promo.bands
-    mx = float(promo.max_weight) or 1.0
-    for r in bands.itertuples(index=False):
-        op = min(0.10 + 0.24 * (r.weight / mx), 0.42)   # graded, capped
-        fig.add_vrect(x0=r.x0, x1=r.x1, fillcolor=r.color, opacity=op,
-                      line_width=0, layer="below")
-    # Legend proxy (one square per dominant tactic present).  Use a REAL date x
-    # with a null y (no point plots) so Plotly still infers the date x-axis —
-    # an all-None first trace makes it mis-type the axis and drop every trace.
-    x_anchor = disp[vel.WEEK_START].iloc[0] if not disp.empty else None
-    for t in promo.tactics:
-        fig.add_scatter(x=[x_anchor], y=[None], mode="markers", name=f"Promo · {t}",
-                        marker=dict(size=11, symbol="square", opacity=0.55,
-                                    color=tsp.TACTIC_COLORS.get(t, "#8e8e8e")),
-                        legendgroup="promo", hoverinfo="skip", showlegend=True)
-    # Hover markers at the top of each promo week (the actionable detail).
-    idx_cols = [iri.SELL_THROUGH_INDEX, vel.DEMAND_INDEX, vel.SUPPLY_INDEX]
-    tops = [pd.to_numeric(disp[c], errors="coerce").max()
-            for c in idx_cols if c in disp.columns]
-    ytop = max([float(v) for v in tops if pd.notna(v)] + [120.0])
-    htext = [
-        f"<b>Promo · week of {pd.Timestamp(w):%b %d, %Y}</b><br>"
-        f"Dominant: {t}<br>Active: {_esc_html(a)}<br>"
-        f"SKUs on promo: {int(n)}<br>Spend ${s:,.0f} · Vol {v:,.0f} lbs<br>"
-        f"{_esc_html(cs)}" + (f"<br><i>{_esc_html(d)}</i>" if d else "")
-        for w, t, a, n, s, v, cs, d in zip(
-            bands["week_start"], bands["tactic"], bands["tactics_active"],
-            bands["total_skus"], bands["spend"], bands["volume"],
-            bands["corps"], bands["descs"])]
-    fig.add_scatter(
-        x=list(bands["week_start"]), y=[ytop] * len(bands), mode="markers",
-        marker=dict(size=9, symbol="triangle-down", color="#555", opacity=0.5),
-        name="Promo detail", hovertext=htext, hoverinfo="text", showlegend=False)
-
-
-_VELOCITY_METHOD_MD = (
-    "- **Formula** — each series is rebased: `index = velocity ÷ baseline × 100`, "
-    "where **baseline = MEDIAN velocity over weeks with activity (full history)**, "
-    "so the index reads *vs a typical week* and the Week slider only zooms.\n"
-    "- **Series** — **Sell-through (IRI)** = Σ Units ÷ Σ stores selling (consumer POS, "
-    "*leads*); **Demand** = our order lbs ÷ distinct ship-to (*follows*); **Supply** = "
-    "our shipped lbs ÷ distinct ship-to (*lags*).  Only shape/timing compares across "
-    "series, never levels.\n"
-    "- **Promo shading** — weeks with a consumer promo (`dp_fy_*_actual_trade_spend`), "
-    "colour = dominant tactic, depth ∝ # SKUs on promo (scope = filtered SKUs via "
-    "`item_number`→PDH + Corporate Group).\n"
-    "- **Source** — IRI POS file + `dbo.Shipments`; reacts to the shipment **and** IRI "
-    "filters + the Week window."
-)
-
-
-def _render_velocity_chart(disp: pd.DataFrame, promo=None, iri_file: str = "") -> None:
-    """Hero chart: signal banner → KPIs → methodology → the three velocity index
-    lines + shaded consumer-promo windows (colour = dominant tactic, depth = SKUs)."""
-    st.markdown("#### 📈 Velocity Index — leading signal (shelf → orders → shipments)")
-    _render_velocity_signal(disp)                         # banner
-    _render_velocity_kpis(disp)                           # metrics
-    _chart_method(_VELOCITY_METHOD_MD                     # explanation
-                  + (f"\n- **IRI file** — `{iri_file}`." if iri_file else ""))
-    weeks = list(disp[vel.WEEK_START])
-    index_specs = [
-        ("Sell-through (IRI) Velocity", iri.SELL_THROUGH_INDEX, _VEL_ST_COLOR, "solid", 3.0),
-        ("Demand Velocity", vel.DEMAND_INDEX, _VEL_DEMAND_COLOR, "dash", 2.5),
-        ("Supply Velocity", vel.SUPPLY_INDEX, _VEL_SUPPLY_COLOR, "dot", 2.5),
-    ]
-    present = [s for s in index_specs if s[1] in disp.columns and disp[s[1]].notna().any()]
-    if not present:
-        st.info("No indexed series in the selected window.")
-        return
-    names = [s[0] for s in present]
-    shown = st.multiselect("Show index lines", options=names, default=names,
-                           key="velocity_show_lines")
-    if not shown:
-        st.info("Pick at least one line.")
-        return
-
-    fig = go.Figure()
-    _render_promo_shading(fig, disp, promo)
-    for name, col, color, dash, width in present:
-        if name not in shown:
-            continue
-        fig.add_scatter(
-            x=weeks, y=disp[col], name=name, mode="lines+markers", yaxis="y",
-            line=dict(color=color, dash=dash, width=width),
-            marker=dict(color=color, size=6),
-            hovertemplate=f"{name}: %{{y:.0f}}<br>week of %{{x|%Y-%m-%d}}<extra></extra>")
-    fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
-    fig.update_layout(
-        height=420, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=18),
-        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
-                   tickvals=weeks, tickformat="%b %d", tickangle=-45,
-                   showgrid=True, gridcolor="#eeeeee"),
-        yaxis=dict(title=dict(text="Velocity index (100 = typical week)"),
-                   showgrid=True, gridcolor="#eeeeee"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        plot_bgcolor="white",
-    )
-    st.plotly_chart(fig, use_container_width=True, key="velocity_chart")
-    if promo is not None and not promo.bands.empty:
-        st.caption(
-            "🎯 Shaded bands = weeks with a consumer promo for the filtered SKUs / "
-            "corporate group.  Hover a ▾ for tactics, spend, promo volume and accounts.  "
-            "Our order velocity typically **leads** the on-shelf window.")
-
-
-def _render_volume_chart(selections: dict, week_range: tuple) -> None:
-    """Dedicated absolute-volume chart (title → banner → KPIs → method → chart):
-    weekly Ordered vs Shipped lbs + Fill Rate — the raw pounds a planner ships.
-
-    Reads the Oracle order book (``dbo.Orders`` + Products/Customers dims) via
-    :mod:`data_sources.orders_fill_rate`, NOT ``dbo.Shipments`` like the rest
-    of the section.  Shipments only holds lines that shipped, so it cannot
-    show a cut — its fill rate is structurally ~99%.  The order book keeps the
-    original ordered quantity next to the cancelled and shipped quantities, so
-    a line that was ordered and then killed lands in the denominator where it
-    belongs.
-
-    Takes the raw filter selections + the Week window rather than the merged
-    shipment frame, because it has to filter its own source.
-    """
-    st.markdown("#### 📦 Weekly Ordered vs Shipped lbs — our volume & fill rate")
-
-    def _tup(col):
-        return tuple(sorted(selections.get(col) or ()))
-
-    try:
-        (weekly, t_ord, t_orig, t_shp, t_cut, done_orig, done_shp,
-         open_lines) = _cached_orders_fill_weekly(
-            _tup(vel.COL_PORTFOLIO), _tup(vel.COL_PRODUCT_MINOR),
-            _tup(vel.COL_PRODUCT_DESC), _tup(vel.COL_CUSTOMER),
-            _tup(vel.COL_BUSINESS_UNIT), _tup(vel.COL_PRODUCT_FORMAT),
-            _tup(vel.COL_CORP_GROUP), week_range[0], week_range[1])
-    except ofr.OrdersFillRateError as exc:
-        st.error(f"❌ Could not load `dbo.Orders`.\n\n{exc}")
-        return
-    if weekly is None or weekly.empty:
-        st.info("No order lines match the current filters in this window.")
-        return
-
-    weeks = list(weekly[vel.WEEK_START])
-    o = pd.to_numeric(weekly[ofr.COL_ORDERED_LBS], errors="coerce")
-    s = pd.to_numeric(weekly[ofr.COL_SHIPPED_LBS], errors="coerce")
-    # Fill rate is measured on COMPLETED lines only, against the ORIGINAL
-    # ordered quantity — so a cut counts as a miss, and a week whose lines
-    # simply have not shipped yet keeps its true volume in the bars without
-    # dragging the ratio down.
-    fillw = (done_shp / done_orig) if done_orig else None
-    cut_rate = (t_cut / t_orig) if t_orig else None
-
-    if fillw is not None:
-        lvl = "aligned" if fillw >= 0.99 else ("watch" if fillw >= 0.95 else "alert")
-        head = ("Orders and shipments are matched." if fillw >= 0.99
-                else "Shipments are running below orders — a service gap.")
-        detail = (f"Window fill rate {fillw * 100:.1f}% (shipped "
-                  f"{done_shp:,.0f} ÷ originally ordered {done_orig:,.0f} lbs "
-                  f"on completed lines).")
-        if t_cut > 0:
-            detail += (f"  {t_cut:,.0f} lbs were cut after ordering"
-                       + (f" ({cut_rate * 100:.1f}% of demand)."
-                          if cut_rate else "."))
-        _dq_banner({"level": lvl, "headline": head, "detail": detail,
-                    "drill_in": ""})
-
-    _dq_kpis([
-        ("Ordered (window)", f"{t_ord:,.0f} lbs", "net of cuts · displayed weeks"),
-        ("Shipped (window)", f"{t_shp:,.0f} lbs", "sum of the displayed weeks"),
-        ("Cut after ordering", f"{t_cut:,.0f} lbs",
-         f"{cut_rate * 100:.1f}% of original demand" if cut_rate is not None
-         else "cancelled on surviving lines"),
-        ("Fill rate", f"{fillw * 100:.1f}%" if fillw is not None else "—",
-         "shipped ÷ original ordered"),
-        ("Open lines", f"{open_lines:,}", "not yet shipped · excluded from fill"),
-    ])
-    _chart_method(
-        "- **Formula** — Fill rate = Σ Shipped lbs ÷ Σ **Original** Ordered lbs, "
-        "so pounds that were ordered and then cancelled count as a miss.  "
-        "`dbo.Shipments` cannot show this: it only holds lines that shipped, "
-        "which is why the old version of this chart sat near 99%.\n"
-        "- **Completed lines only** — a line enters the fill-rate ratio once it "
-        f"reaches {', '.join(sorted(ofr.COMPLETED_LINE_STATUSES))}.  Lines still "
-        "in flight stay in the volume bars but are left out of the ratio, so the "
-        "newest weeks aren't punished for simply not having shipped yet "
-        "(see the *Open lines* tile).\n"
-        "- **Scope** — sales-order lines (`Line Type Code` = ORA_BUY, "
-        "`Category Code` = ORDER), net of fully-cancelled lines: returns, "
-        "credit-only and bill-only lines are excluded so they can't net "
-        "against real demand.  **Partial** cuts on surviving lines are kept — "
-        "they are the point.\n"
-        "- **Ordered bar** — `Ordered Quantity Pounds` (already net of "
-        "cancellations); the gap to the original demand is the *Cut* tile.\n"
-        "- **Method** — weekly sums on the Monday-anchored grid; reacts to the "
-        "same filters (Business Unit … Customer, Corporate Group) + the Week "
-        "window as the rest of the section.\n"
-        "- **Source** — `dbo.Orders` (`Original Ordered` / `Canceled` / "
-        "`Ordered` / `Shipped Quantity Pounds`), joined to `dbo.Products` on "
-        "Inventory Item ID for the product dimensions and to `dbo.Customers` "
-        "on Party Site ID for the customer.  Both dimensions are deduplicated "
-        "to one row per key before joining, and the join is checked for "
-        "fan-out.\n"
-        "- **Chart** — grouped bars (ordered vs shipped) + a fill-rate line on "
-        "the right axis.")
-
-    fill = pd.to_numeric(weekly[ofr.FILL_RATE_GROSS], errors="coerce") * 100.0
-    cut = pd.to_numeric(weekly[ofr.COL_CANCELED_LBS], errors="coerce")
-    fig = go.Figure()
-    fig.add_bar(x=weeks, y=o, name="Ordered lbs", marker=dict(color="#e67e22"),
-                hovertemplate="Ordered: %{y:,.0f} lbs<extra></extra>")
-    fig.add_bar(x=weeks, y=s, name="Shipped lbs", marker=dict(color="#137d78"),
-                hovertemplate="Shipped: %{y:,.0f} lbs<extra></extra>")
-    if float(cut.fillna(0).sum()) > 0:
-        fig.add_bar(x=weeks, y=cut, name="Cut lbs", marker=dict(color="#8e44ad"),
-                    hovertemplate="Cut after ordering: %{y:,.0f} lbs<extra></extra>")
-    fig.add_scatter(x=weeks, y=fill, name="Fill rate %", yaxis="y2", mode="lines+markers",
-                    line=dict(color="#c0392b", width=2), marker=dict(size=5),
-                    connectgaps=False,
-                    hovertemplate="Fill: %{y:.1f}%<extra></extra>")
-    fig.update_layout(
-        height=360, margin=dict(l=10, r=10, t=40, b=10), barmode="group", bargap=0.2,
-        font=dict(color=_BH_FONT_COLOR, size=18),
-        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array",
-                   tickvals=weeks, tickformat="%b %d", tickangle=-45, showgrid=False),
-        yaxis=dict(title=dict(text="Lbs"), showgrid=True, gridcolor="#eeeeee",
-                   rangemode="tozero"),
-        yaxis2=dict(title=dict(text="Fill %"), overlaying="y", side="right",
-                    range=[0, 110], showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white",
-    )
-    st.plotly_chart(fig, use_container_width=True, key="velocity_volume_chart")
-
-
-# ── Demand Quality & Base Erosion (three MECE charts) ────────────────────────
-
-def _dq_kpis(tiles) -> None:
-    cards = "".join(
-        f'<div class="dpc-kpi dpc-kpi--walk"><div class="k-label">{_esc_html(t)}</div>'
-        f'<div class="k-value">{_esc_html(v)}</div><span class="k-sub">{_esc_html(sub)}</span></div>'
-        for t, v, sub in tiles)
-    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
-
-
-def _dq_banner(sig: dict) -> None:
-    """Assumption banner (traffic light) + a markdown drill-in caption."""
-    fg, bg = _VEL_SIGNAL_STYLE.get(sig.get("level"), ("#374151", "#f3f4f6"))
-    icon = {"alert": "🔴", "watch": "🟠", "aligned": "🟢"}.get(sig.get("level"), "⚪")
-    st.markdown(
-        f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
-        f"border-radius:6px;font-size:0.95rem'>{icon} <b style='color:{fg}'>"
-        f"{_esc_html(sig.get('headline', ''))}</b><br><span style='color:#374151'>"
-        f"{_esc_html(sig.get('detail', ''))}</span></div>", unsafe_allow_html=True)
-    if sig.get("drill_in"):
-        st.caption(f"🔎 **Drill-in to solidify:** {sig['drill_in']}")
-
-
-def _chart_method(md: str) -> None:
-    """Collapsed 'how this chart is built' block — formula, method, source."""
-    with st.expander("ℹ️ Formula · methodology · data source", expanded=False):
-        st.markdown(md)
-
-
-def _render_base_health(qd: pd.DataFrame) -> None:
-    """① Base vs Total velocity — is the base eroding beneath the promos?"""
-    st.markdown("#### ① Base Demand Health — is the base eroding under the promos?")
-    sig = dq.base_erosion_signal(qd)
-    _dq_banner(sig)                                       # banner
-    sl = sig.get("base_slope")
-    trend = ("—" if sl is None else f"{sl:+.1f}/wk" + ("" if sig.get("significant") else " (n.s.)"))
-    dist_last = _vel_last(qd.get(dq.DIST_INDEX))
-    base_u = _vel_last(qd.get(dq.BASE_UNITS))
-    _dq_kpis([                                            # metrics
-        ("Base index", f"{sig.get('base_last'):.0f}" if sig.get("base_last") is not None else "—",
-         "latest · everyday demand"),
-        ("Distribution idx", f"{dist_last:.0f}" if dist_last is not None else "—",
-         "stores selling · vs normal"),
-        ("Base trend", trend, "OLS slope, last 13 wks"),
-        ("Base units", f"{base_u:,.0f}" if base_u is not None else "—", "latest week (absolute)"),
-    ])
-    _chart_method(                                        # explanation
-        "- **Formula** — Base velocity = Σ **Base Units** ÷ Σ stores selling "
-        "(distribution-neutral, indexed ÷ its own full-history median × 100).  "
-        "**Distribution** = Σ stores selling, indexed the same way.  "
-        "Base **volume** ≈ base velocity × stores, so a base decline is split by "
-        "shift-share into **rate-of-sale** (velocity) vs **distribution** (stores).\n"
-        "- **Trend** — OLS slope over the last 13 wks with a significance test "
-        "(‘n.s.’ = not statistically distinguishable from flat, so don't over-react).\n"
-        "- **Read** — base *below* total = promo cushion (shaded); base sliding while "
-        "total holds = promo-masked erosion; falling distribution vs falling velocity "
-        "tells you *why*.\n"
-        "- **Source** — IRI POS `Base Units`, `U Sales`, `Units per Store Selling`; "
-        "reacts to the **IRI** filters + Week window.")
-    x = list(qd[iri.WEEK_START])                          # chart
-    fig = go.Figure()
-    fig.add_scatter(x=x, y=qd[dq.TOTAL_INDEX], name="Total velocity", mode="lines",
-                    line=dict(color="#9ca3af", width=1.5),
-                    hovertemplate="Total: %{y:.0f}<extra></extra>")
-    fig.add_scatter(x=x, y=qd[dq.BASE_INDEX], name="Base velocity (everyday)",
-                    mode="lines+markers", line=dict(color="#1f77b4", width=3),
-                    marker=dict(size=5), fill="tonexty", fillcolor="rgba(244,180,0,0.14)",
-                    hovertemplate="Base: %{y:.0f}<extra></extra>")
-    if dq.DIST_INDEX in qd.columns and qd[dq.DIST_INDEX].notna().any():
-        fig.add_scatter(x=x, y=qd[dq.DIST_INDEX], name="Distribution (stores)", mode="lines",
-                        line=dict(color="#2ca02c", dash="dot", width=2),
-                        hovertemplate="Distribution: %{y:.0f}<extra></extra>")
-    fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
-    fig.update_layout(
-        height=340, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=18),
-        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array", tickvals=x,
-                   tickformat="%b %d", tickangle=-45, showgrid=False),
-        yaxis=dict(title=dict(text="Velocity index (100 = normal)"),
-                   showgrid=True, gridcolor="#eeeeee"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
-    st.plotly_chart(fig, use_container_width=True, key="dq_base_chart")
-
-
-def _render_promo_economics(qd: pd.DataFrame) -> None:
-    """② Promo dependency, price give-up and efficiency."""
-    st.markdown("#### ② Promo Economics — renting volume, and is it still efficient?")
-    sig = dq.promo_economics_signal(qd)
-    _dq_banner(sig)                                       # banner
-    et = sig.get("eff_trend")
-    _dq_kpis([                                            # metrics
-        ("Recent lift %", f"{sig.get('lift_recent'):.0f}%" if sig.get("lift_recent") is not None else "—",
-         "incremental ÷ base"),
-        ("Discount depth", f"{sig.get('depth_recent'):.0f}%" if sig.get("depth_recent") is not None else "—",
-         "base price vs realised"),
-        ("Promo efficiency", "n/a" if et is None else ("falling" if et < 0 else "steady/rising"),
-         "lift per ACV point, trend"),
-    ])
-    _chart_method(                                        # explanation
-        "- **Formula** — Lift % = Σ Incremental ÷ Σ Base; Discount depth = (base price − "
-        "realised price) ÷ base price; Efficiency = Lift % ÷ ACV feature/display "
-        "(only where ACV ≥ 2%, else it explodes near zero).\n"
-        "- **Read** — rising lift = more promo-dependent; deeper depth for the same lift "
-        "= paying more per point; falling efficiency = promo fatigue.\n"
-        "- **Source** — IRI POS `Incremental/Base Units`, `$ Sales`, `Base Price`, "
-        "`ACV Feature and/or Display`; reacts to the **IRI** filters + Week window.\n"
-        "- **Chart** — Lift % area + Discount depth + ACV lines (all %).")
-    x = list(qd[iri.WEEK_START])                          # chart
-    fig = go.Figure()
-    fig.add_scatter(x=x, y=qd[dq.LIFT_PCT], name="Lift % (promo dependency)", mode="lines",
-                    fill="tozeroy", line=dict(color="#f4b400", width=2),
-                    fillcolor="rgba(244,180,0,0.15)",
-                    hovertemplate="Lift: %{y:.0f}%<extra></extra>")
-    fig.add_scatter(x=x, y=qd[dq.DEPTH_PCT], name="Discount depth %", mode="lines",
-                    line=dict(color="#c0392b", dash="dash", width=2),
-                    hovertemplate="Depth: %{y:.1f}%<extra></extra>")
-    fig.add_scatter(x=x, y=qd[dq.ACV], name="ACV feature/display %", mode="lines",
-                    line=dict(color="#2ca02c", dash="dot", width=2),
-                    hovertemplate="ACV: %{y:.1f}%<extra></extra>")
-    fig.update_layout(
-        height=340, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=18),
-        xaxis=dict(title=dict(text="Week"), type="date", tickmode="array", tickvals=x,
-                   tickformat="%b %d", tickangle=-45, showgrid=False),
-        yaxis=dict(title=dict(text="%"), showgrid=True, gridcolor="#eeeeee",
-                   rangemode="tozero"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
-    st.plotly_chart(fig, use_container_width=True, key="dq_promo_chart")
-
-    # Drill-in: depth → lift response curve (diminishing returns).
-    rc = dq.promo_response_curve(qd)
-    if rc.get("available"):
-        r2 = rc.get("r2")
-        st.caption(
-            f"🔎 **Depth → lift response** — marginal ≈ **{rc['marginal']:.1f} lift‑pts "
-            f"per point of discount depth**"
-            + (f" (R²={r2:.2f})" if r2 is not None else "")
-            + f" across {rc['n']} promoted weeks.  A flat/negative slope means deeper "
-            "cuts aren't buying proportional lift (diminishing returns / fatigue).")
-        fig2 = go.Figure()
-        fig2.add_scatter(x=rc["depth"], y=rc["lift"], mode="markers", name="promoted weeks",
-                         marker=dict(size=7, color="#f4b400", opacity=0.6),
-                         hovertemplate="depth %{x:.1f}% → lift %{y:.0f}%<extra></extra>")
-        fig2.add_scatter(x=rc["fit_x"], y=rc["fit_y"], mode="lines", name="fit",
-                         line=dict(color="#c0392b", width=2))
-        fig2.update_layout(
-            height=300, margin=dict(l=10, r=10, t=20, b=10),
-            font=dict(color=_BH_FONT_COLOR, size=18),
-            xaxis=dict(title=dict(text="Discount depth %"), showgrid=True, gridcolor="#eeeeee"),
-            yaxis=dict(title=dict(text="Lift %"), showgrid=True, gridcolor="#eeeeee",
-                       rangemode="tozero"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
-        st.plotly_chart(fig2, use_container_width=True, key="dq_response_chart")
-
-
-def _render_promo_cohort(cohort) -> None:
-    """③ Event-study around our promo onsets — build vs borrow."""
-    st.markdown("#### ③ Promo Cohort — do promos build demand or borrow it?")
-    _dq_banner(dq.promo_cohort_signal(cohort))            # banner
-    if cohort is None or cohort.curve is None or cohort.curve.empty:
-        return
-    su = cohort.summary
-    shift, pull = su.get("base_shift_pct"), su.get("pull_forward_ratio")
-    _dq_kpis([                                            # metrics
-        ("Promo onsets", f"{cohort.n_events}", "clean starts averaged"),
-        ("Base shift", f"{shift:+.0f} pts" if pd.notna(shift) else "—", "post vs pre-promo base"),
-        ("Pull-forward", f"{pull * 100:.0f}%" if pd.notna(pull) else "—", "of lift given back after"),
-    ])
-    _chart_method(                                        # explanation
-        "- **Method** — event study: each **promo onset** (a fresh start on our "
-        "`dp_fy_*_actual_trade_spend` calendar) is aligned to event-time (weeks −4…+6) "
-        "and the IRI base/total velocity is averaged across onsets.\n"
-        "- **Read** — a post-promo trough below the pre-promo baseline = **borrowing** "
-        "(pull-forward); base settling above baseline = **building** (recruitment).\n"
-        "- **Metrics** — Base shift = post − pre base; Pull-forward = post deficit ÷ "
-        "in-promo lift.  Needs ≥3 clean onsets, else it says so.\n"
-        "- **Source** — trade-spend onsets (our items/corp) + IRI velocity; window-"
-        "independent (uses every onset in history).")
-    c = cohort.curve                                      # chart
-    fig = go.Figure()
-    fig.add_vrect(x0=-0.5, x1=2.5, fillcolor="rgba(244,180,0,0.10)", line_width=0,
-                  layer="below", annotation_text="in-promo", annotation_position="top left")
-    fig.add_scatter(x=c["offset"], y=c["total_mean"], name="Total velocity",
-                    mode="lines+markers", line=dict(color="#9ca3af", width=2))
-    fig.add_scatter(x=c["offset"], y=c["base_mean"], name="Base velocity",
-                    mode="lines+markers", line=dict(color="#1f77b4", width=3))
-    pre = cohort.summary.get("tot_pre")
-    if pre is not None and pd.notna(pre):
-        fig.add_hline(y=float(pre), line=dict(color="#9ca3af", dash="dash", width=1),
-                      annotation_text="pre-promo baseline", annotation_position="bottom right")
-    fig.add_vline(x=0, line=dict(color="#f4b400", width=2))
-    fig.update_layout(
-        height=340, margin=dict(l=10, r=10, t=30, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=18),
-        xaxis=dict(title=dict(text="Weeks relative to promo start"), tickmode="array",
-                   tickvals=list(c["offset"]), showgrid=True, gridcolor="#eeeeee"),
-        yaxis=dict(title=dict(text="Velocity index (100 = normal)"),
-                   showgrid=True, gridcolor="#eeeeee"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0), plot_bgcolor="white")
-    st.plotly_chart(fig, use_container_width=True, key="dq_cohort_chart")
-
-
-def _render_demand_quality(quality_weekly, cohort, week_range: tuple) -> None:
-    """Delineated section: base vs promo decomposition — three MECE reads."""
-    if quality_weekly is None or quality_weekly.empty:
-        return
-    st.markdown("### 🔬 Demand Quality & Base Erosion")
-    st.caption(
-        "Splits the Sell-through line into **BASE** (everyday, full-price) vs "
-        "**PROMO** (incremental) demand — three MECE reads: ① is the base eroding, "
-        "② is the promo worth it, ③ do promos build or borrow.  Each banner states "
-        "an **assumption** to act on, plus a **drill-in** to confirm it.")
-    qd = quality_weekly[quality_weekly[iri.WEEK_START].dt.date.between(*week_range)].reset_index(drop=True)
-    if qd.empty:
-        st.info("No IRI quality weeks in the selected range.")
-        return
-    if len(qd) < 8:
-        st.warning(
-            f"⚠️ Only {len(qd)} IRI weeks in view — reads here can be noisy.  Widen the "
-            "Week window or loosen the IRI filters before acting on the trends.")
-    _render_base_health(qd)
-    _render_promo_economics(qd)
-    _render_promo_cohort(cohort)
-
-
-# Mix-shift palette (segments); size uses the first four = small→large like the
-# stacked-area convention (single-serve → half-gallon).
-_VEL_MIX_PALETTE: tuple[str, ...] = (
-    "#1f77b4", "#2ca02c", "#f5a623", "#e0523d", "#8e44ad", "#17becf", "#7f7f7f",
-)
-
-
-def _hex_rgba(hex_color: str, alpha: float) -> str:
-    h = hex_color.lstrip("#")
-    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-    return f"rgba({r},{g},{b},{alpha})"
-
-
-@st.fragment
-def _render_velocity_mix(iri_raw: pd.DataFrame, iri_sel: dict, week_range: tuple) -> None:
-    """Second chart: consumer MIX SHIFT (pack size / brand / subtype) — is the
-    shopper's basket composition moving?  100%-stacked share (or indexed share)
-    + adaptive KPIs + an auto so-what, reactive to the same Week window.
-
-    Its own fragment so the lens / view toggles rerun ONLY this chart (~100 ms
-    mix rebuild) instead of the whole section (which re-does the ~500 ms
-    shipment-velocity rebuild).  The Week slider and IRI filters live in the
-    parent, so changing them still reruns the parent and re-calls this with
-    fresh args — both charts stay in sync."""
-    st.markdown("#### 🧺 Consumer Mix Shift — are shoppers trading down or switching away?")
-    st.caption(
-        "Base health tells you *how much* everyday demand you have; this tells you "
-        "*where it's going* — smaller packs (affordability), premium→regular "
-        "(de-premiumising) or your brand→a competitor (share loss).  Unit shares "
-        "from the IRI POS file (same filters); top segments shown, the tail rolled "
-        "into **Other**.  **Brand** spans the whole category, so it ignores the IRI "
-        "Brand filter.  Filter the IRI block to a product family for the sharpest read.")
-
-    labels = [lab for _, lab in iri.MIX_DIMENSIONS]
-    key_by_label = {lab: k for k, lab in iri.MIX_DIMENSIONS}
-    c_dim, c_view = st.columns([1.2, 1])
-    with c_dim:
-        dim_label = st.radio("Mix lens", options=labels, horizontal=True,
-                             key="velocity_mix_dim")
-    with c_view:
-        view = st.radio("View", options=["Share mix (100% stacked)",
-                                          "Indexed share (base = 100)"],
-                        horizontal=True, key="velocity_mix_view")
-
-    mix = iri.build_iri_mix(
-        iri_raw, key_by_label[dim_label],
-        geographies=iri_sel.get(iri.COL_GEOGRAPHY) or None,
-        brands=iri_sel.get(iri.COL_BRAND) or None,
-        subtypes=iri_sel.get(iri.COL_SUBTYPE) or None,
-        processes=iri_sel.get(iri.COL_PROCESS) or None,
-        sizes=iri_sel.get(iri.COL_SIZE) or None,
-    )
-    if key_by_label[dim_label] == iri.MIX_BRAND:
-        st.caption("ℹ️ Brand lens = share of the **whole category**, so the IRI "
-                   "**Major Brand** filter is intentionally ignored here (a brand's "
-                   "share of itself is 100%).  All other IRI filters + the Week "
-                   "window still apply.")
-    if mix.weekly.empty or not mix.segments:
-        st.info("No IRI rows match the current filters for this mix lens.")
-        return
-    dm = mix.weekly[mix.weekly[iri.WEEK_START].dt.date.between(*week_range)].reset_index(drop=True)
-    if dm.empty:
-        st.info("No IRI weeks in the selected range.")
-        return
-
-    summ = iri.summarize_iri_mix(dm, mix)
-
-    # ── Auto so-what banner ─────────────────────────────────────────────────
-    if summ.get("available"):
-        fg, bg = _VEL_SIGNAL_STYLE.get(summ["level"], ("#374151", "#f3f4f6"))
-        icon = "🟠" if summ["level"] == vsig.LEVEL_WATCH else "🟢"
-        (gn, gd), (ln, ld) = summ["gainer"], summ["loser"]
-        movers = (f"  Biggest gainer <b>{_esc_html(gn)}</b> ({gd:+.1f} pp), "
-                  f"biggest loser <b>{_esc_html(ln)}</b> ({ld:+.1f} pp).")
-        st.markdown(
-            f"<div style='background:{bg};border-left:5px solid {fg};padding:10px 14px;"
-            f"border-radius:6px;font-size:0.95rem'>{icon} <b style='color:{fg}'>"
-            f"{_esc_html(summ['headline'])}</b><br><span style='color:#374151'>"
-            f"{_esc_html(summ['detail'])}{movers}</span></div>",
-            unsafe_allow_html=True)
-
-    # ── KPI tiles (marquee metric adapts to the lens) ───────────────────────
-    def _fmt(v):
-        if v is None:
-            return "—"
-        return f"{v:.1f} oz" if mix.marquee_unit == "oz" else f"{v:.1f}%"
-    mq_first, mq_last = summ.get("marquee_first"), summ.get("marquee_last")
-    arrow = ""
-    if mq_first is not None and mq_last is not None:
-        arrow = " ↑" if mq_last > mq_first else (" ↓" if mq_last < mq_first else "")
-    tiles = [
-        (f"{mix.marquee_label} · start", _fmt(mq_first), "first week in view"),
-        (f"{mix.marquee_label} · latest", _fmt(mq_last) + arrow, "last week in view"),
-        ("Shift", summ.get("shift_text", "—"),
-         f"mix-shift index {summ.get('mix_index', 0):.0f}% of vol. reallocated"),
-    ]
-    cards = "".join(
-        f'<div class="dpc-kpi dpc-kpi--walk"><div class="k-label">{_esc_html(t)}</div>'
-        f'<div class="k-value">{_esc_html(v)}</div><span class="k-sub">{_esc_html(sub)}</span></div>'
-        for t, v, sub in tiles)
-    st.markdown(f'{_DPC_KPI_CSS}<div class="dpc-kpis">{cards}</div>', unsafe_allow_html=True)
-
-    _chart_method(
-        "- **Formula** — each segment's weekly **unit share** = its U Sales ÷ total; "
-        "the marquee is weighted-avg pack size (oz) for Size, else the tracked segment's "
-        "share.  Mix-shift index = ½·Σ|Δ share| (% of volume reallocated).\n"
-        "- **Method** — top segments shown, the tail rolled into **Other**; **Brand** "
-        "spans the whole category (ignores the IRI Brand filter).  Reacts to the **IRI** "
-        "filters + Week window.\n"
-        "- **Source** — IRI POS `U Sales` by Custom Size / Major Brand / Custom Subtype.\n"
-        "- **Chart** — 100%-stacked share (or each segment indexed to its first week).")
-
-    # ── Chart ───────────────────────────────────────────────────────────────
-    weeks = list(dm[iri.WEEK_START])
-    segs = [s for s in mix.segments if s in dm.columns]
-    colors = {s: _VEL_MIX_PALETTE[i % len(_VEL_MIX_PALETTE)] for i, s in enumerate(segs)}
-    fig = go.Figure()
-    if view.startswith("Share mix"):
-        for s in segs:
-            col = colors[s]
-            fig.add_scatter(
-                x=weeks, y=dm[s], name=s, mode="lines", stackgroup="one",
-                line=dict(width=0.5, color=col), fillcolor=_hex_rgba(col, 0.75),
-                hovertemplate=f"{s}: %{{y:.1f}}%<extra></extra>")
-        yaxis = dict(title=dict(text="Unit share (%)"), range=[0, 100],
-                     ticksuffix="%", showgrid=True, gridcolor="#eeeeee")
-    else:
-        base = dm.iloc[0]
-        for s in segs:
-            b = float(base.get(s, 0.0) or 0.0)
-            if b <= 0:
-                continue
-            fig.add_scatter(
-                x=weeks, y=dm[s] / b * 100.0, name=s, mode="lines+markers",
-                line=dict(width=2.5, color=colors[s]), marker=dict(size=5, color=colors[s]),
-                hovertemplate=f"{s}: %{{y:.0f}} (100 = first week)<extra></extra>")
-        fig.add_hline(y=100, line=dict(color="#9ca3af", dash="dash", width=1))
-        yaxis = dict(title=dict(text="Share index (first week = 100)"),
-                     showgrid=True, gridcolor="#eeeeee")
-    fig.update_layout(
-        height=380, margin=dict(l=10, r=10, t=40, b=10),
-        font=dict(color=_BH_FONT_COLOR, size=18),
-        xaxis=dict(title=dict(text="Week"), tickmode="array", tickvals=weeks,
-                   tickformat="%b %d", tickangle=-45, showgrid=False),
-        yaxis=yaxis,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        plot_bgcolor="white",
-    )
-    st.plotly_chart(fig, use_container_width=True, key="velocity_mix_chart")
-    st.download_button(
-        "⬇️ Download weekly mix shares (CSV)",
-        data=dm.to_csv(index=False).encode("utf-8"),
-        file_name=f"velocity_mix_{key_by_label[dim_label]}_"
-                  f"{pd.Timestamp.utcnow():%Y%m%d}.csv",
-        mime="text/csv", key="velocity_mix_download", use_container_width=True)
-
-
-@st.fragment
-def _render_velocity_analysis_body() -> None:
-    """IRI sell-through vs our demand/supply velocity — indexed leading-signal view."""
-    try:
-        df = _cached_shipments_enriched()   # fetch + Portfolio-Minor + Corp-Group, cached
-    except vel.ShipmentsVelocityError as exc:
-        st.error(f"❌ Could not load `dbo.Shipments`.\n\n{exc}")
-        return
-    if df is None or df.empty or vel.COL_ORDER_DATE not in df.columns:
-        st.info("No shipment rows available.")
-        return
-
-    # IRI consumer sell-through (best-effort — the section still works without it).
-    iri_raw: Optional[pd.DataFrame] = None
-    iri_file, iri_err = "", None
-    try:
-        iri_raw, iri_file = iri.fetch_iri_df()
-    except iri.IRIVelocityError as exc:
-        iri_err = str(exc)
-
-    # Trade-spend promo windows (best-effort — overlay only).
-    ts_df: Optional[pd.DataFrame] = None
-    ts_err = None
-    try:
-        ts_df = tsp.fetch_trade_spend_df()
-    except tsp.TradeSpendError as exc:
-        ts_err = str(exc)
-
-    # ── Our shipment filters ────────────────────────────────────────────────
-    dim_specs = [
-        (vel.COL_BUSINESS_UNIT, "Business Unit"),
-        (vel.COL_PORTFOLIO,     "Portfolio"),
-        (vel.COL_PRODUCT_MINOR, "Portfolio Minor"),
-        (vel.COL_PRODUCT_FORMAT, "Product Format"),
-        (vel.COL_PRODUCT_DESC,  "Product Description"),
-        (vel.COL_CORP_GROUP,    "Corporate Group"),
-        (vel.COL_CUSTOMER,      "Customer"),
-    ]
-    selections: dict[str, list[str]] = {}
-    st.markdown(
-        "**Our shipments — filters** (`dbo.Shipments`; the volume & fill-rate "
-        "chart applies the same filters to `dbo.Orders`)")
-    cols = st.columns(3)
-    for i, (canonical, label) in enumerate(dim_specs):
-        options = vel.distinct_values(df, canonical)
-        if not options:
-            continue
-        default = ([vel.DEFAULT_BUSINESS_UNIT]
-                   if canonical == vel.COL_BUSINESS_UNIT
-                   and vel.DEFAULT_BUSINESS_UNIT in options else [])
-        with cols[i % 3]:
-            selections[canonical] = st.multiselect(
-                label, options=options, default=default, key=f"velocity_{canonical}",
-                help="Leave empty to include all." if default == [] else None)
-
-    # ── IRI consumer sell-through filters (new block) ───────────────────────
-    iri_sel: dict[str, list[str]] = {}
-    if iri_raw is not None:
-        st.markdown("**IRI — consumer sell-through filters** (Circana POS; includes competitors)")
-        icols = st.columns(3)
-        for i, col in enumerate(iri.FILTER_COLS):
-            opts = iri.distinct_values(iri_raw, col)
-            if not opts:
-                continue
-            default = ["DARIGOLD"] if col == iri.COL_BRAND and "DARIGOLD" in opts else []
-            with icols[i % 3]:
-                iri_sel[col] = st.multiselect(
-                    f"IRI · {col}", options=opts, default=default,
-                    key=f"velocity_iri_{col}",
-                    help="Leave empty to include all." if not default else None)
-    elif iri_err:
-        st.caption(f"ℹ️ IRI sell-through unavailable — showing our velocities only.  ({iri_err})")
-
-    # ── Build full-history indexed series (cached per filter block), merge ───
-    def _tup(col):
-        return tuple(sorted(selections.get(col) or ()))
-
-    def _itup(col):
-        return tuple(sorted(iri_sel.get(col) or ()))
-    ship_weekly = _cached_shipment_weekly(
-        _tup(vel.COL_PORTFOLIO), _tup(vel.COL_PRODUCT_MINOR), _tup(vel.COL_PRODUCT_DESC),
-        _tup(vel.COL_CUSTOMER), _tup(vel.COL_BUSINESS_UNIT), _tup(vel.COL_PRODUCT_FORMAT),
-        _tup(vel.COL_CORP_GROUP))
-    iri_weekly = None
-    if iri_raw is not None:
-        iri_weekly = _cached_iri_weekly(
-            _itup(iri.COL_GEOGRAPHY), _itup(iri.COL_BRAND), _itup(iri.COL_SUBTYPE),
-            _itup(iri.COL_PROCESS), _itup(iri.COL_SIZE))
-    merged = _velocity_merge(ship_weekly, iri_weekly)
-    merged = merged[merged[vel.WEEK_START].notna()]
-    if merged.empty:
-        st.info("No shipments/IRI match the current filters.")
-        return
-
-    # ── Shared Week slider (renamed from Order date range) ──────────────────
-    wk_dates = sorted(merged[vel.WEEK_START].dt.date.unique())
-    wk_min, wk_max = wk_dates[0], wk_dates[-1]
-    if wk_min == wk_max:
-        week_range = (wk_min, wk_max)
-        st.caption(f"Single week: {wk_min:%Y-%m-%d}")
-    else:
-        d_lo, d_hi = _velocity_default_window(merged)
-        week_range = st.slider(
-            "Week", min_value=wk_min, max_value=wk_max, value=(d_lo, d_hi),
-            format="YYYY-MM-DD", key="velocity_week_range",
-            help="Harmonised weekly grid across `dbo.Shipments` and the IRI file "
-                 "(Circana weeks, Monday-anchored).  Defaults to the overlap.")
-    disp = merged[merged[vel.WEEK_START].dt.date.between(*week_range)].reset_index(drop=True)
-    if disp.empty:
-        st.info("No weeks in the selected range.")
-        return
-
-    # ① Absolute-volume chart FIRST (our ordered vs shipped lbs).
-    # Reads `dbo.Orders` off the same filters + Week window — not `disp`,
-    # which is the shipments/IRI merge the index charts below are built on.
-    _render_volume_chart(selections, week_range)
-    st.markdown("---")
-
-    # ── Promo overlay controls (drive the velocity index shading + the cohort) ─
-    promo = None
-    sel_tacs: list[str] = []
-    item_keys = None
-    if ts_df is not None:
-        tac_opts = tsp.distinct_tactics(ts_df)
-        default_tacs = [t for t in tsp.CONSUMER_TACTICS if t in tac_opts]
-        sel_tacs = st.multiselect(
-            "🎯 Shade promo tactics (consumer shelf events)", options=tac_opts,
-            default=default_tacs, key="velocity_promo_tactics",
-            help="Trade-spend promo windows shaded on the velocity index chart, "
-                 "coloured by tactic.  Year-long 'Corp Program' / fee rows are available "
-                 "but off by default (they'd flood the chart).  Cancelled promos excluded.")
-        # Item scope = SKUs behind the PRODUCT-filtered shipments (bridged to
-        # trade-spend item_number via PDH, since dbo.Shipments has no SKU); the
-        # corp scope reuses the Corporate Group filter.  (Customer refines the
-        # velocity lines only — trade spend has no grain below Corporate Group.)
-        prod_cols = (vel.COL_BUSINESS_UNIT, vel.COL_PORTFOLIO, vel.COL_PRODUCT_MINOR,
-                     vel.COL_PRODUCT_FORMAT, vel.COL_PRODUCT_DESC)
-        any_prod = any(selections.get(c) for c in prod_cols)
-        if any_prod:
-            m = pd.Series(True, index=df.index)
-            for c in prod_cols:
-                vals = selections.get(c)
-                if vals and c in df.columns:
-                    m &= df[c].astype(str).str.strip().isin([str(v) for v in vals])
-            item_keys = _velocity_item_scope(df[m])
-        if sel_tacs:
-            ik_tup = tuple(sorted(item_keys)) if item_keys is not None else None
-            bands, tactics, maxw = _cached_promo(
-                ik_tup, _tup(vel.COL_CORP_GROUP), tuple(sel_tacs),
-                week_range[0], week_range[1])
-            promo = tsp.PromoWindows(bands, tactics, maxw)
-    elif ts_err:
-        st.caption(f"ℹ️ Promo overlay unavailable — {ts_err}")
-
-    # ② Velocity index (self-contained: signal → KPIs → method → chart).
-    _render_velocity_chart(disp, promo=promo, iri_file=iri_file)
-    st.markdown("---")
-
-    # ③ Demand Quality & Base Erosion — base vs promo decomposition (needs IRI).
-    quality_weekly = cohort = None
-    if iri_raw is not None:
-        quality_weekly = _cached_iri_quality(
-            _itup(iri.COL_GEOGRAPHY), _itup(iri.COL_BRAND), _itup(iri.COL_SUBTYPE),
-            _itup(iri.COL_PROCESS), _itup(iri.COL_SIZE))
-        # Cohort onsets from the FULL-history promo calendar (window-independent
-        # — the event study should use every clean start, not just the view).
-        if ts_df is not None and sel_tacs:
-            ik_tup = tuple(sorted(item_keys)) if item_keys is not None else None
-            bands_full, _, _ = _cached_promo(
-                ik_tup, _tup(vel.COL_CORP_GROUP), tuple(sel_tacs), None, None)
-            onsets = dq.promo_onsets(set(bands_full["week_start"]))
-            cohort = dq.build_promo_cohort(quality_weekly, onsets)
-    _render_demand_quality(quality_weekly, cohort, week_range)
-
-    # Consumer mix shift (needs the IRI file).
-    if iri_raw is not None:
-        st.markdown("---")
-        _render_velocity_mix(iri_raw, iri_sel, week_range)
-
-    today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    st.download_button(
-        "⬇️ Download weekly velocity + index (CSV)",
-        data=disp.to_csv(index=False).encode("utf-8"),
-        file_name=f"velocity_weekly_{today}.csv", mime="text/csv",
-        key="velocity_download", use_container_width=True,
-    )
+        render_embedded_resource(
+            url=_VELOCITY_REPORT_URL,
+            title="Velocity Analysis (Fabric)",
+            embed_url=to_powerbi_embed_url(_VELOCITY_REPORT_URL),
+            height=900,
+            fallback_note=(
+                "This is the live Velocity Analysis report. The frame below "
+                "uses Power BI's embed mode with Entra-ID auto-auth, but "
+                "tenant SSO policy may still require an interactive sign-in. "
+                "If the frame is blank, use the button below to open the "
+                "report directly in Fabric."
+            ),
+        )
 
 
 # ── 3. Entry point ────────────────────────────────────────────────────────────
@@ -11465,7 +10379,8 @@ def render() -> None:
     3. Business Health              (collapsible, collapsed)
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
-    6. (Archived) Velocity Analysis (🗄️, collapsible, collapsed — last)
+    6. Velocity Analysis            (🚀, collapsible, collapsed — embedded
+                                     Fabric report, last on the page)
 
     Two mechanisms keep this page from re-doing everything on every click:
 
@@ -11477,8 +10392,9 @@ def render() -> None:
       inner fragment ids.  Actions that genuinely need a whole-page refresh (a
       cache flush after an upload or a withdraw) call ``st.rerun(scope="app")``.
     * **Lazy-load gates.**  A collapsed ``st.expander`` still EXECUTES its body,
-      so the archived Velocity Analysis and the APS summary sit behind
-      :func:`_section_load_gate` and read Fabric only once asked.
+      so Velocity Analysis (whose report iframe would otherwise mount on every
+      visit) and the APS summary sit behind :func:`_section_load_gate` and do
+      their loading only once asked.
     """
     apply_custom_css()
     st.markdown(
@@ -11511,7 +10427,7 @@ def render() -> None:
     _render_demand_summary()
     st.markdown("---")
 
-    # Archived last: Velocity Analysis is no longer part of the daily flow, so
-    # it sits at the very bottom where it can't push the live sections below the
-    # fold.  Its load gate means the archived section costs nothing until asked.
+    # Last on the page: the embedded report is reference material rather than
+    # part of the daily flow, and its load gate means it costs nothing here
+    # until someone asks for it.
     _render_velocity_analysis()

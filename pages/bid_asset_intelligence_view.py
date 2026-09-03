@@ -2456,7 +2456,7 @@ def _render_bid_asset_section() -> None:
         except BidAssetStoreError as exc:
             st.error(
                 f"Could not list files in `Files/{_LAKEHOUSE_FOLDER}`: {exc}\n\n"
-                "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+                "If Microsoft Fabric is not signed in, visit **Documentation** "
                 "in the sidebar to sign in, then return here."
             )
             return
@@ -2523,7 +2523,7 @@ def _render_bid_asset_section() -> None:
         except BidAssetStoreError as exc:
             st.error(
                 f"Could not read bid data from Fabric Lakehouse: {exc}\n\n"
-                "If Microsoft Fabric is not signed in, visit **Home & Fabric Sign-in** "
+                "If Microsoft Fabric is not signed in, visit **Documentation** "
                 "in the sidebar to sign in, then return here."
             )
             return
@@ -2620,17 +2620,17 @@ and sharpen future bid strategies. Key resources include:
 - **Granular Data:** Detailed breakdowns of item-level PCM, GP and price builds.
 
 Data is loaded automatically from the **Fabric Lakehouse** (`Files/Program_Bid_Management`).
-Sign in to Microsoft Fabric on the **Home & Fabric Sign-in** page if the data does not appear.
+Sign in to Microsoft Fabric on the **Documentation** page if the data does not appear.
 """)
     st.markdown("---")
 
     # ── Fabric auth gate ──────────────────────────────────────────────────────
     # If the user is not signed in, show a concise redirect warning and stop.
-    # The actual sign-in UI lives exclusively on the Home & Fabric Sign-in page.
+    # The actual sign-in UI lives exclusively on the Documentation page.
     if not fabric_signin_widget.is_fabric_signed_in():
         st.warning(
             "🔒 **Microsoft Fabric is not connected.**\n\n"
-            "Please visit **Home & Fabric Sign-in** in the sidebar to sign in. "
+            "Please visit **Documentation** in the sidebar to sign in. "
             "Once signed in, return here — bid data will load automatically."
         )
         return

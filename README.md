@@ -107,11 +107,11 @@ O365 credentials). They are never committed and never printed.
 
 ```mermaid
 flowchart TD
-    HOME["🏠 Home & Fabric Sign-in"]
+    HOME["📖 Documentation (landing + Fabric sign-in)"]
     subgraph PRICING["Pricing"]
       NPQ["New Price Quote"]
       PEA["Pricing Execution Automation (RGM)"]
-      PBE["Pricebook Editor"]
+      PBE["Oracle Pricing Data Download"]
       UE["Unit Economics"]
       PG["Pricing Granularity"]
     end
@@ -131,10 +131,10 @@ flowchart TD
 
 | Page | What it is for |
 |---|---|
-| **Home & Fabric Sign‑in** | Landing + one‑click Microsoft Fabric connection |
+| **Documentation** | Landing page: Microsoft Fabric sign-in, a how-to for every page, every calculation formula, and clickable links to each lakehouse folder |
 | **New Price Quote** | Build a customer price quote from cost + policy inputs |
 | **Pricing Execution Automation** | Generate the VBCS files Oracle needs (Fixed / KS / Variable / Combine) |
-| **Pricebook Editor** | Review and push pricebook changes to Oracle ORDS |
+| **Oracle Pricing Data Download** | Read price adjustments from Oracle ORDS, edit as CSV, push the changes back |
 | **Unit Economics / Pricing Granularity** | Cost & margin breakdowns |
 | **Bid Assistant** | Support RFP/bid decisions |
 | **Market Barometer** | USDA / CME market context |
@@ -163,7 +163,7 @@ flowchart TD
 
     CMP --> BH["Business Health<br/>order-momentum by category"]
     CMP --> FA["Forecast Accuracy<br/>rolling lag-1 bias + trend"]
-    POS["IRI / Circana POS"] --> VEL["Velocity, Trade Spend<br/>& Demand Quality"]
+    VEL["Velocity Analysis<br/>(embedded Fabric report)"]
 ```
 
 **The main ideas**

@@ -539,7 +539,7 @@ def _save_extract_snapshot(df: pd.DataFrame, base_name: str) -> None:
         st.session_state[_SS_SNAPSHOT_MSG] = (
             "warning",
             "CSV downloaded, but **no Fabric snapshot was saved** — Microsoft "
-            "Fabric is not connected.  Open **Home & Fabric Sign-in** in the "
+            "Fabric is not connected.  Open **Documentation** in the "
             "sidebar, then download again to keep an `Extract_Snapshot` copy.",
         )
         return
@@ -591,8 +591,8 @@ def _render_vbcs_compare_section(read_df) -> None:
 
         if not _fsw.is_fabric_signed_in():
             st.warning(
-                "🔒 **Microsoft Fabric is not connected.** Open **Home & Fabric "
-                "Sign-in** in the sidebar, then return here to compare."
+                "🔒 **Microsoft Fabric is not connected.** Open "
+                "**Documentation** in the sidebar, then return here to compare."
             )
             return
 

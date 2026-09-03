@@ -3325,7 +3325,7 @@ def _compute_all_outputs(
 # the module is still within the same session.
 #
 # NOTE: The device-code sign-in flow itself (URL + code + "Check status"
-# button) was moved to the Home & Fabric Sign-in page and lives in
+# button) was moved to the Documentation page and lives in
 # utils/fabric_signin_widget.py.  This module no longer owns that UI.
 _SS_FABRIC_RECOVERY_DONE = f"{_SS_PREFIX}_fabric_recovery_done"
 
@@ -3394,11 +3394,11 @@ def _require_fabric_auth() -> bool:
     """Gate on Fabric auth; return True if auth is broken (caller should stop rendering).
 
     Checks auth status and runs per-store cache recovery when a sign-in that
-    was completed on the **Home & Fabric Sign-in** page is detected for the
+    was completed on the **Documentation** page is detected for the
     first time in this session.
 
     The interactive sign-in UI (device-code URL, "Check status" button, retry
-    button) now lives exclusively on the Home & Fabric Sign-in page
+    button) now lives exclusively on the Documentation page
     (``utils/fabric_signin_widget.py``).  This function no longer renders any
     sign-in widgets — it only gates rendering and runs the per-store recovery
     that is specific to this module.
@@ -3409,13 +3409,13 @@ def _require_fabric_auth() -> bool:
        session, reset device-code state, return False (render normally).
     B. **Auth healthy** — return False immediately.
     C. **Auth broken** — show a concise warning directing the user to
-       Home & Fabric Sign-in, return True (stop rendering this section).
+       Documentation, return True (stop rendering this section).
     """
     status = _fabric_auth.device_code_signin_status()
     err    = _fabric_auth.cached_auth_error()
 
     # ── (A) Sign-in just succeeded — run per-store recovery once ─────────────
-    # The sign-in was completed on the Home & Fabric Sign-in page.  Detect it
+    # The sign-in was completed on the Documentation page.  Detect it
     # via the process-wide device_code_signin_status() and run the per-store
     # invalidation exactly once per session so stale empty-cache frames from
     # the pre-sign-in render are evicted before this module tries to read them.
@@ -3436,7 +3436,7 @@ def _require_fabric_auth() -> bool:
     # ── (C) Auth broken — direct user to the centralized sign-in page ─────────
     st.warning(
         "🔒 **Microsoft Fabric is not connected.**\n\n"
-        "Please visit **Home & Fabric Sign-in** in the sidebar to sign in. "
+        "Please visit **Documentation** in the sidebar to sign in. "
         "Once signed in, return here — this module will load automatically."
     )
     return True
@@ -5339,7 +5339,7 @@ def render_monthly_resin_freight_mover_tracker() -> None:
     current_month = pd.Timestamp(date.today().replace(day=1))
 
     # Fabric auth gate.  If auth is broken, show a warning directing the user
-    # to Home & Fabric Sign-in and stop rendering.  If a sign-in was just
+    # to Documentation and stop rendering.  If a sign-in was just
     # completed (detected via shared device-code state), run per-store cache
     # recovery before proceeding.  The interactive sign-in UI is on the Home
     # page; this module only gates and recovers.

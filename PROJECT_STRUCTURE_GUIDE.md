@@ -13,7 +13,7 @@ Pricing_Execution_Agent/
 ├── 🎨 PRESENTATION LAYER (What users see)
 │   ├── streamlit_app.py              # Main router - entry point
 │   └── pages/                         # UI views for each page
-│       ├── home_view.py
+│       ├── documentation_view.py
 │       ├── new_price_quote_view.py
 │       ├── market_barometer_view.py
 │       ├── pricing_granularity_view.py
@@ -72,15 +72,20 @@ Pricing_Execution_Agent/
 
 ### 🎨 **Presentation Layer - Pages**
 
-#### `pages/home_view.py` (52 lines)
-**Role**: Landing page / dashboard
+#### `pages/documentation_view.py`
+**Role**: Landing page, Fabric sign-in, and the app's manual
 
 **What it does**:
-- Welcomes users
-- Provides quick links to other pages
-- Shows overview of available tools
+- Hosts the ONLY Microsoft Fabric sign-in panel in the app
+- Explains how to drive every page in the sidebar, step by step
+- Publishes every calculation formula in Excel-rebuildable form
+- Deep-links each lakehouse folder the app reads or writes
 
-**UI Elements**: Headers, info boxes, quick start guide
+**UI Elements**: Sign-in panel, expanders per page / formula, link table
+
+**Note**: the page bodies are built from module-level tuples
+(`_PAGE_GUIDES`, `_FORMULAS`, `_LAKEHOUSE_PATHS`) — add an entry, not a
+render branch. It performs no I/O, so it renders even when Fabric is down.
 
 ---
 
@@ -554,7 +559,8 @@ data_helpers.py → Display to User
 
 | What You Want to Change | File to Edit |
 |------------------------|--------------|
-| Home page UI | `pages/home_view.py` |
+| Documentation / landing page UI | `pages/documentation_view.py` |
+| Sidebar order & page names | `streamlit_app.py` (`VIEW_NAME_MAPPING`, `LANDING_VIEW`, `NAV_PINNED_LAST`) |
 | New Price Quote UI | `pages/new_price_quote_view.py` |
 | VBCS Generator UI | `pages/pricing_execution_automation_view.py` |
 | Global styling | `utils/ui_helpers.py` |

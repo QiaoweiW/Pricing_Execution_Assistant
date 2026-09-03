@@ -42,7 +42,7 @@ PAGES_DIR = Path(__file__).parent / "pages"
 # Mapping of view file names to display names.
 # Only views listed here are eligible for sidebar navigation.
 VIEW_NAME_MAPPING = {
-    "home_view":                          "Home & Fabric Sign-in",
+    "documentation_view":                 "Documentation",
     "bid_asset_intelligence_view":        "Bid Assistant",
     "htst_activity_monitor_view":         "Shipment Monitor & HTST Requote",
     "new_price_quote_view":               "New Price Quote",
@@ -52,8 +52,21 @@ VIEW_NAME_MAPPING = {
     "unit_economics_view":                "Unit Economics",
     "demand_view":                        "Demand Insight",
     "demand_planner_analytics_view":      "Demand Planner Analytics",
-    "pricebook_editor_view":              "Pricebook Editor",
+    "pricebook_editor_view":              "Oracle Pricing Data Download",
 }
+
+# The landing page — first in the sidebar, and the page the app opens on.
+# Named once here so the router, the ordering and the fallbacks agree.
+LANDING_VIEW: str = "Documentation"
+
+# Sidebar order is: LANDING_VIEW, then everything not pinned (alphabetical),
+# then NAV_PINNED_LAST in the order written.  Pinning by DISPLAY name keeps
+# this readable next to VIEW_NAME_MAPPING; unknown names are ignored, so a
+# view that is renamed or removed can never break navigation.
+NAV_PINNED_LAST: tuple = (
+    "Bid Assistant",
+    "Oracle Pricing Data Download",
+)
 
 # Views temporarily hidden from the sidebar without being deleted.
 # Add a view's file-stem here to suppress its navigation button while keeping
@@ -65,7 +78,7 @@ AVAILABLE_VIEWS = {}
 PAGE_ROUTER = {}
 
 for view_file in PAGES_DIR.glob("*_view.py"):
-    view_name = view_file.stem  # e.g., "home_view"
+    view_name = view_file.stem  # e.g., "documentation_view"
 
     if view_name in VIEW_NAME_MAPPING and view_name not in HIDDEN_VIEWS:
         try:
@@ -112,9 +125,9 @@ apply_custom_css()
 #      any page is hot.
 #
 # Best-effort: failures DO NOT block the app. A user without Fabric
-# access can still use the local-only pages (Home, Pricing Granularity,
-# etc.); pages that need Fabric will surface their own contextual error
-# when the user navigates to them.
+# access can still read Documentation (which is why it renders no Fabric
+# reads of its own); pages that need Fabric will surface their own
+# contextual error when the user navigates to them.
 if "fabric_warm" not in st.session_state:
     try:
         from data_sources import fabric_auth
@@ -163,13 +176,18 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Page selection buttons - dynamically generated from available views
-    # Sort views to ensure Home is first, then alphabetical order
-    sorted_views = sorted(AVAILABLE_VIEWS.keys())
-    if "Home & Fabric Sign-in" in sorted_views:
-        sorted_views.remove("Home & Fabric Sign-in")
-        sorted_views.insert(0, "Home & Fabric Sign-in")
-    
+    # Page selection buttons - dynamically generated from available views.
+    # Order: landing page, then the daily-use views alphabetically, then the
+    # pinned-last views.  Everything is filtered through AVAILABLE_VIEWS so a
+    # view that failed to import simply doesn't get a button.
+    middle = sorted(
+        name for name in AVAILABLE_VIEWS
+        if name != LANDING_VIEW and name not in NAV_PINNED_LAST
+    )
+    sorted_views = (
+        [LANDING_VIEW] if LANDING_VIEW in AVAILABLE_VIEWS else []
+    ) + middle + [n for n in NAV_PINNED_LAST if n in AVAILABLE_VIEWS]
+
     for display_name in sorted_views:
         # Create a safe key from the display name
         key_safe = display_name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
@@ -197,9 +215,9 @@ with st.sidebar:
 
 # Initialize session state if not exists
 if 'selected_page' not in st.session_state:
-    # Default to Home & Fabric Sign-in if available, otherwise first available view
-    if "Home & Fabric Sign-in" in PAGE_ROUTER:
-        st.session_state.selected_page = "Home & Fabric Sign-in"
+    # Default to the landing page if available, otherwise first available view
+    if LANDING_VIEW in PAGE_ROUTER:
+        st.session_state.selected_page = LANDING_VIEW
     elif PAGE_ROUTER:
         st.session_state.selected_page = list(PAGE_ROUTER.keys())[0]
     else:
@@ -220,11 +238,14 @@ if render_function:
     # to trace routing, add a single ``logger.debug(...)`` here instead.
     render_function()
 else:
-    # Default to Home if unknown page (shouldn't happen, but safety check)
-    st.warning(f"⚠️ Unknown page: {st.session_state.selected_page}. Redirecting to Home.")
-    if "Home & Fabric Sign-in" in PAGE_ROUTER:
-        st.session_state.selected_page = "Home & Fabric Sign-in"
-        PAGE_ROUTER["Home & Fabric Sign-in"]()
+    # Default to the landing page if unknown (shouldn't happen, but safety check)
+    st.warning(
+        f"⚠️ Unknown page: {st.session_state.selected_page}. "
+        f"Redirecting to {LANDING_VIEW}."
+    )
+    if LANDING_VIEW in PAGE_ROUTER:
+        st.session_state.selected_page = LANDING_VIEW
+        PAGE_ROUTER[LANDING_VIEW]()
     elif PAGE_ROUTER:
         # Fallback to first available view
         first_view = list(PAGE_ROUTER.keys())[0]

@@ -2,7 +2,7 @@
 Centralized Microsoft Fabric sign-in widget.
 
 This module owns the ONLY interactive Fabric sign-in UI in the application.
-It is called exclusively from the **Home & Fabric Sign-in** page.
+It is called exclusively from the **Documentation** page.
 
 Every other page that requires Fabric access should:
   1. Call :func:`is_fabric_signed_in` to check auth status.
@@ -18,14 +18,14 @@ Bid Asset Intelligence, Demand Planner Analytics) had separate, inconsistent
 warnings with no clear single place to authenticate. By centralizing here:
 
 * Users authenticate once → every Fabric-backed view is immediately unlocked.
-* Other views show a simple, consistent "go to Home & Fabric Sign-in" message
+* Other views show a simple, consistent "go to Documentation" message
   instead of competing sign-in prompts or cryptic Azure error text.
 * Future Fabric-backed features inherit the benefit without any sign-in code
   of their own.
 
 Public API
 ----------
-* ``render_fabric_signin_section()``  — full sign-in panel for the Home page.
+* ``render_fabric_signin_section()``  — full sign-in panel for the Documentation page.
 * ``is_fabric_signed_in()``           — True when auth is currently healthy.
 """
 from __future__ import annotations
@@ -60,8 +60,8 @@ def is_fabric_signed_in() -> bool:
 
     A ``True`` result means ``acquire_storage_token`` will succeed on the
     next call — no interactive sign-in is needed.  Pages use this to decide
-    whether to attempt their Fabric reads or to show a "go to Home & Fabric
-    Sign-in" warning instead.
+    whether to attempt their Fabric reads or to show a "go to Documentation"
+    warning instead.
 
     Note: this is a cheap, non-blocking check.  It reads the in-process
     auth-failure cache without touching the network.
@@ -72,7 +72,7 @@ def is_fabric_signed_in() -> bool:
 def render_fabric_signin_section() -> None:
     """Render the centralized Microsoft Fabric sign-in panel.
 
-    Called exclusively from the **Home & Fabric Sign-in** page.  Manages
+    Called exclusively from the **Documentation** page.  Manages
     the full device-code sign-in state machine:
 
     State machine (first matching branch wins)

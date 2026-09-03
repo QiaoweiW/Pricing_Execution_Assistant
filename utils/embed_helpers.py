@@ -66,12 +66,25 @@ def to_sharepoint_excel_embed_url(url: str) -> str:
     return rewritten
 
 
+# Report-viewer hosts we can rewrite into an embed URL.  Fabric and Power BI
+# serve the SAME report objects off the same ``/groups/<g>/reports/<id>/<page>``
+# path shape — a report opened from the Fabric portal carries an identical
+# reportId — so both rewrite to ``app.powerbi.com/reportEmbed``, which is the
+# only host that serves an embeddable frame.
+_REPORT_VIEWER_HOSTS: frozenset = frozenset({
+    "app.powerbi.com",
+    "app.fabric.microsoft.com",
+})
+
+
 def to_powerbi_embed_url(url: str) -> Optional[str]:
-    """Return a ``reportEmbed`` URL for a Power BI report viewer link.
+    """Return a ``reportEmbed`` URL for a Power BI / Fabric report viewer link.
 
     Converts URLs of the form
     ``https://app.powerbi.com/groups/<group>/reports/<reportId>/<pageName>?ctid=<tenantId>...``
-    into the embed-mode equivalent
+    — or the Fabric-portal equivalent
+    ``https://app.fabric.microsoft.com/groups/<group>/reports/<reportId>/<pageName>?experience=fabric-developer``
+    — into the embed-mode equivalent
     ``https://app.powerbi.com/reportEmbed?reportId=<reportId>&pageName=<pageName>&ctid=<tenantId>&autoAuth=true``.
 
     The ``autoAuth=true`` flag tells the Power BI service to silently
@@ -79,11 +92,15 @@ def to_powerbi_embed_url(url: str) -> Optional[str]:
     tenant session — no second sign-in prompt.  Users who are *not* signed
     in will see Power BI's own sign-in page inside the frame.
 
+    ``ctid`` is only appended when the source URL carries one; Fabric portal
+    links usually don't, and omitting it lets the service resolve the tenant
+    from the browser session instead of pinning the wrong one.
+
     Returns ``None`` if *url* does not match the expected viewer pattern,
     so the caller can fall back to rendering the raw link.
     """
     parsed = urlparse(url)
-    if parsed.netloc.lower() != "app.powerbi.com":
+    if parsed.netloc.lower() not in _REPORT_VIEWER_HOSTS:
         return None
 
     # Path looks like: /groups/<group>/reports/<reportId>/<pageName>

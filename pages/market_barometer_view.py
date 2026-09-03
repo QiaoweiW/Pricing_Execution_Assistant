@@ -54,9 +54,6 @@ from pages.monthly_resin_freight_mover_tracker import (
     render_monthly_resin_freight_mover_tracker,
 )
 from pages.walmart_fresh_tracker import render_walmart_fresh_tracker
-from pages.weekly_and_monthly_butter_tracker import (
-    render_weekly_and_monthly_butter_tracker,
-)
 from utils.ui_helpers import apply_custom_css
 
 
@@ -1177,10 +1174,11 @@ def render() -> None:
     ----
     1. Instructions
     2. Monthly Milk, Resin & Freight Movers (collapsible, collapsed by default)
-    3. API key check → upload widget (if invalid) or auto-refresh (if valid)
-    4. Load inflation data — gate on non-empty before proceeding
-    5. Walmart Fresh Tracker (collapsible, collapsed by default)
-    6. Market Indices dashboard (collapsible, expanded by default)
+    3. Annual COLA Movers (collapsible, collapsed by default)
+    4. API key check → upload widget (if invalid) or auto-refresh (if valid)
+    5. Load inflation data — gate on non-empty before proceeding
+    6. Walmart Fresh Tracker (collapsible, collapsed by default)
+    7. Market Indices dashboard (collapsible, expanded by default)
     """
     apply_custom_css()
     st.markdown('<h1 class="main-header">Market Barometer</h1>', unsafe_allow_html=True)
@@ -1188,14 +1186,6 @@ def render() -> None:
     _render_instructions()
 
     # Divider separates the instructions from the collapsible trackers below.
-    st.markdown("---")
-
-    # Weekly & Monthly Butter Movers — surfaces two charts (CME weekly
-    # average, USDA dairy products weighted price) inside its own
-    # foldable expander. Renders BEFORE Monthly Milk/Resin/Freight
-    # Movers per the May-2026 spec; a thin divider keeps the two
-    # collapsibles visually distinct when both are collapsed.
-    render_weekly_and_monthly_butter_tracker()
     st.markdown("---")
 
     # Monthly Milk, Resin & Freight Movers is a fully self-contained

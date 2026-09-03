@@ -30,9 +30,6 @@ from typing import Optional
 
 import pandas as pd
 
-# Reuse the workbook updater's normalizers — single source of truth, no dup.
-from .price_book_updater import _norm_item, _norm_key
-
 # Canonical match keys + the value column, by canonical (alnum-lower) name.
 _KEY_ITEM = "itemname"
 _KEY_UOM = "pricinguom"
@@ -73,6 +70,30 @@ class CompareResult:
     @property
     def warnings(self) -> list[str]:
         return [e.text for e in self.log if e.level == "warning"]
+
+
+def _norm_text(v: object) -> str:
+    """Collapse NBSP/whitespace and strip — for labels, headers, site names."""
+    return re.sub(r"\s+", " ", str(v).replace("\xa0", " ")).strip()
+
+
+def _norm_key(v: object) -> str:
+    """Case-insensitive match key (site / UOM)."""
+    return _norm_text(v).upper()
+
+
+def _norm_item(v: object) -> str:
+    """Item number as a clean digit string across int / float / str inputs.
+
+    The two sides spell the same item differently — Oracle hands back the
+    string ``"340021"`` while a spreadsheet export can carry the int
+    ``340021`` or the float ``340021.0``; all three must collapse to one key.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return re.sub(r"\.0$", "", _norm_text(v))
 
 
 def _canon(col: object) -> str:

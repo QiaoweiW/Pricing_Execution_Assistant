@@ -17,7 +17,6 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from . import price_book_updater as _pbu
 from . import vbcs_compare as _vc
 from .batch import make_batch_number
 from .ords_client import push_changes
@@ -25,10 +24,6 @@ from .schemas import LOVS, STATUS_LABELS
 
 # Columns rendered with 4-decimal precision when they are numeric.
 _PRICE_COLS = {"baseprice", "adjustmentamount"}
-
-# Session-state key for the last Update-Price-Books run (list[UpdateReport]),
-# so the results + download buttons survive reruns until the next run.
-_SS_PBU_REPORTS = "pbu_update_reports"
 
 # VBCS-compare: lakehouse folder + secrets section + session key for the result.
 _VBCS_FOLDER = "VBCS"
@@ -511,129 +506,6 @@ def render_editor(cfg: dict, fetch_fn, filter_options: dict | None = None) -> No
         )
         if bad:
             st.caption("Re-fetch from Oracle to confirm the current persisted status of each row.")
-
-
-# ── Update Price Books (offline workbook fill from an Oracle extract) ─────────
-
-def render_price_book_updater() -> None:
-    """Render the 'Update Price Books' section.
-
-    A self-contained, offline workflow (no Oracle/ORDS/Fabric I/O): upload one
-    Oracle price-adjustment extract (CSV) + one-or-more customer Price Book
-    workbooks (.xlsx), pick the Old / New price periods, and the matched rows'
-    Old/New/Change cells are filled from the extract and highlighted. Output is
-    a per-file report plus the updated workbooks (individually or as a ZIP).
-
-    All parsing / matching / editing lives in :mod:`price_book_updater`; this
-    function is purely the Streamlit surface.
-    """
-    st.markdown("---")
-    st.subheader("✏️ Update Price Books")
-    st.caption(
-        "Fill each Price Book's **Old Price** / **New Price** from an Oracle "
-        "extract: matched on Item ↔ itemname, Customer Site Name ↔ shiptositename "
-        "(case-insensitive), and Pricing UOM ↔ pricinguom. Only matched rows are "
-        "changed (and highlighted). **Excel** inputs are edited in place; **PDF** "
-        "inputs are converted into an updated copy of the Excel template below."
-    )
-
-    extract_file = st.file_uploader(
-        "1) Oracle price-adjustment extract (CSV)",
-        type=["csv"], key="pbu_extract",
-        help="The Oracle extract (priceadjs schema) holding the price snapshots.",
-    )
-    book_files = st.file_uploader(
-        "2) Price Book file(s) — Excel and/or PDF, upload one or many",
-        type=["xlsx", "pdf"], accept_multiple_files=True, key="pbu_books",
-    )
-    template_file = st.file_uploader(
-        "3) Excel template — only needed when uploading PDFs (its formatting / "
-        "logo is cloned for each PDF conversion)",
-        type=["xlsx"], key="pbu_template",
-        help="An existing Excel price book whose layout/branding the PDF "
-             "conversions should match.",
-    )
-
-    if extract_file is None:
-        st.info("Upload the Oracle extract to choose the price periods.")
-        return
-
-    try:
-        extract_df = _pbu.load_oracle_extract(extract_file.getvalue())
-        periods = _pbu.available_periods(extract_df)
-    except _pbu.PriceBookUpdateError as exc:
-        st.error(f"❌ {exc}")
-        return
-    if not periods:
-        st.warning("The extract has no usable `adjustmentstartdate` values.")
-        return
-
-    # Period pickers sourced from the extract's distinct snapshots. Multi-select
-    # so the user can search several dates per side; leaving a side EMPTY keeps
-    # that price column as-is. (A single-period extract → assign it to Old OR New
-    # to update only that column.) When a row matches >1 selected period, the
-    # latest one wins.
-    label_to_ts = {_pbu.format_period(p): p for p in periods}
-    c1, c2 = st.columns(2)
-    with c1:
-        old_labels = st.multiselect(
-            "Old Price Search Period(s)", list(label_to_ts), key="pbu_old",
-            help="Snapshot(s) whose amount fills Old Price. Leave empty to keep "
-                 "the existing Old Price. If a row matches several, the latest is used.")
-    with c2:
-        new_labels = st.multiselect(
-            "New Price Search Period(s)", list(label_to_ts), key="pbu_new",
-            help="Snapshot(s) whose amount fills New Price. Leave empty to keep "
-                 "the existing New Price.")
-    old_periods = [label_to_ts[l] for l in old_labels]
-    new_periods = [label_to_ts[l] for l in new_labels]
-
-    both_blank = not old_periods and not new_periods
-    if both_blank:
-        st.info("Pick at least one period (Old and/or New) to update.")
-
-    if st.button("▶️ Update Price Books", type="primary",
-                 disabled=(not book_files or both_blank), key="pbu_run"):
-        files = [(f.name, f.getvalue()) for f in book_files]
-        template_bytes = template_file.getvalue() if template_file is not None else None
-        with st.spinner("Matching the Oracle extract into the Price Book(s)…"):
-            st.session_state[_SS_PBU_REPORTS] = _pbu.update_price_books(
-                files, extract_df, old_periods, new_periods,
-                template_bytes=template_bytes)
-
-    reports = st.session_state.get(_SS_PBU_REPORTS)
-    if reports:
-        _render_price_book_update_results(reports)
-
-
-def _render_price_book_update_results(reports: list) -> None:
-    """Render per-file outcomes + download buttons for an updater run."""
-    updated = [r for r in reports if r.ok and r.rows_updated]
-    st.markdown(f"**{len(updated)} of {len(reports)} file(s) updated.**")
-
-    # One-click ZIP of every workbook that produced bytes (updated or pass-through).
-    if any(r.workbook_bytes for r in reports):
-        st.download_button(
-            "⬇️ Download all updated workbooks (ZIP)",
-            data=_pbu.build_zip(reports),
-            file_name="Updated_Price_Books.zip",
-            mime="application/zip", key="pbu_zip",
-        )
-
-    renderer = {"success": st.success, "warning": st.warning, "error": st.error}
-    for i, rep in enumerate(reports):
-        renderer.get(rep.level, st.info)(f"**{rep.file_name}** — {rep.message}")
-        if rep.unmatched:
-            with st.expander(f"{len(rep.unmatched)} unmatched row(s) in {rep.file_name}"):
-                st.write(", ".join(rep.unmatched))
-        if rep.workbook_bytes is not None and rep.rows_updated:
-            st.download_button(
-                f"⬇️ Download updated {rep.file_name}",
-                data=rep.workbook_bytes,
-                file_name=f"Updated_{rep.file_name}",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"pbu_dl_{i}",
-            )
 
 
 # ── Auto-save a snapshot of every downloaded CSV to Fabric ──────────────────

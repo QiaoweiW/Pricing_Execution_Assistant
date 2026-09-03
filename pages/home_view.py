@@ -3,8 +3,8 @@ Home & Fabric Sign-in page view.
 
 This is the single centralized location for Microsoft Fabric authentication.
 Users sign in here ONCE; every Fabric-backed view (Monthly Milk/Resin/Freight
-Movers, Bid Asset Intelligence, Shipment Monitor, Butter Movers, etc.) will
-then work without further sign-in prompts.
+Movers, Bid Asset Intelligence, Shipment Monitor, Demand Planner Analytics,
+etc.) will then work without further sign-in prompts.
 """
 import streamlit as st
 
@@ -83,8 +83,9 @@ Select a page from the sidebar to get started.
 #### Tips & Resources
 
 - **Sign in to Microsoft Fabric once** (using the panel above) to unlock
-  Bid Asset Intelligence, Monthly Movers, Shipment Monitor, Butter Movers,
-  and any future Fabric-backed feature — no per-page re-authentication needed.
+  Bid Asset Intelligence, Monthly Movers, Shipment Monitor, Demand Planner
+  Analytics, and any future Fabric-backed feature — no per-page
+  re-authentication needed.
 - All CSV uploads should be **UTF-8 encoded**.
 - In the **Market Barometer**, the Monthly Milk, Resin & Freight Movers and
   Walmart Fresh Tracker sections are collapsed by default — click to expand

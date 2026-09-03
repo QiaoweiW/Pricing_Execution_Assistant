@@ -14,8 +14,8 @@ Design rationale
 Previously the device-code sign-in flow (URL + code + "Check status" button)
 was embedded directly in the Monthly Milk, Resin & Freight Movers module.
 That created user confusion: other Fabric-backed pages (Shipment Monitor,
-Butter Movers, Bid Asset Intelligence) had separate, inconsistent warnings
-with no clear single place to authenticate. By centralizing here:
+Bid Asset Intelligence, Demand Planner Analytics) had separate, inconsistent
+warnings with no clear single place to authenticate. By centralizing here:
 
 * Users authenticate once → every Fabric-backed view is immediately unlocked.
 * Other views show a simple, consistent "go to Home & Fabric Sign-in" message
@@ -94,7 +94,8 @@ def render_fabric_signin_section() -> None:
     st.caption(
         "Sign in once here to unlock all Fabric-backed views: "
         "Monthly Milk/Resin/Freight Movers, Bid Asset Intelligence, "
-        "Shipment Monitor, Butter Movers, and any future Fabric features."
+        "Shipment Monitor, Demand Planner Analytics, and any future "
+        "Fabric features."
     )
 
     status = _fabric_auth.device_code_signin_status()

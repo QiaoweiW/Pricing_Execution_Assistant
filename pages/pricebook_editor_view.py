@@ -19,7 +19,7 @@ can be re-exposed behind a selector once their schema + read functions exist
 import streamlit as st
 
 from pricebook import ords_client
-from pricebook.editor import render_editor, render_price_book_updater
+from pricebook.editor import render_editor
 from pricebook.schemas import TABLES
 
 # The editor is locked to Price Adjustments.
@@ -38,8 +38,3 @@ def render():
         # Market dropdown options sourced from distinct ORDS values (cached).
         filter_options={"market": ords_client.distinct_markets},
     )
-
-    # Offline "Update Price Books" workflow (upload extract + workbooks →
-    # fill matched Old/New prices → download). Independent of the ORDS read/edit
-    # above; see pricebook/price_book_updater.py.
-    render_price_book_updater()

@@ -10420,15 +10420,17 @@ def _velocity_item_scope(scoped_df: pd.DataFrame) -> Optional[set]:
 
 
 def _render_velocity_analysis() -> None:
-    """Foldable 'Velocity Analysis' section — weekly ordered vs shipped lbs.
+    """Foldable '(Archived) Velocity Analysis' section — ordered vs shipped lbs.
 
-    A collapsed ``st.expander`` matching the other page sections.  Reads
+    A collapsed ``st.expander`` matching the other page sections, rendered LAST
+    on the page: the section is archived, not deleted, so the analysis stays
+    reachable without competing with the live sections for attention.  Reads
     ``dbo.Shipments`` (OneLake) for the index charts, and ``dbo.Orders``
     (+ Products/Customers dims) for the volume & fill-rate chart, which needs
     the cancelled quantity that Shipments does not carry.  The interactive
     body is fragment-isolated so filter changes rerun only this block.
     """
-    with st.expander("🚀 Velocity Analysis", expanded=False):
+    with st.expander("🗄️ (Archived) Velocity Analysis", expanded=False):
         st.caption(
             "**Leading-signal view**: consumer **Sell-through (IRI)** vs our "
             "**Demand** (orders) and **Supply** (shipments) velocity — all rebased "
@@ -11460,9 +11462,10 @@ def render() -> None:
     ----
     1. Page header + Instructions
     2. IBP Cadence and Supporting files (📅, collapsible, collapsed)
-    3. Velocity Analysis           (🚀, collapsible, collapsed)
+    3. Business Health              (collapsible, collapsed)
     4. RO Comparison                (collapsible, expanded by default)
     5. Demand Summary               (collapsible, collapsed by default)
+    6. (Archived) Velocity Analysis (🗄️, collapsible, collapsed — last)
 
     Two mechanisms keep this page from re-doing everything on every click:
 
@@ -11474,7 +11477,7 @@ def render() -> None:
       inner fragment ids.  Actions that genuinely need a whole-page refresh (a
       cache flush after an upload or a withdraw) call ``st.rerun(scope="app")``.
     * **Lazy-load gates.**  A collapsed ``st.expander`` still EXECUTES its body,
-      so Velocity Analysis and the APS summary sit behind
+      so the archived Velocity Analysis and the APS summary sit behind
       :func:`_section_load_gate` and read Fabric only once asked.
     """
     apply_custom_css()
@@ -11487,9 +11490,6 @@ def render() -> None:
     st.markdown("---")
 
     _render_ibp_supporting_files()
-    st.markdown("---")
-
-    _render_velocity_analysis()
     st.markdown("---")
 
     # Business Health (trailing-window order momentum) — a self-contained
@@ -11509,3 +11509,9 @@ def render() -> None:
     st.markdown("---")
 
     _render_demand_summary()
+    st.markdown("---")
+
+    # Archived last: Velocity Analysis is no longer part of the daily flow, so
+    # it sits at the very bottom where it can't push the live sections below the
+    # fold.  Its load gate means the archived section costs nothing until asked.
+    _render_velocity_analysis()

@@ -74,10 +74,9 @@ def caps(monkeypatch):
         return df
 
     _ST.data_editor = _editor
-    # No Fabric in tests: signed-in + empty archive.
+    # No Fabric in tests: report the session as signed in.
     monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
                         lambda: True)
-    monkeypatch.setattr(page, "list_pipeline_review_snapshots", lambda: [])
     return c
 
 

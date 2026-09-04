@@ -118,6 +118,8 @@ def caps(monkeypatch):
     _ST.date_input = lambda *a, **k: k.get("value")
     _ST.file_uploader = lambda *a, **k: c.get("_upload")
     _ST.spinner = lambda *a, **k: _Ctx()
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: False)
     return c
 
 
@@ -199,7 +201,7 @@ def test_step1_points_at_the_reference_file_and_offers_it_as_a_template(caps):
     # Named, linked, and framed as the thing to compare against.
     assert "Distribution_Tracker_20260831_164436.csv" in rendered
     assert "Append_New_History%2FArchive" in rendered
-    assert "Compare your export to this file" in rendered
+    assert "should look like the table below" in rendered
 
 
 def test_step1_names_only_the_failure_causing_checks(caps):
@@ -211,10 +213,72 @@ def test_step1_names_only_the_failure_causing_checks(caps):
         assert cause in rendered, cause
 
 
-def test_step1_offers_the_pre_upload_reconcile(caps):
+def test_step1_offers_the_item_master_download(caps, monkeypatch):
+    """Point 4 of the checks is the only Fabric fix — the file sits beside it."""
+    calls = []
+    monkeypatch.setattr(page, "_render_ro_item_master_download_button",
+                        lambda **k: calls.append(k))
     _run_step1(caps, None)
-    labels = " ".join(lbl for lbl, _ in caps["expanders"]).lower()
-    assert "before you upload" in labels
+    assert calls, "Step 1 must offer RO_Item_Master.csv"
+    # A distinct widget key, or it collides with the same button in Step 4c.
+    assert calls[0].get("key_suffix"), calls[0]
+
+
+def test_reconcile_is_silent_when_the_files_agree(caps, monkeypatch):
+    """A clean background check must render nothing at all."""
+    class _Aligned:
+        is_aligned = True
+
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: True)
+    monkeypatch.setattr(page, "_run_ro_seed_summary_reconcile", lambda: _Aligned())
+    page.st.session_state.clear()
+    page._render_ro_reconcile_autocheck()
+    assert caps["warning"] == [] and caps["success"] == [] and caps["error"] == []
+    assert caps["expanders"] == []
+
+
+def test_reconcile_speaks_up_when_the_files_diverge(caps, monkeypatch):
+    class _Diverged:
+        is_aligned = False
+
+    shown = []
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: True)
+    monkeypatch.setattr(page, "_run_ro_seed_summary_reconcile", lambda: _Diverged())
+    monkeypatch.setattr(page, "_render_ro_seed_summary_reconcile_result",
+                        lambda r: shown.append(r))
+    page.st.session_state.clear()
+    page._render_ro_reconcile_autocheck()
+    assert len(shown) == 1
+
+
+def test_reconcile_stays_silent_when_signed_out(caps, monkeypatch):
+    """No Fabric session, no reads — and no scary banner either."""
+    calls = []
+    monkeypatch.setattr(page, "_run_ro_seed_summary_reconcile",
+                        lambda: calls.append(1))
+    page.st.session_state.clear()
+    page._render_ro_reconcile_autocheck()
+    assert calls == []
+    assert caps["warning"] == [] and caps["error"] == []
+
+
+def test_reconcile_runs_once_per_session(caps, monkeypatch):
+    """Two Fabric reads — it must not fire on every rerun."""
+    calls = []
+
+    class _Aligned:
+        is_aligned = True
+
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: True)
+    monkeypatch.setattr(page, "_run_ro_seed_summary_reconcile",
+                        lambda: (calls.append(1), _Aligned())[1])
+    page.st.session_state.clear()
+    page._render_ro_reconcile_autocheck()
+    page._render_ro_reconcile_autocheck()
+    assert len(calls) == 1
 
 
 def test_step1_folds_in_the_excel_backtestable_method(caps):
@@ -266,8 +330,7 @@ def test_a_fabric_problem_links_to_the_file(caps):
 def test_step4_explains_delete_then_reupload(caps, monkeypatch):
     for fn in ("_render_month_cleanup", "_render_ro_rules_panel",
                "_render_ro_seed_download_button",
-               "_render_ro_item_master_download_button",
-               "_render_post_upload_guidance"):
+               "_render_ro_item_master_download_button"):
         monkeypatch.setattr(page, fn, lambda *a, **k: None)
     page._render_ro_step4_rerun()
     rendered = " ".join(caps["info"] + caps["markdown"])
@@ -281,8 +344,7 @@ def test_step4_explains_delete_then_reupload(caps, monkeypatch):
 
 def test_step4c_holds_only_the_two_reference_downloads(caps, monkeypatch):
     """4c is a download shelf now — no regenerate, no reconcile."""
-    for fn in ("_render_month_cleanup", "_render_ro_rules_panel",
-               "_render_post_upload_guidance"):
+    for fn in ("_render_month_cleanup", "_render_ro_rules_panel"):
         monkeypatch.setattr(page, fn, lambda *a, **k: None)
     monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
                         lambda: False)
@@ -314,6 +376,13 @@ def test_no_save_buttons_or_removed_panels_remain():
         "_render_ro_comparison_save_button",
         "_render_ro_regen_from_published",
         "_render_ro_comparison_generate_button",
+        "_render_warnings_banner",
+        "_render_post_upload_guidance",
+        "_render_ro_pipeline_review_archive",
+        "_render_ro_seed_summary_reconcile_button",
+        "please review and fix before saving",
+        "Archived review snapshots",
+        "Regenerate RO_Seed with current rules",
     ):
         assert gone not in src, f"{gone} should have been removed"
 
@@ -335,3 +404,10 @@ def test_pipeline_at_a_glance_is_collapsed_and_the_flow_is_four_steps():
     # Pipeline at a Glance renders last, after Step 4.
     assert (src.index("_render_ro_step4_rerun()")
             < src.index("_render_ro_pipeline_analytics_section()"))
+
+
+def test_rule_changes_point_at_the_step_1_upload():
+    """The regenerate button is gone, so the copy must name its replacement."""
+    src = open(page.__file__, encoding="utf-8").read()
+    assert "rebuild_ro_seed_from_published_history" not in src
+    assert "take effect the next time you upload in Step 1" in src or            "effect the next time" in src

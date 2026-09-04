@@ -222,7 +222,6 @@ from data_sources.ro_comparison import (
     YEAR1_PROB_LE,
     YEAR1_PROB_PRIOR,
     AutoRegenResult,
-    ComparisonWarnings,
     RoComparisonError,
     _recompute_derived_columns,
     build_ro_comparison,
@@ -237,7 +236,6 @@ from data_sources.ro_comparison import (
     list_months,
     regenerate_comparison_output,
     ro_item_master_blob_path,
-    list_pipeline_review_snapshots,
     save_pipeline_review_snapshot,
     save_ro_comparison_output,
     fetch_ro_comparison_output_df,
@@ -275,7 +273,6 @@ from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
     fetch_ro_seed_raw_bytes,
-    rebuild_ro_seed_from_published_history,
     ro_seed_blob_path,
     run_distribution_tracker_pipeline,
 )
@@ -1424,13 +1421,10 @@ def _render_ro_comparison() -> None:
             history_df, dimitems_df, item_master_df,
             prior_month, le_month, dimitems_err, item_master_err,
         )
-        warnings: ComparisonWarnings = st.session_state[_SS_WARNINGS]
-
         with step2:
             # Banner + warnings sit directly above the table so the most
             # recent action is visually closest to what it changed.
             _render_auto_regen_banner_once()
-            _render_warnings_banner(warnings)
             _render_summary_report_section()
 
         # ── STEP 3 · Drivers & drill-in ──────────────────────────────────
@@ -1576,6 +1570,44 @@ _SS_RO_PREFLIGHT_NAME: str = "_ro_input_preflight_filename"
 _SS_RO_ACK: str = "ro_input_ack_unlinked"
 
 
+#: Guards the background reconcile to one run per session — it costs two
+#: Fabric reads, and the answer only changes when something is republished.
+_SS_RECONCILE_CHECKED: str = "_ro_reconcile_autocheck_done"
+
+
+def _render_ro_reconcile_autocheck() -> None:
+    """Check RO_Seed against the published RO Summary; stay silent if they agree.
+
+    The two files travel through independent pipelines and can legitimately
+    drift — a Summary edit saved directly, a stale seed under today's rules, a
+    risk still in ``RO_History_Tracker.csv`` but dropped from the last
+    Distribution Tracker upload.  When they diverge, the mgmt-plan files
+    under-report R&O against what the planner just approved, and no amount of
+    re-uploading fixes it, so it is worth interrupting for.
+
+    Runs once per session (two Fabric reads) and renders **nothing** on the
+    normal path.  A failure of the check itself is logged rather than shown:
+    on a first-ever run ``RO_Comparison_Output.csv`` legitimately does not
+    exist yet, and a red banner about a diagnostic would read as a broken app.
+    """
+    if not fabric_signin_widget.is_fabric_signed_in():
+        return
+    if st.session_state.get(_SS_RECONCILE_CHECKED):
+        result = st.session_state.get(_SS_RECONCILE_RESULT)
+    else:
+        result = _run_ro_seed_summary_reconcile()
+        st.session_state[_SS_RECONCILE_RESULT] = result
+        st.session_state[_SS_RECONCILE_CHECKED] = True
+
+    if result is None or isinstance(result, str):
+        if isinstance(result, str):
+            logger.info("RO_Seed / RO Summary reconcile did not run: %s", result)
+        return
+    if getattr(result, "is_aligned", False):
+        return
+    _render_ro_seed_summary_reconcile_result(result)
+
+
 def _render_ro_status_strip(months: list) -> None:
     """Render the one-line "where am I?" strip at the top of the section.
 
@@ -1624,17 +1656,15 @@ def _render_ro_input_contract() -> None:
     ``RO_Comparison_Output.csv`` wrong — everything else the pre-flight will
     tell them about, on their actual file, with the row number.
     """
-    st.markdown(
-        f"**1 · Compare your export to this file** — "
-        f"[{_RO_INPUT_EXAMPLE_NAME}]({_RO_INPUT_EXAMPLE_URL}), the last "
-        f"Distribution Tracker the app accepted. Its first three rows:"
-    )
+    st.markdown("**1 · Your upload file should look like the table below:**")
     st.dataframe(
         pd.read_csv(io.StringIO(_RO_INPUT_EXAMPLE_CSV), dtype=str),
         use_container_width=True, hide_index=True,
     )
     st.caption(
-        f"Same columns, same formats, and your rows underneath. "
+        f"The first three rows of **{_RO_INPUT_EXAMPLE_NAME}**, the last "
+        f"Distribution Tracker the app accepted — same columns, same formats, "
+        f"your rows underneath. "
         f"[Open the file in Fabric]({_RO_INPUT_EXAMPLE_URL}) · "
         f"[browse every past upload]({_RO_INPUT_ARCHIVE_URL})"
     )
@@ -1654,6 +1684,11 @@ def _render_ro_input_contract() -> None:
         "4. **An item not classified in `RO_Item_Master.csv`** — it counts in "
         "Total B2C but under no portfolio row, so the lines stop adding up."
     )
+
+    # RO_Item_Master sits right here, under the four checks: point 4 above is
+    # the only one the planner fixes in Fabric rather than in her spreadsheet,
+    # so the file she needs is one click from the sentence that names it.
+    _render_ro_item_master_download_button(key_suffix="_step1")
 
     st.download_button(
         "⬇️ Download the example as a blank template (CSV)",
@@ -1820,25 +1855,12 @@ def _render_ro_step1_input(
 
         _render_ro_input_contract()
 
-        # Pre-upload diagnostic: does the CURRENT state already disagree with
-        # itself?  Belongs before the upload, not after — a seed that is
-        # already out of step with the published Summary explains a wrong
-        # report without the planner uploading anything at all, and re-running
-        # the pipeline on top of it would only bury the cause.
-        with st.expander(
-            "🔍 Report already looks wrong? Check the current files agree "
-            "(before you upload)",
-            expanded=False,
-        ):
-            st.caption(
-                "`RO_Seed.csv` (what the Demand Plan ETL reads) and the "
-                "published RO Summary travel through separate pipelines and "
-                "can drift — a Summary edit saved directly, a stale seed under "
-                "today's rules, a risk still in history but dropped from the "
-                "last upload. If they disagree, fix that first: uploading a "
-                "new file will not resolve it."
-            )
-            _render_ro_seed_summary_reconcile_button()
+        # Silent unless it finds something: RO_Seed vs the published RO Summary
+        # is checked in the background, and a clean result renders nothing at
+        # all.  A planner should not have to run a diagnostic to learn the
+        # current files disagree — but nor should she read a green banner
+        # confirming the normal case on every visit.
+        _render_ro_reconcile_autocheck()
 
         st.markdown("---")
         st.markdown("**2 · Upload and run**")
@@ -1953,15 +1975,14 @@ def _render_ro_step4_rerun() -> None:
             "3. The report in Step 2 rebuilds itself."
         )
         _render_month_cleanup()
-        _render_post_upload_guidance()
 
         st.markdown("---")
         st.markdown("#### 4b · Change which rows count as Opportunity or Risk")
         st.caption(
             "These rules decide what lands in RO_Seed. Changing the **Risk** "
             "rules updates the Delta Breakdown · Risk column immediately; "
-            "changing the **Opportunity** rules takes effect when you "
-            "regenerate the seed."
+            "changing the **Opportunity** rules takes effect the next time "
+            "you upload in Step 1."
         )
         _render_ro_rules_panel()
 
@@ -1980,8 +2001,14 @@ def _render_ro_step4_rerun() -> None:
 # ── RO Comparison helpers ───────────────────────────────────────────────────
 
 
-def _render_ro_item_master_download_button() -> None:
-    """Render a red download button for ``RO_Item_Master.csv`` from Fabric."""
+def _render_ro_item_master_download_button(*, key_suffix: str = "") -> None:
+    """Render a red download button for ``RO_Item_Master.csv`` from Fabric.
+
+    ``key_suffix`` namespaces the widget key so the button can appear in more
+    than one place — Step 1 (beside the item-classification check that sends
+    the planner to this file) and Step 4c (the reference-file shelf) — without
+    the two colliding on Streamlit's widget-key registry.
+    """
     if not fabric_signin_widget.is_fabric_signed_in():
         st.caption(
             "_Sign in via **Documentation** to download "
@@ -2012,7 +2039,7 @@ def _render_ro_item_master_download_button() -> None:
         data=raw_bytes,
         file_name=f"RO_Item_Master_{today}.csv",
         mime="text/csv",
-        key="ro_cmp_dl_item_master",
+        key=f"ro_cmp_dl_item_master{key_suffix}",
         type="primary",
         help=(
             f"Downloads a byte-for-byte copy of `Files/{blob_path}` "
@@ -2055,45 +2082,6 @@ def _render_ro_seed_download_button() -> None:
 # Session key holding the last reconciliation result so the divergence detail
 # survives a Streamlit rerun (opening an expander) without re-reading Fabric.
 _SS_RECONCILE_RESULT: str = "_ro_seed_summary_reconcile_result"
-
-
-def _render_ro_seed_summary_reconcile_button() -> None:
-    """One-click audit: does RO_Seed.csv agree with the RO Summary Report?
-
-    The Demand Plan ETL builds ``qry_mgmt_plan_full`` / ``qry_total_item_
-    level_demand`` from ``RO_Seed.csv``; the RO Summary Report is built from
-    ``RO_Comparison_Output.csv``.  Both files travel through independent
-    pipelines and can legitimately drift — a Summary edit saved directly, a
-    stale seed under the current rules, a risk still carried in
-    ``RO_History_Tracker.csv`` but dropped from the latest Distribution
-    Tracker upload.  When they drift, the mgmt-plan files silently
-    under-report R&O relative to what the planner just approved.
-
-    This surfaces the drift explicitly: one button, one call, warning + row
-    detail when risks live in one file but not the other, under the CURRENT
-    :class:`data_sources.ro_rules_config.RoRulesConfig` so the audit matches
-    exactly what the RO Summary above is showing.  Pure diagnostic — nothing
-    is written to Fabric.
-    """
-    if not fabric_signin_widget.is_fabric_signed_in():
-        return
-
-    clicked = st.button(
-        "🔍 Reconcile RO_Seed with RO Summary",
-        key="ro_cmp_reconcile_seed_summary",
-        help=(
-            "Check that every risk the RO Summary Report shows is also in "
-            "RO_Seed.csv (the file the Demand Plan ETL reads).  Divergences "
-            "are the top reason qry_mgmt_plan_full / qry_total_item_level_"
-            "demand don't reflect a freshly committed risk."
-        ),
-    )
-    if clicked:
-        st.session_state[_SS_RECONCILE_RESULT] = _run_ro_seed_summary_reconcile()
-
-    result = st.session_state.get(_SS_RECONCILE_RESULT)
-    if result is not None:
-        _render_ro_seed_summary_reconcile_result(result)
 
 
 def _run_ro_seed_summary_reconcile():
@@ -2178,7 +2166,7 @@ def _render_ro_seed_summary_reconcile_result(result) -> None:
         f"is rebuilt.\n"
         f"* **{len(result.missing_from_summary)}** risk(s) in RO_Seed but "
         f"missing from the RO Summary → usually a stale "
-        f"`RO_Comparison_Output.csv` (Regenerate it below).\n\n"
+        f"`RO_Comparison_Output.csv` — re-upload in Step 1 to refresh it.\n\n"
         f"{rules_caption}."
     )
 
@@ -2491,54 +2479,6 @@ def _maybe_auto_regenerate_comparison_output(
     st.session_state[_SS_AUTO_REGEN_BANNER] = result
 
 
-def _render_post_upload_guidance() -> None:
-    """Tell the planner how to see their changes after uploading a new file.
-
-    Replaces the deprecated "🔄 Refresh from Fabric" button.  Two
-    things changed since that button was useful:
-
-    1. ``RO_History_Tracker.csv`` cache keys are now ETag-driven (see
-       :func:`data_sources.ro_comparison._compute_history_blob_signature`),
-       so every render does a sub-100ms HEAD-equivalent to see if
-       Fabric has a fresh version.  When it does, the comparison
-       output + every downstream table auto-regenerate in the same
-       render — no button click required.
-    2. The "Upload Customer Input" path also writes into the same
-       Fabric pipeline.  Once Fabric materialises the new history
-       (typically minutes after upload — outside this app's control),
-       the next render here picks it up automatically.
-
-    The remaining failure mode is *browser-side staleness* — a
-    proxy / browser cache pinning the previous Streamlit asset
-    bundle.  We surface the canonical hard-refresh shortcuts so the
-    planner can self-serve in those rare cases without us needing a
-    code-side "force refresh" hack.
-
-    Collapsed by default so the upload control stays above the fold;
-    expand when troubleshooting stale data after an upload.
-    """
-    with st.expander(
-        "ℹ️ Changes auto-refresh after upload — troubleshooting",
-        expanded=False,
-    ):
-        st.markdown(
-            "✅ **Changes auto-refresh.**  Once Fabric ingests your upload "
-            "(usually within a few minutes), this page detects the new "
-            "`RO_History_Tracker.csv` ETag on the next render and "
-            "automatically rebuilds the RO Comparison table, the driver "
-            "breakdown, the Early-Start-Date Programs table, and the "
-            "RO Summary Report — no button click required.\n\n"
-            "**If you still don't see your changes after a few minutes:**\n"
-            "1. Wait one more minute, then reload the page tab.\n"
-            "2. If the table is still stale, do a **hard refresh** to clear "
-            "your browser's local cache:\n"
-            "   - **Windows / Linux:** `Ctrl` + `Shift` + `R` (or `Ctrl` + `F5`)\n"
-            "   - **macOS:** `⌘` + `Shift` + `R`\n"
-            "3. As a last resort, sign out of Microsoft Fabric (top of the "
-            "sidebar) and sign back in — this drops every cached token and "
-            "forces a fresh read."
-        )
-
 
 def _render_auto_regen_banner_once() -> None:
     """Pop and render the most recent auto-regen banner if present.
@@ -2607,76 +2547,7 @@ def _ensure_summary_in_session(
     _maybe_autosave_ro_comparison_output(trigger="comparison rebuild")
 
 
-def _render_warnings_banner(w: ComparisonWarnings) -> None:
-    """Render the consolidated warnings banner above the table.
 
-    Foldable so a planner staring at a clean run doesn't have a
-    multi-line orange block dominating the page header — the banner
-    is collapsed by default and the title text gives the count.
-    Listing item IDs (capped at 30 per category to keep the body
-    legible once expanded) lets the planner ctrl-F them in the table
-    immediately instead of scrolling.
-    """
-    if not w.has_any():
-        return
-
-    def _format_items(items: list[str]) -> str:
-        if not items:
-            return ""
-        head = ", ".join(items[:30])
-        tail = f"… (+{len(items) - 30} more)" if len(items) > 30 else ""
-        return f"{head}{tail}"
-
-    lines: list[str] = []
-    if w.missing_brand:
-        lines.append(
-            f"**Missing Brand** ({len(w.missing_brand)} item(s) — please fill): "
-            f"{_format_items(w.missing_brand)}"
-        )
-    if w.missing_portfolio:
-        lines.append(
-            f"**Missing Portfolio Major/Minor** ({len(w.missing_portfolio)} item(s) "
-            f"not found in dp_dimitems — please fill): {_format_items(w.missing_portfolio)}"
-        )
-    if w.missing_supply_format:
-        lines.append(
-            f"**Missing Supply Format** ({len(w.missing_supply_format)} item(s) "
-            f"with no value from either dp_dimitems or RO_History Format): "
-            f"{_format_items(w.missing_supply_format)}"
-        )
-    if w.unparseable_dates:
-        lines.append(
-            f"**Unparseable dates** ({len(w.unparseable_dates)} item(s)): "
-            f"{_format_items(w.unparseable_dates)}"
-        )
-    if w.unparseable_numerics:
-        lines.append(
-            f"**Unparseable numeric cells** ({len(w.unparseable_numerics)} item(s)): "
-            f"{_format_items(w.unparseable_numerics)}"
-        )
-    if w.dimitems_unavailable:
-        lines.append(
-            "**dp_dimitems unavailable** — Portfolio Major/Minor are blank and "
-            "Supply Format falls back to RO_History Format for every row. "
-            "Fix Fabric sign-in and reload."
-        )
-    for note in w.extras:
-        lines.append(f"**Other:** {note}")
-
-    # Foldable container — collapsed by default.  The expander label
-    # surfaces the *count* so the planner can decide at a glance
-    # whether to expand without reading the body.  Body uses markdown
-    # bullets so the existing **bold** category labels render
-    # consistently with the previous flat ``st.warning`` layout.
-    with st.expander(
-        f"⚠️ {len(lines)} note(s) — please review and fix before saving",
-        expanded=False,
-    ):
-        for line in lines:
-            st.markdown(f"- {line}")
-
-
-@st.fragment
 def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     """Render the editor + subtotal + per-Format summary + Save.
 
@@ -3609,37 +3480,6 @@ def _render_ro_high_urgency_table(comp_df: pd.DataFrame) -> None:
         except RoComparisonError as exc:
             st.error(f"❌ Could not archive the snapshot to Fabric.\n\n{exc}")
 
-    _render_ro_pipeline_review_archive()
-
-
-def _render_ro_pipeline_review_archive() -> None:
-    """Collapsed list of archived RO Pipeline Review snapshots (audit trail).
-
-    Read-back for the write-only archive — surfaces the timestamped CSVs the
-    Refresh button writes so the trail is reachable from the app.  Requires
-    Fabric sign-in; degrades to a hint / info banner otherwise.
-    """
-    with st.expander("🗂️ Archived review snapshots", expanded=False):
-        if not fabric_signin_widget.is_fabric_signed_in():
-            st.caption("_Sign in to list archived snapshots._")
-            return
-        try:
-            files = list_pipeline_review_snapshots()
-        except RoComparisonError as exc:
-            st.warning(f"Could not list the archive: {exc}")
-            return
-        if not files:
-            st.info("No snapshots archived yet — use **Refresh & archive** above.")
-            return
-        # Newest first (already sorted by the data source); show the recent few.
-        st.caption(f"{len(files)} snapshot(s) — most recent first.")
-        st.dataframe(
-            pd.DataFrame(
-                [{"File": f.name,
-                  "Last modified (UTC)": f.last_modified or "—",
-                  "Size (KB)": round((f.size or 0) / 1024, 1)}
-                 for f in files[:25]]),
-            use_container_width=True, hide_index=True)
 
 
 # Build-up segment styling: solid green base (expected in-year) → lighter timing
@@ -3790,11 +3630,14 @@ def _render_ro_rules_panel() -> None:
       re-runs :func:`build_summary_report` immediately, so the Delta
       Breakdown ↔ Risk column updates on the next fragment rerun without
       touching Fabric.
-    * **Regeneration** — the Opportunity gate (Reflected-in-APS whitelist,
+    * **Next upload** — the Opportunity gate (Reflected-in-APS whitelist,
       Pipeline Status excludes, Opportunity probability threshold) lives
-      *upstream* of the persisted ``RO_Seed.csv``, so changing it requires
-      the **Regenerate RO_Seed** button below to rewrite the seed and
-      history files with the new rules applied.
+      *upstream* of the persisted ``RO_Seed.csv``, so changing it takes effect
+      when Step 1 next runs the pipeline.  There is no separate regenerate
+      button: :func:`data_sources.ro_seed_pipeline.run_distribution_tracker_pipeline`
+      rebuilds the seed over the same published history, for the same latest
+      snapshot month, under whatever config this panel holds — the identical
+      result the old button produced, minus a second way to do one thing.
     """
     current = ro_rules_config_from_session(st.session_state)
 
@@ -3828,8 +3671,8 @@ def _render_ro_rules_panel() -> None:
         st.caption(
             "The **Delta Breakdown ▸ Risk** column reacts to the Risk rules "
             "here immediately.  The Opportunity rules take effect only after "
-            "you click **Regenerate RO_Seed with current rules** below — "
-            "they sit upstream of the persisted RO_Seed."
+            "you next upload the Distribution Tracker in Step 1 — they "
+            "sit upstream of the persisted RO_Seed."
         )
 
         st.markdown("**Opportunity — what lands in RO_Seed**")
@@ -3913,49 +3756,18 @@ def _render_ro_rules_panel() -> None:
         )
         st.session_state[RO_RULES_SESSION_KEY] = updated
 
-        # Regenerate button — reruns the seed pipeline on the published
-        # Distribution_Tracker_History.csv with the current rules.  Behind an
-        # explicit anchor so the planner keeps FY27 control; defaults match
-        # the upload path's default.
-        st.markdown("---")
-        st.markdown("**Regenerate RO_Seed with current rules**")
-        st.caption(
-            "Re-reads the published `Distribution_Tracker_History.csv` from "
-            "Fabric and rebuilds `RO_Seed.csv` + `RO_History_Tracker.csv` "
-            "with the rules above.  Uses the latest snapshot month(s) in "
-            "history."
+        # NO regenerate button here, deliberately.  Re-uploading the
+        # Distribution Tracker in Step 1 produces an identical seed: both
+        # paths call ``_build_ro_seed`` over the same published history, for
+        # the same latest snapshot month, with the config below — so a second
+        # button would be a second way to do one thing, and the upload is the
+        # path that also re-validates the input.
+        st.info(
+            "Rule changes take effect the next time you **upload in Step 1**. "
+            "The **Risk** rules re-slice the Delta Breakdown · Risk column "
+            "immediately; the **Opportunity** rules change what lands in "
+            "`RO_Seed.csv`, which is rebuilt on that upload."
         )
-        anchor = st.date_input(
-            "Fiscal year-end anchor",
-            value=date(2027, 3, 31),
-            format="YYYY-MM-DD",
-            key="ro_rules_regen_anchor",
-            help="Drives 'Days in Year' in the seed expansion.",
-        )
-        if st.button(
-            "🔁 Regenerate RO_Seed with current rules",
-            key="ro_rules_regen_btn",
-            type="primary",
-            help="Rewrites RO_Seed.csv + RO_History_Tracker.csv in Fabric using "
-                 "the rules above — no upload required.",
-        ):
-            with st.spinner("Regenerating RO_Seed from published history…"):
-                result = rebuild_ro_seed_from_published_history(
-                    anchor_date=anchor, config=updated,
-                )
-            st.session_state[_SS_PIPELINE_RESULT] = result
-            if result.ok:
-                # Force the downstream views to re-read the freshly written
-                # files and clear the picker keys so the LE selector snaps to
-                # the newest snapshot month, then rerun — mirrors the upload
-                # path's post-run recovery.
-                fetch_ro_history_df(force_refresh=True)
-                st.session_state.pop("ro_cmp_prior_month", None)
-                st.session_state.pop("ro_cmp_le_month", None)
-                st.rerun(scope="app")
-            else:
-                st.error("❌ Regenerate failed — see the log below.")
-                _render_ro_pipeline_summary(result)
 
 
 @st.fragment

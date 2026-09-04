@@ -1453,7 +1453,7 @@ def _render_ro_comparison() -> None:
             _render_filtered_editor_fragment(prior_month, le_month)
 
         # ── STEP 4 · Re-run or retune ────────────────────────────────────
-        _render_ro_step4_rerun(prior_month, le_month)
+        _render_ro_step4_rerun()
 
         # Pipeline at a Glance — a headline read rather than a step, so it
         # closes the section collapsed instead of sitting between the editor
@@ -1472,8 +1472,8 @@ _RO_INPUT_EXAMPLE_URL: str = (
     "https://app.fabric.microsoft.com/groups/"
     "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
     "a01f513d-eee7-41eb-8c15-670bc40e7fc8?experience=fabric-developer"
-    "&selectedPath=Files%2FRO+Tracking%2FAppend_New_History%2FArchive%2F"
-    "Distribution_Tracker_20260831_164436.csv&extensionScenario=openArtifact"
+    "&selectedPath=Files%2FRO%20Tracking%2FAppend_New_History%2FArchive%2F"
+    "Distribution_Tracker_20260831_164436.csv"
 )
 _RO_INPUT_ARCHIVE_URL: str = (
     _FABRIC_LAKEHOUSE_BASE
@@ -1615,57 +1615,57 @@ def _render_ro_status_strip(months: list) -> None:
 
 
 def _render_ro_input_contract() -> None:
-    """Render "what your file must contain" + the downloadable example."""
-    st.markdown("**1 · Check your file against the required shape**")
-    cols = list(rpf.REQUIRED_KEY_COLUMNS) + list(rpf.REQUIRED_NUMERIC_COLUMNS)
-    reverse_alias = {v: k for k, v in rpf.HEADER_ALIASES.items()}
-    contract = pd.DataFrame({
-        "Column": [rpf.MONTH_COLUMN] + cols,
-        "Must contain": (
-            ["The FIRST day of the month you are uploading, e.g. 2026-06-01 — "
-             "the same value in every row"]
-            + ["A date, e.g. 2027-01-01" if c == "First Ship Date"
-               else "A fraction (0.5) or a percent (50%)" if c == "Probability"
-               else "A number — blank counts as zero" if c in rpf.REQUIRED_NUMERIC_COLUMNS
-               else "Text" for c in cols]
-        ),
-        "Older name also accepted": (
-            ["—"] + [reverse_alias.get(c, "—") for c in cols]
-        ),
-    })
-    st.dataframe(contract, use_container_width=True, hide_index=True,
-                 height=36 * (len(contract) + 1) + 4)
-    st.info(
-        "**The one people forget:** the **Month** column. Excel's "
-        "*Customer Input* export does not include it — you have to add it, "
-        "and every row needs the first of the month you are uploading."
+    """Show the reference Distribution Tracker and what actually breaks a run.
+
+    Framed against a real archived upload rather than an abstract column
+    contract: a planner comparing their export to a file the app has already
+    accepted gets the answer faster than one reading a twelve-row spec.  The
+    prose deliberately names only the things that make
+    ``RO_Comparison_Output.csv`` wrong — everything else the pre-flight will
+    tell them about, on their actual file, with the row number.
+    """
+    st.markdown(
+        f"**1 · Compare your export to this file** — "
+        f"[{_RO_INPUT_EXAMPLE_NAME}]({_RO_INPUT_EXAMPLE_URL}), the last "
+        f"Distribution Tracker the app accepted. Its first three rows:"
+    )
+    st.dataframe(
+        pd.read_csv(io.StringIO(_RO_INPUT_EXAMPLE_CSV), dtype=str),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        f"Same columns, same formats, and your rows underneath. "
+        f"[Open the file in Fabric]({_RO_INPUT_EXAMPLE_URL}) · "
+        f"[browse every past upload]({_RO_INPUT_ARCHIVE_URL})"
     )
 
-    with st.expander("📄 See a real example file (and download it as a template)",
-                     expanded=False):
-        st.markdown(
-            f"These three rows have the exact columns and formats the app "
-            f"expects. They are taken from **{_RO_INPUT_EXAMPLE_NAME}**, a "
-            f"file the app has already accepted — "
-            f"[open it in Fabric]({_RO_INPUT_EXAMPLE_URL}) to see the whole "
-            f"thing, or [browse every past upload]({_RO_INPUT_ARCHIVE_URL})."
-        )
-        st.dataframe(
-            pd.read_csv(io.StringIO(_RO_INPUT_EXAMPLE_CSV), dtype=str),
-            use_container_width=True, hide_index=True,
-        )
-        st.download_button(
-            "⬇️ Download this as a blank template (CSV)",
-            data=_RO_INPUT_EXAMPLE_CSV.encode("utf-8"),
-            file_name="Distribution_Tracker_TEMPLATE.csv",
-            mime="text/csv",
-            key="ro_input_template_dl",
-            help=(
-                "Use this when the app does not recognise your own export: "
-                "paste your rows under these headers, delete the three "
-                "example rows, and upload."
-            ),
-        )
+    st.info(
+        "**You do not need to audit every column.** Four things make the "
+        "report come out wrong, and the check below finds all of them in your "
+        "own file — naming the exact row:\n\n"
+        "1. **A missing `Month` column.** The export does not include it; you "
+        "add it, set to the first of the month you are uploading "
+        "(e.g. `2026-06-01`), the same value in every row. This is the one "
+        "people forget.\n"
+        "2. **A broken `Lbs./yr` cell** — an `#N/A` or `#REF!` reads as "
+        "**zero volume**, so the opportunity silently disappears.\n"
+        "3. **An unreadable `Probability` or `First Ship Date`** — the first "
+        "multiplies every volume, the second decides how much lands in-year.\n"
+        "4. **An item not classified in `RO_Item_Master.csv`** — it counts in "
+        "Total B2C but under no portfolio row, so the lines stop adding up."
+    )
+
+    st.download_button(
+        "⬇️ Download the example as a blank template (CSV)",
+        data=_RO_INPUT_EXAMPLE_CSV.encode("utf-8"),
+        file_name="Distribution_Tracker_TEMPLATE.csv",
+        mime="text/csv",
+        key="ro_input_template_dl",
+        help=(
+            "Use this when your own export is not recognised: paste your rows "
+            "under these headers, delete the three example rows, and upload."
+        ),
+    )
 
 
 def _render_ro_seed_method() -> None:
@@ -1697,15 +1697,19 @@ def _render_preflight_finding(finding) -> None:
                 f"[🔗 Open the folder in Fabric]({_RO_ITEM_MASTER_FABRIC_URL})"
             )
         if finding.cells is not None and not finding.cells.empty:
-            st.markdown(
-                f"**{len(finding.cells)} place(s) to fix** — "
-                "download this list if it is long:"
-            )
-            st.dataframe(finding.cells, use_container_width=True,
-                         hide_index=True,
-                         height=min(36 * (len(finding.cells) + 1) + 4, 320))
+            total = len(finding.cells)
+            shown = finding.cells.head(rpf.MAX_CELLS_SHOWN)
+            if total > rpf.MAX_CELLS_SHOWN:
+                st.markdown(
+                    f"**{total} place(s) to fix** — first "
+                    f"{rpf.MAX_CELLS_SHOWN} shown; the download has all of them:"
+                )
+            else:
+                st.markdown(f"**{total} place(s) to fix:**")
+            st.dataframe(shown, use_container_width=True, hide_index=True,
+                         height=min(36 * (len(shown) + 1) + 4, 320))
             st.download_button(
-                "⬇️ Download this fix list (CSV)",
+                f"⬇️ Download the full fix list ({total} rows, CSV)",
                 data=finding.cells.to_csv(index=False).encode("utf-8"),
                 file_name=f"RO_input_fixes_{finding.code.lower()}.csv",
                 mime="text/csv",
@@ -1816,6 +1820,26 @@ def _render_ro_step1_input(
 
         _render_ro_input_contract()
 
+        # Pre-upload diagnostic: does the CURRENT state already disagree with
+        # itself?  Belongs before the upload, not after — a seed that is
+        # already out of step with the published Summary explains a wrong
+        # report without the planner uploading anything at all, and re-running
+        # the pipeline on top of it would only bury the cause.
+        with st.expander(
+            "🔍 Report already looks wrong? Check the current files agree "
+            "(before you upload)",
+            expanded=False,
+        ):
+            st.caption(
+                "`RO_Seed.csv` (what the Demand Plan ETL reads) and the "
+                "published RO Summary travel through separate pipelines and "
+                "can drift — a Summary edit saved directly, a stale seed under "
+                "today's rules, a risk still in history but dropped from the "
+                "last upload. If they disagree, fix that first: uploading a "
+                "new file will not resolve it."
+            )
+            _render_ro_seed_summary_reconcile_button()
+
         st.markdown("---")
         st.markdown("**2 · Upload and run**")
         uploaded = st.file_uploader(
@@ -1904,7 +1928,7 @@ def _render_ro_step1_input(
             _render_ro_pipeline_summary(result)
 
 
-def _render_ro_step4_rerun(prior_month: date, le_month: date) -> None:
+def _render_ro_step4_rerun() -> None:
     """Render Step 4: replace an input, or change how RO is read.
 
     Both destructive and configuration controls live here, out of the happy
@@ -1929,6 +1953,7 @@ def _render_ro_step4_rerun(prior_month: date, le_month: date) -> None:
             "3. The report in Step 2 rebuilds itself."
         )
         _render_month_cleanup()
+        _render_post_upload_guidance()
 
         st.markdown("---")
         st.markdown("#### 4b · Change which rows count as Opportunity or Risk")
@@ -1941,12 +1966,15 @@ def _render_ro_step4_rerun(prior_month: date, le_month: date) -> None:
         _render_ro_rules_panel()
 
         st.markdown("---")
-        st.markdown("#### 4c · Cross-check and re-publish")
-        _render_ro_comparison_generate_button(prior_month, le_month)
+        st.markdown("#### 4c · Download the reference files")
+        st.caption(
+            "The two files the pipeline reads. Download either to inspect it, "
+            "or to edit and re-upload it to Fabric — `RO_Item_Master.csv` is "
+            "the one to edit when Step 1 reports an item that will not "
+            "classify."
+        )
         _render_ro_seed_download_button()
-        _render_ro_seed_summary_reconcile_button()
         _render_ro_item_master_download_button()
-        _render_post_upload_guidance()
 
 
 # ── RO Comparison helpers ───────────────────────────────────────────────────
@@ -1973,29 +2001,8 @@ def _render_ro_item_master_download_button() -> None:
         )
         return
 
-    # Scope red styling to this download via a marker + sibling selector.
-    st.markdown(
-        '<span id="ro-item-master-dl-marker"></span>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        """
-        <style>
-        #ro-item-master-dl-marker ~ div [data-testid="stDownloadButton"] button {
-            background-color: #d32f2f !important;
-            color: #ffffff !important;
-            border: 1px solid #b71c1c !important;
-        }
-        #ro-item-master-dl-marker ~ div [data-testid="stDownloadButton"] button:hover {
-            background-color: #b71c1c !important;
-            border-color: #8b0000 !important;
-            color: #ffffff !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
+    # ``type="primary"`` alone gives the red treatment now; the old
+    # marker-plus-sibling-selector CSS hack it needed is gone.
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")
     st.download_button(
         label=(
@@ -2037,6 +2044,7 @@ def _render_ro_seed_download_button() -> None:
         file_name=f"RO_Seed_{today}.csv",
         mime="text/csv",
         key="ro_cmp_dl_ro_seed",
+        type="primary",
         help=(
             f"Byte-for-byte copy of `Files/{blob_path}` — the R&O source the "
             "Demand Plan pipeline expands into `tbl_ro_input`."
@@ -2597,96 +2605,6 @@ def _ensure_summary_in_session(
     # ``RO_History_Tracker.csv`` change-detect path wrote.  Idempotent via
     # signature guard — repeat reruns within the same session don't write.
     _maybe_autosave_ro_comparison_output(trigger="comparison rebuild")
-
-
-def _render_ro_comparison_generate_button(
-    prior_month: date,
-    le_month: date,
-) -> None:
-    """Render an explicit "regenerate from source" button.
-
-    Distinct from the other two write paths:
-
-      * **Auto-regen** only fires when ``RO_History_Tracker.csv``'s
-        fingerprint drifts from the last-saved output — and only if the
-        cached read already surfaced the fresh bytes.
-      * **💾 Save** republishes the in-memory frame *including* any
-        hand-edits made in the table.
-
-    This button **force-reads the latest `RO_History_Tracker.csv`
-    (+ dp_dimitems / RO_Item_Master dims) straight from Fabric**, rebuilds
-    the comparison for the selected Prior/LE months, and overwrites
-    ``RO_Comparison_Output.csv`` — **discarding** any manual cell edits.
-
-    The force-refresh is the crux: without it the button would regenerate
-    from whatever ``fetch_ro_history_df`` last cached, so a just-updated
-    ``RO_History_Tracker.csv`` could produce an identical table (the bug
-    this fixes).  After writing, it drops the cached comparison + the
-    auto-regen session guard and **reruns**, so the page re-reads the now-
-    fresh source at the top and every downstream table rebuilds from the
-    new baseline.
-    """
-    clicked = st.button(
-        "🔁 Generate `RO_Comparison_Output.csv` from current RO_History",
-        key="ro_cmp_generate_from_history",
-        use_container_width=True,
-        help=(
-            "Force-reads the latest `RO_History_Tracker.csv` from Fabric "
-            "(which already reflects `Distribution_Tracker_History.csv`), "
-            "rebuilds the comparison for the selected Prior/LE months, and "
-            "overwrites `Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`. "
-            "Ignores any in-tab cell edits — use **💾 Save** to keep those."
-        ),
-    )
-    if not clicked:
-        return
-
-    # 1. Force a FRESH read of the required source, bypassing the ETag /
-    #    TTL cache entirely.  A stale cached frame is exactly why a
-    #    just-updated RO_History could regenerate an identical table.
-    try:
-        with st.spinner(
-            "Reading the latest RO_History_Tracker.csv from Microsoft Fabric…"
-        ):
-            history_df = fetch_ro_history_df(force_refresh=True)
-    except RoComparisonError as exc:
-        st.error(f"❌ Could not read the latest RO_History_Tracker.csv.\n\n{exc}")
-        return
-    if history_df is None or history_df.empty:
-        st.warning("RO_History_Tracker.csv is empty — nothing to generate from.")
-        return
-
-    # 2. Best-effort fresh read of the soft dimension sources; a failure
-    #    just leaves the Portfolio / Supply-Format cascade to its fallback.
-    def _refresh_soft(fetcher) -> pd.DataFrame | None:
-        try:
-            return fetcher(force_refresh=True)
-        except RoComparisonError:
-            return None
-
-    dimitems_df = _refresh_soft(fetch_dimitems_df)
-    item_master_df = _refresh_soft(fetch_ro_item_master_df)
-
-    # 3. Rebuild + save unconditionally from the fresh frames.
-    try:
-        with st.spinner(
-            "Generating RO_Comparison_Output.csv from current RO_History…"
-        ):
-            result = regenerate_comparison_output(
-                history_df, dimitems_df, item_master_df, prior_month, le_month,
-            )
-    except RoComparisonError as exc:
-        st.error(f"❌ Could not generate RO_Comparison_Output.csv.\n\n{exc}")
-        return
-
-    # 4. Drop the cached comparison + the auto-regen session guard, stash the
-    #    one-shot banner, and rerun.  On the rerun the top-of-section
-    #    ``fetch_ro_history_df()`` returns the now-fresh cache and
-    #    ``_ensure_summary_in_session`` rebuilds the on-screen table from it.
-    _invalidate_ro_comparison_downstream()
-    st.session_state.pop(_SS_AUTO_REGEN_SIG, None)
-    st.session_state[_SS_AUTO_REGEN_BANNER] = result
-    st.rerun(scope="app")
 
 
 def _render_warnings_banner(w: ComparisonWarnings) -> None:

@@ -129,7 +129,15 @@ def _run_step1(caps, upload, item_master=None):
 
 
 def _master(*items) -> pd.DataFrame:
-    return pd.DataFrame({"Item #": list(items), "Item Desc": ["x"] * len(items)})
+    """A fully classified RO_Item_Master — the "nothing to report" case."""
+    n = len(items)
+    return pd.DataFrame({
+        "Item #": list(items),
+        "Item Desc": ["x"] * n,
+        "Portfolio Major": ["HTST"] * n,
+        "Portfolio Minor": ["Gallon Jug"] * n,
+        "Brand Category": ["Branded"] * n,
+    })
 
 
 def _run_button(caps):
@@ -184,11 +192,29 @@ def test_acknowledging_an_unlinked_item_enables_the_run(caps):
 
 # ── Step 1 guidance ──────────────────────────────────────────────────────────
 
-def test_step1_offers_the_example_and_a_downloadable_template(caps):
+def test_step1_points_at_the_reference_file_and_offers_it_as_a_template(caps):
     _run_step1(caps, None)
     assert any("template" in d.lower() for d in caps["download"])
-    labels = " ".join(lbl for lbl, _ in caps["expanders"])
-    assert "example" in labels.lower()
+    rendered = " ".join(caps["markdown"] + caps["captions"])
+    # Named, linked, and framed as the thing to compare against.
+    assert "Distribution_Tracker_20260831_164436.csv" in rendered
+    assert "Append_New_History%2FArchive" in rendered
+    assert "Compare your export to this file" in rendered
+
+
+def test_step1_names_only_the_failure_causing_checks(caps):
+    """Guidance must not read as "audit every column"."""
+    _run_step1(caps, None)
+    rendered = " ".join(caps["info"])
+    assert "do not need to audit every column" in rendered
+    for cause in ("Month", "Lbs./yr", "Probability", "RO_Item_Master.csv"):
+        assert cause in rendered, cause
+
+
+def test_step1_offers_the_pre_upload_reconcile(caps):
+    _run_step1(caps, None)
+    labels = " ".join(lbl for lbl, _ in caps["expanders"]).lower()
+    assert "before you upload" in labels
 
 
 def test_step1_folds_in_the_excel_backtestable_method(caps):
@@ -239,14 +265,11 @@ def test_a_fabric_problem_links_to_the_file(caps):
 
 def test_step4_explains_delete_then_reupload(caps, monkeypatch):
     for fn in ("_render_month_cleanup", "_render_ro_rules_panel",
-               "_render_ro_comparison_generate_button",
                "_render_ro_seed_download_button",
-               "_render_ro_seed_summary_reconcile_button",
                "_render_ro_item_master_download_button",
                "_render_post_upload_guidance"):
         monkeypatch.setattr(page, fn, lambda *a, **k: None)
-    from datetime import date
-    page._render_ro_step4_rerun(date(2026, 5, 1), date(2026, 6, 1))
+    page._render_ro_step4_rerun()
     rendered = " ".join(caps["info"] + caps["markdown"])
     assert "delete" in rendered.lower()
     assert "Step 1" in rendered
@@ -255,6 +278,31 @@ def test_step4_explains_delete_then_reupload(caps, monkeypatch):
 
 
 # ── The removals stay removed ────────────────────────────────────────────────
+
+def test_step4c_holds_only_the_two_reference_downloads(caps, monkeypatch):
+    """4c is a download shelf now — no regenerate, no reconcile."""
+    for fn in ("_render_month_cleanup", "_render_ro_rules_panel",
+               "_render_post_upload_guidance"):
+        monkeypatch.setattr(page, fn, lambda *a, **k: None)
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: False)
+    page._render_ro_step4_rerun()
+    rendered = " ".join(caps["markdown"])
+    assert "Download the reference files" in rendered
+    assert "Generate" not in rendered
+    assert not any("Reconcile" in b[0] for b in caps["buttons"])
+
+
+def test_both_reference_downloads_are_primary_styled():
+    """Red, per the design: these are the two files a planner actually takes."""
+    src = open(page.__file__, encoding="utf-8").read()
+    for key in ("ro_cmp_dl_ro_seed", "ro_cmp_dl_item_master"):
+        i = src.index(key)
+        window = src[i - 400:i + 400]
+        assert 'type="primary"' in window, key
+    # The old marker-plus-CSS red hack is gone.
+    assert "ro-item-master-dl-marker" not in src
+
 
 def test_no_save_buttons_or_removed_panels_remain():
     src = open(page.__file__, encoding="utf-8").read()
@@ -265,6 +313,7 @@ def test_no_save_buttons_or_removed_panels_remain():
         "_render_summary_report_diagnostic",
         "_render_ro_comparison_save_button",
         "_render_ro_regen_from_published",
+        "_render_ro_comparison_generate_button",
     ):
         assert gone not in src, f"{gone} should have been removed"
 
@@ -284,5 +333,5 @@ def test_pipeline_at_a_glance_is_collapsed_and_the_flow_is_four_steps():
                  "Step 3 · Drivers", "Step 4 · Re-upload"):
         assert step in src, step
     # Pipeline at a Glance renders last, after Step 4.
-    assert (src.index("_render_ro_step4_rerun(prior_month, le_month)")
+    assert (src.index("_render_ro_step4_rerun()")
             < src.index("_render_ro_pipeline_analytics_section()"))

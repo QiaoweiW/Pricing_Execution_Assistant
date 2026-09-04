@@ -25,12 +25,21 @@ def _csv(*rows: str, header: str = _GOOD_HEADER) -> bytes:
     return (header + "".join(rows)).encode("utf-8")
 
 
-def _master(*items) -> pd.DataFrame:
-    return pd.DataFrame({
+def _master(*items, **blank) -> pd.DataFrame:
+    """A fully classified RO_Item_Master, unless a classifier is blanked out.
+
+    ``_master(340021)`` → the item classifies cleanly.
+    ``_master(340021, portfolio_minor="")`` → present but unclassified.
+    """
+    n = len(items)
+    cols = {
         "Item #": list(items),
-        "Item Desc": ["x"] * len(items),
-        "Portfolio Major": ["HTST"] * len(items),
-    })
+        "Item Desc": ["x"] * n,
+        "Portfolio Major": [blank.get("portfolio_major", "HTST")] * n,
+        "Portfolio Minor": [blank.get("portfolio_minor", "Gallon Jug")] * n,
+        "Brand Category": [blank.get("brand_category", "Branded")] * n,
+    }
+    return pd.DataFrame(cols)
 
 
 def _codes(result) -> set:
@@ -71,7 +80,7 @@ def test_every_probability_form_the_pipeline_accepts_passes(prob):
 def test_formats_the_pipeline_cleans_are_not_flagged(value):
     row = _GOOD_ROW.replace(",1000000,", f",\"{value}\",")
     res = pf.check_distribution_tracker(_csv(row), item_master_df=_master(340021))
-    assert "INVALID_NUMBER" not in _codes(res), value
+    assert "INVALID_VOLUME" not in _codes(res), value
 
 
 # ── Blocking: structure ──────────────────────────────────────────────────────
@@ -101,14 +110,31 @@ def test_bad_month_values_block_and_name_the_row(month, reason):
     assert finding.cells.iloc[0]["Excel row"] == 2
 
 
-def test_missing_required_column_blocks():
-    header = _GOOD_HEADER.replace("Taxonomy,", "")
-    row = _GOOD_ROW.replace("Retail,", "")
+@pytest.mark.parametrize("col,cell", [
+    ("Format", "HTST,"), ("Customer", "Walmart,"), ("Item #", "340021,"),
+])
+def test_missing_critical_column_blocks(col, cell):
+    header = _GOOD_HEADER.replace(f"{col},", "")
+    row = _GOOD_ROW.replace(cell, "", 1)
     res = pf.check_distribution_tracker(_csv(row, header=header),
                                         item_master_df=_master(340021))
-    assert not res.ok_to_run
+    assert not res.ok_to_run, col
     finding = next(f for f in res.findings if f.code == "MISSING_COLUMNS")
-    assert "Taxonomy" in set(finding.cells["Missing column"])
+    assert col in set(finding.cells["Missing column"])
+
+
+@pytest.mark.parametrize("col,cell", [
+    ("Taxonomy", "Retail,"), ("Item Desc", "Milk Gallon,"),
+])
+def test_missing_optional_column_is_acknowledgeable_not_blocking(col, cell):
+    """Totals stay correct — the field just comes through blank."""
+    header = _GOOD_HEADER.replace(f"{col},", "")
+    row = _GOOD_ROW.replace(cell, "", 1)
+    res = pf.check_distribution_tracker(_csv(row, header=header),
+                                        item_master_df=_master(340021))
+    assert res.ok_to_run, col
+    finding = next(f for f in res.findings if f.code == "MISSING_OPTIONAL_COLUMNS")
+    assert finding.severity == pf.SEVERITY_ACK
 
 
 def test_empty_file_blocks():
@@ -125,21 +151,35 @@ def test_unreadable_bytes_block_without_raising():
 # ── Blocking: the silent-zero cases ──────────────────────────────────────────
 
 @pytest.mark.parametrize("bad", ["#N/A", "#REF!", "NA", "n/a", "#VALUE!", "TBD"])
-def test_excel_errors_in_a_numeric_cell_block(bad):
+def test_excel_errors_in_the_volume_column_block(bad):
     row = _GOOD_ROW.replace(",1000000,", f",{bad},")
     res = pf.check_distribution_tracker(_csv(row), item_master_df=_master(340021))
     assert not res.ok_to_run, bad
-    finding = next(f for f in res.findings if f.code == "INVALID_NUMBER")
+    finding = next(f for f in res.findings if f.code == "INVALID_VOLUME")
     assert finding.cells.iloc[0]["Column"] == "Lbs./yr"
     assert finding.cells.iloc[0]["What your file has"] == bad
 
 
-def test_invalid_number_reports_the_right_excel_row():
+@pytest.mark.parametrize("col,before,after", [
+    ("PC$/yr", ",50000,", ",#N/A,"),
+    ("Slotting", ",0\n", ",#REF!\n"),
+])
+def test_broken_dollar_cells_do_not_block(col, before, after):
+    """No volume rides on these columns, so they must not stop a run."""
+    row = _GOOD_ROW.replace(before, after)
+    assert row != _GOOD_ROW, "the fixture row changed shape"
+    res = pf.check_distribution_tracker(_csv(row), item_master_df=_master(340021))
+    assert res.ok_to_run, col
+    assert "INVALID_MONEY" in _codes(res)
+    assert "INVALID_VOLUME" not in _codes(res)
+
+
+def test_invalid_volume_reports_the_right_excel_row():
     res = pf.check_distribution_tracker(
         _csv(_GOOD_ROW, _GOOD_ROW.replace(",1000000,", ",#N/A,"), _GOOD_ROW),
         item_master_df=_master(340021),
     )
-    finding = next(f for f in res.findings if f.code == "INVALID_NUMBER")
+    finding = next(f for f in res.findings if f.code == "INVALID_VOLUME")
     assert list(finding.cells["Excel row"]) == [3]
 
 
@@ -161,11 +201,51 @@ def test_unreadable_ship_date_blocks(ship):
 
 # ── Acknowledgeable: item-master linkage ─────────────────────────────────────
 
+@pytest.mark.parametrize("blanked,field", [
+    ({"portfolio_major": ""}, "Portfolio Major"),
+    ({"portfolio_minor": "  "}, "Portfolio Minor"),
+    ({"brand_category": ""}, "Brand Category"),
+])
+def test_item_present_but_unclassified_says_which_field_is_blank(blanked, field):
+    """The second way linkage fails: the row exists, the classifier doesn't."""
+    res = pf.check_distribution_tracker(
+        _csv(_GOOD_ROW), item_master_df=_master(340021, **blanked),
+    )
+    assert res.ok_to_run                       # not a volume problem
+    finding = next(f for f in res.findings if f.code == "ITEM_MASTER_GAPS")
+    row = finding.cells.iloc[0]
+    assert row["Item #"] == "340021"
+    assert field in row["Why it will fail"], row["Why it will fail"]
+    assert field in row["What to fill in"]
+    assert "In RO_Item_Master.csv" in row["Why it will fail"]
+
+
+def test_a_master_missing_a_classifier_column_entirely_is_reported():
+    master = _master(340021).drop(columns=["Portfolio Minor"])
+    res = pf.check_distribution_tracker(_csv(_GOOD_ROW), item_master_df=master)
+    finding = next(f for f in res.findings if f.code == "ITEM_MASTER_GAPS")
+    assert "Portfolio Minor" in finding.cells.iloc[0]["Why it will fail"]
+
+
+def test_the_two_linkage_causes_are_distinguished_per_item():
+    """One list, one reason per row — the planner shouldn't have to correlate."""
+    rows = _GOOD_ROW + _GOOD_ROW.replace(",340021,", ",111111,")
+    master = pd.concat([
+        _master(340021, portfolio_minor=""),    # present, unclassified
+    ], ignore_index=True)                       # 111111 absent entirely
+    res = pf.check_distribution_tracker(_csv(rows), item_master_df=master)
+    finding = next(f for f in res.findings if f.code == "ITEM_MASTER_GAPS")
+    why = dict(zip(finding.cells["Item #"], finding.cells["Why it will fail"]))
+    assert why["340021"].startswith("In RO_Item_Master.csv")
+    assert why["111111"] == "Not in RO_Item_Master.csv"
+    assert "not in the file" in finding.title and "unclassified" in finding.title
+
+
 def test_unlinked_item_is_acknowledgeable_not_blocking():
     res = pf.check_distribution_tracker(_csv(_GOOD_ROW), item_master_df=_master(999999))
     assert res.ok_to_run            # structurally fine — planner may proceed
     assert not res.clean            # but it needs an explicit acknowledgement
-    finding = next(f for f in res.findings if f.code == "UNLINKED_ITEMS")
+    finding = next(f for f in res.findings if f.code == "ITEM_MASTER_GAPS")
     assert finding.severity == pf.SEVERITY_ACK
     assert finding.fix_where == pf.FIX_IN_FABRIC
     assert finding.fabric_path.endswith("RO_Item_Master.csv")
@@ -176,7 +256,7 @@ def test_unlinked_item_is_acknowledgeable_not_blocking():
 def test_item_numbers_match_despite_leading_zeros_and_formatting():
     row = _GOOD_ROW.replace(",340021,", ",0340021,")
     res = pf.check_distribution_tracker(_csv(row), item_master_df=_master("340021"))
-    assert "UNLINKED_ITEMS" not in _codes(res)
+    assert "ITEM_MASTER_GAPS" not in _codes(res)
 
 
 def test_missing_item_master_is_reported_not_silently_passed():
@@ -190,19 +270,18 @@ def test_unlinked_items_are_deduplicated_and_counted():
         _csv(_GOOD_ROW, _GOOD_ROW, _GOOD_ROW.replace(",340021,", ",111111,")),
         item_master_df=_master(999999),
     )
-    finding = next(f for f in res.findings if f.code == "UNLINKED_ITEMS")
+    finding = next(f for f in res.findings if f.code == "ITEM_MASTER_GAPS")
     counts = dict(zip(finding.cells["Item #"], finding.cells["Rows in your file"]))
     assert counts == {"340021": 2, "111111": 1}
 
 
 # ── Informational ────────────────────────────────────────────────────────────
 
-def test_duplicate_rows_are_informational_only():
+def test_duplicate_rows_are_not_reported_at_all():
+    """The pipeline sums duplicates by design, so flagging them is pure noise."""
     res = pf.check_distribution_tracker(_csv(_GOOD_ROW, _GOOD_ROW),
                                         item_master_df=_master(340021))
-    assert res.ok_to_run
-    finding = next(f for f in res.findings if f.code == "DUPLICATE_ROWS")
-    assert finding.severity == pf.SEVERITY_INFO
+    assert res.clean, _codes(res)
 
 
 def test_every_finding_carries_actionable_guidance():

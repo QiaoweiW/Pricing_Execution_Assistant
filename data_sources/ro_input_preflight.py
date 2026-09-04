@@ -21,10 +21,19 @@ Two severities, by design
 * ``SEVERITY_BLOCK`` — the file's structure or numbers are wrong.  Running
   would corrupt the published report, so the caller must refuse.  Always
   fixable in the planner's own spreadsheet.
-* ``SEVERITY_ACK`` — the file is structurally sound but references items that
-  are not in ``RO_Item_Master.csv``.  Those items will be unclassified in the
-  roll-up, which is sometimes legitimate (a genuinely new SKU), so the caller
-  may proceed once the planner explicitly acknowledges it.
+* ``SEVERITY_ACK`` — the file is structurally sound, but something will come
+  through blank or unclassified: an item missing from ``RO_Item_Master.csv``,
+  a blank classifier on the master row, a broken dollar cell, or an absent
+  optional column.  None of it makes the volume numbers wrong, and each is
+  sometimes legitimate (a genuinely new SKU), so the caller may proceed once
+  the planner explicitly acknowledges it.
+
+Deliberately NOT checked
+------------------------
+Anything that cannot make ``RO_Comparison_Output.csv`` wrong.  Duplicate rows
+(the pipeline sums them, by design), blank optional text fields, and cells in
+columns no total depends on are left alone: a gate that reports harmless
+findings trains people to click past the ones that matter.
 
 Nothing here imports Streamlit or touches Fabric — the caller supplies the
 bytes and (optionally) the already-fetched RO_Item_Master frame — so the whole
@@ -63,14 +72,34 @@ HEADER_ALIASES: dict = {
     "Total Anticipated Slotting Costs": "Slotting",
 }
 
-#: Columns the RO_Seed build groups on — a missing one silently collapses rows.
-REQUIRED_KEY_COLUMNS: tuple = (
-    "Format", "Customer", "Taxonomy", "Brand", "Item #", "Item Desc",
-    "Probability", "First Ship Date",
+#: Columns whose absence or corruption makes ``RO_Comparison_Output.csv``
+#: wrong.  Only these block a run — the point of this module is to catch what
+#: breaks the report, not to audit every cell in the file.
+#:
+#: * ``Format`` / ``Customer`` / ``Item #`` — the RO Key and the portfolio
+#:   join.  Lose one and rows merge together or classify nowhere.
+#: * ``Probability`` — multiplies every probabilized volume.
+#: * ``First Ship Date`` — decides how much lands inside the fiscal year.
+#: * ``Lbs./yr`` — the volume every headline number is built from.
+CRITICAL_COLUMNS: tuple = (
+    "Format", "Customer", "Item #", "Probability", "First Ship Date", "Lbs./yr",
 )
 
-#: Columns that are summed. A bad cell here becomes zero volume if unguarded.
-REQUIRED_NUMERIC_COLUMNS: tuple = ("Lbs./yr", "PC$/yr", "Slotting")
+#: Part of the contract, but the report still builds without them: these come
+#: through blank rather than wrong, so they are worth a mention, not a block.
+OPTIONAL_COLUMNS: tuple = ("Taxonomy", "Brand", "Item Desc", "PC$/yr", "Slotting")
+
+#: The one column whose bad cells silently become **zero volume**.
+VOLUME_COLUMN: str = "Lbs./yr"
+
+#: Dollar metrics — they ride along in the report but drive no volume, so a
+#: broken cell here is worth flagging without stopping the run.
+MONEY_COLUMNS: tuple = ("PC$/yr", "Slotting")
+
+#: Cap on how many problem rows are rendered inline; the full set always goes
+#: into the downloadable fix list.  A planner fixing 400 cells wants the CSV,
+#: not 400 rows on screen.
+MAX_CELLS_SHOWN: int = 25
 
 #: Read as strings so we see exactly what the planner's file contains — a
 #: pandas-parsed frame would already have turned "#N/A" into NaN and hidden it.
@@ -237,97 +266,144 @@ def _check_month_column(df: pd.DataFrame) -> list:
     )]
 
 
-def _check_required_columns(df: pd.DataFrame) -> list:
-    """Every grouping and numeric column the RO_Seed build needs must exist."""
-    expected = list(REQUIRED_KEY_COLUMNS) + list(REQUIRED_NUMERIC_COLUMNS)
-    missing = [c for c in expected if c not in df.columns]
-    if not missing:
-        return []
-
-    # Show the alias where one exists — the planner's export may use it.
+def _check_columns(df: pd.DataFrame) -> list:
+    """Critical columns must exist; optional ones only earn a mention."""
     reverse_alias = {v: k for k, v in HEADER_ALIASES.items()}
-    rows = [
-        (c, reverse_alias.get(c, "—"))
-        for c in missing
-    ]
+    out = []
+
+    missing_critical = [c for c in CRITICAL_COLUMNS if c not in df.columns]
+    if missing_critical:
+        out.append(Finding(
+            code="MISSING_COLUMNS",
+            severity=SEVERITY_BLOCK,
+            title=f"{len(missing_critical)} column(s) the report cannot be built without",
+            means=(
+                "These columns are what the report groups and totals by. With "
+                "one missing, rows that should be separate merge together and "
+                "every total below them is wrong."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=(
+                "Open your file in Excel and look at the header row (row 1).",
+                "Add each column below. The header text must match exactly — "
+                "no extra spaces, same capitalisation.",
+                "If your export uses the older name shown alongside, either "
+                "name works — so look for a typo before adding a duplicate.",
+                "Save as CSV (UTF-8) and upload again.",
+            ),
+            cells=pd.DataFrame(
+                [(c, reverse_alias.get(c, "—")) for c in missing_critical],
+                columns=["Missing column", "Older name also accepted"],
+            ),
+        ))
+
+    missing_optional = [c for c in OPTIONAL_COLUMNS if c not in df.columns]
+    if missing_optional:
+        out.append(Finding(
+            code="MISSING_OPTIONAL_COLUMNS",
+            severity=SEVERITY_ACK,
+            title=f"{len(missing_optional)} column(s) missing — the report will "
+                  f"build, but those fields come through blank",
+            means=(
+                "Nothing breaks: totals stay correct. Rows just carry no "
+                f"{', '.join(missing_optional)}, so they will read as blank "
+                "in the report and in any drill-in."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=(
+                "Add the column(s) below to your export if you want those "
+                "fields populated.",
+                "Or tick the box below to run without them.",
+            ),
+            cells=pd.DataFrame(
+                [(c, reverse_alias.get(c, "—")) for c in missing_optional],
+                columns=["Missing column", "Older name also accepted"],
+            ),
+        ))
+    return out
+
+
+def _bad_number_rows(df: pd.DataFrame, col: str) -> list:
+    """Rows in *col* the pipeline cannot read as a number."""
+    bad = []
+    for idx, text in enumerate(df[col].astype(str)):
+        stripped = text.strip()
+        if not stripped:
+            continue                          # blank is legitimately zero
+        if _is_excel_error(stripped):
+            bad.append((
+                _excel_row(idx), col, stripped,
+                "A number — the formula behind this cell is broken",
+            ))
+            continue
+        # Mirror the pipeline's own cleanup before judging it unparseable, so
+        # "1,234" and "$1,234" (which it handles) are NOT flagged.
+        cleaned = pd.to_numeric(
+            pd.Series([stripped]).str.replace(r"[^\d.-]", "", regex=True),
+            errors="coerce",
+        ).iloc[0]
+        if pd.isna(cleaned):
+            bad.append((_excel_row(idx), col, stripped, "A number, e.g. 1250000"))
+    return bad
+
+
+_CELL_COLUMNS: list = ["Excel row", "Column", "What your file has", "What it needs"]
+
+
+def _check_volume(df: pd.DataFrame) -> list:
+    """``Lbs./yr`` must be numeric — a bad cell here becomes zero volume."""
+    if VOLUME_COLUMN not in df.columns:
+        return []
+    bad = _bad_number_rows(df, VOLUME_COLUMN)
+    if not bad:
+        return []
     return [Finding(
-        code="MISSING_COLUMNS",
+        code="INVALID_VOLUME",
         severity=SEVERITY_BLOCK,
-        title=f"{len(missing)} required column(s) are missing from your file",
+        title=f"{len(bad)} row(s) have a broken {VOLUME_COLUMN} value",
         means=(
-            "The app groups and totals your rows using these columns. If one "
-            "is absent, rows that should be separate get merged together and "
-            "the totals come out wrong."
+            "This is the one that bites. A cell the app cannot read counts as "
+            "**zero volume**, so the opportunity quietly vanishes from the "
+            "report — no error, no warning, just a smaller number than the "
+            "truth."
         ),
         fix_where=FIX_IN_EXCEL,
         fix_steps=(
-            "Open your file in Excel and look at the header row (row 1).",
-            "Add each missing column below. The header text must match "
-            "exactly — no extra spaces, same capitalisation.",
-            "If your export uses the older name shown in the second column, "
-            "either name works — check for a typo rather than adding a "
-            "duplicate.",
-            "Save as CSV (UTF-8) and upload again.",
-        ),
-        cells=pd.DataFrame(rows, columns=["Missing column", "Older name also accepted"]),
-    )]
-
-
-def _check_numeric_cells(df: pd.DataFrame) -> list:
-    """Volume / dollar / slotting cells must be numbers, not Excel errors."""
-    present = [c for c in REQUIRED_NUMERIC_COLUMNS if c in df.columns]
-    if not present:
-        return []
-
-    bad_rows = []
-    for col in present:
-        series = df[col].astype(str)
-        for idx, text in enumerate(series):
-            stripped = text.strip()
-            if not stripped:
-                continue                      # blank is legitimately zero
-            if _is_excel_error(stripped):
-                bad_rows.append((
-                    _excel_row(idx), col, stripped,
-                    "A number — the formula behind this cell is broken",
-                ))
-                continue
-            # Mirror the pipeline's own cleanup before judging it unparseable,
-            # so "1,234" and "$1,234" (which it handles) are NOT flagged.
-            cleaned = pd.to_numeric(
-                pd.Series([stripped]).str.replace(r"[^\d.-]", "", regex=True),
-                errors="coerce",
-            ).iloc[0]
-            if pd.isna(cleaned):
-                bad_rows.append((
-                    _excel_row(idx), col, stripped, "A number, e.g. 1250000",
-                ))
-
-    if not bad_rows:
-        return []
-
-    return [Finding(
-        code="INVALID_NUMBER",
-        severity=SEVERITY_BLOCK,
-        title=f"{len(bad_rows)} cell(s) hold an error or text where a number belongs",
-        means=(
-            "This is the dangerous one. Left alone, each of these cells is "
-            "read as **zero volume** — so the opportunity quietly disappears "
-            "from the report instead of showing up as a problem."
-        ),
-        fix_where=FIX_IN_EXCEL,
-        fix_steps=(
-            "Open your file in Excel and go to each cell listed below.",
-            "An **#N/A** or **#REF!** usually means a lookup formula lost its "
-            "source. Fix the formula, or paste the correct number in as a value.",
+            "Open your file in Excel and go to each row listed below.",
+            "An **#N/A** or **#REF!** means a lookup lost its source. Fix the "
+            "formula, or paste the correct number in as a value.",
             "A genuinely empty cell is fine — leave it blank rather than "
             "typing “NA”.",
             "Save as CSV (UTF-8) and upload again.",
         ),
-        cells=pd.DataFrame(
-            bad_rows,
-            columns=["Excel row", "Column", "What your file has", "What it needs"],
+        cells=pd.DataFrame(bad, columns=_CELL_COLUMNS),
+    )]
+
+
+def _check_money(df: pd.DataFrame) -> list:
+    """``PC$/yr`` / ``Slotting`` — flag, but never block: no volume rides on them."""
+    bad = []
+    for col in MONEY_COLUMNS:
+        if col in df.columns:
+            bad.extend(_bad_number_rows(df, col))
+    if not bad:
+        return []
+    return [Finding(
+        code="INVALID_MONEY",
+        severity=SEVERITY_ACK,
+        title=f"{len(bad)} row(s) have a broken dollar value",
+        means=(
+            "Volume and the probabilized totals are unaffected — these columns "
+            "carry dollars only. The affected rows will show $0 rather than "
+            "their real value."
         ),
+        fix_where=FIX_IN_EXCEL,
+        fix_steps=(
+            "Fix the rows below if the dollar figures matter for this cycle.",
+            "Otherwise tick the box below and run — the volume numbers are "
+            "correct either way.",
+        ),
+        cells=pd.DataFrame(bad, columns=_CELL_COLUMNS),
     )]
 
 
@@ -420,108 +496,142 @@ def _check_ship_dates(df: pd.DataFrame) -> list:
     )]
 
 
+#: The RO_Item_Master fields that classify an item into the report's rows.
+#: A blank in any of them puts the item's volume in Total B2C but under no
+#: portfolio row — the same visible symptom as a missing item.
+ITEM_MASTER_CLASSIFIERS: tuple = (
+    "Portfolio Major", "Portfolio Minor", "Brand Category",
+)
+
+
+def _norm_item_key(series: pd.Series) -> pd.Series:
+    """Digits-only item key, leading zeros dropped, blanks as NA."""
+    return (series.astype(str).str.replace(r"[^\d]", "", regex=True)
+            .str.lstrip("0").replace("", pd.NA))
+
+
 def _check_item_master_linkage(
     df: pd.DataFrame,
     item_master_df: Optional[pd.DataFrame],
     item_master_path: str,
 ) -> list:
-    """Items absent from RO_Item_Master will be unclassified in the roll-up."""
+    """Report every item whose classification will fail, and why.
+
+    Two distinct causes, same visible symptom in the report, so they are listed
+    together with a per-item reason rather than split into two findings the
+    planner has to correlate:
+
+    * the item has no row in ``RO_Item_Master.csv`` at all;
+    * it has a row, but one of the classifier fields is blank.
+    """
     if "Item #" not in df.columns:
-        return []
+        return []                              # already reported as missing
+
     if item_master_df is None or item_master_df.empty:
         return [Finding(
             code="ITEM_MASTER_UNAVAILABLE",
             severity=SEVERITY_ACK,
-            title="RO_Item_Master.csv could not be read, so linkage wasn’t checked",
+            title="RO_Item_Master.csv could not be read, so items weren’t checked",
             means=(
                 "Items are classified into Portfolio Major / Minor and Brand "
-                "Category through this file. Without it, rows may land "
-                "unclassified in the roll-up."
+                "Category through that file. Without it, rows may land "
+                "unclassified in the report."
             ),
             fix_where=FIX_IN_FABRIC,
             fix_steps=(
                 "Open the Fabric link below and confirm "
-                "**RO_Item_Master.csv** is present in the folder.",
-                "If it is missing, upload the latest copy to that folder.",
-                "Come back here and re-upload your file to re-run the check.",
+                "**RO_Item_Master.csv** is in the folder.",
+                "If it is missing, upload the latest copy there.",
+                "Re-upload your file here to run the check again.",
             ),
             fabric_path=item_master_path,
         )]
 
-    def _norm(series: pd.Series) -> pd.Series:
-        return (series.astype(str).str.replace(r"[^\d]", "", regex=True)
-                .str.lstrip("0").replace("", pd.NA))
+    master = item_master_df.copy()
+    master.columns = [str(c).strip() for c in master.columns]
+    has_key = "Item #" in master.columns
+    master_keys = _norm_item_key(master["Item #"]) if has_key else pd.Series(dtype=object)
 
-    if "Item #" not in item_master_df.columns:
-        known = set()
-    else:
-        known = set(_norm(item_master_df["Item #"]).dropna())
+    # key -> the classifier fields that are blank on that master row
+    blanks_by_key: dict = {}
+    if has_key:
+        classifiers = [c for c in ITEM_MASTER_CLASSIFIERS if c in master.columns]
+        absent = [c for c in ITEM_MASTER_CLASSIFIERS if c not in master.columns]
+        for pos, key in enumerate(master_keys):
+            if pd.isna(key):
+                continue
+            blank = [
+                c for c in classifiers
+                if not str(master[c].iloc[pos]).strip()
+                or str(master[c].iloc[pos]).strip().lower() in ("nan", "none")
+            ]
+            blanks_by_key[key] = blank + absent
+    known = set(blanks_by_key)
 
-    file_items = _norm(df["Item #"])
     desc = (df["Item Desc"].astype(str) if "Item Desc" in df.columns
             else pd.Series([""] * len(df), index=df.index))
+    file_keys = _norm_item_key(df["Item #"])
 
-    unlinked: dict = {}
-    for idx, key in enumerate(file_items):
-        if pd.isna(key) or key in known:
+    # raw item -> [description, row count, why, what to fill in]
+    problems: dict = {}
+    for pos, key in enumerate(file_keys):
+        if pd.isna(key):
             continue
-        raw_item = str(df["Item #"].iloc[idx]).strip()
-        unlinked.setdefault(raw_item, [str(desc.iloc[idx]).strip(), 0])
-        unlinked[raw_item][1] += 1
+        raw = str(df["Item #"].iloc[pos]).strip()
+        if key not in known:
+            why = "Not in RO_Item_Master.csv"
+            todo = "Add a row: Item #, Item Desc, " + ", ".join(
+                ITEM_MASTER_CLASSIFIERS)
+        else:
+            blank = blanks_by_key[key]
+            if not blank:
+                continue                       # properly classified
+            why = f"In RO_Item_Master.csv, but {', '.join(blank)} is blank"
+            todo = "Fill in " + ", ".join(blank)
+        entry = problems.setdefault(raw, [str(desc.iloc[pos]).strip(), 0, why, todo])
+        entry[1] += 1
 
-    if not unlinked:
+    if not problems:
         return []
 
-    rows = [(item, d or "—", n) for item, (d, n) in sorted(unlinked.items())]
+    rows = [(item, d or "—", n, why, todo)
+            for item, (d, n, why, todo) in sorted(problems.items())]
+    n_absent = sum(1 for r in rows if r[3].startswith("Not in"))
+    n_blank = len(rows) - n_absent
+    detail = " · ".join(filter(None, [
+        f"{n_absent} not in the file" if n_absent else "",
+        f"{n_blank} present but unclassified" if n_blank else "",
+    ]))
+
     return [Finding(
-        code="UNLINKED_ITEMS",
+        code="ITEM_MASTER_GAPS",
         severity=SEVERITY_ACK,
-        title=f"{len(rows)} item number(s) are not in RO_Item_Master.csv",
+        title=f"{len(rows)} item(s) will not classify — {detail}",
         means=(
-            "These items have no Portfolio Major / Minor or Brand Category, so "
-            "their volume will sit unclassified in the RO Summary Report — it "
-            "still counts in Total B2C, but it will not appear under the right "
-            "portfolio row. That is expected for a brand-new SKU; it is a "
-            "problem if the item has been sold before."
+            "Each item below still counts in **Total B2C**, but it appears "
+            "under no portfolio row — so the portfolio lines will not add up "
+            "to the total. Expected for a brand-new SKU; a real problem if the "
+            "item has been sold before."
         ),
         fix_where=FIX_IN_FABRIC,
         fix_steps=(
-            "Click the Fabric link below — it opens the folder holding "
-            "**RO_Item_Master.csv**.",
-            "Select **RO_Item_Master.csv** and download it (⋯ → Download).",
-            "Open it in Excel and add one row per item listed below, filling "
-            "in **Item #**, **Item Desc**, **Portfolio Major**, "
-            "**Portfolio Minor** and **Brand Category**.",
-            "Back in Fabric, **delete the existing RO_Item_Master.csv** in "
-            "that folder, then upload your edited file with the *same name* "
+            "Download **RO_Item_Master.csv** — the red button in Step 4c, or "
+            "the Fabric link below (⋯ → Download).",
+            "Open it in Excel and work through the list below: each row says "
+            "whether the item is missing entirely or just unclassified, and "
+            "which fields to fill in.",
+            "In Fabric, **delete the existing RO_Item_Master.csv**, then "
+            "upload your edited file under the *same name* "
             "(⋯ → Upload → Upload files).",
-            "Return here and re-upload your Distribution Tracker — the check "
+            "Come back and re-upload your Distribution Tracker — this check "
             "will clear.",
-            "In a hurry? Tick the acknowledgement box below to run now and "
-            "classify these items later.",
+            "In a hurry? Tick the box below to run now and classify later.",
         ),
-        cells=pd.DataFrame(rows, columns=["Item #", "Item description", "Rows in your file"]),
+        cells=pd.DataFrame(rows, columns=[
+            "Item #", "Item description", "Rows in your file",
+            "Why it will fail", "What to fill in",
+        ]),
         fabric_path=item_master_path,
-    )]
-
-
-def _check_duplicates(df: pd.DataFrame) -> list:
-    """Exact-duplicate business rows are summed together — worth knowing."""
-    keys = [c for c in REQUIRED_KEY_COLUMNS if c in df.columns]
-    if not keys or df.empty:
-        return []
-    dup_count = int(df.duplicated(subset=keys, keep="first").sum())
-    if not dup_count:
-        return []
-    return [Finding(
-        code="DUPLICATE_ROWS",
-        severity=SEVERITY_INFO,
-        title=f"{dup_count} row(s) repeat the same customer / item combination",
-        means=(
-            "That is fine — the app adds their volumes together into one line. "
-            "Flagged only so a copy-paste accident does not double a number "
-            "without you noticing."
-        ),
     )]
 
 
@@ -608,15 +718,17 @@ def check_distribution_tracker(
                 df[MONTH_COLUMN], errors="coerce").dropna().unique()}
         )
 
+    # Ordered by what breaks the report worst, so the first thing a planner
+    # reads is the thing most worth fixing.
     result.findings.extend(_check_month_column(df))
-    result.findings.extend(_check_required_columns(df))
-    result.findings.extend(_check_numeric_cells(df))
+    result.findings.extend(_check_columns(df))
+    result.findings.extend(_check_volume(df))
     result.findings.extend(_check_probability(df))
     result.findings.extend(_check_ship_dates(df))
     result.findings.extend(
         _check_item_master_linkage(df, item_master_df, item_master_path)
     )
-    result.findings.extend(_check_duplicates(df))
+    result.findings.extend(_check_money(df))
     return result
 
 
@@ -629,8 +741,12 @@ __all__ = [
     "FIX_NONE",
     "MONTH_COLUMN",
     "HEADER_ALIASES",
-    "REQUIRED_KEY_COLUMNS",
-    "REQUIRED_NUMERIC_COLUMNS",
+    "CRITICAL_COLUMNS",
+    "OPTIONAL_COLUMNS",
+    "VOLUME_COLUMN",
+    "MONEY_COLUMNS",
+    "MAX_CELLS_SHOWN",
+    "ITEM_MASTER_CLASSIFIERS",
     "Finding",
     "PreflightResult",
     "check_distribution_tracker",

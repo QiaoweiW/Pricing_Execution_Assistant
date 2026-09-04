@@ -1,6 +1,9 @@
-"""Unit tests for the Business Health per-category four-lever deep-dive:
-Lever A (gap read), B (Net-Sales decomposition), C (Vol×Margin), D (concentration),
-plus the Finance enrichment that feeds B/C."""
+"""Unit tests for the Business Health per-category deep-dive.
+
+Two lenses, both driven entirely by IBP **Order** lbs: **A** order YoY across
+the trailing windows, and **Mix Shifts** — the top Customer×SKU movers computed
+for EVERY trailing window (L12M / L6M / L3M).
+"""
 
 from datetime import date
 
@@ -10,235 +13,141 @@ import pytest
 from data_sources.demand_plan_comparison import (
     BH_CATEGORY_ROWS,
     BH_CATEGORY_LABELS,
-    BH_GAP_BUILDING,
-    BH_GAP_DRAINING,
-    BH_GAP_BALANCED,
-    BH_MOVE_PRICE_UP,
-    BH_MOVE_VOLUME_UP,
-    BH_MOVE_VOLUME_DOWN,
-    BH_MOVE_PRICE_DOWN,
-    BH_VM_UP_UP,
-    BH_VM_UP_DOWN,
-    BH_VM_DOWN_UP,
-    BH_VM_DOWN_DOWN,
+    BH_PERIOD_ORDER,
     BH_TAG_EXIT,
     BH_TAG_SOFTENING,
     BH_TAG_SUBSTITUTION,
     BH_TAG_GROWTH,
-    BH_TAG_NEW,
-    _bh_gap_flag,
-    _bh_decomp_sowhat,
-    _bh_vol_margin_quadrant,
     build_business_health_categories,
-    enrich_finance_df,
 )
-
 
 PRIOR = date(2026, 6, 1)   # single-month fixtures land in every window ending here
 
-
-# ── Pure-helper tests (exhaustive over the branches) ─────────────────────────
-
-def test_gap_flag_branches():
-    # Building / draining require a material gap with the SAME sign in BOTH L6M
-    # and L3M (args: order_l6m, ship_l6m, order_l3m, ship_l3m).
-    assert _bh_gap_flag(0.30, 0.20, 0.28, 0.18) == BH_GAP_BUILDING   # orders outpace both
-    assert _bh_gap_flag(0.10, 0.30, 0.12, 0.28) == BH_GAP_DRAINING   # ships outpace both
-    assert _bh_gap_flag(0.20, 0.20, 0.20, 0.20) == BH_GAP_BALANCED   # no gap
-    # Sign flips between periods → flat (no clear signal).
-    assert _bh_gap_flag(0.30, 0.20, 0.18, 0.28) == BH_GAP_BALANCED
-    # Inside the 1pp noise band even if same sign → flat.
-    assert _bh_gap_flag(0.204, 0.20, 0.203, 0.20) == BH_GAP_BALANCED
-    assert _bh_gap_flag(None, 0.2, 0.2, 0.2) == ""
-    assert _bh_gap_flag(0.2, 0.2, 0.2, None) == ""
+_COLS = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc",
+         "month", "pounds"]
 
 
-def test_decomp_sowhat_branches():
-    # Positive move: price/mix dominates → price-led; volume dominates → volume-led.
-    assert _bh_decomp_sowhat(0.25, 0.05) == BH_MOVE_PRICE_UP    # price_mix +20 vs vol +5
-    assert _bh_decomp_sowhat(0.25, 0.20) == BH_MOVE_VOLUME_UP   # price_mix +5 vs vol +20
-    # Negative move: price/mix dominates → price-led ▼; volume dominates → volume-led ▼.
-    assert _bh_decomp_sowhat(-0.25, -0.05) == BH_MOVE_PRICE_DOWN
-    assert _bh_decomp_sowhat(-0.25, -0.20) == BH_MOVE_VOLUME_DOWN
-    assert _bh_decomp_sowhat(None, 0.1) == ""
-
-
-def test_vol_margin_quadrants():
-    assert _bh_vol_margin_quadrant(0.10, 0.20, 0.18) == BH_VM_UP_UP      # vol↑ margin↑
-    assert _bh_vol_margin_quadrant(0.10, 0.16, 0.18) == BH_VM_UP_DOWN    # vol↑ margin↓
-    assert _bh_vol_margin_quadrant(-0.08, 0.19, 0.18) == BH_VM_DOWN_UP   # vol↓ margin↑
-    assert _bh_vol_margin_quadrant(-0.08, 0.16, 0.18) == BH_VM_DOWN_DOWN  # vol↓ margin↓
-    assert _bh_vol_margin_quadrant(None, 0.2, 0.2) == ""
-
-
-def test_no_promo_categories_rule():
-    """Fresh Milk is the only B2C category sold without trade/promo — the Lever C
-    assumption wording keys off this."""
-    from data_sources.demand_plan_comparison import BH_NO_PROMO_CATEGORIES
-    assert BH_NO_PROMO_CATEGORIES == frozenset({"fresh_milk"})
-    assert BH_NO_PROMO_CATEGORIES <= set(BH_CATEGORY_ROWS)
+def _frame(rows: list[tuple]) -> pd.DataFrame:
+    """Build an enriched-orders frame from ``(customer, sku, month, lbs)`` rows."""
+    df = pd.DataFrame(
+        [("Butter", "Sticks", "Branded", "Packaged Butter", c, s, m, p)
+         for c, s, m, p in rows],
+        columns=_COLS,
+    )
+    df["month"] = pd.to_datetime(df["month"]).dt.date
+    df["item_key"] = df["item_desc"]
+    return df
 
 
 # ── Fixtures: a Butter deep-dive with clean, single-month numbers ────────────
 
 def _orders() -> pd.DataFrame:
-    """Butter orders — several Customer×SKU lines for Lever D, incl. an
-    order-only account (MT Food Bank) that has NO shipment (the RCA case)."""
-    rows = [
+    """Butter orders — several Customer×SKU lines, incl. an order-only account
+    (MT Food Bank) that has NO shipment.  Orders are the demand signal precisely
+    so lines like that are not missed."""
+    return _frame([
         # Growers.
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco",  "KS Btr Qtr", "2026-06-01", 2_000_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco",  "KS Btr Qtr", "2025-06-01", 1_000_000),  # +1.0
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Kroger",  "KRO Salted", "2026-06-01",   800_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Kroger",  "KRO Salted", "2025-06-01",   300_000),  # +0.5
+        ("Costco", "KS Btr Qtr", "2026-06-01", 2_000_000),
+        ("Costco", "KS Btr Qtr", "2025-06-01", 1_000_000),   # +1.0
+        ("Kroger", "KRO Salted", "2026-06-01",   800_000),
+        ("Kroger", "KRO Salted", "2025-06-01",   300_000),   # +0.5
         # Decliners.
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "MT Food Bank", "DG Btr", "2025-06-01", 1_400_000),  # -1.4 (order-only)
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Baugh",   "WhF Btr",  "2026-06-01",   100_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Baugh",   "WhF Btr",  "2025-06-01",   900_000),  # -0.8
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Golden State (McD)", "DG Btr", "2026-06-01", 200_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Golden State (McD)", "DG Btr", "2025-06-01", 800_000),  # -0.6
-    ]
-    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
-    df = pd.DataFrame(rows, columns=cols)
-    df["month"] = pd.to_datetime(df["month"]).dt.date
-    df["item_key"] = df["item_desc"]
-    return df
+        ("MT Food Bank", "DG Btr", "2025-06-01", 1_400_000),  # -1.4 (order-only)
+        ("Baugh", "WhF Btr", "2026-06-01",   100_000),
+        ("Baugh", "WhF Btr", "2025-06-01",   900_000),        # -0.8
+        ("Golden State (McD)", "DG Btr", "2026-06-01", 200_000),
+        ("Golden State (McD)", "DG Btr", "2025-06-01", 800_000),   # -0.6
+    ])
 
 
-def _shipments() -> pd.DataFrame:
-    """Butter shipments — total L3M 3.0M vs YAG 2.5M (+20%).  Note MT Food Bank
-    has NO shipment row, so a shipment-based Lever D would miss it."""
-    rows = [
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "KS Btr Qtr", "2026-06-01", 3_000_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "KS Btr Qtr", "2025-06-01", 2_500_000),
-    ]
-    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
-    df = pd.DataFrame(rows, columns=cols)
-    df["month"] = pd.to_datetime(df["month"]).dt.date
-    df["item_key"] = df["item_desc"]
-    return df
-
-
-def _finance_enriched() -> pd.DataFrame:
-    """Butter finance — Net Sales L3M $3.0M vs YAG $2.4M (+25%); Gross Profit
-    $0.6M both sides → margin 20% current."""
-    rows = [
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2026-06-01", 3_000_000.0, 600_000.0),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Butter Stick", "2025-06-01", 2_400_000.0, 600_000.0),
-    ]
-    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc",
-            "month", "net_sales", "gross_profit"]
-    df = pd.DataFrame(rows, columns=cols)
-    df["month"] = pd.to_datetime(df["month"]).dt.date
-    df["item_key"] = df["item_desc"]
-    return df
-
-
-def _butter(**kw):
+def _butter(frame: pd.DataFrame | None = None, **kw):
     cats = {c.row_id: c for c in build_business_health_categories(
-        _orders(), _shipments(), PRIOR, **kw)}
+        _orders() if frame is None else frame, PRIOR, **kw)}
     return cats["butter"]
 
 
-# ── Builder wiring ───────────────────────────────────────────────────────────
+def _l3m(cat):
+    """The L3M Mix Shifts block — every single-month fixture lands in it."""
+    return cat.concentrations["L3M"]
+
+
+# ── Shape ───────────────────────────────────────────────────────────────────
 
 def test_categories_shape_and_order():
-    cats = build_business_health_categories(_orders(), _shipments(), PRIOR)
+    cats = build_business_health_categories(_orders(), PRIOR)
     assert [c.row_id for c in cats] == list(BH_CATEGORY_ROWS)
     assert [c.label for c in cats] == [BH_CATEGORY_LABELS[r] for r in BH_CATEGORY_ROWS]
 
 
-def test_lever_a_gap_read():
-    # Orders −29.5% vs Shipments +20% → shipments outpacing orders → draining.
-    assert _butter().gap_flag == BH_GAP_DRAINING
+def test_lens_a_order_series_covers_every_window():
+    """Lens A reads order pounds + YoY for each trailing window."""
+    series = _butter().order_series
+    assert set(series) >= set(BH_PERIOD_ORDER)
+    # Butter L3M: 3.1M current (2.0 + 0.8 + 0.1 + 0.2) vs 4.4M year-ago.
+    assert series["L3M"]["vol"] == pytest.approx(3.1, rel=1e-3)
+    assert series["L3M"]["yoy"] == pytest.approx(3.1 / 4.4 - 1.0, rel=1e-3)
 
 
-def test_lever_b_decomposition_and_sowhat():
-    butter = _butter(finance_enriched=_finance_enriched())
-    d = butter.decomp["L3M"]
-    assert d["volume"] == pytest.approx(0.20, rel=1e-3)      # shipped-lbs YoY
-    assert d["net_sales"] == pytest.approx(0.25, rel=1e-3)   # finance net sales YoY
-    assert d["price_mix"] == pytest.approx(0.05, rel=1e-3)   # residual 25 − 20
-    # Volume (+20) dominates the +25 net move → bought (volume).
-    assert butter.decomp_sowhat == BH_MOVE_VOLUME_UP
-    # All three periods carry the decomposition keys.
-    for p in ("L12M", "L6M", "L3M"):
-        assert set(butter.decomp[p]) == {"volume", "price_mix", "net_sales"}
+# ── Mix Shifts — computed per window ────────────────────────────────────────
+
+def test_mix_shifts_computed_for_every_trailing_window():
+    """Every category carries a Mix Shifts block for L12M, L6M AND L3M."""
+    for cat in build_business_health_categories(_orders(), PRIOR):
+        assert set(cat.concentrations) == set(BH_PERIOD_ORDER)
 
 
-def test_lever_b_without_finance_is_blank():
-    butter = _butter()
-    assert butter.decomp["L3M"]["net_sales"] is None
-    assert butter.decomp["L3M"]["price_mix"] is None
-    assert butter.decomp_sowhat == ""
+def test_mix_shifts_window_separates_structural_from_recent():
+    """The whole point of running all three windows.
+
+    A mover whose activity sits outside the recent windows shows up ONLY at
+    L12M — so a planner can tell a structural shift from a recent one instead
+    of reading a single L3M snapshot.
+    """
+    frame = _frame([
+        # Recent mover: Jun 2026 vs Jun 2025 — inside L3M, L6M and L12M.
+        ("Costco", "Recent SKU", "2026-06-01", 1_000_000),
+        ("Costco", "Recent SKU", "2025-06-01",   200_000),   # +0.8
+        # Structural-only mover: Oct 2025 vs Oct 2024.  Oct 2025 is inside the
+        # L12M window (Jul 25 - Jun 26) but outside L6M (Jan - Jun 26) and L3M.
+        ("Sysco", "Old SKU", "2025-10-01", 2_000_000),
+        ("Sysco", "Old SKU", "2024-10-01",   500_000),       # +1.5, L12M only
+    ])
+    conc = _butter(frame).concentrations
+    l12 = {s.label for s in conc["L12M"].all_movers}
+    l6 = {s.label for s in conc["L6M"].all_movers}
+    l3 = {s.label for s in conc["L3M"].all_movers}
+
+    assert "Sysco × Old SKU" in l12          # structural — visible at the year
+    assert "Sysco × Old SKU" not in l6       # …and only there
+    assert "Sysco × Old SKU" not in l3
+    assert "Costco × Recent SKU" in l3 & l6 & l12   # recent — visible everywhere
 
 
-def test_lever_c_margin_table_and_reading():
-    butter = _butter(finance_enriched=_finance_enriched())
-    # GP% = Gross Profit ÷ Net Sales.
-    assert butter.margin_pct["L3M"] == pytest.approx(0.20, rel=1e-3)   # 0.6 / 3.0
-    # Dollar totals behind the margin come from the finance series ($M).
-    assert butter.finance_series["Gross Profit"]["L3M"]["vol"] == pytest.approx(0.6, rel=1e-3)
-    assert butter.finance_series["Net Sales"]["L3M"]["vol"] == pytest.approx(3.0, rel=1e-3)
-    # GL-month header comes from the single Actual month (Jun 2026) in every window.
-    for p in ("L12M", "L6M", "L3M"):
-        assert butter.margin_gl_months[p] == "Jun 2026 · 1 mo"
-    # Vol ▲ (+20%) and margin flat/▲ across periods → healthy growth.
-    assert butter.vol_margin_quadrant == BH_VM_UP_UP
+def test_mix_shifts_windows_are_independently_scaled():
+    """Each window's ``share`` is a % of THAT window's gross move, not L3M's."""
+    frame = _frame([
+        ("Costco", "Recent SKU", "2026-06-01", 1_000_000),
+        ("Costco", "Recent SKU", "2025-06-01",   200_000),   # +0.8 in every window
+        ("Sysco", "Old SKU", "2025-10-01", 2_000_000),
+        ("Sysco", "Old SKU", "2024-10-01",   500_000),       # +1.5, L12M only
+    ])
+    conc = _butter(frame).concentrations
+    assert conc["L3M"].total_abs_m == pytest.approx(0.8, rel=1e-3)
+    assert conc["L12M"].total_abs_m == pytest.approx(2.3, rel=1e-3)   # 0.8 + 1.5
+    # Costco is the whole L3M move but only a third of the L12M move.
+    l3_costco = next(s for s in conc["L3M"].all_movers if s.customer == "Costco")
+    l12_costco = next(s for s in conc["L12M"].all_movers if s.customer == "Costco")
+    assert l3_costco.share == pytest.approx(1.0, rel=1e-3)
+    assert l12_costco.share == pytest.approx(0.8 / 2.3, rel=1e-3)
 
 
-def test_lever_c_discrete_windows_and_monthly():
-    """Lever C now uses DISCRETE (non-overlapping) windows + a 12-month monthly
-    GP% series with order/ship lbs (single-month fixture lands in recent3)."""
-    butter = _butter(finance_enriched=_finance_enriched())
-    d = butter.margin_discrete
-    assert set(d) == {"recent3", "prior3", "prior6"}
-    # Jun-2026 fixture lands only in recent3 (Apr–Jun 2026).
-    assert d["recent3"]["gp_pct"] == pytest.approx(0.20, rel=1e-3)   # 0.6 / 3.0
-    assert d["recent3"]["ship_m"] == pytest.approx(3.0, rel=1e-3)
-    assert d["recent3"]["order_m"] == pytest.approx(3.1, rel=1e-3)   # 2.0+0.8+0.1+0.2
-    assert d["prior3"]["gp_pct"] is None and d["prior6"]["gp_pct"] is None
-    # Explicit GL months on the recent window.
-    assert butter.margin_discrete_gl["recent3"] == "Jun 2026 · 1 mo"
-    # Monthly: 12 ordered months; GP% present only for the funded month.
-    m = butter.margin_monthly
-    assert len(m) == 12
-    assert list(m["month"]) == sorted(m["month"])                   # oldest → newest
-    assert m["gp_pct"].notna().sum() == 1
-    assert float(m["gp_pct"].dropna().iloc[0]) == pytest.approx(0.20, rel=1e-3)
-    assert m["gp_pct_roll3"].notna().sum() >= 1                     # rolling avg present
-
-
-def test_margin_gl_months_actual_only():
-    """GL months reflect ONLY Actual finance rows (Budget dropped by enrichment)."""
-    pdh = pd.DataFrame({
-        "Item No": ["310180"], "Item Description": ["DG Btr"],
-        "Portfolio Major": ["Butter"], "Supply Format": ["Sticks"],
-        "Portfolio Minor": ["Packaged Butter"], "Brand": ["Branded"],
-    })
-    # Actual for Apr+May+Jun 2026 (in L3M); a Budget row for Jul 2026 must NOT
-    # extend the range.
-    finance = pd.DataFrame({
-        "Budget/Actual": ["Actual", "Actual", "Actual", "Budget"],
-        "Item No.": ["310180"] * 4,
-        "Customer": ["Costco"] * 4,
-        "GLMonth": [46113, 46143, 46174, 46204],   # Apr, May, Jun, Jul 2026
-        "Net Sales": ["100", "100", "100", "999"],
-        "Gross Profit": ["20", "20", "20", "200"],
-    })
-    fin = enrich_finance_df(finance, pdh)
-    butter = _butter(finance_enriched=fin)
-    # L3M window = Apr–Jun 2026 → three Actual months; Jul (Budget) excluded.
-    assert butter.margin_gl_months["L3M"] == "Apr 2026 – Jun 2026 · 3 mo"
-
-
-def test_lever_d_concentration_order_based_captures_mt_food_bank():
-    """Lever D ranks by ORDER-lbs Δ, so MT Food Bank (order-only, no shipment)
-    is captured — the RCA fix — as the #1 decliner."""
-    conc = _butter().concentration
+def test_mix_shifts_order_based_captures_mt_food_bank():
+    """Ranked by ORDER-lbs Δ, so MT Food Bank (order-only, no shipment) is
+    captured as the #1 decliner."""
+    conc = _l3m(_butter())
     # Order deltas: Costco +1.0, Kroger +0.5, MT Food Bank −1.4, Baugh −0.8,
     # Golden State −0.6 → Σ|Δ| = 4.3M.
     assert conc.total_abs_m == pytest.approx(4.3, rel=1e-3)
-    # Two growers (only two positive), three decliners.
     assert [g.label for g in conc.growers] == ["Costco × KS Btr Qtr", "Kroger × KRO Salted"]
     assert conc.growers[0].delta_m == pytest.approx(1.0, rel=1e-3)
     assert conc.growers[0].share == pytest.approx(1.0 / 4.3, rel=1e-3)
@@ -254,12 +163,12 @@ def test_lever_d_concentration_order_based_captures_mt_food_bank():
     assert all(g.kind == "grower" for g in conc.growers)
 
 
-def test_lever_d_tags_and_decline_concentration():
+def test_mix_shifts_tags_and_decline_concentration():
     """Each mover is tagged exit / softening / substitution / growth / new, and
     the decline concentration answers 'few accounts or broad?'."""
-    conc = _butter().concentration
+    conc = _l3m(_butter())
     tags = {s.label: s.tag for s in (*conc.decliners, *conc.growers)}
-    assert tags["MT Food Bank × DG Btr"] == BH_TAG_EXIT            # 1.4M → 0 (walked away)
+    assert tags["MT Food Bank × DG Btr"] == BH_TAG_EXIT             # 1.4M → 0 (walked away)
     assert tags["Golden State (McD) × DG Btr"] == BH_TAG_SOFTENING  # 0.8M → 0.2M partial
     assert tags["Costco × KS Btr Qtr"] == BH_TAG_GROWTH             # 1.0M → 2.0M
     # Net decline: MT 1.4 + Baugh 0.8 + Golden 0.6 = 2.8M across 3 accounts.
@@ -269,9 +178,9 @@ def test_lever_d_tags_and_decline_concentration():
     # all_movers = every significant mover, ranked by |Δ| desc, each tagged.
     am = conc.all_movers
     assert len(am) == 5                                        # 2 growers + 3 decliners
-    assert am[0].label == "MT Food Bank × DG Btr"             # biggest |Δ| (1.4M)
-    assert abs(am[0].delta_m) >= abs(am[-1].delta_m)          # sorted by |Δ|
-    assert all(s.tag and s.customer and s.sku for s in am)    # tagged + customer/sku set
+    assert am[0].label == "MT Food Bank × DG Btr"              # biggest |Δ| (1.4M)
+    assert abs(am[0].delta_m) >= abs(am[-1].delta_m)           # sorted by |Δ|
+    assert all(s.tag and s.customer and s.sku for s in am)     # tagged + customer/sku set
     # by_customer: one block per customer, ordered by |net|, biggest on top.
     bc = conc.by_customer
     assert {g.customer for g in bc} == {
@@ -283,24 +192,14 @@ def test_lever_d_tags_and_decline_concentration():
                for g, nxt in zip(bc, bc[1:]))
 
 
-def test_lever_d_substitution_tag():
+def test_mix_shifts_substitution_tag():
     """A customer that drops one SKU and picks up another (net ~flat) is tagged
     SUBSTITUTION on both lines — the lbs moved, not lost/gained."""
-    from data_sources.demand_plan_comparison import (
-        _category_concentration, COMPARISON_TEMPLATE, _last_n_months, _shift_year_back,
-    )
-    tby = {r.row_id: r for r in COMPARISON_TEMPLATE}
-    cur = _last_n_months(PRIOR, 3)
-    yag = {_shift_year_back(m) for m in cur}
-    rows = [   # Costco: SKU A 1.0M → 0 ; SKU B 0 → 1.0M (same customer, net flat)
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "SKU A", "2025-06-01", 1_000_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "SKU B", "2026-06-01", 1_000_000),
-    ]
-    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
-    df = pd.DataFrame(rows, columns=cols)
-    df["month"] = pd.to_datetime(df["month"]).dt.date
-    df["item_key"] = df["item_desc"]
-    conc = _category_concentration(df, "butter", cur, yag, tby)
+    frame = _frame([   # Costco: SKU A 1.0M → 0 ; SKU B 0 → 1.0M (net flat)
+        ("Costco", "SKU A", "2025-06-01", 1_000_000),
+        ("Costco", "SKU B", "2026-06-01", 1_000_000),
+    ])
+    conc = _l3m(_butter(frame))
     tags = {s.label: s.tag for s in (*conc.decliners, *conc.growers)}
     assert tags["Costco × SKU A"] == BH_TAG_SUBSTITUTION   # dropped but reappears
     assert tags["Costco × SKU B"] == BH_TAG_SUBSTITUTION   # as SKU B, same customer
@@ -311,173 +210,29 @@ def test_lever_d_substitution_tag():
     assert g.gross_m == pytest.approx(2.0, rel=1e-3) and len(g.movers) == 2
 
 
-def test_lever_d_excludes_near_zero_movers():
+def test_mix_shifts_excludes_near_zero_movers():
     """Lines below ~0.5% of the gross move are dropped from the mover table."""
-    from data_sources.demand_plan_comparison import (
-        _category_concentration, COMPARISON_TEMPLATE, _last_n_months, _shift_year_back,
-    )
-    tby = {r.row_id: r for r in COMPARISON_TEMPLATE}
-    cur = _last_n_months(PRIOR, 3)
-    yag = {_shift_year_back(m) for m in cur}
-    rows = [   # Big mover 1.0M + a trivial 1k-lb line (~0.1% of gross) → dropped.
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Costco", "Big", "2026-06-01", 1_000_000),
-        ("Butter", "Sticks", "Branded", "Packaged Butter", "Tiny Co", "Small", "2026-06-01", 1_000),
-    ]
-    cols = ["pmaj", "sfmt", "brand", "pminor", "customer_name", "item_desc", "month", "pounds"]
-    df = pd.DataFrame(rows, columns=cols)
-    df["month"] = pd.to_datetime(df["month"]).dt.date
-    df["item_key"] = df["item_desc"]
-    conc = _category_concentration(df, "butter", cur, yag, tby)
+    frame = _frame([   # Big mover 1.0M + a trivial 1k-lb line (~0.1%) → dropped.
+        ("Costco", "Big", "2026-06-01", 1_000_000),
+        ("Tiny Co", "Small", "2026-06-01", 1_000),
+    ])
+    conc = _l3m(_butter(frame))
     labels = {s.label for s in conc.all_movers}
     assert "Costco × Big" in labels
     assert not any("Tiny Co" in lbl for lbl in labels)          # near-0% excluded
     assert {g.customer for g in conc.by_customer} == {"Costco"}  # Tiny Co dropped
 
 
-def test_lever_d_ships_only_would_miss_mt_food_bank():
-    """Regression guard: a shipment-based rank misses the order-only account
-    (there is no MT Food Bank shipment row) — hence Lever D uses orders."""
-    from data_sources.demand_plan_comparison import (
-        _category_concentration, COMPARISON_TEMPLATE, _last_n_months, _shift_year_back,
-    )
-    tby = {r.row_id: r for r in COMPARISON_TEMPLATE}
-    cur = _last_n_months(PRIOR, 3)
-    yag = {_shift_year_back(m) for m in cur}
-    ship_conc = _category_concentration(_shipments(), "butter", cur, yag, tby)
-    labels = [s.label for s in (*ship_conc.growers, *ship_conc.decliners)]
-    assert not any("MT Food Bank" in lbl for lbl in labels)
-
+# ── Degradation ─────────────────────────────────────────────────────────────
 
 def test_empty_inputs_degrade():
-    cats = build_business_health_categories(None, None, PRIOR)
+    cats = build_business_health_categories(None, PRIOR)
     assert [c.row_id for c in cats] == list(BH_CATEGORY_ROWS)
     for c in cats:
-        assert c.gap_flag == "" and c.decomp_sowhat == "" and c.vol_margin_quadrant == ""
-        assert c.concentration.growers == () and c.concentration.decliners == ()
-        assert all(v == "—" for v in c.margin_gl_months.values())   # no finance
-
-
-# ── Finance enrichment (feeds Levers B & C) ──────────────────────────────────
-
-def test_enrich_finance_df_actual_only_and_pdh_dims():
-    """enrich_finance_df keeps only Actual rows and attaches PDH dims by Item No."""
-    pdh = pd.DataFrame({
-        "Item No": ["310180"],
-        "Item Description": ["DG Btr Qtr 1Lb 30cs"],
-        "Portfolio Major": ["Butter"],
-        "Supply Format": ["Sticks"],
-        "Portfolio Minor": ["Packaged Butter"],
-        "Brand": ["Branded"],
-    })
-    finance = pd.DataFrame({
-        "Budget/Actual": ["Actual", "Budget", "Actual"],
-        "Item No.": ["310180", "310180", "310180"],
-        "Item Description": ["DG Btr Qtr 1Lb 30cs"] * 3,
-        "Customer": ["Costco", "Costco", "Kroger"],
-        "GLMonth": [45778, 45778, 45778],   # 2025-05-01 (excel serial)
-        "Net Sales": ["1,000.50", "9999", "500"],
-        "Gross Profit": ["400.25", "8888", "100"],
-    })
-    out = enrich_finance_df(finance, pdh)
-    assert list(out.columns) == [
-        "item_key", "item_desc", "customer_name", "month",
-        "net_sales", "gross_profit", "pmaj", "sfmt", "pminor", "brand",
-        "fin_category",
-    ]
-    assert len(out) == 2                       # Budget row dropped
-    assert out["net_sales"].sum() == pytest.approx(1500.50)   # comma parsed
-    assert out["gross_profit"].sum() == pytest.approx(500.25)
-    assert set(out["pmaj"]) == {"Butter"}      # PDH dims attached via Item No.
-    assert out["month"].iloc[0] == date(2025, 5, 1)
-
-
-def test_enrich_finance_df_missing_metric_column_degrades_to_zero():
-    """A finance metric whose source column is absent → all-zeros, not a crash."""
-    finance = pd.DataFrame({
-        "Budget/Actual": ["Actual"],
-        "Item No.": ["310180"],
-        "Customer": ["Costco"],
-        "GLMonth": [45778],
-        "Net Sales": ["1000"],
-        # No "Gross Profit" column present.
-    })
-    out = enrich_finance_df(finance, None)
-    assert (out["gross_profit"] == 0.0).all()
-    assert out["net_sales"].sum() == pytest.approx(1000.0)
+        assert set(c.concentrations) == set(BH_PERIOD_ORDER)
+        for conc in c.concentrations.values():
+            assert conc.growers == () and conc.decliners == ()
 
 
 def test_packaged_butter_label_is_consistent():
-    """Butter is labelled 'Packaged Butter' (its pminor scope) in the template
-    (drives APS/IBP/BH tables) and the BH category cards."""
-    from data_sources.demand_plan_comparison import COMPARISON_TEMPLATE
     assert BH_CATEGORY_LABELS["butter"] == "Packaged Butter"
-    leaf = {r.row_id: r for r in COMPARISON_TEMPLATE}["butter"]
-    assert leaf.label == "Packaged Butter"
-
-
-def test_enrich_finance_df_empty():
-    assert enrich_finance_df(None, None).empty
-    assert list(enrich_finance_df(None, None).columns) == [
-        "item_key", "item_desc", "customer_name", "month",
-        "net_sales", "gross_profit", "pmaj", "sfmt", "pminor", "brand",
-        "fin_category",
-    ]
-
-
-def test_enrich_finance_df_fin_category_from_finance_taxonomy():
-    """fin_category is derived from Finance's own Product Group + Format."""
-    pdh = pd.DataFrame({
-        "Item No": ["1", "2", "3"],
-        "Item Description": ["a", "b", "c"],
-        "Portfolio Major": ["Butter", "ESL", "Cultured"],
-        "Supply Format": ["Sticks", "Small Carton", "Large Tub"],
-        "Portfolio Minor": ["Packaged Butter", "", "Cottage Cheese"],
-        "Brand": ["Branded", "Branded", "Branded"],
-    })
-    finance = pd.DataFrame({
-        "Budget/Actual": ["Actual"] * 3,
-        "Item No.": ["1", "2", "3"],
-        "GLMonth": [46174] * 3,
-        "Net Sales": ["1", "1", "1"],
-        "Product Group Name": ["BUTTER", "UP CLASS II MILK", "COTTAGE CHEESE"],
-        "Format": ["Butter", "Large Carton", "3 & 5 lb."],
-    })
-    out = enrich_finance_df(finance, pdh).set_index("item_key")
-    assert out.loc["1", "fin_category"] == "butter"
-    assert out.loc["2", "fin_category"] == "esl_lc"   # UP + Format Large Carton
-    assert out.loc["3", "fin_category"] == "cult_cottage_cheese"
-
-
-def test_lever_c_reconciliation_pdh_vs_finance():
-    """Reconciliation: Packaged-Butter card (PDH) vs Finance's full BUTTER group.
-    Bulk Butter is in Finance's group but not the PDH card → shows as a gap."""
-    pdh = pd.DataFrame({
-        "Item No": ["1", "2"],
-        "Item Description": ["DG Packaged Btr", "DG Bulk Btr"],
-        "Portfolio Major": ["Butter", "Butter"],
-        "Supply Format": ["Sticks", "Bulk"],
-        "Portfolio Minor": ["Packaged Butter", "Bulk Butter"],
-        "Brand": ["Branded", "Branded"],
-    })
-    finance = pd.DataFrame({
-        "Budget/Actual": ["Actual", "Actual"],
-        "Item No.": ["1", "2"],
-        "Customer": ["Costco", "WinCo"],
-        "GLMonth": [46174, 46174],                 # 2026-06
-        "Net Sales": ["3000000", "1000000"],
-        "Gross Profit": ["600000", "100000"],
-        "Product Group Name": ["BUTTER", "BUTTER"],
-        "Format": ["Butter", "Butter"],
-    })
-    enr = enrich_finance_df(finance, pdh)
-    cats = {c.row_id: c for c in build_business_health_categories(
-        None, None, PRIOR, finance_enriched=enr)}
-    r = cats["butter"].reconciliation
-    assert r.available
-    assert r.net_pdh["L3M"] == pytest.approx(3.0)          # Packaged only
-    assert r.net_fin["L3M"] == pytest.approx(4.0)          # Packaged + Bulk
-    assert (r.net_pdh["L3M"] - r.net_fin["L3M"]) == pytest.approx(-1.0)
-    # Driver names the item AND exactly where PDH files it (Bulk Butter, which
-    # maps to none of the seven cards) so a planner can catch the difference.
-    driver = next(d for d in r.drivers if "Bulk Btr" in d)
-    assert "Bulk Butter" in driver and "excludes it" in driver

@@ -400,7 +400,7 @@ def test_aps_prior_leg_columns_present_only_in_aps_mode():
 
 def test_business_health_windows_yoy_and_flag():
     """L3M/L6M/L12M Order sums + YAG, Order YoY, momentum Flag, and the Total-B2C
-    chart series for BOTH Orders and Shipments."""
+    Order chart series.  Business Health is orders-only — the demand signal."""
     from data_sources.demand_plan_comparison import BH_COL_FLAG, BH_FLAG_RISING
     esl = dict(item_key="100", item_desc="DG Milk", customer_no="1",
                customer_name="C", pmaj="ESL", sfmt="Large Carton",
@@ -411,11 +411,7 @@ def test_business_health_windows_yoy_and_flag():
         {**esl, "month": dt.date(2025, 7, 1), "pounds": 10e6},   # L12M cur only
         {**esl, "month": dt.date(2024, 7, 1), "pounds": 10e6},   # L12M YAG only
     ])
-    shipments = _enriched_ibp([
-        {**esl, "month": dt.date(2026, 6, 1), "pounds": 20e6},   # L3M shipments
-        {**esl, "month": dt.date(2025, 6, 1), "pounds": 10e6},
-    ])
-    res = build_business_health(orders, shipments, dt.date(2026, 6, 1))
+    res = build_business_health(orders, dt.date(2026, 6, 1))
     row = res.table.loc[res.table["_row_id"] == "esl_lc_branded"].iloc[0]
     assert float(row["L3M Orders"]) == 12.0 and float(row["L3M Orders YAG"]) == 6.0
     assert float(row["L6M Orders"]) == 12.0 and float(row["L6M Orders YAG"]) == 6.0
@@ -427,11 +423,10 @@ def test_business_health_windows_yoy_and_flag():
     # Total B2C rolls the single leaf up unchanged.
     tot = res.table.loc[res.table["_row_id"] == "total_b2c"].iloc[0]
     assert float(tot["L12M Orders"]) == 22.0
-    # Chart series: Orders + Shipments Total-B2C volume + YoY per window.
+    # Chart series: the Total-B2C Order volume + YoY per window (the only line).
+    assert set(res.chart_series) == {"Orders"}
     assert res.chart_series["Orders"]["L3M"]["vol"] == 12.0
     assert round(res.chart_series["Orders"]["L3M"]["yoy"], 4) == 1.0
-    assert res.chart_series["Shipments"]["L3M"]["vol"] == 20.0
-    assert round(res.chart_series["Shipments"]["L3M"]["yoy"], 4) == 1.0   # (20−10)/10
     # Window labels drive the legend + the explicit YoY definition.
     assert res.window_labels["L3M"] == ("Apr 2026 – Jun 2026", "Apr 2025 – Jun 2025")
     assert res.window_labels["L12M"] == ("Jul 2025 – Jun 2026", "Jul 2024 – Jun 2025")

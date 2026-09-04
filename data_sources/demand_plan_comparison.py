@@ -177,86 +177,6 @@ _IBP_CUSTOMER_NAME_CANDIDATES: tuple[str, ...] = (
     "Customer Name", "CustomerName", "Customer_Name",
 )
 
-# Finance extract (Files/Finance/finance_data_*.csv).  Wide GL table at
-# Item × Customer × month; Business Health reads Net Sales for its YoY line.
-# Item No. joins to PDH so Net Sales is categorised by the SAME rules as volume.
-_FIN_ITEM_CANDIDATES: tuple[str, ...] = (
-    "Item No.", "Item No", "Item Number", "Item #", "ItemNo", "Item",
-)
-_FIN_MONTH_CANDIDATES: tuple[str, ...] = (
-    "GLMonth", "GL Month", "Month Start", "Start of Month",
-)
-_FIN_NET_SALES_CANDIDATES: tuple[str, ...] = (
-    "Net Sales", "NetSales", "Net_Sales",
-)
-_FIN_GROSS_PROFIT_CANDIDATES: tuple[str, ...] = (
-    "Gross Profit", "GrossProfit", "Gross_Profit",
-)
-_FIN_CUSTOMER_CANDIDATES: tuple[str, ...] = (
-    "Customer", "Customer Name", "CustomerName",
-)
-_FIN_DESC_CANDIDATES: tuple[str, ...] = (
-    "Item Description", "Item Desc", "Description",
-)
-# Finance's own taxonomy columns — used ONLY to derive a "finance-report"
-# category per row (``fin_category``) for the Business Health reconciliation
-# panel.  Category rollups themselves are driven by PDH (see enrich_finance_df),
-# so volume and net sales share one classification; this is the reference the
-# reconciliation compares against so a planner can see (and RCA) any gap.
-_FIN_FORMAT_CANDIDATES: tuple[str, ...] = ("Format", "Format 1")
-_FIN_PRODUCT_GROUP_CANDIDATES: tuple[str, ...] = (
-    "Product Group Name", "Product Group", "ProductGroupName",
-)
-# Product Group → category (Finance's native rollup).  Butter is the FULL
-# product group here (Packaged + Bulk) — that's how the finance P&L reports it —
-# so the reconciliation surfaces the Bulk-Butter gap vs our Packaged-only card.
-_FIN_PG_TO_CATEGORY: dict[str, str] = {
-    "BUTTER": "butter",
-    "COTTAGE CHEESE": "cult_cottage_cheese",
-    "SOUR CREAM": "cult_sour_cream",
-    "HTST MILK": "fresh_milk", "HTST CASELESS": "fresh_milk",
-    "HTST CLASS II MILK": "fresh_milk",
-}
-# ESL (ultra-pasteurised) product groups, split into carton categories by the
-# granular finance "Format" column.
-_FIN_ESL_PRODUCT_GROUPS: frozenset = frozenset({
-    "UP MILK", "UP CLASS II MILK", "UP MIX", "ASEPTIC", "ASEPTIC CLASS II",
-})
-_FIN_ESL_FORMAT_TO_CATEGORY: dict[str, str] = {
-    "large carton": "esl_lc", "small carton": "esl_sc", "aseptic": "aseptic",
-}
-
-
-def _finance_native_category(product_group: object, fmt: object) -> Optional[str]:
-    """Map a finance row to a Business Health category via Finance's OWN taxonomy
-    (Product Group + granular Format) — the reconciliation reference, computed
-    independently of PDH.  Returns ``None`` for rows outside the seven categories.
-    """
-    pg = str(product_group).strip().upper()
-    direct = _FIN_PG_TO_CATEGORY.get(pg)
-    if direct is not None:
-        return direct
-    if pg in _FIN_ESL_PRODUCT_GROUPS:
-        return _FIN_ESL_FORMAT_TO_CATEGORY.get(str(fmt).strip().casefold())
-    return None
-_FIN_BUDGET_ACTUAL_CANDIDATES: tuple[str, ...] = (
-    "Budget/Actual", "Budget/Actuals", "Budget Actual", "Actual/Budget",
-)
-# Only "Actual" rows drive the momentum lines (a "how are we actually doing"
-# read); Budget / R&O rows for future months are excluded.
-_FIN_ACTUAL_TOKEN: str = "actual"
-
-# Finance-derived Business Health lines, in display order.  Each entry is
-# ``(chart line name, enriched value column, source-column candidates)``.  This
-# is the SINGLE source of truth: :func:`enrich_finance_df` materialises the
-# value columns from it, and both Business Health builders + the chart iterate
-# it — so adding a future finance line (e.g. Product Contribution) is a
-# one-tuple change with no other edits.
-BH_FINANCE_METRICS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("Net Sales", "net_sales", _FIN_NET_SALES_CANDIDATES),
-    ("Gross Profit", "gross_profit", _FIN_GROSS_PROFIT_CANDIDATES),
-)
-
 # Tracker (qry_mgmt_plan_history_tracker.csv) — Item Description column.
 # Used as a fallback only; driver tables prefer the PDH description so
 # item naming is consistent across plan + actuals.
@@ -1922,112 +1842,6 @@ def enrich_ibp_shipments_df(
     return _enrich_ibp(ibp_df, dim_frame)   # default qty candidates = shipments
 
 
-# Value columns materialised on the enriched Finance frame — one per finance
-# metric (see :data:`BH_FINANCE_METRICS`), in registry order.
-_FINANCE_VALUE_COLS: tuple[str, ...] = tuple(
-    col for _name, col, _cands in BH_FINANCE_METRICS)
-# Column order of the enriched Finance frame (mirrors _enrich_ibp's shape so it
-# flows through _bh_window_measures / _bh_apply_combo_exclude unchanged; the
-# finance value columns replace ``pounds`` as the additive values).
-_FINANCE_ENRICHED_COLS: tuple[str, ...] = (
-    "item_key", "item_desc", "customer_name", "month", *_FINANCE_VALUE_COLS,
-    "pmaj", "sfmt", "pminor", "brand", "fin_category",
-)
-
-
-def _empty_finance_enriched() -> pd.DataFrame:
-    """Empty, correctly-shaped enriched Finance frame."""
-    return pd.DataFrame(columns=list(_FINANCE_ENRICHED_COLS))
-
-
-def _fin_numeric(series: pd.Series, index: pd.Index) -> pd.Series:
-    """Currency-tolerant numeric coercion (strips thousands commas → float)."""
-    if series is None:
-        return pd.Series(0.0, index=index)
-    return pd.to_numeric(
-        series.astype("string").str.replace(",", "", regex=False),
-        errors="coerce",
-    ).fillna(0.0)
-
-
-def enrich_finance_df(
-    finance_df: Optional[pd.DataFrame],
-    pdh_df: Optional[pd.DataFrame],
-) -> pd.DataFrame:
-    """Return a tidy Finance frame (**Actual** rows) with PDH dims attached.
-
-    Output columns: ``item_key, item_desc, customer_name, month (first-of-month
-    date)``, one float column per :data:`BH_FINANCE_METRICS` value (``net_sales``,
-    ``gross_profit``, …), then ``pmaj, sfmt, pminor, brand``.  Every finance
-    metric is classified by joining ``Item No.`` to PDH — the SAME dimensions
-    the volume lines use — so a category's finance-YoY covers exactly the same
-    items as its Order/Shipment YoY.  Only ``Budget/Actual == "Actual"`` rows are
-    kept (both Actual scenarios partition the products, so summing across them
-    does not double-count).  A finance metric whose source column is absent is
-    materialised as all-zeros (that line simply reads flat/empty) rather than
-    failing the whole enrichment.  Missing / empty input, or none of the metric
-    columns present → an empty, correctly-shaped frame.
-    """
-    if finance_df is None or finance_df.empty:
-        return _empty_finance_enriched()
-
-    item_col = _resolve_column(finance_df, _FIN_ITEM_CANDIDATES)
-    month_col = _resolve_column(finance_df, _FIN_MONTH_CANDIDATES)
-    metric_cols = {
-        col: _resolve_column(finance_df, cands)
-        for _name, col, cands in BH_FINANCE_METRICS
-    }
-    if not (item_col and month_col and any(metric_cols.values())):
-        logger.warning(
-            "Finance extract missing a required column (item=%r, month=%r, "
-            "metrics=%r); finance lines will be empty.",
-            item_col, month_col, metric_cols,
-        )
-        return _empty_finance_enriched()
-
-    work = finance_df
-    ba_col = _resolve_column(finance_df, _FIN_BUDGET_ACTUAL_CANDIDATES)
-    if ba_col:
-        keep = work[ba_col].astype(str).str.strip().str.casefold() == _FIN_ACTUAL_TOKEN
-        work = work[keep]
-    if work.empty:
-        return _empty_finance_enriched()
-
-    cust_col = _resolve_column(work, _FIN_CUSTOMER_CANDIDATES)
-    cust_name = (
-        _vectorised_clean_str(work[cust_col])
-        if cust_col else pd.Series([""] * len(work), index=work.index, dtype="object")
-    )
-
-    # Finance-report category per row from Finance's OWN taxonomy (Product Group
-    # + Format) — used only by the reconciliation panel; the category ROLLUP is
-    # PDH-driven (below), so volume and net sales share one classification.
-    pg_col = _resolve_column(work, _FIN_PRODUCT_GROUP_CANDIDATES)
-    fmt_col = _resolve_column(work, _FIN_FORMAT_CANDIDATES)
-    if pg_col:
-        pgs = work[pg_col].astype(str).to_numpy()
-        fmts = (work[fmt_col].astype(str).to_numpy()
-                if fmt_col else [""] * len(work))
-        fin_category = [_finance_native_category(pg, fm) for pg, fm in zip(pgs, fmts)]
-    else:
-        fin_category = [None] * len(work)
-
-    cols: dict[str, object] = {
-        "item_key": _vectorised_item_key(work[item_col]).values,
-        "customer_name": cust_name.values,
-        "month": _vectorised_start_of_month(work[month_col]).values,
-        "fin_category": fin_category,
-    }
-    for col, src in metric_cols.items():      # net_sales, gross_profit, …
-        cols[col] = _fin_numeric(work[src] if src else None, work.index).values
-    base = pd.DataFrame(cols)
-
-    enriched = _attach_dims(base, base["item_key"], build_item_dim_frame(pdh_df))
-    enriched["item_desc"] = enriched["desc"]
-    out = enriched[list(_FINANCE_ENRICHED_COLS)]
-    return out.dropna(subset=["month"]).reset_index(drop=True)
-
-
 def resolve_ro_summary_path(
     *,
     pmaj: str,
@@ -3554,8 +3368,8 @@ class BusinessHealthResult:
 
     ``table`` — one ORDER-based row per comparison-template row (metadata + the
     six level columns + three Order-YoY fractions + the text Flag).
-    ``chart_series`` — Total-B2C volume + YoY per window for BOTH sources:
-    ``{"Orders": {bucket: {"vol": float, "yoy": float|None}}, "Shipments": …}``.
+    ``chart_series`` — Total-B2C order volume + YoY per window:
+    ``{"Orders": {bucket: {"vol": float, "yoy": float|None}}}``.
     ``window_labels`` — ``{bucket: (current_range, year_ago_range)}`` human
     strings for the legend + YoY definition.  ``prior_month`` — the anchor.
     """
@@ -3571,14 +3385,6 @@ def _month_range_label(months: set[date]) -> str:
         return "—"
     lo, hi = min(months), max(months)
     return f"{lo:%b %Y}" if lo == hi else f"{lo:%b %Y} – {hi:%b %Y}"
-
-
-def _gl_months_label(months: set[date]) -> str:
-    """GL-month range + count for a Lever-C column header, e.g.
-    ``"Apr 2026 – Jun 2026 · 3 mo"`` (``"—"`` when the set is empty)."""
-    if not months:
-        return "—"
-    return f"{_month_range_label(months)} · {len(months)} mo"
 
 
 def _bh_flag(l3m_yoy: Optional[float], l12m_yoy: Optional[float]) -> str:
@@ -3673,26 +3479,21 @@ def _bh_total_series(measures: dict[str, dict[str, float]]) -> dict[str, dict[st
 
 def build_business_health(
     orders_enriched: Optional[pd.DataFrame],
-    shipments_enriched: Optional[pd.DataFrame],
     prior_month: date,
-    *,
-    finance_enriched: Optional[pd.DataFrame] = None,
 ) -> BusinessHealthResult:
-    """Trailing-window momentum from enriched IBP **Orders** (+ Shipments chart).
+    """Trailing-window order momentum from enriched IBP **Orders**.
 
     For *prior_month* (first-of-month), the L3M / L6M / L12M windows END at that
     month (inclusive) and each YAG window is the same span one year earlier.
-    The per-category **table** is ORDER-based (pound sums, YoY, momentum Flag);
-    the **chart** series carry Total-B2C volume + YoY for Orders, Shipments and
-    — when ``finance_enriched`` is supplied — Net Sales.  Degrades to zeros
-    (blank Flags) when a source is missing.
+    Both the per-category **table** and the headline **chart** series are
+    ORDER-based (pound sums, YoY, momentum Flag) — orders are the demand signal
+    this section reads.  Degrades to zeros (blank Flags) when orders are absent.
     """
     pm = prior_month.replace(day=1)
     cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
     yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
 
     order_measures = _bh_window_measures(orders_enriched, cur_windows, yag_windows)
-    ship_measures = _bh_window_measures(shipments_enriched, cur_windows, yag_windows)
 
     records: list[dict] = []
     for tpl in COMPARISON_TEMPLATE:
@@ -3720,30 +3521,19 @@ def build_business_health(
         w: (_month_range_label(cur_windows[w]), _month_range_label(yag_windows[w]))
         for w in BH_WINDOW_MONTHS
     }
-    chart_series = {
-        "Orders": _bh_total_series(order_measures),
-        "Shipments": _bh_total_series(ship_measures),
-    }
-    # Finance lines (Net Sales, Gross Profit, …) — one Total-B2C series each.
-    if finance_enriched is not None:
-        for name, col, _cands in BH_FINANCE_METRICS:
-            measures = _bh_window_measures(
-                finance_enriched, cur_windows, yag_windows, col)
-            chart_series[name] = _bh_total_series(measures)
+    chart_series = {"Orders": _bh_total_series(order_measures)}
     return BusinessHealthResult(
         table=df, window_labels=window_labels, prior_month=pm,
         chart_series=chart_series)
 
 
-# ── Per-category four-lever deep-dive ────────────────────────────────────────
-# Each of the seven executive categories is analysed through four "levers":
-#   A  Orders vs Shipments YoY (L12M→L6M→L3M) + a channel gap read
-#   B  Net-Sales decomposition:  Net Sales YoY% ≈ Units YoY% + Price/mix YoY% (residual)
-#   C  Margin:  Gross Profit % over L12M→L6M→L3M + a Vol×Margin quadrant reading
-#   D  Top Customer×SKU movers by the L3M order-lbs swing
-# Volume for B/C is IBP **Shipped** lbs (the shipment line in Lever A); Lever D
-# ranks by IBP **Order** lbs (the demand signal); Net Sales and Gross Profit
-# come from the Finance extract.
+# ── Per-category deep-dive ───────────────────────────────────────────────────
+# Each of the seven executive categories is analysed through two lenses, both
+# driven entirely by IBP **Order** lbs — the demand signal:
+#   A  Order lbs YoY across the trailing windows (L12M→L6M→L3M)
+#   D  Mix Shifts: top Customer×SKU movers by the order-lbs swing, computed for
+#      EACH trailing window so a mover can be read as a recent blip (L3M only)
+#      or a structural shift (visible at L6M and L12M too).
 
 # Template row-ids for the seven categories, in display order, + nice labels.
 BH_CATEGORY_ROWS: tuple[str, ...] = (
@@ -3759,133 +3549,37 @@ BH_CATEGORY_LABELS: dict[str, str] = {
     "fresh_milk": "Fresh Milk",
     "butter": "Packaged Butter",
 }
-# Periods shown left→right in the Lever B table (widest → narrowest, OVERLAPPING
-# trailing windows).  Lever A/B/D still use these.
+# Trailing windows shown widest → narrowest.  These OVERLAP by construction
+# (L3M ⊂ L6M ⊂ L12M), which is the point: the same mover appearing in all three
+# is structural, one appearing only in L3M is recent.  Used by both lenses.
 BH_PERIOD_ORDER: tuple[str, ...] = ("L12M", "L6M", "L3M")
-# Lever C uses DISCRETE (non-overlapping) windows instead, left→right oldest→
-# newest, so the turnaround arc reads as distinct chunks rather than nested
-# cumulative totals: prior 6 mo (mo 7-12) → prior 3 mo (mo 4-6) → recent 3 mo.
-BH_DISCRETE_ORDER: tuple[str, ...] = ("prior6", "prior3", "recent3")
-BH_DISCRETE_LABELS: dict[str, str] = {
-    "prior6": "Prior 6 mo", "prior3": "Prior 3 mo", "recent3": "Recent 3 mo",
-}
-# Lever D chart shows the top-N movers per direction (growers / decliners); the
-# foldable table below the chart lists ALL movers.
-BH_MOVER_TOP_N: int = 3
 
-# Lever A — Darigold **internal** finished-goods inventory read (an ASSUMPTION,
-# not a fact — we don't see production).  Rationale: we produce to demand
-# (orders), so ΔFG ≈ Orders − Shipments.  Orders YoY ABOVE Shipments YoY ⇒ we're
-# booking demand faster than we ship ⇒ finished goods / backlog BUILDING; the
-# reverse ⇒ we're shipping down our own stock ⇒ DRAINING.  Only called when the
-# gap is material AND consistent across L6M and L3M — else "flat".
-BH_GAP_BUILDING: str = "Building"
-BH_GAP_DRAINING: str = "Draining"
-BH_GAP_BALANCED: str = "Balanced"
-# Lever A gap must clear this (fraction, i.e. 0.01 = 1pp) in BOTH L6M and L3M,
-# same sign, before we call building/draining — a single-period 0.5pp wobble is
-# noise, not an inventory signal.
-_BH_GAP_DEADBAND: float = 0.01
-
-# Lever D — per-mover classification tags (page renders icon + wording).
+# Structural tag per mover (Mix Shifts) — WHY a Customer×SKU line moved, so a
+# planner can tell a walked-away account from a softening one, and organic
+# growth from genuinely new business.
 BH_TAG_EXIT: str = "exit"                  # decliner: last-year lbs → ~0 (walked away)
 BH_TAG_SOFTENING: str = "softening"        # decliner: partial decline, still buying
 BH_TAG_SUBSTITUTION: str = "substitution"  # mover offset within same customer/SKU
 BH_TAG_GROWTH: str = "growth"              # grower: organic expansion of existing line
 BH_TAG_NEW: str = "new"                    # grower: from ~0 last year (new business)
-# A decliner is an EXIT when this-year L3M lbs fall below this fraction of last
+# A decliner is an EXIT when this-year lbs fall below this fraction of last
 # year's (a near-complete walk-away); a mover is SUBSTITUTION when its customer
 # (or its SKU) is roughly volume-neutral overall — the lbs moved, not lost.
 _BH_EXIT_RATIO: float = 0.15
 _BH_SUBST_RATIO: float = 0.5
-# Concentration read: how many accounts explain this share of the L3M decline.
+
+# Share of a window's net decline that "concentrated" means (decline_k / accounts).
 _BH_CONCENTRATION_PCT: float = 0.80
-# Mover table: drop lines below this share of the category's gross move — they
-# round to "0%" and are just noise the planner shouldn't scan.
+# Movers below this share of the gross move are noise — dropped from the
+# foldable all-movers table so it stays readable.
 _BH_MOVER_MIN_SHARE: float = 0.005
-
-# Lever B — Price-Volume-Mix (PVM) read on the L3M Net-Sales move: which term
-# (units, or price & mix) drove the Net Sales YoY, and which way.  Tokens; the
-# page turns each into a short tag + a plain-English explanation.
-BH_MOVE_PRICE_UP: str = "price_up"        # net sales up, price/mix dominated
-BH_MOVE_VOLUME_UP: str = "volume_up"      # net sales up, units dominated
-BH_MOVE_VOLUME_DOWN: str = "volume_down"  # net sales down, units dominated
-BH_MOVE_PRICE_DOWN: str = "price_down"    # net sales down, price/mix dominated
-
-# Lever C — Vol × Margin quadrant TOKEN (direction of L3M volume YoY × the
-# L3M-vs-L12M change in Gross Profit %).  The page turns the token into a
-# neutral, assumption-framed reading; the wording is category-aware because some
-# categories have trade/promo and some don't (see BH_NO_PROMO_CATEGORIES).
-BH_VM_UP_UP: str = "up_up"
-BH_VM_UP_DOWN: str = "up_down"
-BH_VM_DOWN_UP: str = "down_up"
-BH_VM_DOWN_DOWN: str = "down_down"
-
-# Categories sold WITHOUT trade/promo — a margin move here is price / cost / mix,
-# never promo depth, so the Lever C assumption is phrased accordingly.
-BH_NO_PROMO_CATEGORIES: frozenset = frozenset({"fresh_milk"})
-
-
-def _bh_gap_flag(
-    order_l6m: Optional[float], ship_l6m: Optional[float],
-    order_l3m: Optional[float], ship_l3m: Optional[float],
-) -> str:
-    """Lever A: classify the Orders−Shipments YoY gap into building / draining /
-    flat — an assumption about Darigold's own finished-goods inventory.
-
-    Robust (not one-period): calls building/draining ONLY when the gap clears the
-    deadband with the **same sign in BOTH L6M and L3M**.  A single-period wobble
-    inside the band reads as ``Balanced`` (flat — no clear inventory signal)."""
-    vals = (order_l6m, ship_l6m, order_l3m, ship_l3m)
-    if any(v is None or pd.isna(v) for v in vals):
-        return ""
-    gap_l6m = order_l6m - ship_l6m
-    gap_l3m = order_l3m - ship_l3m
-    if gap_l6m > _BH_GAP_DEADBAND and gap_l3m > _BH_GAP_DEADBAND:
-        return BH_GAP_BUILDING
-    if gap_l6m < -_BH_GAP_DEADBAND and gap_l3m < -_BH_GAP_DEADBAND:
-        return BH_GAP_DRAINING
-    return BH_GAP_BALANCED
-
-
-def _bh_decomp_sowhat(
-    net_yoy: Optional[float], vol_yoy: Optional[float],
-) -> str:
-    """Lever B: Price-Volume-Mix read on the L3M Net-Sales move (token).
-
-    Price/mix is the residual ``net_yoy − vol_yoy``.  Whichever of price/mix or
-    volume has the larger magnitude is the driver; the sign of the net move sets
-    the direction.  Returns a BH_MOVE_* token (page renders the wording); ""
-    when undefined.
-    """
-    if net_yoy is None or vol_yoy is None or pd.isna(net_yoy) or pd.isna(vol_yoy):
-        return ""
-    price_mix = net_yoy - vol_yoy
-    price_driven = abs(price_mix) >= abs(vol_yoy)
-    if net_yoy >= 0:
-        return BH_MOVE_PRICE_UP if price_driven else BH_MOVE_VOLUME_UP
-    return BH_MOVE_PRICE_DOWN if price_driven else BH_MOVE_VOLUME_DOWN
-
-
-def _bh_vol_margin_quadrant(
-    vol_yoy_l3m: Optional[float],
-    gp_pct_l3m: Optional[float], gp_pct_l12m: Optional[float],
-) -> str:
-    """Lever C: (L3M volume direction) × (L3M-vs-L12M margin direction) → a
-    BH_VM_* quadrant token (page composes the assumption text); "" when undefined."""
-    if (vol_yoy_l3m is None or gp_pct_l3m is None or gp_pct_l12m is None
-            or any(pd.isna(x) for x in (vol_yoy_l3m, gp_pct_l3m, gp_pct_l12m))):
-        return ""
-    vol_up = vol_yoy_l3m >= 0
-    margin_up = (gp_pct_l3m - gp_pct_l12m) >= 0
-    if vol_up:
-        return BH_VM_UP_UP if margin_up else BH_VM_UP_DOWN
-    return BH_VM_DOWN_UP if margin_up else BH_VM_DOWN_DOWN
-
+# Mix Shifts charts show the top-N movers per direction (growers / decliners); the
+# foldable table below the chart lists ALL movers.
+BH_MOVER_TOP_N: int = 3
 
 @dataclass(frozen=True)
 class BhMoverSegment:
-    """One Customer × SKU mover on a category's Lever-D diverging bar.
+    """One Customer × SKU mover on a category's Mix Shifts diverging bar.
 
     ``delta_m`` is the signed L3M **order**-lbs swing (millions); ``share`` is
     |Δ| ÷ the category's total gross movement (0–1) — this line's **percentage
@@ -3906,7 +3600,7 @@ class BhMoverSegment:
 
 @dataclass(frozen=True)
 class BhCustomerGroup:
-    """One customer's block in the Lever-D mover table: its **net** L3M swing
+    """One customer's block in a Mix Shifts mover table: its **net** swing
     (ins − outs, millions), its gross churn (Σ|Δ|), and every significant SKU
     mover within it (``movers``, ranked by |Δ| desc).  Customers are ordered by
     |net_delta_m| so the biggest net movers sit on top."""
@@ -3918,7 +3612,7 @@ class BhCustomerGroup:
 
 @dataclass(frozen=True)
 class BhConcentration:
-    """Lever D: the L3M order-lbs move across a category's Customer×SKU lines.
+    """Mix Shifts: one window's order-lbs move across a category's Customer×SKU lines.
 
     ``total_abs_m`` is Σ|Δ order lbs| (millions) — the denominator behind each
     mover's percentage of impact.  ``growers`` / ``decliners`` are the top-N
@@ -3947,73 +3641,22 @@ class BhConcentration:
 
 
 @dataclass(frozen=True)
-class BhReconciliation:
-    """Lever-C reconciliation: our PDH-driven rollup vs Finance's own report.
-
-    Both sides read the SAME finance dollars; only the *classification* differs
-    — our card rolls up by PDH (so volume and net sales agree), while Finance's
-    report groups by its own Product Group / Format taxonomy.  ``net_pdh`` /
-    ``net_fin`` / ``gp_pdh`` / ``gp_fin`` are ``{period: $M}``.  ``drivers`` are
-    concise, human notes naming the items behind any gap (empty when they tie).
-    ``available`` is False when the Finance extract wasn't loaded.
-    """
-    available: bool
-    net_pdh: dict[str, float]
-    net_fin: dict[str, float]
-    gp_pdh: dict[str, float]
-    gp_fin: dict[str, float]
-    drivers: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class BusinessHealthCategory:
-    """One category's four-lever deep-dive.
+    """One category's deep-dive, driven entirely by IBP **Order** lbs.
 
-    Raw series (shared by the levers) — ``order_series`` / ``ship_series`` are
-    ``{bucket: {"vol", "yoy"}}``; ``finance_series`` maps each finance line
-    (:data:`BH_FINANCE_METRICS`) to the same shape (empty when the extract is
-    absent).  Derived levers:
-
-    * **A** ``gap_flag`` — channel building/draining from the L3M Orders vs
-      Shipments YoY gap.
-    * **B** ``decomp`` — ``{period: {"volume", "price_mix", "net_sales"}}`` YoY
-      fractions (price_mix = net_sales − volume residual); ``decomp_sowhat`` —
-      earned vs bought/lost read on the L3M move.
-    * **C** ``margin_pct`` — ``{period: Gross Profit ÷ Net Sales}``;
-      ``margin_gl_months`` — ``{period: GL-month range label}`` from **Actual**
-      finance rows only; ``vol_margin_quadrant`` — the Vol×Margin quadrant token.
-      (The Gross-Profit / Net-Sales dollar totals behind the margin come from
-      ``finance_series[...]["vol"]``.)
-    * **D** ``concentration`` — the L3M shipped-lbs move split across
-      Customer×SKU lines (:class:`BhConcentration`).
-
-    ``reconciliation`` — PDH-rollup vs Finance-report cross-check
-    (:class:`BhReconciliation`), shown in a foldable panel under Lever C.
+    * ``order_series`` — ``{window: {"vol", "yoy"}}`` order pounds and YoY for
+      each trailing window (:data:`BH_PERIOD_ORDER`).  Lens **A**.
+    * ``concentrations`` — ``{window: BhConcentration}``: the order-lbs move
+      split across Customer×SKU lines, computed for EVERY trailing window.
+      Lens **D**.  Because the windows nest (L3M ⊂ L6M ⊂ L12M), a mover present
+      in all three is a structural shift while one visible only at L3M is
+      recent — which is the read the three charts exist to give.
     """
     row_id: str
     label: str
     flag: str
     order_series: dict[str, dict[str, Optional[float]]]
-    ship_series: dict[str, dict[str, Optional[float]]]
-    finance_series: dict[str, dict[str, dict[str, Optional[float]]]]
-    gap_flag: str
-    decomp: dict[str, dict[str, Optional[float]]]
-    decomp_sowhat: str
-    margin_pct: dict[str, Optional[float]]
-    margin_gl_months: dict[str, str]
-    vol_margin_quadrant: str
-    concentration: BhConcentration
-    reconciliation: BhReconciliation
-    # Lever C detail: a 12-month monthly margin series (GP% faint + 3-mo rolling,
-    # with monthly order/ship lbs) and DISCRETE (non-overlapping) window totals.
-    #   margin_monthly — DataFrame[month, gp_m, net_m, order_m, ship_m, gp_pct,
-    #                    gp_pct_roll3] ordered oldest→newest.
-    #   margin_discrete — {window: {gp_m, net_m, order_m, ship_m, gp_pct}} over
-    #                    the three discrete windows (:data:`BH_DISCRETE_ORDER`).
-    #   margin_discrete_gl — {window: GL-month range label} (Actual finance).
-    margin_monthly: "pd.DataFrame" = field(default_factory=lambda: pd.DataFrame())
-    margin_discrete: dict = field(default_factory=dict)
-    margin_discrete_gl: dict = field(default_factory=dict)
+    concentrations: dict[str, BhConcentration]
 
 
 def _category_leaf_rows(
@@ -4046,14 +3689,14 @@ def _category_mask(
 
 def _category_pair_deltas(
     frame: Optional[pd.DataFrame], row_id: str,
-    cur_l3m: set, yag_l3m: set, template_by_id: dict[str, "TemplateRow"],
+    cur_window: set, yag_window: set, template_by_id: dict[str, "TemplateRow"],
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """``(cur, yag, delta_m)`` L3M pound Series indexed by ``(customer, sku)``.
+    """``(cur, yag, delta_m)`` pound Series indexed by ``(customer, sku)``.
 
-    Sums the category's rows in the current L3M window and its year-ago span,
+    Sums the category's rows in *cur_window* and its year-ago span,
     aligns them on the full key union, and returns the signed swing in millions
-    of lbs.  Works on any enriched frame with ``pounds`` (orders or shipments);
-    Lever D uses **shipments**.  Empty Series when the category has no rows.
+    of lbs.  Works on any enriched frame carrying ``pounds``; Mix Shifts passes
+    IBP **Orders**.  Empty Series when the category has no rows.
     """
     empty = pd.Series(dtype=float)
     if frame is None or frame.empty:
@@ -4071,7 +3714,7 @@ def _category_pair_deltas(
         pounds = pd.to_numeric(w["pounds"], errors="coerce").fillna(0.0)
         return pounds.groupby([cust, sku]).sum()
 
-    cur, yag = _grouped(cur_l3m), _grouped(yag_l3m)
+    cur, yag = _grouped(cur_window), _grouped(yag_window)
     keys = cur.index.union(yag.index)
     if len(keys) == 0:
         return empty, empty, empty
@@ -4082,11 +3725,13 @@ def _category_pair_deltas(
 
 def _category_concentration(
     frame: Optional[pd.DataFrame], row_id: str,
-    cur_l3m: set, yag_l3m: set,
+    cur_window: set, yag_window: set,
     template_by_id: dict[str, "TemplateRow"], top_n: int = BH_MOVER_TOP_N,
 ) -> BhConcentration:
-    """Lever D: the category's top-N Customer×SKU growers and decliners by L3M
-    **order**-lbs swing, each carrying its percentage of the total gross move.
+    """Mix Shifts: the category's top-N Customer×SKU growers and decliners by
+    **order**-lbs swing over *cur_window*, each carrying its percentage of the
+    total gross move.  The window is a parameter, so the same routine serves
+    the L3M / L6M / L12M charts without duplication.
 
     Uses ORDER lbs (the demand signal) so order-side accounts that don't
     generate a matching shipment line — e.g. food-bank / donation orders like
@@ -4095,7 +3740,7 @@ def _category_concentration(
     label — the % of business impact each line represents.
     """
     cur, yag, delta_m = _category_pair_deltas(
-        frame, row_id, cur_l3m, yag_l3m, template_by_id)
+        frame, row_id, cur_window, yag_window, template_by_id)
     if len(delta_m) == 0:
         return BhConcentration(0.0, (), ())
     total_abs = float(delta_m.abs().sum())
@@ -4176,282 +3821,46 @@ def _category_concentration(
         decline_total_m=decline_total, all_movers=all_movers, by_customer=by_customer)
 
 
-def _bh_margin_pct(
-    finance_series: dict[str, dict[str, dict[str, Optional[float]]]], period: str,
-) -> Optional[float]:
-    """Gross Profit ÷ Net Sales for *period* from the category's finance series
-    (``None`` when finance is absent or Net Sales ~ 0)."""
-    ns = finance_series.get("Net Sales", {}).get(period, {}).get("vol")
-    gp = finance_series.get("Gross Profit", {}).get(period, {}).get("vol")
-    if ns is None or gp is None or abs(ns) < 1e-9:
-        return None
-    return gp / ns
-
-
 # Max reclassification drivers to name in a reconciliation note (per direction).
 _BH_RECON_DRIVER_TOP_N: int = 2
 
 
-def _bh_reconciliation(
-    finance_enriched: Optional[pd.DataFrame], row_id: str,
-    template_by_id: dict[str, "TemplateRow"],
-    cur_windows: dict[str, set],
-) -> BhReconciliation:
-    """PDH-rollup vs Finance-report reconciliation for one category.
-
-    Both sides sum the SAME finance dollars; the only difference is *which rows*
-    land in the category — our card uses the PDH rollup (:func:`_category_mask`),
-    Finance's report uses its own ``fin_category``.  Returns per-period Net Sales
-    & Gross Profit for each side plus concise driver notes naming the items that
-    each side files here but the other files elsewhere (ranked by L12M net sales).
-    """
-    empty = {p: 0.0 for p in cur_windows}
-    if (finance_enriched is None or finance_enriched.empty
-            or "fin_category" not in finance_enriched.columns):
-        return BhReconciliation(False, dict(empty), dict(empty),
-                                dict(empty), dict(empty), ())
-
-    fin = finance_enriched
-    pdh_mask = _category_mask(fin, row_id, template_by_id)
-    fin_mask = fin["fin_category"] == row_id
-    month = fin["month"]
-
-    def _sums(mask, col):
-        return {p: float(fin.loc[mask & month.isin(w), col].sum()) / _LBS_PER_MILLION
-                for p, w in cur_windows.items()}
-
-    net_pdh, net_fin = _sums(pdh_mask, "net_sales"), _sums(fin_mask, "net_sales")
-    gp_pdh, gp_fin = _sums(pdh_mask, "gross_profit"), _sums(fin_mask, "gross_profit")
-
-    # Per-row PDH category (which of the seven cards, if any) so a driver note
-    # can name EXACTLY where PDH files a disputed item — the point being that a
-    # planner can see the reclassification and catch it at a glance.
-    pdh_cat = pd.Series(pd.NA, index=fin.index, dtype=object)
-    for cid in BH_CATEGORY_ROWS:
-        pdh_cat = pdh_cat.mask(_category_mask(fin, cid, template_by_id), cid)
-
-    desc_key = fin["item_desc"].astype(str).str.strip().replace("", "(no PDH item)")
-    l12 = month.isin(cur_windows.get("L12M", set()))
-
-    def _pdh_where(idx) -> str:
-        """Human label for where PDH files an item (a category card, or its raw
-        pmaj · pminor when it maps to none of the seven B2C cards)."""
-        cats = pdh_cat.loc[idx].dropna()
-        if len(cats):
-            return BH_CATEGORY_LABELS.get(cats.iloc[0], str(cats.iloc[0]))
-        r = fin.loc[idx[0]]
-        parts = [str(r.get("pmaj", "")).strip(),
-                 str(r.get("pminor", "") or r.get("sfmt", "")).strip()]
-        raw = " · ".join(p for p in parts if p) or "an unclassified item"
-        return f"{raw} (outside the seven B2C cards)"
-
-    def _fin_where(idx) -> str:
-        """Human label for where Finance files an item (its fin_category)."""
-        cats = fin.loc[idx, "fin_category"].dropna()
-        if not len(cats):
-            return "outside the seven B2C categories"
-        cid = cats.iloc[0]
-        return BH_CATEGORY_LABELS.get(cid, str(cid))
-
-    drivers: list[str] = []
-    # (mask of items only this side files here, template for the note, where-fn)
-    for mask, is_finance_only in ((fin_mask & ~pdh_mask, True), (pdh_mask & ~fin_mask, False)):
-        sub_all = fin[l12 & mask]
-        if sub_all.empty:
-            continue
-        keys = desc_key[l12 & mask]
-        totals = sub_all["net_sales"].groupby(keys).sum()
-        for desc in totals.abs().sort_values(ascending=False).head(_BH_RECON_DRIVER_TOP_N).index:
-            idx = sub_all.index[keys == desc]
-            amt = abs(float(sub_all.loc[idx, "net_sales"].sum())) / _LBS_PER_MILLION
-            if is_finance_only:      # Finance counts it here; PDH put it elsewhere
-                drivers.append(
-                    f"{desc} (${amt:.1f}M, L12M): PDH classifies it as "
-                    f"**{_pdh_where(idx)}**, so this card excludes it — Finance counts it here.")
-            else:                    # this card counts it; Finance put it elsewhere
-                drivers.append(
-                    f"{desc} (${amt:.1f}M, L12M): Finance classifies it as "
-                    f"**{_fin_where(idx)}**, so Finance excludes it — this card counts it here.")
-    return BhReconciliation(True, net_pdh, net_fin, gp_pdh, gp_fin, tuple(drivers))
-
-
-def _bh_cat_frame(
-    frame: Optional[pd.DataFrame], row_id: str,
-    template_by_id: dict[str, "TemplateRow"],
-) -> Optional[pd.DataFrame]:
-    """The category's rows from an enriched frame (PDH mask); None when empty."""
-    if frame is None or frame.empty:
-        return None
-    sub = frame[_category_mask(frame, row_id, template_by_id)]
-    return sub if not sub.empty else None
-
-
-def _bh_window_sum(masked: Optional[pd.DataFrame], months: set, col: str) -> float:
-    """Σ of *col* over an already-category-masked frame's rows whose month ∈ *months*."""
-    if masked is None or masked.empty or col not in masked.columns:
-        return 0.0
-    w = masked[masked["month"].isin(months)]
-    return float(pd.to_numeric(w[col], errors="coerce").fillna(0.0).sum())
-
-
-def _bh_margin_detail(
-    finance: Optional[pd.DataFrame], orders: Optional[pd.DataFrame],
-    shipments: Optional[pd.DataFrame], row_id: str,
-    template_by_id: dict[str, "TemplateRow"], months_ordered: list,
-    discrete: dict[str, set],
-) -> tuple[pd.DataFrame, dict]:
-    """Lever C detail for one category: ``(monthly_df, discrete_dict)``.
-
-    Monthly (oldest→newest, one row per month in *months_ordered*): GP$/NS$
-    (finance), order/ship lbs — all in millions — plus **GP%** and its **3-mo
-    trailing rolling average**.  Discrete: the same totals over each
-    non-overlapping window in *discrete*, with a per-window GP%.
-    """
-    fin = _bh_cat_frame(finance, row_id, template_by_id)
-    ord_ = _bh_cat_frame(orders, row_id, template_by_id)
-    shp = _bh_cat_frame(shipments, row_id, template_by_id)
-
-    def _monthly(masked, col):
-        s = pd.Series(0.0, index=months_ordered, dtype=float)
-        if masked is not None and col in masked.columns:
-            g = (pd.to_numeric(masked[col], errors="coerce").fillna(0.0)
-                 .groupby(masked["month"]).sum())
-            s = g.reindex(months_ordered).fillna(0.0)
-        return s
-    gp, ns = _monthly(fin, "gross_profit"), _monthly(fin, "net_sales")
-    monthly = pd.DataFrame({
-        "month": list(months_ordered),
-        "gp_m": gp.to_numpy() / _LBS_PER_MILLION,
-        "net_m": ns.to_numpy() / _LBS_PER_MILLION,
-        "order_m": _monthly(ord_, "pounds").to_numpy() / _LBS_PER_MILLION,
-        "ship_m": _monthly(shp, "pounds").to_numpy() / _LBS_PER_MILLION,
-    })
-    # GP% only where net sales are non-trivial (else NaN → a gap in the line).
-    gp_pct = gp.divide(ns.where(ns > 1e-9)).reset_index(drop=True)
-    monthly["gp_pct"] = gp_pct
-    monthly["gp_pct_roll3"] = gp_pct.rolling(3, min_periods=1).mean()
-
-    discrete_out: dict[str, dict] = {}
-    for wk, wv in discrete.items():
-        g = _bh_window_sum(fin, wv, "gross_profit")
-        n = _bh_window_sum(fin, wv, "net_sales")
-        discrete_out[wk] = {
-            "gp_m": g / _LBS_PER_MILLION, "net_m": n / _LBS_PER_MILLION,
-            "order_m": _bh_window_sum(ord_, wv, "pounds") / _LBS_PER_MILLION,
-            "ship_m": _bh_window_sum(shp, wv, "pounds") / _LBS_PER_MILLION,
-            "gp_pct": (g / n) if n > 1e-9 else None,
-        }
-    return monthly, discrete_out
-
-
 def build_business_health_categories(
     orders_enriched: Optional[pd.DataFrame],
-    shipments_enriched: Optional[pd.DataFrame],
     prior_month: date,
     *,
-    finance_enriched: Optional[pd.DataFrame] = None,
     top_n: int = BH_MOVER_TOP_N,
 ) -> list[BusinessHealthCategory]:
-    """Per-category (7) four-lever deep-dive (see :class:`BusinessHealthCategory`).
+    """Per-category (7) deep-dive (see :class:`BusinessHealthCategory`).
 
-    Same windows / anchoring as :func:`build_business_health`; reads the SAME
-    (already filter-narrowed) enriched frames, so every lever reacts to every
-    section filter.  Volume for B/C is IBP **Shipped** lbs; Lever D ranks by IBP
-    **Order** lbs (so order-only accounts are captured).  Net Sales and Gross
-    Profit come from ``finance_enriched`` (:func:`enrich_finance_df`) — the
-    decomposition (B) and margin (C) degrade to blanks when finance is absent,
-    while the Orders/Shipments levers (A) and concentration (D) still populate.
+    Same windows / anchoring as :func:`build_business_health`, reading the SAME
+    (already filter-narrowed) enriched orders frame so both lenses react to
+    every section filter.  Everything here is IBP **Order** lbs: the demand
+    signal, which also captures order-only accounts (e.g. food-bank donations)
+    that never generate a matching shipment line.
     """
     pm = prior_month.replace(day=1)
     cur_windows = {w: _last_n_months(pm, n) for w, n in BH_WINDOW_MONTHS.items()}
     yag_windows = {w: {_shift_year_back(m) for m in ms} for w, ms in cur_windows.items()}
     order_measures = _bh_window_measures(orders_enriched, cur_windows, yag_windows)
-    ship_measures = _bh_window_measures(shipments_enriched, cur_windows, yag_windows)
-    # Compute each finance metric's measures ONCE (all template rows at a time),
-    # then slice per category below — no per-category rescans.
-    fin_measures: dict[str, dict] = {}
-    if finance_enriched is not None:
-        for name, col, _cands in BH_FINANCE_METRICS:
-            fin_measures[name] = _bh_window_measures(
-                finance_enriched, cur_windows, yag_windows, col)
     template_by_id = {r.row_id: r for r in COMPARISON_TEMPLATE}
-    cur_l3m, yag_l3m = cur_windows["L3M"], yag_windows["L3M"]
-
-    # GL-month range per period from ACTUAL finance rows only (enrich_finance_df
-    # already dropped Budget rows), so Lever C's column headers show exactly
-    # which actual months rolled into each L12M/L6M/L3M total.  Window-level
-    # (identical across categories), computed once.
-    fin_months = (
-        set(finance_enriched["month"])
-        if finance_enriched is not None and not finance_enriched.empty else set()
-    )
-    margin_gl_months = {
-        p: _gl_months_label(fin_months & cur_windows[p]) for p in BH_PERIOD_ORDER
-    }
-    # Lever C DISCRETE (non-overlapping) windows + their 12 ordered months.
-    _w3, _w6, _w12 = cur_windows["L3M"], cur_windows["L6M"], cur_windows["L12M"]
-    discrete_windows = {"recent3": _w3, "prior3": _w6 - _w3, "prior6": _w12 - _w6}
-    months_12 = sorted(_w12)
-    margin_discrete_gl = {
-        k: _gl_months_label(fin_months & v) for k, v in discrete_windows.items()
-    }
 
     out: list[BusinessHealthCategory] = []
     for rid in BH_CATEGORY_ROWS:
         order_series = _bh_series_for_row(order_measures, rid)
-        ship_series = _bh_series_for_row(ship_measures, rid)
-        finance_series = {
-            name: _bh_series_for_row(m, rid) for name, m in fin_measures.items()
-        }
-        net_ser = finance_series.get("Net Sales", {})
         flag = _bh_flag(order_series["L3M"]["yoy"], order_series["L12M"]["yoy"])
-
-        # Lever A — Darigold internal inventory read (L6M+L3M Orders vs Shipments
-        # YoY; building/draining only when material AND consistent across both).
-        gap_flag = _bh_gap_flag(
-            order_series["L6M"]["yoy"], ship_series["L6M"]["yoy"],
-            order_series["L3M"]["yoy"], ship_series["L3M"]["yoy"])
-
-        # Lever B — Net Sales ≈ Volume (IBP shipped) + Price/mix (residual),
-        # per period so the reader sees how price/mix evolves L12M→L3M.
-        decomp: dict[str, dict[str, Optional[float]]] = {}
-        for period in BH_PERIOD_ORDER:
-            vol = ship_series[period]["yoy"]
-            net = net_ser.get(period, {}).get("yoy") if net_ser else None
-            price_mix = (net - vol) if (net is not None and vol is not None) else None
-            decomp[period] = {"volume": vol, "price_mix": price_mix, "net_sales": net}
-        decomp_sowhat = _bh_decomp_sowhat(
-            decomp["L3M"]["net_sales"], decomp["L3M"]["volume"])
-
-        # Lever C — Gross Profit % per period + Vol×Margin quadrant reading.
-        margin_pct = {p: _bh_margin_pct(finance_series, p) for p in BH_PERIOD_ORDER}
-        vol_margin_quadrant = _bh_vol_margin_quadrant(
-            ship_series["L3M"]["yoy"], margin_pct["L3M"], margin_pct["L12M"])
-
-        # Lever D — top movers by the L3M ORDER-lbs swing (demand signal), so
-        # order-only accounts (e.g. MT Food Bank) are captured.
-        concentration = _category_concentration(
-            orders_enriched, rid, cur_l3m, yag_l3m, template_by_id, top_n)
-
-        # Lever C reconciliation — PDH rollup (this card) vs Finance's report.
-        reconciliation = _bh_reconciliation(
-            finance_enriched, rid, template_by_id, cur_windows)
-
-        # Lever C detail — 12-month monthly margin + discrete-window totals.
-        margin_monthly, margin_discrete = _bh_margin_detail(
-            finance_enriched, orders_enriched, shipments_enriched, rid,
-            template_by_id, months_12, discrete_windows)
-
+        # Mix Shifts once per trailing window.  Same routine, different window —
+        # reading the three side by side separates a recent blip from a
+        # structural shift.
+        concentrations = {
+            w: _category_concentration(
+                orders_enriched, rid, cur_windows[w], yag_windows[w],
+                template_by_id, top_n)
+            for w in BH_PERIOD_ORDER
+        }
         out.append(BusinessHealthCategory(
             row_id=rid, label=BH_CATEGORY_LABELS[rid], flag=flag,
-            order_series=order_series, ship_series=ship_series,
-            finance_series=finance_series, gap_flag=gap_flag,
-            decomp=decomp, decomp_sowhat=decomp_sowhat,
-            margin_pct=margin_pct, margin_gl_months=margin_gl_months,
-            vol_margin_quadrant=vol_margin_quadrant,
-            concentration=concentration, reconciliation=reconciliation,
-            margin_monthly=margin_monthly, margin_discrete=margin_discrete,
-            margin_discrete_gl=margin_discrete_gl))
+            order_series=order_series, concentrations=concentrations))
     return out
 
 

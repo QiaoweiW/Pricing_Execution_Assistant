@@ -32,6 +32,7 @@ widget interaction.
 """
 from __future__ import annotations
 
+import io
 import logging
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -263,13 +264,13 @@ from data_sources.ro_summary_report import (
     RoSummaryReportError,
     build_summary_report,
     clear_comparison_output_cache,
-    diag_dim_summary,
     drop_all_zero_rows,
     recompute_subtotals,
     save_ro_summary_report,
     summary_to_csv_bytes,
 )
 from data_sources import ro_pipeline_analytics as rpa
+from data_sources import ro_input_preflight as rpf
 from data_sources.ro_seed_pipeline import (
     PipelineResult,
     delete_history_rows_for_month,
@@ -472,11 +473,6 @@ def _render_ibp_supporting_files() -> None:
 
 # Session-state keys.  Centralised so we never typo a key elsewhere.
 _SS_SUMMARY_DF      = "_ro_cmp_summary_df"
-# "Regenerate from published RO_Comparison_Output.csv" panel — a read-only
-# snapshot the planner pulls on demand, kept separate from the live in-memory
-# frame so the RO_History rebuild above never clobbers it.
-_SS_RO_REGEN_DF     = "_ro_regen_published_df"
-_SS_RO_REGEN_AT     = "_ro_regen_published_at"
 _SS_MONTHS_SIG      = "_ro_cmp_months_sig"
 _SS_WARNINGS        = "_ro_cmp_warnings"
 _SS_DIMITEMS_ERROR  = "_ro_cmp_dimitems_error"
@@ -1307,50 +1303,41 @@ def _render_business_health_sku_drilldown(
 # after a full-app rerun.  The inner fragments already provide the isolation
 # this outer one was meant to add, so the wrapper was pure risk.
 def _render_ro_comparison() -> None:
-    """Render the RO Comparison section end-to-end inside a foldable expander.
+    """Render the RO Comparison section as a numbered, four-step workflow.
 
-    The section is a self-contained workflow: upload the latest
-    Customer Input CSV → pick the two months to compare → review the
-    enriched summary → edit any cells that need attention → publish
-    back to ``RO_Reporting/RO_Comparison_Output.csv``.
+    The flow, top to bottom, is the order the planner actually works in:
 
-    Wrapped in ``st.expander(expanded=True)`` to match the foldable
-    pattern used by the other dashboards on this page while still
-    showing the summary by default — collapse to hide everything,
-    expand to see the full workflow.
+      **Step 1 — Upload the Distribution Tracker.**  The one action that
+      matters, so it is first and it opens itself when there is no input.
+      Every upload is validated BEFORE anything is written (see
+      :mod:`data_sources.ro_input_preflight`): the run button stays disabled
+      while the file is structurally wrong, because the pipeline downstream is
+      deliberately forgiving and would otherwise publish an ``#N/A`` as zero
+      volume.
+      **Step 2 — RO Output.**  Month pickers, the roll-up, one download.  No
+      save button: both ``RO_Comparison_Output.csv`` and
+      ``RO_Summary_Report.csv`` are auto-published on every rebuild and every
+      cell edit (:func:`_maybe_autosave_ro_comparison_output`,
+      :func:`_maybe_autosave_ro_summary_report`).
+      **Step 3 — Drivers & drill-in.**  Field filters sit here, next to the
+      tables they slice, rather than above the report they push off-screen.
+      **Step 4 — Re-run or retune.**  Replacing an input means deleting the
+      month first, so that destructive tool lives here — quarantined out of
+      the happy path — alongside the RO inclusion rules.
+
+    Pipeline at a Glance closes the section, collapsed: it is a headline read,
+    not a step, and it was previously wedged between the editor and the report.
     """
     with st.expander("🔁 RO Comparison", expanded=True):
         st.caption(
-            "Compare two RO_History snapshots month-over-month, enrich with the "
-            "dp_dimitems portfolio dimensions, edit any cells that need attention, "
-            "and publish the result to the RO_Reporting folder in Microsoft Fabric."
+            "Upload the Distribution Tracker, run RO_Seed, then read the "
+            "month-over-month comparison. Follow the four steps in order — "
+            "each one opens when it is your turn to act."
         )
 
-        _render_ro_item_master_download_button()
-        _render_ro_seed_download_button()
-        _render_ro_seed_summary_reconcile_button()
-
-        # 1a. RO inclusion rules — placed at the top of the section so
-        #     planners see what's currently in Opportunity vs Risk BEFORE
-        #     scanning the tables, and can retune without hunting.
-        _render_ro_rules_panel()
-
-        # 1b. "How to see your changes after upload" guidance.
-        #     Replaces the old "🔄 Refresh from Fabric" button.  The
-        #     auto-refresh path is now ETag-driven (see
-        #     ``ro_comparison._compute_history_blob_signature``), so a
-        #     manual button no longer adds any capability — but planners
-        #     still need to know WHAT to do when they don't see their
-        #     change.  Surface that flow explicitly here.
-        _render_post_upload_guidance()
-        st.markdown("")  # vertical breathing room before the comparison block.
-
-        # 2. Fabric auth gate — match the pattern used by every other
-        #    Fabric-backed page in this app (see
-        #    pages/bid_asset_intelligence_view.py).  Without this gate
-        #    the auto-fetch below would re-trigger the credential chain
-        #    on every render, which on a broken auth chain blocks the
-        #    page for tens of seconds and floods the log with retries.
+        # Fabric auth gate FIRST — every step below needs it, and without the
+        # gate the auto-fetches re-trigger the credential chain on every
+        # render, which on a broken chain blocks the page for tens of seconds.
         if not fabric_signin_widget.is_fabric_signed_in():
             st.warning(
                 "🔒 **Microsoft Fabric is not connected.**\n\n"
@@ -1391,210 +1378,579 @@ def _render_ro_comparison() -> None:
             item_master_df = None
             item_master_err = str(exc)
 
-        # 3. Filters section — Prior/LE month pickers + the per-field filters,
-        #    grouped in ONE "🔍 Filters" expander.  The expander is used as a
-        #    deferred container: the month pickers render first (they drive the
-        #    comparison build below), then the field filters render into the
-        #    SAME expander once the summary frame exists to supply their options
-        #    (see step 5b).
+        # Progress strip — the section's state in one line, so the planner
+        # can tell at a glance whether they have uploaded, whether it ran,
+        # and whether the output is published.
         months = list_months(history_df)
+        _render_ro_status_strip(months)
+
+        # ── STEP 1 · Upload the Distribution Tracker ─────────────────────
+        # Opens itself until a run has happened this session: it is the
+        # section's entry point, and it used to be buried two expanders deep
+        # below three download buttons.
+        _render_ro_step1_input(item_master_df, item_master_err)
+
         if len(months) < 2:
-            st.warning(
-                "RO_History_Tracker.csv has fewer than 2 distinct Month values "
-                f"({len(months)} found) — need at least 2 to build a comparison."
+            st.info(
+                "Once two or more months of history exist, Steps 2–4 appear "
+                f"here. RO_History_Tracker.csv currently has {len(months)} "
+                "month(s) — upload a Distribution Tracker above to add one."
             )
             return
-        filters_exp = st.expander("🔍 Filters", expanded=True)
-        with filters_exp:
+
+        # ── STEP 2 · RO Output ───────────────────────────────────────────
+        step2 = st.expander("**Step 2 · RO Output** — the report", expanded=True)
+        with step2:
+            st.caption(
+                "Pick the two months to compare. The report rebuilds instantly "
+                "and publishes itself to Fabric — there is nothing to save."
+            )
             prior_month, le_month = _render_month_filters(months)
 
         if prior_month == le_month:
-            st.info("Pick two different months to see a comparison.")
+            with step2:
+                st.info("Pick two different months to see a comparison.")
             return
 
-        # 3b. Auto-regenerate `RO_Comparison_Output.csv` if RO_History
-        #     has changed since the last save.  Per planner spec:
-        #     silent overwrite, picker pair, planner edits intentionally
-        #     dropped (they re-edit on top of the new baseline).  See
-        #     ``_maybe_auto_regenerate_comparison_output`` for the
-        #     two-phase implementation that keeps the picker
-        #     interactive on the common no-op render.
+        # Auto-regenerate `RO_Comparison_Output.csv` when RO_History has
+        # changed since the last save: silent overwrite, picker pair, planner
+        # edits intentionally dropped (they re-edit on the new baseline).
         _maybe_auto_regenerate_comparison_output(
             history_df, dimitems_df, item_master_df, prior_month, le_month,
         )
 
-        # 3c. Explicit, on-demand regenerate button.  Force-reads the latest
-        #     RO_History from Fabric and rebuilds regardless of fingerprint
-        #     state (the auto-regen above only fires on a detected change,
-        #     and only if the cached read already surfaced fresh bytes).  It
-        #     reruns after writing, so the refreshed source flows through the
-        #     top-of-section fetch + ``_ensure_summary_in_session`` rebuild.
-        _render_ro_comparison_generate_button(prior_month, le_month)
-
-        # 4. Build (and cache in session_state) the comparison frame.
+        # Build (and cache in session_state) the comparison frame.
         _ensure_summary_in_session(
             history_df, dimitems_df, item_master_df,
             prior_month, le_month, dimitems_err, item_master_err,
         )
         warnings: ComparisonWarnings = st.session_state[_SS_WARNINGS]
 
-        # 4b. Surface the auto-regen banner ONCE, post-build.  Sized
-        #     after the warnings banner so the most recent action is
-        #     visually closest to the table.
-        _render_auto_regen_banner_once()
+        with step2:
+            # Banner + warnings sit directly above the table so the most
+            # recent action is visually closest to what it changed.
+            _render_auto_regen_banner_once()
+            _render_warnings_banner(warnings)
+            _render_summary_report_section()
 
-        # 5. Warnings.
-        _render_warnings_banner(warnings)
-
-        # 5b. Field filters — rendered into the SAME "🔍 Filters" expander as
-        #     the month pickers, now that the summary frame exists to supply
-        #     each multiselect's options.  Selections persist in session_state;
-        #     the editor fragment applies them via `_apply_filters`.  These
-        #     widgets live OUTSIDE the editor fragment, so a field-filter change
-        #     is a full rerun — cheap, because the Fabric reads and the
-        #     comparison build above are signature-guarded and short-circuit
-        #     when nothing upstream changed.
-        with filters_exp:
-            st.divider()
-            _render_field_filter_widgets(st.session_state[_SS_SUMMARY_DF])
-
-        # 6-10. Customer Input upload, RO_Comparison_Output editor,
-        #       per-Format drivers, and Early-Start programs — grouped in
-        #       one foldable subsection (collapsed by default) so month
-        #       pickers + warnings stay visible above.
+        # ── STEP 3 · Drivers & drill-in ──────────────────────────────────
+        # Field filters live HERE, with the tables they slice, instead of
+        # above the report they used to push off-screen.  They render outside
+        # the editor fragment, so a change is a full rerun — cheap, because
+        # every read and build above is signature-guarded.
         with st.expander(
-            "📋 RO Comparison & Drivers & Start Date Validation",
+            "**Step 3 · Drivers & drill-in** — what moved, and which items",
             expanded=False,
         ):
-            # Distribution_Tracker.csv upload — top of the validation
-            # block so the ingest path sits next to the tables it feeds.
-            _render_customer_input_uploader()
-            st.markdown("")  # breathing room before the editor
-
-            # Filters + editor + subtotal + per-Format summary + Save.
-            # Wrapped in a single ``@st.fragment`` so a filter change /
-            # cell edit / Save click re-runs ONLY this block — no Fabric
-            # I/O, no comparison rebuild, no warnings banner re-render.
+            st.caption(
+                "FY27 and annualized variance by Format, the top driver "
+                "buckets behind each, and the item-level rows inside any "
+                "bucket. The filters below narrow every table in this step "
+                "and the report in Step 2."
+            )
+            _render_field_filter_widgets(st.session_state[_SS_SUMMARY_DF])
+            st.divider()
             _render_filtered_editor_fragment(prior_month, le_month)
 
-        # 11. Pipeline at a Glance — headline metric tiles + urgency /
-        #     probability charts over the same in-memory comparison frame
-        #     (``_SS_SUMMARY_DF``), rendered ABOVE the RO Summary roll-up.
+        # ── STEP 4 · Re-run or retune ────────────────────────────────────
+        _render_ro_step4_rerun(prior_month, le_month)
+
+        # Pipeline at a Glance — a headline read rather than a step, so it
+        # closes the section collapsed instead of sitting between the editor
+        # and the report as it used to.
         st.markdown("---")
         _render_ro_pipeline_analytics_section()
 
-        # 12. RO Summary Report — hierarchical roll-up of the
-        #     **in-memory** comparison frame (``_SS_SUMMARY_DF``).
-        #     Lives in its own ``@st.fragment`` so editing a leaf cell
-        #     or hitting Save doesn't trigger any work above; on a
-        #     month-picker change (full page rerun) the fragment
-        #     rebuilds because its signature key drifts from the
-        #     comparison's ``_SS_MONTHS_SIG``.  Tied to the in-memory
-        #     frame on purpose: the planner asked for picker changes
-        #     to update the report instantly without a Fabric round-
-        #     trip.  The top-of-section "🔄 Refresh from Fabric"
-        #     button is the escape hatch for re-reading the published
-        #     CSV when needed.
-        st.markdown("---")
-        _render_summary_report_section()
 
-        # 13. Regenerate-from-published — rebuild the driver table, Pipeline at a
-        #     Glance and RO Summary Report straight from the published
-        #     RO_Comparison_Output.csv (read-only snapshot, on-demand button).
+# ── Step 1 · the input contract, the example, and the pre-flight gate ───────
+#
+# The reference input the planner can copy the shape from.  A real archived
+# upload rather than a synthetic file, so what they see is what the app has
+# actually accepted.  Deep-linked (not read) so opening Step 1 costs no I/O.
+_RO_INPUT_EXAMPLE_NAME: str = "Distribution_Tracker_20260831_164436.csv"
+_RO_INPUT_EXAMPLE_URL: str = (
+    "https://app.fabric.microsoft.com/groups/"
+    "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
+    "a01f513d-eee7-41eb-8c15-670bc40e7fc8?experience=fabric-developer"
+    "&selectedPath=Files%2FRO+Tracking%2FAppend_New_History%2FArchive%2F"
+    "Distribution_Tracker_20260831_164436.csv&extensionScenario=openArtifact"
+)
+_RO_INPUT_ARCHIVE_URL: str = (
+    _FABRIC_LAKEHOUSE_BASE
+    + "&selectedPath=Files%2FRO%20Tracking%2FAppend_New_History%2FArchive"
+)
+
+# Three rows in the exact column order the app expects.  Doubles as the
+# downloadable template, so a planner whose own export has drifted can start
+# from a file the app is guaranteed to recognise.
+_RO_INPUT_EXAMPLE_CSV: str = (
+    "Month,Format,Customer,Taxonomy,Brand,Item #,Item Desc,Probability,"
+    "First Ship Date,Reflected in APS,Pipeline Status,"
+    "Anticipated Annual Lbs. Vol,Annual PC $,Total Anticipated Slotting Costs\n"
+    "2026-06-01,HTST,Walmart,Retail,Private Label,340021,"
+    "50 HTST Generic Item Jug,0.25,2027-01-01,No,Presented,23027714.3,0,0\n"
+    "2026-06-01,ESL,Costco,Club,Branded,342060,"
+    "DG OF Choc 2pc 59oz Disp UP,0.5,2027-01-01,No,Presented,2737394.4,0,15000\n"
+    "2026-06-01,Butter,Medosweet,Foodservice,Private Label,310678,"
+    "DG Btr Elg 30-1lb,0.25,2027-02-01,No,Bid Submitted,4394000,0,0\n"
+)
+
+# What ▶️ Run RO_Seed does, written so it can be rebuilt in a spreadsheet.
+# Folded into Step 1 rather than living as its own module-level section: the
+# planner needs it at the moment they are about to press the button.
+_RO_SEED_METHOD_MD: str = """
+**Stage 1 — which rows become opportunities**
+
+Your file is added to `Distribution_Tracker_History.csv` (rows for the same
+Month are replaced, not duplicated), then filtered:
+
+```
+KEEP a row when
+      Reflected in APS  = No
+  AND Probability       > 0
+  AND Pipeline Status NOT IN (Declined, Closed)
+
+EXCEPT R&O risk lines, which skip the Pipeline Status test
+       (a committed loss counts even once the deal is closed)
+```
+
+The thresholds above are the *current* rules — Step 4 shows them and lets you
+change them.
+
+**Stage 2 — duplicate rows are added together**
+
+```
+GROUP BY  Format, Customer, Taxonomy, Brand, Item #, Item Desc,
+          Probability, First Ship Date
+SUM       Lbs./yr, PC$/yr, Slotting
+```
+
+In Excel: a SUMIFS over those eight key columns.
+
+**Stage 3 — the seven computed columns**
+
+```
+First Ship Round = IF(DAY(First Ship Date) > 1,
+                      EOMONTH(First Ship Date, 0) + 1,
+                      First Ship Date)
+
+Lbs./yr Exp      = Probability * Lbs./yr
+
+Days in Year     = MIN(365, MAX(0, (FY-end anchor - First Ship Round) + 1))
+
+FY Lbs. Total    = Lbs./yr     * Days in Year / 365
+FY Lbs. Exp      = Lbs./yr Exp * Days in Year / 365
+
+RO Key           = a stable number per
+                   (Format, Customer, Taxonomy, Brand, Item #)
+```
+
+`FY Lbs. Exp` is the number the report calls **FY27 Probabilized**, and
+`Lbs./yr Exp` is what rolls into the annualized (FY28) columns.
+
+**Worked example** — 1,000,000 lbs/yr at 25%, first shipping 2027-01-15,
+FY-end anchor 2027-03-31:
+
+```
+First Ship Round = 2027-02-01        (the 15th is mid-month, so round up)
+Lbs./yr Exp      = 0.25 * 1,000,000            =   250,000
+Days in Year     = (2027-03-31 - 2027-02-01)+1 =        59
+FY Lbs. Total    = 1,000,000 * 59 / 365        =   161,644
+FY Lbs. Exp      =   250,000 * 59 / 365        =    40,411
+```
+
+**Stage 4 — merged into history.** The expanded seed replaces the matching
+Month in `RO_History_Tracker.csv` and is appended for new months. That file is
+what Step 2 compares month-over-month.
+"""
+
+#: Which pre-flight severity renders with which Streamlit callout + icon.
+_PREFLIGHT_STYLE: dict = {
+    rpf.SEVERITY_BLOCK: ("error", "🛑"),
+    rpf.SEVERITY_ACK: ("warning", "⚠️"),
+    rpf.SEVERITY_INFO: ("info", "ℹ️"),
+}
+
+_SS_RO_PREFLIGHT: str = "_ro_input_preflight_result"
+_SS_RO_PREFLIGHT_NAME: str = "_ro_input_preflight_filename"
+_SS_RO_ACK: str = "ro_input_ack_unlinked"
+
+
+def _render_ro_status_strip(months: list) -> None:
+    """Render the one-line "where am I?" strip at the top of the section.
+
+    Four states in the order the planner moves through them.  This is the
+    cheapest possible fix for the section's biggest orientation problem: with
+    nine peer-level controls and no numbering, there was previously no way to
+    tell whether an upload had happened, whether it had run, or whether the
+    published output was current.
+    """
+    result: Optional[PipelineResult] = st.session_state.get(_SS_PIPELINE_RESULT)
+    anchor = st.session_state.get("ro_cmp_anchor_date")
+
+    if result is None:
+        run_state = "⚪ **RO_Seed** not run this session"
+    elif result.ok:
+        ran = ", ".join(result.snapshot_months) or "—"
+        run_state = f"🟢 **RO_Seed** ran · {ran}"
+    else:
+        run_state = "🔴 **RO_Seed** last run failed"
+
+    latest = months[-1].strftime("%Y-%m-%d") if months else "none"
+    published_at = st.session_state.get(_SS_SUMMARY_REPORT_LOADED_AT)
+    published = (
+        f"🟢 **Output** auto-saved {published_at:%H:%M}"
+        if published_at is not None else "⚪ **Output** not built yet"
+    )
+
+    parts = [
+        f"📥 **History** {len(months)} month(s), latest {latest}",
+        run_state,
+        published,
+    ]
+    if anchor is not None:
+        parts.append(f"📅 **FY-end** {anchor:%Y-%m-%d}")
+    st.markdown("  ·  ".join(parts))
+    st.markdown("")
+
+
+def _render_ro_input_contract() -> None:
+    """Render "what your file must contain" + the downloadable example."""
+    st.markdown("**1 · Check your file against the required shape**")
+    cols = list(rpf.REQUIRED_KEY_COLUMNS) + list(rpf.REQUIRED_NUMERIC_COLUMNS)
+    reverse_alias = {v: k for k, v in rpf.HEADER_ALIASES.items()}
+    contract = pd.DataFrame({
+        "Column": [rpf.MONTH_COLUMN] + cols,
+        "Must contain": (
+            ["The FIRST day of the month you are uploading, e.g. 2026-06-01 — "
+             "the same value in every row"]
+            + ["A date, e.g. 2027-01-01" if c == "First Ship Date"
+               else "A fraction (0.5) or a percent (50%)" if c == "Probability"
+               else "A number — blank counts as zero" if c in rpf.REQUIRED_NUMERIC_COLUMNS
+               else "Text" for c in cols]
+        ),
+        "Older name also accepted": (
+            ["—"] + [reverse_alias.get(c, "—") for c in cols]
+        ),
+    })
+    st.dataframe(contract, use_container_width=True, hide_index=True,
+                 height=36 * (len(contract) + 1) + 4)
+    st.info(
+        "**The one people forget:** the **Month** column. Excel's "
+        "*Customer Input* export does not include it — you have to add it, "
+        "and every row needs the first of the month you are uploading."
+    )
+
+    with st.expander("📄 See a real example file (and download it as a template)",
+                     expanded=False):
+        st.markdown(
+            f"These three rows have the exact columns and formats the app "
+            f"expects. They are taken from **{_RO_INPUT_EXAMPLE_NAME}**, a "
+            f"file the app has already accepted — "
+            f"[open it in Fabric]({_RO_INPUT_EXAMPLE_URL}) to see the whole "
+            f"thing, or [browse every past upload]({_RO_INPUT_ARCHIVE_URL})."
+        )
+        st.dataframe(
+            pd.read_csv(io.StringIO(_RO_INPUT_EXAMPLE_CSV), dtype=str),
+            use_container_width=True, hide_index=True,
+        )
+        st.download_button(
+            "⬇️ Download this as a blank template (CSV)",
+            data=_RO_INPUT_EXAMPLE_CSV.encode("utf-8"),
+            file_name="Distribution_Tracker_TEMPLATE.csv",
+            mime="text/csv",
+            key="ro_input_template_dl",
+            help=(
+                "Use this when the app does not recognise your own export: "
+                "paste your rows under these headers, delete the three "
+                "example rows, and upload."
+            ),
+        )
+
+
+def _render_ro_seed_method() -> None:
+    """Fold the Excel-reproducible RO_Seed method in beside the Run button."""
+    with st.expander(
+        "🧮 What “Run RO_Seed” does — every formula, so you can check it in Excel",
+        expanded=False,
+    ):
+        st.markdown(_RO_SEED_METHOD_MD)
+
+
+def _render_preflight_finding(finding) -> None:
+    """Render one pre-flight finding: what, so-what, and exactly where to fix."""
+    callout, icon = _PREFLIGHT_STYLE.get(finding.severity, ("info", "ℹ️"))
+    getattr(st, callout)(f"{icon} **{finding.title}**\n\n{finding.means}")
+
+    if not finding.fix_steps:
+        return
+
+    where = ("Fix this in **your spreadsheet**"
+             if finding.fix_where == rpf.FIX_IN_EXCEL
+             else "Fix this in **Microsoft Fabric**")
+    with st.expander(f"How to fix it — {where}", expanded=finding.blocking):
+        st.markdown(
+            "\n".join(f"{i}. {s}" for i, s in enumerate(finding.fix_steps, 1))
+        )
+        if finding.fix_where == rpf.FIX_IN_FABRIC and finding.fabric_path:
+            st.markdown(
+                f"[🔗 Open the folder in Fabric]({_RO_ITEM_MASTER_FABRIC_URL})"
+            )
+        if finding.cells is not None and not finding.cells.empty:
+            st.markdown(
+                f"**{len(finding.cells)} place(s) to fix** — "
+                "download this list if it is long:"
+            )
+            st.dataframe(finding.cells, use_container_width=True,
+                         hide_index=True,
+                         height=min(36 * (len(finding.cells) + 1) + 4, 320))
+            st.download_button(
+                "⬇️ Download this fix list (CSV)",
+                data=finding.cells.to_csv(index=False).encode("utf-8"),
+                file_name=f"RO_input_fixes_{finding.code.lower()}.csv",
+                mime="text/csv",
+                key=f"ro_pf_dl_{finding.code}",
+            )
+
+
+def _render_preflight_panel(result) -> bool:
+    """Render the pre-flight verdict; return True when the run may proceed.
+
+    The gate exists because the pipeline downstream is forgiving by design —
+    it coerces a bad cell to NaN and carries on.  In an app that means a
+    broken export would run, write three files to Fabric, and publish a report
+    in which an ``#N/A`` had silently become zero volume.  So: structural
+    problems disable the button, and an item-master gap needs one explicit
+    tick (a brand-new SKU with no master row is a legitimate case).
+    """
+    if result is None:
+        return False
+
+    if result.clean:
+        st.success(
+            f"✅ **Checked and ready** — {result.row_count:,} rows"
+            + (f", month {', '.join(result.months)}" if result.months else "")
+            + ". Nothing to fix."
+        )
+        return True
+
+    blocking, ack = result.blocking, result.acknowledgeable
+    if blocking:
+        st.error(
+            f"🛑 **{len(blocking)} thing(s) must be fixed before this can "
+            f"run.** Nothing has been written to Fabric. Each one below says "
+            f"exactly where to fix it — then upload the file again."
+        )
+    else:
+        st.warning(
+            f"⚠️ **The file is usable, but {len(ack)} thing(s) need your "
+            f"attention.** Read them, then tick the box to run anyway."
+        )
+
+    for finding in blocking + ack:
+        _render_preflight_finding(finding)
+
+    for finding in result.informational:
+        st.caption(f"ℹ️ {finding.title} — {finding.means}")
+
+    # Spelling drift is the other classic cause of a wrong-looking report, and
+    # it is invisible in a numbers check.  Surfacing the file's own vocabulary
+    # here — before the run — replaces the old post-run "Diagnostic" panel,
+    # which showed the same thing after the damage was done.
+    if result.parsed is not None and not result.parsed.empty:
+        with st.expander(
+            "🔍 Check the spelling of your Format / Brand / Customer values",
+            expanded=False,
+        ):
+            st.caption(
+                "These are the exact values in your file. A value spelled "
+                "differently from the rest of the history (“1 Gallon Jug” vs "
+                "“Gallon Jug”) still uploads, but it lands on its own row in "
+                "the report instead of adding to the right one."
+            )
+            dim_cols = [c for c in ("Format", "Brand", "Taxonomy", "Customer")
+                        if c in result.parsed.columns]
+            for chunk_start in range(0, len(dim_cols), 2):
+                for col, holder in zip(dim_cols[chunk_start:chunk_start + 2],
+                                       st.columns(2)):
+                    with holder:
+                        counts = (result.parsed[col].astype(str).str.strip()
+                                  .value_counts().reset_index())
+                        counts.columns = [col, "Rows"]
+                        st.markdown(f"**{col}**")
+                        st.dataframe(counts, use_container_width=True,
+                                     hide_index=True,
+                                     height=min(36 * (len(counts) + 1) + 4, 240))
+
+    if blocking:
+        return False
+
+    return st.checkbox(
+        "I understand — run anyway and classify these items later",
+        key=_SS_RO_ACK,
+    )
+
+
+def _render_ro_step1_input(
+    item_master_df: Optional[pd.DataFrame],
+    item_master_err: Optional[str],
+) -> None:
+    """Render Step 1: the input contract, the upload, the gate, the run.
+
+    Opens itself until a successful run has happened this session, because it
+    is the section's entry point.  Previously this block sat at the bottom of
+    a collapsed expander titled "RO Comparison & Drivers & Start Date
+    Validation", below three download buttons — the page opened with exits
+    rather than its one entrance.
+    """
+    result: Optional[PipelineResult] = st.session_state.get(_SS_PIPELINE_RESULT)
+    with st.expander(
+        "**Step 1 · Upload the Distribution Tracker** — start here",
+        expanded=result is None or not result.ok,
+    ):
+        st.caption(
+            "Export the **Customer Input** table from the tracker workbook, "
+            "add a **Month** column, upload it, and run. Your file is checked "
+            "first — nothing is written to Fabric until it passes."
+        )
+
+        _render_ro_input_contract()
+
         st.markdown("---")
-        _render_ro_regen_from_published()
+        st.markdown("**2 · Upload and run**")
+        uploaded = st.file_uploader(
+            "Upload Distribution_Tracker.csv",
+            type=["csv"],
+            key="ro_cmp_customer_input_upload",
+        )
+
+        c1, _c2 = st.columns([1, 2])
+        with c1:
+            anchor = st.date_input(
+                "Fiscal year-end anchor",
+                value=date(2027, 3, 31),
+                format="YYYY-MM-DD",
+                key="ro_cmp_anchor_date",
+                help="The fiscal year-end used for 'Days in Year'. Change it "
+                     "when the fiscal year rolls.",
+            )
+
+        _render_ro_seed_method()
+
+        # ── Pre-flight: validate on upload, cached per file so re-renders
+        #    (a date-input change, a checkbox tick) don't re-parse the CSV.
+        may_run = False
+        if uploaded is not None:
+            cache_key = (uploaded.name, uploaded.size)
+            if st.session_state.get(_SS_RO_PREFLIGHT_NAME) != cache_key:
+                with st.spinner("Checking your file…"):
+                    st.session_state[_SS_RO_PREFLIGHT] = (
+                        rpf.check_distribution_tracker(
+                            uploaded.getvalue(),
+                            item_master_df=item_master_df,
+                            item_master_path=ro_item_master_blob_path(),
+                        )
+                    )
+                st.session_state[_SS_RO_PREFLIGHT_NAME] = cache_key
+                st.session_state.pop(_SS_RO_ACK, None)
+            if item_master_err:
+                st.caption(
+                    f"_RO_Item_Master.csv could not be read this session "
+                    f"({item_master_err}) — the linkage check ran without it._"
+                )
+            may_run = _render_preflight_panel(
+                st.session_state.get(_SS_RO_PREFLIGHT)
+            )
+        else:
+            st.session_state.pop(_SS_RO_PREFLIGHT, None)
+            st.session_state.pop(_SS_RO_PREFLIGHT_NAME, None)
+
+        run_clicked = st.button(
+            "▶️ Run RO_Seed",
+            key="ro_cmp_customer_input_save",
+            type="primary",
+            disabled=not may_run,
+            help=(
+                "Merges your file into the distribution history, rebuilds "
+                "RO_Seed.csv, and updates RO_History_Tracker.csv in Fabric."
+                if may_run else
+                "Upload a file that passes the checks above to enable this."
+            ),
+        )
+        if uploaded is None:
+            st.caption("Upload a file to enable the run.")
+
+        if run_clicked and uploaded is not None:
+            with st.spinner(
+                "Running the RO pipeline (merge history → build RO_Seed → "
+                "update RO_History_Tracker)…"
+            ):
+                pipeline_result = run_distribution_tracker_pipeline(
+                    uploaded.getvalue(), anchor_date=anchor,
+                    config=ro_rules_config_from_session(st.session_state),
+                )
+            st.session_state[_SS_PIPELINE_RESULT] = pipeline_result
+            if pipeline_result.ok:
+                # The pipeline just wrote new history.  Drop the cached read
+                # and reset the month pickers so the just-absorbed month shows
+                # up and the LE picker defaults to it.
+                fetch_ro_history_df(force_refresh=True)
+                st.session_state.pop("ro_cmp_prior_month", None)
+                st.session_state.pop("ro_cmp_le_month", None)
+                st.rerun(scope="app")
+
+        # Run receipt — persists until the next run.
+        if result is not None:
+            _render_ro_pipeline_summary(result)
+
+
+def _render_ro_step4_rerun(prior_month: date, le_month: date) -> None:
+    """Render Step 4: replace an input, or change how RO is read.
+
+    Both destructive and configuration controls live here, out of the happy
+    path.  Deleting a month is what makes a re-upload clean (the pipeline
+    replaces matching-Month rows, so a mislabeled month has to come out
+    explicitly), and it used to render immediately below the uploader — where
+    a first-time planner reading top-to-bottom walked straight into it.
+    """
+    with st.expander(
+        "**Step 4 · Re-upload, or change how RO is read** — when something needs fixing",
+        expanded=False,
+    ):
+        st.markdown("#### 4a · Replace a month you have already uploaded")
+        st.info(
+            "Uploading the same month again **replaces** it, so most of the "
+            "time you can simply re-upload at Step 1.\n\n"
+            "Delete the month first when you need a clean slate — a month was "
+            "uploaded with the wrong label, or rows were removed from the "
+            "source and should disappear from history:\n\n"
+            "1. Pick the month below and delete it from both history files.\n"
+            "2. Go back to **Step 1** and upload the corrected file.\n"
+            "3. The report in Step 2 rebuilds itself."
+        )
+        _render_month_cleanup()
+
+        st.markdown("---")
+        st.markdown("#### 4b · Change which rows count as Opportunity or Risk")
+        st.caption(
+            "These rules decide what lands in RO_Seed. Changing the **Risk** "
+            "rules updates the Delta Breakdown · Risk column immediately; "
+            "changing the **Opportunity** rules takes effect when you "
+            "regenerate the seed."
+        )
+        _render_ro_rules_panel()
+
+        st.markdown("---")
+        st.markdown("#### 4c · Cross-check and re-publish")
+        _render_ro_comparison_generate_button(prior_month, le_month)
+        _render_ro_seed_download_button()
+        _render_ro_seed_summary_reconcile_button()
+        _render_ro_item_master_download_button()
+        _render_post_upload_guidance()
 
 
 # ── RO Comparison helpers ───────────────────────────────────────────────────
 
-
-def _render_ro_regen_from_published() -> None:
-    """Button + read-only panel that (re)builds the R&O driver table, Pipeline
-    at a Glance and RO Summary Report straight from the **published**
-    ``Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`` — a fresh Fabric
-    read, independent of the live RO_History → in-memory frame above.
-
-    Kept read-only and in its own session slot (:data:`_SS_RO_REGEN_DF`) so it
-    never fights the RO_History rebuild that owns ``_SS_SUMMARY_DF``; unique
-    widget keys (``…_regen``) avoid colliding with the live sections."""
-    with st.expander("📄 Regenerate from published RO_Comparison_Output.csv", expanded=False):
-        st.caption(
-            "Reads the **published** `Files/RO Tracking/RO_Reporting/"
-            "RO_Comparison_Output.csv` fresh from Fabric and rebuilds the R&O "
-            "driver table, Pipeline at a Glance and RO Summary Report **from that "
-            "file** — a read-only snapshot (the live views above run off RO_History)."
-        )
-        if st.button("🔄 Regenerate from published RO_Comparison_Output.csv",
-                     key="ro_regen_from_published_btn", use_container_width=True):
-            try:
-                with st.spinner("Reading published RO_Comparison_Output.csv from Microsoft Fabric…"):
-                    st.session_state[_SS_RO_REGEN_DF] = fetch_ro_comparison_output_df()
-                    st.session_state[_SS_RO_REGEN_AT] = datetime.now()
-            except RoComparisonError as exc:
-                st.session_state.pop(_SS_RO_REGEN_DF, None)
-                st.error(f"❌ Could not read RO_Comparison_Output.csv.\n\n{exc}")
-
-        df = st.session_state.get(_SS_RO_REGEN_DF)
-        if df is None or df.empty:
-            return
-        at = st.session_state.get(_SS_RO_REGEN_AT)
-        st.caption(f"Regenerated from the published file · {len(df):,} rows"
-                   + (f" · read {at:%Y-%m-%d %H:%M}" if at else ""))
-
-        # 1) R&O driver table (top-3 buckets per Format) — read-only snapshot.
-        st.markdown("**Δ Current Fiscal Probabilized Lbs — by Format** _(top 3 drivers)_")
-        summary = compute_per_format_summary(df)
-        if summary.empty:
-            st.caption("_No driver movement in the published file._")
-        else:
-            def _color_signed(v):
-                try:
-                    x = float(v)
-                except (TypeError, ValueError):
-                    return ""
-                return ("color:#1b7f3a;font-weight:600" if x > 0
-                        else "color:#c0392b;font-weight:600" if x < 0 else "")
-
-            def _bold_total(row):
-                return (["font-weight:700"] * len(row)
-                        if row[PER_FORMAT_FORMAT_COL] == PER_FORMAT_TOTAL_LABEL
-                        else [""] * len(row))
-            styler = (summary.style.map(_color_signed, subset=[PER_FORMAT_DELTA_COL])
-                      .apply(_bold_total, axis=1))
-            cc = st.column_config
-            st.dataframe(
-                styler, use_container_width=True, hide_index=True,
-                height=min(36 * (len(summary) + 1) + 38, 480),
-                column_config={
-                    PER_FORMAT_FORMAT_COL: cc.TextColumn("Format", width="small"),
-                    PER_FORMAT_DELTA_COL: cc.NumberColumn(format="accounting"),
-                    **{c: cc.TextColumn(c, width="large") for c in PER_FORMAT_DRIVER_COLS}})
-
-        # 2) Pipeline at a Glance — tiles + charts from the published file.
-        st.markdown("### 🎯 Pipeline at a Glance — published file")
-        in_year_m, full_year_m = _ro_total_b2c_totals(df)
-        _render_ro_pipeline_tiles(df, in_year_m=in_year_m, full_year_m=full_year_m)
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            _render_ro_urgency_chart(df, key_suffix="_regen")
-        with cc2:
-            _render_ro_buildup_chart(df, key_suffix="_regen")
-
-        # 3) RO Summary Report — hierarchical roll-up of the published file.
-        st.markdown("### 📊 RO Summary Report — published file")
-        try:
-            report_df, _warn, _tpl = build_summary_report(
-                df, config=ro_rules_config_from_session(st.session_state),
-            )
-        except RoSummaryReportError as exc:
-            st.error(f"❌ Could not build the RO Summary Report.\n\n{exc}")
-            return
-        st.dataframe(report_df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "⬇️ Download regenerated RO Summary Report (CSV)",
-            data=report_df.to_csv(index=False).encode("utf-8"),
-            file_name="RO_Summary_Report_regenerated.csv", mime="text/csv",
-            key="ro_regen_summary_download", use_container_width=True)
 
 def _render_ro_item_master_download_button() -> None:
     """Render a red download button for ``RO_Item_Master.csv`` from Fabric."""
@@ -1849,94 +2205,6 @@ def _render_ro_seed_summary_reconcile_result(result) -> None:
             )
             st.dataframe(result.missing_from_summary, hide_index=True,
                          use_container_width=True)
-
-
-def _render_customer_input_uploader() -> None:
-    """Render the Distribution Tracker upload → run-pipeline → RO Summary block.
-
-    On **Run & Save to Fabric** the entire former Fabric-notebook pipeline runs
-    in-app (see :func:`run_distribution_tracker_pipeline`): merge the upload into
-    ``Distribution_Tracker_History.csv`` → build ``RO_Seed.csv`` → expand + merge
-    into ``RO_History_Tracker.csv``, then delete the staged source. The run
-    report (with warnings surfaced prominently) renders in a foldable RO Summary
-    directly beneath the button.
-
-    Independence guarantee: this block is fully self-contained — the comparison
-    table below renders whether or not anything has been uploaded.
-    """
-    st.markdown(
-        "<h4 style='font-size:1.35rem; margin-top:0.25rem;'>"
-        "📤 Upload &quot;Distribution_Tracker.csv&quot; to run the RO pipeline"
-        "</h4>",
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "Export the 'Customer Input' table as **Distribution_Tracker.csv** with a "
-        "**Month** column set to the first day of the current month (e.g. "
-        "2026-06-01). On **Run & Save to Fabric** the app merges it into the "
-        "distribution history, rebuilds RO_Seed, and updates RO_History_Tracker — "
-        "then the RO Comparison below refreshes automatically. No Fabric notebook "
-        "needed."
-    )
-    uploaded = st.file_uploader(
-        "Upload Distribution_Tracker.csv",
-        type=["csv"],
-        key="ro_cmp_customer_input_upload",
-        label_visibility="collapsed",
-    )
-
-    # Fiscal year-end anchor (Analysis!$B$3) — drives the "Days in Year"
-    # expansion maths. Defaults to the notebook's value; planner can override.
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        anchor = st.date_input(
-            "Fiscal year-end anchor",
-            value=date(2027, 3, 31),
-            format="YYYY-MM-DD",
-            key="ro_cmp_anchor_date",
-            help="Analysis!$B$3 — the fiscal year-end used to compute 'Days in "
-                 "Year'. Defaults to 3/31/2027; change it when the fiscal year rolls.",
-        )
-
-    run_clicked = st.button(
-        "▶️ Run & Save to Fabric",
-        key="ro_cmp_customer_input_save",
-        type="primary",
-        disabled=uploaded is None,
-        help="Runs the full pipeline and writes Distribution_Tracker_History.csv, "
-             "RO_Seed.csv and RO_History_Tracker.csv to Microsoft Fabric.",
-    )
-
-    if run_clicked and uploaded is not None:
-        with st.spinner(
-            "Running the RO pipeline (merge history → build RO_Seed → "
-            "update RO_History_Tracker)…"
-        ):
-            result = run_distribution_tracker_pipeline(
-                uploaded.getvalue(), anchor_date=anchor,
-                config=ro_rules_config_from_session(st.session_state),
-            )
-        st.session_state[_SS_PIPELINE_RESULT] = result
-        if result.ok:
-            # The pipeline just wrote new history to Fabric. The comparison and
-            # month pickers above were rendered BEFORE this write (so they still
-            # show the pre-upload months), and the month selectboxes persist
-            # their prior value by key (so they'd stay on the old "latest" even
-            # after a refresh). Drop the cached history read AND reset the
-            # picker keys, then rerun — so the just-absorbed month appears and
-            # the LE picker defaults to it immediately.
-            fetch_ro_history_df(force_refresh=True)
-            st.session_state.pop("ro_cmp_prior_month", None)
-            st.session_state.pop("ro_cmp_le_month", None)
-            st.rerun(scope="app")
-
-    # RO Summary — persists across reruns until the next run.
-    result: Optional[PipelineResult] = st.session_state.get(_SS_PIPELINE_RESULT)
-    if result is not None:
-        _render_ro_pipeline_summary(result)
-
-    # Maintenance tool: delete a mislabeled month from the history files.
-    _render_month_cleanup()
 
 
 # Icons for each run-log level, used by the RO Summary renderer.
@@ -2331,55 +2599,6 @@ def _ensure_summary_in_session(
     _maybe_autosave_ro_comparison_output(trigger="comparison rebuild")
 
 
-def _render_ro_comparison_save_button(summary_df: pd.DataFrame) -> None:
-    """Render the manual "Save to Fabric" button for RO_Comparison_Output.csv.
-
-    Bypasses the signature-guard in :func:`_maybe_autosave_ro_comparison_output`
-    so an explicit click ALWAYS writes, even when an identical save already
-    happened in this session (the planner may have just edited a cell —
-    the editor edits land in :data:`_SS_SUMMARY_DF` but don't change the
-    Prior/LE signature, so the auto-save guard would otherwise skip them).
-    """
-    if summary_df is None or summary_df.empty:
-        return
-
-    if not st.button(
-        "💾 Save `RO_Comparison_Output.csv` to Fabric",
-        key="ro_cmp_output_save",
-        type="primary",
-        help=(
-            "Republishes the current comparison view (including any in-tab "
-            "cell edits) to "
-            "`Files/RO Tracking/RO_Reporting/RO_Comparison_Output.csv`. "
-            "The Auto-save path covers Prior/LE month changes — use this "
-            "button after editing cells in the table above."
-        ),
-    ):
-        return
-
-    try:
-        with st.spinner("Saving RO_Comparison_Output.csv to Microsoft Fabric…"):
-            blob_path = save_ro_comparison_output(summary_df)
-    except RoComparisonError as exc:
-        st.error(f"❌ Save failed.\n\n{exc}")
-        return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Unexpected error saving RO_Comparison_Output.csv.")
-        st.error(
-            "❌ Save failed unexpectedly — the file was not written.\n\n"
-            f"{type(exc).__name__}: {exc}"
-        )
-        return
-
-    # Stamp the guard so the auto-save flow doesn't re-write the same frame
-    # on the very next rerun.  Mirror the key the auto-save path uses.
-    st.session_state[_SS_AUTOSAVE_RO_CMP_SIG] = (
-        st.session_state.get(_SS_MONTHS_SIG),
-        _signature_for(summary_df),
-    )
-    st.success(f"✅ Saved to `Files/{blob_path}` ({len(summary_df):,} rows).")
-
-
 def _render_ro_comparison_generate_button(
     prior_month: date,
     le_month: date,
@@ -2638,7 +2857,11 @@ def _render_filtered_editor_fragment(prior_month, le_month) -> None:
     #     :func:`_ensure_summary_in_session`.
     # The button is the explicit escape hatch for planner edits, which the
     # other paths cannot detect on their own.
-    _render_ro_comparison_save_button(summary_df)
+    # Cell edits change the frame signature but not the Prior/LE months, so
+    # the rebuild-time auto-save would skip them.  Calling the same hook here
+    # republishes edits with no button; the signature guard makes it a no-op
+    # when nothing actually changed.
+    _maybe_autosave_ro_comparison_output(trigger="cell edit")
 
 
 # Sentinel option surfaced inside every filter multiselect — picking
@@ -3903,10 +4126,10 @@ def _render_summary_report_fragment() -> None:
         loaded_at = st.session_state.get(_SS_SUMMARY_REPORT_LOADED_AT)
         if loaded_at is not None:
             st.caption(
-                f"Built from in-memory comparison at "
-                f"**{loaded_at:%Y-%m-%d %H:%M:%S}**.  Click **🔄 Refresh "
-                "from Fabric** at the top of the section to re-read the "
-                "published CSV from scratch."
+                f"Built from the current comparison at "
+                f"**{loaded_at:%Y-%m-%d %H:%M:%S}** and saved to Fabric "
+                f"automatically.  Reacts to the Prior / LE months and the "
+                f"field filters above."
             )
     with tb_show:
         show_empty = st.checkbox(
@@ -3921,12 +4144,6 @@ def _render_summary_report_fragment() -> None:
         )
 
     full_df: pd.DataFrame = st.session_state[_SS_SUMMARY_REPORT_DF]
-    raw_df:  pd.DataFrame = st.session_state.get(
-        _SS_SUMMARY_REPORT_RAW_DF, pd.DataFrame(),
-    )
-
-    # ── Diagnostic expander (always before warnings) ─────────────
-    _render_summary_report_diagnostic(raw_df)
 
     # ── Optional warnings ────────────────────────────────────────
     report_warnings: list[str] = st.session_state.get(_SS_SUMMARY_REPORT_WARNINGS, [])
@@ -4022,51 +4239,29 @@ def _render_summary_report_actions(export_df: pd.DataFrame) -> None:
         frame passed to :func:`save_ro_summary_report`.
     """
     today = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    row_count = len(export_df)
 
-    dl_col, save_col = st.columns([1, 1])
-    with dl_col:
-        st.download_button(
-            label="⬇️ Download RO Summary Report (CSV)",
-            data=summary_to_csv_bytes(export_df),
-            file_name=f"RO_Summary_Report_{today}.csv",
-            mime="text/csv",
-            key="ro_sr_download",
-            type="primary",
-            use_container_width=True,
-            help=(
-                "Downloads the current report as a CSV — same column "
-                "headers and row shape as "
-                "`Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv` "
-                "(full template, all rows including zeros).  Includes "
-                "any edits you just made in the table above."
-            ),
-        )
-    with save_col:
-        if st.button(
-            "💾 Save RO_Summary_Report.csv (overwrite)",
-            key="ro_sr_save",
-            type="primary",
-            use_container_width=True,
-            help=(
-                "Overwrites `Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv` "
-                "with the FULL 30-row template (subtotals + every leaf, including "
-                "all-zero rows) so downstream consumers get a stable shape."
-            ),
-        ):
-            try:
-                with st.spinner("Saving RO_Summary_Report.csv to Microsoft Fabric…"):
-                    blob_path = save_ro_summary_report(export_df)
-            except RoSummaryReportError as exc:
-                st.error(f"❌ Save failed.\n\n{exc}")
-            except Exception as exc:  # noqa: BLE001 — surface any other failure
-                logger.exception("Unexpected error saving RO_Summary_Report.csv")
-                st.error(
-                    "❌ Save failed unexpectedly — the file was not written.\n\n"
-                    f"{type(exc).__name__}: {exc}"
-                )
-            else:
-                st.success(f"✅ Saved to `Files/{blob_path}` ({row_count} rows).")
+    st.download_button(
+        label="⬇️ Download RO Summary Report (CSV)",
+        data=summary_to_csv_bytes(export_df),
+        file_name=f"RO_Summary_Report_{today}.csv",
+        mime="text/csv",
+        key="ro_sr_download",
+        type="primary",
+        use_container_width=True,
+        help=(
+            "Downloads the current report as a CSV — same column "
+            "headers and row shape as "
+            "`Files/RO Tracking/RO_Reporting/RO_Summary_Report.csv` "
+            "(full template, all rows including zeros).  Includes "
+            "any edits you just made in the table above."
+        ),
+    )
+    st.caption(
+        f"💾 Saved to Fabric automatically — `Files/RO Tracking/RO_Reporting/"
+        f"RO_Summary_Report.csv` ({len(export_df)} rows, full template). "
+        f"Nothing to click: every rebuild and every cell edit republishes "
+        f"on its own."
+    )
 
 
 def _render_summary_report_warnings(warnings: list[str]) -> None:
@@ -4089,74 +4284,6 @@ def _render_summary_report_warnings(warnings: list[str]) -> None:
     ):
         for note in warnings:
             st.markdown(f"- {note}")
-
-
-def _render_summary_report_diagnostic(raw_df: pd.DataFrame) -> None:
-    """Render the read-only Diagnostic expander above the warnings list.
-
-    Shows the unique values + row counts for every dim column in the
-    just-loaded ``RO_Comparison_Output.csv`` so a planner can
-    self-diagnose "0 matches" warnings: if my template expects
-    ``SFmt = "Gallon Jug"`` but the CSV has ``"1 Gallon Jug"``,
-    the diagnostic will surface the actual literal in 2 seconds.
-
-    All compute is delegated to
-    :func:`ro_summary_report.diag_dim_summary` so this function is
-    only responsible for layout.  Default-collapsed because most
-    runs have nothing wrong.
-    """
-    if raw_df is None or raw_df.empty:
-        return
-
-    diag = diag_dim_summary(raw_df)
-
-    with st.expander(
-        "🔬 Diagnostic — unique dim values in `RO_Comparison_Output.csv`",
-        expanded=False,
-    ):
-        st.caption(
-            f"**{len(raw_df):,} total rows** in the loaded CSV.  Compare the "
-            "literal strings below against the template's match criteria — "
-            "any whitespace / casing / synonym mismatch is the most common "
-            "cause of a *0 rows matched* warning."
-        )
-
-        # Four side-by-side value-count tables (PMaj / SFmt / PMinor / Brand).
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Portfolio Major** values (rows)")
-            _render_diag_value_table(diag["unique_pmaj"])
-            st.markdown("**Portfolio Minor** values (rows)")
-            _render_diag_value_table(diag["unique_pminor"])
-        with c2:
-            st.markdown("**Supply Format** values (rows)")
-            _render_diag_value_table(diag["unique_sfmt"])
-            st.markdown("**Brand** values (rows) → derived `Brand Category`")
-            _render_diag_value_table(diag["unique_brand"])
-
-        st.markdown(
-            "**(Portfolio Major, Supply Format, Portfolio Minor, Brand Category) "
-            "combinations** — what the template actually filters against:"
-        )
-        st.dataframe(
-            diag["combo_full"],
-            use_container_width=True,
-            height=min(35 * (len(diag["combo_full"]) + 1) + 38, 360),
-            hide_index=True,
-        )
-
-
-def _render_diag_value_table(df: pd.DataFrame) -> None:
-    """Render one diagnostic value-count frame as a compact table."""
-    if df.empty:
-        st.caption("_(no rows)_")
-        return
-    st.dataframe(
-        df,
-        use_container_width=True,
-        height=min(35 * (len(df) + 1) + 38, 240),
-        hide_index=True,
-    )
 
 
 # ── RO Summary Report — read-only screenshot-styled presentation ─────────────
@@ -4539,7 +4666,7 @@ _SS_DEMAND_PIPELINE_RESULT = "_demand_plan_pipeline_result"
 def _render_base_plan_uploader() -> None:
     """Upload a new Base Plan → run the in-app Demand Plan ETL → auto-refresh.
 
-    Mirrors the RO uploader (:func:`_render_customer_input_uploader`): on **Run**
+    Mirrors the RO uploader (:func:`_render_ro_step1_input`): on **Run**
     the former Fabric-notebook pipeline runs in-app
     (:func:`run_demand_plan_pipeline`) — rebuilding ``tbl_ro_input``,
     ``qry_mgmt_plan_full``, ``qry_demand_item_customer_detail`` and

@@ -47,6 +47,9 @@ from typing import Optional
 
 import pandas as pd
 
+from .ro_risk import seed_scope_mask
+from .ro_rules_config import RoRulesConfig
+
 
 # ── Severities & fix locations ───────────────────────────────────────────────
 
@@ -171,6 +174,7 @@ class PreflightResult:
     """Outcome of validating one upload."""
     findings: list = field(default_factory=list)
     row_count: int = 0
+    rows_in_scope: int = 0
     months: list = field(default_factory=list)
     parsed: Optional[pd.DataFrame] = None
 
@@ -228,7 +232,7 @@ def _check_month_column(df: pd.DataFrame) -> list:
     parsed = pd.to_datetime(raw, errors="coerce")
 
     bad_rows = []
-    for idx, (text, ts) in enumerate(zip(raw, parsed)):
+    for idx, text, ts in zip(raw.index, raw, parsed):
         if not text:
             bad_rows.append((_excel_row(idx), "(blank)", "A date like 2026-06-01"))
         elif pd.isna(ts):
@@ -326,7 +330,7 @@ def _check_columns(df: pd.DataFrame) -> list:
 def _bad_number_rows(df: pd.DataFrame, col: str) -> list:
     """Rows in *col* the pipeline cannot read as a number."""
     bad = []
-    for idx, text in enumerate(df[col].astype(str)):
+    for idx, text in df[col].astype(str).items():
         stripped = text.strip()
         if not stripped:
             continue                          # blank is legitimately zero
@@ -424,7 +428,7 @@ def _check_probability(df: pd.DataFrame) -> list:
                       frac / 100.0)
 
     bad_rows = []
-    for idx, (text, value) in enumerate(zip(raw, frac)):
+    for idx, text, value in zip(raw.index, raw, frac):
         if not text:
             bad_rows.append((_excel_row(idx), "(blank)", "A probability, e.g. 0.5 or 50%"))
         elif pd.isna(value):
@@ -467,7 +471,7 @@ def _check_ship_dates(df: pd.DataFrame) -> list:
     parsed = pd.to_datetime(raw, errors="coerce")
     bad_rows = [
         (_excel_row(idx), text or "(blank)", "A date like 2027-01-01")
-        for idx, (text, ts) in enumerate(zip(raw, parsed))
+        for idx, text, ts in zip(raw.index, raw, parsed)
         if not text or pd.isna(ts)
     ]
     if not bad_rows:
@@ -492,6 +496,47 @@ def _check_ship_dates(df: pd.DataFrame) -> list:
         ),
         cells=pd.DataFrame(
             bad_rows, columns=["Excel row", "What your file has", "What it needs"],
+        ),
+    )]
+
+
+def _scope_note(
+    df: pd.DataFrame, scoped: pd.DataFrame, cfg,
+) -> list:
+    """Explain, once, why the checks looked at fewer rows than the file has.
+
+    Without this the counts are baffling: a 3,000-row upload reporting "40
+    places to fix" reads like the check gave up half way.  Naming the reasons
+    also tells the planner something useful — that most of her file is already
+    in the base plan, or already declined.
+    """
+    skipped = len(df) - len(scoped)
+    if skipped <= 0:
+        return []
+
+    reasons = []
+    if cfg.reflected_in_aps_only and "Reflected in APS" in df.columns:
+        reasons.append("already reflected in APS")
+    if cfg.normalised_excludes() and "Pipeline Status" in df.columns:
+        reasons.append(
+            f"status is {' or '.join(cfg.pipeline_status_excludes)}"
+        )
+    if "Probability" in df.columns:
+        reasons.append(
+            f"probability is {cfg.min_opp_probability:.0%} or lower"
+        )
+    why = "; ".join(reasons) if reasons else "they do not qualify as R&O"
+
+    return [Finding(
+        code="OUT_OF_SCOPE_ROWS",
+        severity=SEVERITY_INFO,
+        title=f"{skipped:,} of {len(df):,} row(s) were not checked — "
+              f"they never reach the report",
+        means=(
+            f"Skipped because {why}. Those rows are filtered out before the "
+            f"report is built, so nothing in them can change a number — "
+            f"there is no point asking you to fix them. The checks below "
+            f"cover the {len(scoped):,} row(s) that do count."
         ),
     )]
 
@@ -574,10 +619,10 @@ def _check_item_master_linkage(
 
     # raw item -> [description, row count, why, what to fill in]
     problems: dict = {}
-    for pos, key in enumerate(file_keys):
+    for idx, key in file_keys.items():
         if pd.isna(key):
             continue
-        raw = str(df["Item #"].iloc[pos]).strip()
+        raw = str(df.at[idx, "Item #"]).strip()
         if key not in known:
             why = "Not in RO_Item_Master.csv"
             todo = "Add a row: Item #, Item Desc, " + ", ".join(
@@ -588,7 +633,7 @@ def _check_item_master_linkage(
                 continue                       # properly classified
             why = f"In RO_Item_Master.csv, but {', '.join(blank)} is blank"
             todo = "Fill in " + ", ".join(blank)
-        entry = problems.setdefault(raw, [str(desc.iloc[pos]).strip(), 0, why, todo])
+        entry = problems.setdefault(raw, [str(desc.at[idx]).strip(), 0, why, todo])
         entry[1] += 1
 
     if not problems:
@@ -643,6 +688,7 @@ def check_distribution_tracker(
     *,
     item_master_df: Optional[pd.DataFrame] = None,
     item_master_path: str = "RO Tracking/RO_Item_Master.csv",
+    config=None,
 ) -> PreflightResult:
     """Validate an uploaded ``Distribution_Tracker.csv`` before anything runs.
 
@@ -657,6 +703,10 @@ def check_distribution_tracker(
     item_master_path
         Lakehouse path of RO_Item_Master, echoed into the finding so the UI can
         build a deep link.
+    config
+        The planner's current :class:`RoRulesConfig`.  Decides which rows are
+        in scope for the row-level checks, so retuning the rules retunes what
+        gets validated.  ``None`` → the canonical defaults.
 
     Returns
     -------
@@ -718,17 +768,33 @@ def check_distribution_tracker(
                 df[MONTH_COLUMN], errors="coerce").dropna().unique()}
         )
 
-    # Ordered by what breaks the report worst, so the first thing a planner
-    # reads is the thing most worth fixing.
+    # ── File-level checks: the whole upload, in scope or not ─────────────
+    # A missing Month column or an absent required header breaks the merge
+    # itself, so these are not row-scoped.
     result.findings.extend(_check_month_column(df))
     result.findings.extend(_check_columns(df))
-    result.findings.extend(_check_volume(df))
-    result.findings.extend(_check_probability(df))
-    result.findings.extend(_check_ship_dates(df))
+
+    # ── Row-level checks: only rows that could reach RO_Seed ─────────────
+    # Scrutinising a row the pipeline is about to discard — an item already
+    # reflected in APS, a declined programme, a zero-probability line — blocks
+    # the run over data that cannot affect the report.  ``seed_scope_mask`` is
+    # a deliberate superset of what the pipeline keeps, so an unreadable gate
+    # cell leaves its row IN scope and still gets checked.
+    cfg = config or RoRulesConfig.default()
+    in_scope = seed_scope_mask(df, config=cfg)
+    scoped = df.loc[in_scope]                  # index preserved → Excel rows
+    result.rows_in_scope = int(len(scoped))
+    result.findings.extend(_scope_note(df, scoped, cfg))
+
+    # Ordered by what breaks the report worst, so the first thing a planner
+    # reads is the thing most worth fixing.
+    result.findings.extend(_check_volume(scoped))
+    result.findings.extend(_check_probability(scoped))
+    result.findings.extend(_check_ship_dates(scoped))
     result.findings.extend(
-        _check_item_master_linkage(df, item_master_df, item_master_path)
+        _check_item_master_linkage(scoped, item_master_df, item_master_path)
     )
-    result.findings.extend(_check_money(df))
+    result.findings.extend(_check_money(scoped))
     return result
 
 

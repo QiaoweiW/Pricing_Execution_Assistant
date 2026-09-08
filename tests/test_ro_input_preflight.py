@@ -295,3 +295,114 @@ def test_every_finding_carries_actionable_guidance():
         assert f.title and f.means, f.code
         assert f.fix_where in (pf.FIX_IN_EXCEL, pf.FIX_IN_FABRIC), f.code
         assert f.fix_steps, f.code
+
+
+# ── Scope: rows the pipeline discards are not scrutinised ────────────────────
+#
+# Reported from the app: 932 rows flagged for an unreadable First Ship Date,
+# most of them already reflected in APS — rows that never reach the report, so
+# blocking the run on them was pure noise.  Row-level checks now run only over
+# rows that could land in RO_Seed (see data_sources.ro_risk.seed_scope_mask).
+
+_SCOPED_HEADER = (
+    "Month,Format,Customer,Taxonomy,Brand,Item #,Item Desc,Probability,"
+    "First Ship Date,Reflected in APS,Pipeline Status,Lbs./yr,PC$/yr,Slotting\n"
+)
+
+
+def _scoped_row(*, item="340021", prob="0.5", ship="2027-01-01",
+                reflected="no", status="Presented", lbs="1000000") -> str:
+    return (
+        f"2026-06-01,HTST,Walmart,Retail,DG,{item},Milk Gallon,{prob},"
+        f"{ship},{reflected},{status},{lbs},0,0\n"
+    )
+
+
+def _scoped_csv(*rows: str) -> bytes:
+    return (_SCOPED_HEADER + "".join(rows)).encode("utf-8")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("reflected", "yes"),
+    ("status", "Declined"),
+    ("status", "Closed"),
+    ("prob", "0"),
+])
+def test_a_broken_cell_on_an_out_of_scope_row_does_not_block(field, value):
+    """The row never reaches the report, so its bad date is not the app's business."""
+    row = _scoped_row(ship="45641", **{field: value})
+    res = pf.check_distribution_tracker(_scoped_csv(row),
+                                        item_master_df=_master(340021))
+    assert res.ok_to_run, f"{field}={value} should not block"
+    assert "BAD_SHIP_DATE" not in _codes(res)
+
+
+def test_the_same_broken_cell_still_blocks_on_an_in_scope_row():
+    """The control: scoping must not have disabled the check itself."""
+    res = pf.check_distribution_tracker(_scoped_csv(_scoped_row(ship="45641")),
+                                        item_master_df=_master(340021))
+    assert not res.ok_to_run
+    assert "BAD_SHIP_DATE" in _codes(res)
+
+
+def test_out_of_scope_rows_are_counted_and_explained():
+    res = pf.check_distribution_tracker(
+        _scoped_csv(
+            _scoped_row(item="340021"),
+            _scoped_row(item="111111", reflected="yes", ship="45641"),
+            _scoped_row(item="222222", status="Declined", ship="45641"),
+        ),
+        item_master_df=_master(340021, 111111, 222222),
+    )
+    assert res.row_count == 3
+    assert res.rows_in_scope == 1
+    note = next(f for f in res.findings if f.code == "OUT_OF_SCOPE_ROWS")
+    assert note.severity == pf.SEVERITY_INFO
+    assert "2 of 3" in note.title
+    assert "reflected in APS" in note.means
+
+
+def test_excel_row_numbers_survive_the_scope_filter():
+    """The fix list must point at the row in the planner's file, not the subset."""
+    res = pf.check_distribution_tracker(
+        _scoped_csv(
+            _scoped_row(item="111111", reflected="yes"),   # file row 2, skipped
+            _scoped_row(item="222222", reflected="yes"),   # file row 3, skipped
+            _scoped_row(item="340021", ship="45641"),      # file row 4, broken
+        ),
+        item_master_df=_master(340021, 111111, 222222),
+    )
+    finding = next(f for f in res.findings if f.code == "BAD_SHIP_DATE")
+    assert list(finding.cells["Excel row"]) == [4]
+
+
+def test_an_out_of_scope_item_is_not_reported_as_unclassified():
+    """131 unclassified items, mostly already in APS — same noise, same fix."""
+    res = pf.check_distribution_tracker(
+        _scoped_csv(_scoped_row(item="999999", reflected="yes")),
+        item_master_df=_master(340021),
+    )
+    assert "ITEM_MASTER_GAPS" not in _codes(res)
+
+
+def test_a_risk_line_is_in_scope_even_when_declined():
+    """A committed loss counts, so its broken date still has to be fixed."""
+    row = _scoped_row(lbs="-500000", prob="1", status="Declined", ship="45641")
+    res = pf.check_distribution_tracker(_scoped_csv(row),
+                                        item_master_df=_master(340021))
+    assert not res.ok_to_run
+    assert "BAD_SHIP_DATE" in _codes(res)
+
+
+def test_the_planners_rules_decide_what_gets_checked():
+    """Raise the opportunity floor and a 50% row stops being scrutinised."""
+    from data_sources.ro_rules_config import RoRulesConfig
+
+    row = _scoped_row(prob="0.5", ship="45641")
+    strict = RoRulesConfig.default().with_updates(min_opp_probability=0.6)
+
+    assert not pf.check_distribution_tracker(
+        _scoped_csv(row), item_master_df=_master(340021)).ok_to_run
+    assert pf.check_distribution_tracker(
+        _scoped_csv(row), item_master_df=_master(340021),
+        config=strict).ok_to_run

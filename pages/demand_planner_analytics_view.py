@@ -1493,23 +1493,42 @@ _RO_INPUT_EXAMPLE_CSV: str = (
 # Folded into Step 1 rather than living as its own module-level section: the
 # planner needs it at the moment they are about to press the button.
 _RO_SEED_METHOD_MD: str = """
-**Stage 1 — which rows become opportunities**
+**Stage 1 — which rows become opportunities & risks**
 
 Your file is added to `Distribution_Tracker_History.csv` (rows for the same
-Month are replaced, not duplicated), then filtered:
+Month are replaced, not duplicated). Then every row is sorted into one of
+three buckets.
+
+**An opportunity** — volume you hope to win:
 
 ```
-KEEP a row when
-      Reflected in APS  = No
-  AND Probability       > 0
+KEEP as an OPPORTUNITY when all three are true
+      Reflected in APS  = No          (not already in the base plan)
+  AND Probability       > 0           (some chance of landing)
   AND Pipeline Status NOT IN (Declined, Closed)
-
-EXCEPT R&O risk lines, which skip the Pipeline Status test
-       (a committed loss counts even once the deal is closed)
 ```
 
-The thresholds above are the *current* rules — Step 4 shows them and lets you
-change them.
+**A risk** — volume you expect to lose:
+
+```
+KEEP as a RISK when all three are true
+      Reflected in APS  = No          (the loss isn't in the plan yet)
+  AND Lbs./yr           < 0           (a negative volume IS the loss)
+  AND Probability       >= 50%        (likely enough to plan around)
+```
+
+A risk is allowed in **even if its status is Declined or Closed**, and even if
+its probability is below the opportunity floor. That is deliberate: once you
+have committed to losing the volume, the deal being closed does not make the
+loss go away. Everything else is symmetrical — same file, same three columns.
+
+**Everything else is ignored.** A row already reflected in APS, a declined
+programme that is not a loss, or a zero-probability line never reaches the
+report. That is also why the checks above only look at rows that qualify:
+there is no point asking you to fix a date on a row that is not counted.
+
+Both sets of thresholds are the *current* rules — Step 4 shows them and lets
+you change them, and this page re-checks your file when you do.
 
 **Stage 2 — duplicate rows are added together**
 
@@ -1670,9 +1689,11 @@ def _render_ro_input_contract() -> None:
     )
 
     st.info(
-        "**You do not need to audit every column.** Four things make the "
-        "report come out wrong, and the check below finds all of them in your "
-        "own file — naming the exact row:\n\n"
+        "**You do not need to audit every column — or every row.** The check "
+        "below looks only at rows that actually reach the report: anything "
+        "already reflected in APS, declined, or at zero probability is skipped, "
+        "because nothing in it can change a number. Four things go wrong, and "
+        "the check finds all of them in your own file, naming the exact row:\n\n"
         "1. **A missing `Month` column.** The export does not include it; you "
         "add it, set to the first of the month you are uploading "
         "(e.g. `2026-06-01`), the same value in every row. This is the one "
@@ -1887,7 +1908,14 @@ def _render_ro_step1_input(
         #    (a date-input change, a checkbox tick) don't re-parse the CSV.
         may_run = False
         if uploaded is not None:
-            cache_key = (uploaded.name, uploaded.size)
+            # Re-check when the file changes OR when the rules change: the
+            # rules decide which rows are in scope, so a retune can turn a
+            # blocking finding into an irrelevant one (and back).
+            cache_key = (
+                uploaded.name,
+                uploaded.size,
+                ro_rules_config_from_session(st.session_state).signature(),
+            )
             if st.session_state.get(_SS_RO_PREFLIGHT_NAME) != cache_key:
                 with st.spinner("Checking your file…"):
                     st.session_state[_SS_RO_PREFLIGHT] = (
@@ -1895,6 +1923,13 @@ def _render_ro_step1_input(
                             uploaded.getvalue(),
                             item_master_df=item_master_df,
                             item_master_path=ro_item_master_blob_path(),
+                            # The planner's CURRENT rules decide which rows the
+                            # pipeline will keep — and therefore which rows are
+                            # worth checking.  Without this the gate would
+                            # block on rows already reflected in APS, declined,
+                            # or at zero probability: data that cannot reach
+                            # the report no matter how broken it is.
+                            config=ro_rules_config_from_session(st.session_state),
                         )
                     )
                 st.session_state[_SS_RO_PREFLIGHT_NAME] = cache_key

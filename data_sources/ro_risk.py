@@ -1,4 +1,4 @@
-"""Canonical definition of an R&O *risk* line — the single source of truth.
+"""Canonical R&O inclusion rules — what counts as a risk, and what reaches RO_Seed.
 
 A **risk** is a demand **loss the planner is likely to see**.  A line qualifies
 only when it clears ALL THREE conditions:
@@ -32,8 +32,16 @@ Conventions
   filter has already been applied, so callers there pass ``reflected_col=None``
   and condition 1 is treated as already satisfied.
 
-Kept dependency-light (pandas only) so both the RO-seed pipeline and the RO
-summary can import it without a cycle.
+Two predicates live here:
+
+  * :func:`risk_mask` — is this line a risk?  The rule above.
+  * :func:`seed_scope_mask` — could this line reach ``RO_Seed`` at all?  Used
+    by the upload validator so it never blocks a run over rows the pipeline
+    was going to discard anyway (an item already reflected in APS, a declined
+    programme, a zero-probability line).
+
+Kept dependency-light (pandas only) so the RO-seed pipeline, the RO summary and
+the upload pre-flight can all import it without a cycle.
 """
 from __future__ import annotations
 
@@ -110,3 +118,100 @@ def risk_mask(
         )
         mask = mask & reflected
     return mask
+
+
+def seed_scope_mask(
+    df: pd.DataFrame,
+    *,
+    config,
+    volume_col: str = "Lbs./yr",
+    probability_col: str = "Probability",
+    reflected_col: str = "Reflected in APS",
+    status_col: str = "Pipeline Status",
+) -> pd.Series:
+    """Rows that *could* reach ``RO_Seed`` — the validation superset.
+
+    ``ro_seed_pipeline._build_ro_seed`` answers "does this row belong in the
+    seed?".  This answers a deliberately weaker question: "could this row
+    matter?"  The difference is how each treats an **unreadable** gate cell.
+
+    The pipeline is strict, because it has to choose: a blank
+    ``Reflected in APS`` is not the literal ``"no"``, so the row is dropped; a
+    blank ``Probability`` coerces to ``0.0`` and fails the threshold, so the
+    row is dropped.  Either way the line silently disappears from the plan.
+
+    A validator must not inherit that strictness, or it would skip checking
+    precisely the rows whose gate cells are broken — the ones most likely to
+    vanish by accident rather than by decision.  So a row here is out of scope
+    only when a gate is **definitively** satisfied:
+
+    * ``Reflected in APS`` holds a real value that is not ``"no"`` (i.e. Yes) —
+      the planner has said this is already in the base plan;
+    * ``Pipeline Status`` matches an exclude token (Declined / Closed);
+    * ``Probability`` parses cleanly and sits at or below the Opportunity
+      threshold.
+
+    Blank or unparseable cells leave the row **in** scope.  Risk lines are
+    always in scope: they bypass the status and probability gates in the
+    pipeline too.
+
+    The result is therefore a superset of what the pipeline keeps —
+    ``pipeline_kept ⊆ seed_scope_mask`` — which is the property that makes it
+    safe to use for validation.  ``tests/test_ro_seed_scope.py`` asserts that
+    containment against the real pipeline so the two cannot drift apart.
+
+    Parameters
+    ----------
+    config
+        A :class:`data_sources.ro_rules_config.RoRulesConfig`.  Read for
+        ``reflected_in_aps_only``, ``normalised_excludes()``,
+        ``min_opp_probability`` and the Risk parameters, so the scope always
+        reflects the planner's current rules.
+    """
+    if df.empty:
+        return pd.Series([], dtype=bool)
+
+    is_risk = risk_mask(
+        df,
+        volume_col=volume_col,
+        probability_col=probability_col,
+        reflected_col=config.risk_reflected_col(df.columns, reflected_col),
+        min_probability=config.min_risk_probability,
+        require_negative_volume=config.risk_requires_negative_volume,
+    )
+
+    out = pd.Series(False, index=df.index)
+
+    # Reflected in APS = Yes — a decision, not an accident.  A blank stays in
+    # scope: we cannot tell what the planner meant, so we check it.
+    if config.reflected_in_aps_only and reflected_col in df.columns:
+        text = df[reflected_col].astype(str).str.strip().str.lower()
+        stated = text.ne("") & text.ne("nan")
+        out = out | (stated & text.ne(_REFLECTED_NOT_IN_APS))
+
+    # Declined / Closed — again a stated status.  Risk lines are exempt.
+    excludes = config.normalised_excludes()
+    if excludes and status_col in df.columns:
+        status = df[status_col].astype(str).str.lower()
+        dropped = pd.Series(False, index=df.index)
+        for token in excludes:
+            dropped = dropped | status.str.contains(token, na=False)
+        out = out | (dropped & ~is_risk)
+
+    # A probability that reads cleanly, is a possible probability, and does not
+    # clear the bar — a business zero, so the row is genuinely out of play.
+    #
+    # A NEGATIVE value is a different animal: it parses, but no probability can
+    # be below zero, so it is a broken cell rather than a decision.  Those stay
+    # in scope and get reported, because the row vanishes from the plan by
+    # accident.  Same reasoning as an unreadable cell.
+    if probability_col in df.columns:
+        probability = _numeric(df[probability_col])
+        stated_low = (
+            probability.notna()
+            & (probability >= 0.0)
+            & (probability <= float(config.min_opp_probability))
+        )
+        out = out | (stated_low & ~is_risk)
+
+    return ~out

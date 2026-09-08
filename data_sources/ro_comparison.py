@@ -66,6 +66,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
+from data_sources import ro_keys as _ro_keys
 from data_sources.fabric_auth import (
     FabricAuthError,
     acquire_storage_token,
@@ -140,9 +141,9 @@ _ITEM_MASTER_CACHE_TTL_SECONDS: int = 60 * 60
 
 # Brand spellings we normalise to "Private".  Comparison is
 # case-insensitive (we lower() before lookup).
-_PRIVATE_BRAND_TOKENS: frozenset[str] = frozenset({
-    "pl", "private label", "private-label", "privatelabel",
-})
+# Private-label spellings live in ``ro_keys`` so the RO_Seed ↔ RO Summary
+# reconciliation canonicalises Brand exactly the way this module does.
+_PRIVATE_BRAND_TOKENS: frozenset = _ro_keys.PRIVATE_LABEL_TOKENS
 
 # Excel's date epoch — 1899-12-30 corrects for the Lotus-1-2-3 leap-year
 # bug that Excel inherited.  Pandas Timestamp.fromordinal does not
@@ -317,16 +318,12 @@ def _coerce_to_date(value: Any) -> Optional[date]:
 def _normalize_brand(value: Any) -> str:
     """Map ``PL`` / ``Pl`` / ``pl`` / ``Private Label`` → ``"Private"``.
 
-    Returns ``""`` for blanks so the page can surface a "fill me in"
-    warning for the affected rows.  All other values are passed through
-    with surrounding whitespace stripped.
+    Thin alias over :func:`data_sources.ro_keys.canonical_brand` — kept as a
+    module-local name because several call sites and a docstring elsewhere
+    reference it.  Returns ``""`` for blanks so the page can surface a
+    "fill me in" warning rather than inventing a brand.
     """
-    if _is_blank(value):
-        return ""
-    s = str(value).strip()
-    if s.lower() in _PRIVATE_BRAND_TOKENS:
-        return "Private"
-    return s
+    return _ro_keys.canonical_brand(value)
 
 
 def _normalize_item_id(value: Any) -> str:

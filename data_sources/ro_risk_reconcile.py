@@ -37,6 +37,11 @@ Design
 * **Business key = ``(Format, Customer, Taxonomy, Brand, Item #)``.**  Same
   five-column key ``ro_seed_pipeline`` uses for RO Key assignment; guarantees a
   divergence report joins on the same identity the pipeline itself uses.
+* **Canonicalised through :mod:`data_sources.ro_keys`.**  The two files do not
+  spell the key identically — ``RO_Seed`` keeps the raw ``Brand = "PL"`` while
+  ``RO_Comparison_Output`` has already normalised it to ``"Private"`` — so
+  hashing the cells verbatim reported the same line as missing from both sides
+  at once.  Every key cell goes through ``canonical_key_cell`` instead.
 """
 from __future__ import annotations
 
@@ -45,6 +50,10 @@ from typing import Iterable, Optional
 
 import pandas as pd
 
+from .ro_keys import (
+    BUSINESS_KEY_COLS as _RO_BUSINESS_KEY_COLS,
+    canonical_key_cell,
+)
 from .ro_risk import risk_mask
 from .ro_rules_config import RoRulesConfig
 
@@ -57,9 +66,9 @@ from .ro_rules_config import RoRulesConfig
 # ``ro_summary_report._compute_leaf_values`` reads on the summary side.
 
 # Business key — must match ``ro_seed_pipeline._MATCH_COLS``.
-BUSINESS_KEY_COLS: tuple[str, ...] = (
-    "Format", "Customer", "Taxonomy", "Brand", "Item #",
-)
+#: Re-exported from :mod:`data_sources.ro_keys` so existing importers of this
+#: module keep working while the definition lives in exactly one place.
+BUSINESS_KEY_COLS: tuple = _RO_BUSINESS_KEY_COLS
 
 # RO_Seed side — raw Distribution-Tracker-lineage columns.
 SEED_VOLUME_COL: str = "Lbs./yr"
@@ -127,27 +136,6 @@ class RiskReconciliationResult:
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
-def _normalise_cell(value) -> str:
-    """Canonicalise a business-key cell for cross-file comparison.
-
-    Strips whitespace, coerces NaN/None to ``""``, and drops the trailing
-    ``.0`` from floats-that-are-integers (``"380574.0"`` → ``"380574"``) so
-    an ``Int64``-typed Item # on one side matches a string-typed Item # on
-    the other.  Mirrors ``ro_seed_pipeline._norm_item``'s intent.
-    """
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    text = str(value).strip()
-    if text.endswith(".0") and text[:-2].lstrip("-").isdigit():
-        text = text[:-2]
-    return text
-
-
 def _key_series(df: pd.DataFrame) -> pd.Series:
     """Return a Series of ``(f, c, t, b, i)`` business-key tuples for *df*.
 
@@ -159,7 +147,11 @@ def _key_series(df: pd.DataFrame) -> pd.Series:
     cols: list[pd.Series] = []
     for col in BUSINESS_KEY_COLS:
         series = df[col] if col in df.columns else pd.Series("", index=df.index)
-        cols.append(series.map(_normalise_cell))
+        # Per-column canonicalisation, NOT a generic strip: the two sides spell
+        # private label differently ("PL" on the seed, "Private" in the
+        # comparison output), and a verbatim hash reports that one row as
+        # missing from BOTH files at once.
+        cols.append(series.map(lambda v, _c=col: canonical_key_cell(_c, v)))
     # Materialise the zip into a list so pd.Series constructs cleanly on every
     # pandas version (some releases pull once from generators, then hand back
     # an empty Series when reset).  Object dtype keeps the tuples intact.
@@ -230,7 +222,10 @@ def _detail_frame(
     for col in BUSINESS_KEY_COLS:
         if col not in slice_.columns:
             slice_[col] = ""
-        slice_[col] = slice_[col].map(_normalise_cell)
+        # Same canonicalisation the match uses, so the detail a planner reads
+        # shows the identity the two files were compared on — and the two
+        # tables no longer disagree on how to spell the same brand.
+        slice_[col] = slice_[col].map(lambda v, _c=col: canonical_key_cell(_c, v))
 
     keep_cols = list(BUSINESS_KEY_COLS) + [c for c in extra_cols if c in slice_.columns]
     slice_ = slice_.loc[:, keep_cols]

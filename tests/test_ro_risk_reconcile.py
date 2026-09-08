@@ -15,6 +15,7 @@ Pure in-memory DataFrames — no Fabric, no Streamlit.
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from data_sources.ro_risk_reconcile import (
     BUSINESS_KEY_COLS,
@@ -183,3 +184,68 @@ def test_missing_required_column_yields_no_risk_not_an_exception():
                          "Taxonomy": "T", "Brand": "B"}])
     r = reconcile_ro_seed_vs_summary(bad, bad)
     assert r.seed_risk_count == 0 and r.summary_risk_count == 0
+
+
+# ── Business-key canonicalisation ────────────────────────────────────────────
+#
+# Regression: the two files do not spell the key identically.  RO_Seed keeps
+# the raw Distribution Tracker text ("PL"); RO_Comparison_Output has already
+# normalised it ("Private").  Hashing the cells verbatim reported the SAME
+# line as missing from both sides at once — a false divergence indistinguish-
+# able from a real one.  Reported from the app on 2026-09-08.
+
+
+def test_private_label_spellings_match_across_the_two_files():
+    """`Brand = "PL"` on the seed is the same line as `"Private"` in the report."""
+    seed = pd.DataFrame([_seed_row("58", -898560, 1.0, **{"Brand": "PL"})])
+    summary = pd.DataFrame([_summary_row("58", -898560, 1.0, **{"Brand": "Private"})])
+
+    result = reconcile_ro_seed_vs_summary(seed, summary)
+
+    assert result.is_aligned, (
+        f"same line reported as diverging: "
+        f"{len(result.missing_from_seed)} missing-from-seed, "
+        f"{len(result.missing_from_summary)} missing-from-summary"
+    )
+    assert len(result.matched) == 1
+
+
+@pytest.mark.parametrize("seed_brand", [
+    "PL", "pl", "Pl", " PL ", "Private Label", "private-label", "PrivateLabel",
+])
+def test_every_private_label_spelling_canonicalises(seed_brand):
+    seed = pd.DataFrame([_seed_row("58", -100.0, 1.0, **{"Brand": seed_brand})])
+    summary = pd.DataFrame([_summary_row("58", -100.0, 1.0, **{"Brand": "Private"})])
+    assert reconcile_ro_seed_vs_summary(seed, summary).is_aligned, seed_brand
+
+
+def test_a_genuinely_different_brand_still_diverges():
+    """Canonicalisation must not paper over a real mismatch."""
+    seed = pd.DataFrame([_seed_row("58", -100.0, 1.0, **{"Brand": "Darigold"})])
+    summary = pd.DataFrame([_summary_row("58", -100.0, 1.0, **{"Brand": "Private"})])
+
+    result = reconcile_ro_seed_vs_summary(seed, summary)
+
+    assert not result.is_aligned
+    assert len(result.missing_from_seed) == 1
+    assert len(result.missing_from_summary) == 1
+
+
+def test_the_detail_tables_agree_on_how_to_spell_the_brand():
+    """Both sides render the canonical form, so the planner sees one identity."""
+    seed = pd.DataFrame([_seed_row("58", -100.0, 1.0, **{"Brand": "PL"})])
+    summary = pd.DataFrame([_summary_row("99", -200.0, 1.0, **{"Brand": "pl"})])
+
+    result = reconcile_ro_seed_vs_summary(seed, summary)
+
+    assert result.missing_from_summary.iloc[0]["Brand"] == "Private"
+    assert result.missing_from_seed.iloc[0]["Brand"] == "Private"
+
+
+def test_a_blank_brand_is_not_invented():
+    """Blank stays blank — the page warns about it rather than guessing."""
+    seed = pd.DataFrame([_seed_row("58", -100.0, 1.0, **{"Brand": ""})])
+    summary = pd.DataFrame([_summary_row("58", -100.0, 1.0, **{"Brand": ""})])
+    result = reconcile_ro_seed_vs_summary(seed, summary)
+    assert result.is_aligned
+    assert result.matched.iloc[0]["Brand"] == ""

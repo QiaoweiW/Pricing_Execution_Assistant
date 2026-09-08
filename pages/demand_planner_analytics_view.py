@@ -1594,6 +1594,31 @@ _SS_RO_ACK: str = "ro_input_ack_unlinked"
 _SS_RECONCILE_CHECKED: str = "_ro_reconcile_autocheck_done"
 
 
+def _load_ro_item_dims(
+    item_master_df: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """Return the PDH → RO_Item_Master dim cascade for the upload check.
+
+    An item classified in ``qry_pdh.csv`` needs no RO_Item_Master row, so
+    checking the master alone reported items that were never a problem and
+    sent the planner to edit the wrong file.  Reuses the same cascade the
+    Demand Plan Comparison classifies with
+    (:func:`build_item_dim_frame_cascade`) rather than re-deriving it.
+
+    Called only when a file has actually been uploaded, so the PDH read stays
+    off the section's normal render path.  A PDH failure is non-fatal: the
+    cascade degrades to RO_Item_Master alone.
+    """
+    pdh_df = _load_demand_comparison_pdh()
+    if pdh_df is None and (item_master_df is None or item_master_df.empty):
+        return None
+    try:
+        return build_item_dim_frame_cascade(pdh_df, item_master_df)
+    except Exception as exc:  # noqa: BLE001 — a diagnostic must never break the page
+        logger.warning("Could not build the item dim cascade: %s", exc)
+        return None
+
+
 def _render_ro_reconcile_autocheck() -> None:
     """Check RO_Seed against the published RO Summary; stay silent if they agree.
 
@@ -1702,8 +1727,10 @@ def _render_ro_input_contract() -> None:
         "**zero volume**, so the opportunity silently disappears.\n"
         "3. **An unreadable `Probability` or `First Ship Date`** — the first "
         "multiplies every volume, the second decides how much lands in-year.\n"
-        "4. **An item not classified in `RO_Item_Master.csv`** — it counts in "
-        "Total B2C but under no portfolio row, so the lines stop adding up."
+        "4. **An item that no portfolio file recognises** — we look it up in "
+        "`qry_pdh.csv` first and `RO_Item_Master.csv` second, and only tell "
+        "you when neither knows it. Such an item counts in Total B2C but "
+        "under no portfolio row, so the lines stop adding up."
     )
 
     # RO_Item_Master sits right here, under the four checks: point 4 above is
@@ -1921,7 +1948,10 @@ def _render_ro_step1_input(
                     st.session_state[_SS_RO_PREFLIGHT] = (
                         rpf.check_distribution_tracker(
                             uploaded.getvalue(),
-                            item_master_df=item_master_df,
+                            # PDH first, RO_Item_Master filling its gaps — the
+                            # same cascade the comparison classifies with, so
+                            # an item PDH already knows is not reported.
+                            item_dims=_load_ro_item_dims(item_master_df),
                             item_master_path=ro_item_master_blob_path(),
                             # The planner's CURRENT rules decide which rows the
                             # pipeline will keep — and therefore which rows are

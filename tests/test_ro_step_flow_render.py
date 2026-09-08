@@ -42,7 +42,8 @@ sys.modules["streamlit"] = _ST
 sys.modules.setdefault("streamlit.components", MagicMock())
 sys.modules.setdefault("streamlit.components.v1", MagicMock())
 
-from data_sources import ro_input_preflight as rpf  # noqa: E402
+from data_sources import ro_input_preflight as rpf
+from data_sources.demand_plan_comparison import build_item_dim_frame_cascade  # noqa: E402
 import pages.demand_planner_analytics_view as page  # noqa: E402
 
 
@@ -120,26 +121,31 @@ def caps(monkeypatch):
     _ST.spinner = lambda *a, **k: _Ctx()
     monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
                         lambda: False)
+    # Step 1 derives the PDH -> RO_Item_Master cascade lazily (it costs a
+    # Fabric read), so serve whatever the test injected instead.
+    monkeypatch.setattr(page, "_load_ro_item_dims",
+                        lambda _master=None: c.get("_item_dims"))
     return c
 
 
 def _run_step1(caps, upload, item_master=None):
     caps["_upload"] = upload
+    caps["_item_dims"] = item_master
     page.st.file_uploader = lambda *a, **k: upload
     page._render_ro_step1_input(item_master, None)
     return caps
 
 
 def _master(*items) -> pd.DataFrame:
-    """A fully classified RO_Item_Master — the "nothing to report" case."""
+    """A fully classified dim cascade — the "nothing to report" case."""
     n = len(items)
-    return pd.DataFrame({
+    return build_item_dim_frame_cascade(None, pd.DataFrame({
         "Item #": list(items),
         "Item Desc": ["x"] * n,
         "Portfolio Major": ["HTST"] * n,
         "Portfolio Minor": ["Gallon Jug"] * n,
         "Brand Category": ["Branded"] * n,
-    })
+    }))
 
 
 def _run_button(caps):

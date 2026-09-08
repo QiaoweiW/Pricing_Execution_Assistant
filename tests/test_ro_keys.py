@@ -97,3 +97,20 @@ def test_the_comparison_builder_shares_the_brand_map():
     from data_sources.ro_comparison import _normalize_brand
     for raw in ("PL", "private label", "Darigold", "", None):
         assert _normalize_brand(raw) == rk.canonical_brand(raw)
+
+
+def test_canonical_cell_matches_the_dim_cascade_key():
+    """The pre-flight looks items up in the cascade's ``__item_key`` index.
+
+    ``build_item_dim_frame`` builds that key with ``_vectorised_item_key``; the
+    validator builds its side with :func:`canonical_cell`.  If the two ever
+    diverge the check reports items that classify perfectly well, so pin the
+    equality here rather than relying on the two docstrings agreeing.
+    """
+    import pandas as pd
+    from data_sources.demand_plan_comparison import _vectorised_item_key
+
+    for value in ["370072.0", " 58 ", "P-37.0", "0340021", "340021",
+                  58, 58.0, "", "-58.0"]:
+        cascade = _vectorised_item_key(pd.Series([value])).iloc[0]
+        assert rk.canonical_cell(value) == cascade, value

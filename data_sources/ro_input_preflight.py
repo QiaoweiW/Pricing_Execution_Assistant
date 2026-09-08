@@ -47,6 +47,8 @@ from typing import Optional
 
 import pandas as pd
 
+from .ro_dates import canonical_date_series
+from .ro_keys import canonical_cell
 from .ro_risk import seed_scope_mask
 from .ro_rules_config import RoRulesConfig
 
@@ -229,7 +231,9 @@ def _check_month_column(df: pd.DataFrame) -> list:
         )]
 
     raw = df[MONTH_COLUMN].astype(str).str.strip()
-    parsed = pd.to_datetime(raw, errors="coerce")
+    # The pipeline's own parser: ISO, mm/dd/yyyy AND Excel serials.  A bare
+    # pd.to_datetime here would call every serial-formatted Month unreadable.
+    parsed = canonical_date_series(df[MONTH_COLUMN])
 
     bad_rows = []
     for idx, text, ts in zip(raw.index, raw, parsed):
@@ -468,9 +472,13 @@ def _check_ship_dates(df: pd.DataFrame) -> list:
         return []
 
     raw = df["First Ship Date"].astype(str).str.strip()
-    parsed = pd.to_datetime(raw, errors="coerce")
+    # Excel writes a date-formatted cell as a serial (45641 = 2024-12-15) and
+    # the pipeline reads it fine, so the validator must too — see
+    # :mod:`data_sources.ro_dates`.
+    parsed = canonical_date_series(df["First Ship Date"])
     bad_rows = [
-        (_excel_row(idx), text or "(blank)", "A date like 2027-01-01")
+        (_excel_row(idx), text or "(blank)",
+         "A date like 2027-01-01 (an Excel date serial such as 45641 is fine too)")
         for idx, text, ts in zip(raw.index, raw, parsed)
         if not text or pd.isna(ts)
     ]
@@ -489,9 +497,11 @@ def _check_ship_dates(df: pd.DataFrame) -> list:
         fix_where=FIX_IN_EXCEL,
         fix_steps=(
             "Open your file in Excel and go to the **First Ship Date** column.",
-            "Give every row a real date, e.g. **2027-01-01**.",
-            "Watch for dates stored as text — if the cell is left-aligned in "
-            "Excel it is text, not a date. Re-type it.",
+            "Fill in each row listed below with a real date, e.g. "
+            "**2027-01-01**.",
+            "You do NOT need to reformat dates that already work — the app "
+            "reads `2027-01-01`, `01/15/2027` and Excel's own date numbers "
+            "(like `45641`) equally well. Only the rows below need attention.",
             "Save as CSV (UTF-8) and upload again.",
         ),
         cells=pd.DataFrame(
@@ -541,97 +551,103 @@ def _scope_note(
     )]
 
 
-#: The RO_Item_Master fields that classify an item into the report's rows.
-#: A blank in any of them puts the item's volume in Total B2C but under no
-#: portfolio row — the same visible symptom as a missing item.
-ITEM_MASTER_CLASSIFIERS: tuple = (
-    "Portfolio Major", "Portfolio Minor", "Brand Category",
-)
+#: Fields on the cascaded dim frame that place an item on a portfolio row.
+#: These are ``build_item_dim_frame``'s internal names; a blank in either means
+#: the item's volume lands in Total B2C under no portfolio line.
+_DIM_PORTFOLIO_FIELDS: tuple = ("pmaj", "pminor")
 
+#: Internal field name → the label a planner sees in the two source files.
+_DIM_FIELD_LABELS: dict = {
+    "pmaj": "Portfolio Major",
+    "pminor": "Portfolio Minor",
+}
 
-def _norm_item_key(series: pd.Series) -> pd.Series:
-    """Digits-only item key, leading zeros dropped, blanks as NA."""
-    return (series.astype(str).str.replace(r"[^\d]", "", regex=True)
-            .str.lstrip("0").replace("", pd.NA))
-
-
-def _check_item_master_linkage(
+def _check_item_classification(
     df: pd.DataFrame,
-    item_master_df: Optional[pd.DataFrame],
+    item_dims: Optional[pd.DataFrame],
     item_master_path: str,
 ) -> list:
     """Report every item whose classification will fail, and why.
+
+    *item_dims* is the **already-cascaded** dim frame from
+    :func:`data_sources.demand_plan_comparison.build_item_dim_frame_cascade`
+    — ``qry_pdh.csv`` first, ``RO_Item_Master.csv`` filling its gaps, coalesced
+    per field.  Checking against the cascade rather than RO_Item_Master alone
+    matters: an item PDH already classifies needs no master row, and flagging
+    it would send the planner to edit a file that was never the problem.
+
+    Its ``__item_key`` is built by ``_vectorised_item_key``, whose contract
+    (strip, drop a trailing ``.0``) is the same as
+    :func:`data_sources.ro_keys.canonical_cell` — the key used here, so the
+    two sides cannot mismatch.  ``tests/test_ro_keys.py`` pins that equality.
 
     Two distinct causes, same visible symptom in the report, so they are listed
     together with a per-item reason rather than split into two findings the
     planner has to correlate:
 
-    * the item has no row in ``RO_Item_Master.csv`` at all;
-    * it has a row, but one of the classifier fields is blank.
+    * the item appears in neither PDH nor RO_Item_Master;
+    * it is known, but a portfolio field is blank in both.
     """
     if "Item #" not in df.columns:
         return []                              # already reported as missing
 
-    if item_master_df is None or item_master_df.empty:
+    if item_dims is None or item_dims.empty or "__item_key" not in item_dims.columns:
         return [Finding(
             code="ITEM_MASTER_UNAVAILABLE",
             severity=SEVERITY_ACK,
-            title="RO_Item_Master.csv could not be read, so items weren’t checked",
+            title="The item files could not be read, so items weren’t checked",
             means=(
-                "Items are classified into Portfolio Major / Minor and Brand "
-                "Category through that file. Without it, rows may land "
-                "unclassified in the report."
+                "Items are sorted into portfolio rows using **qry_pdh.csv** "
+                "and **RO_Item_Master.csv**. Neither could be read this "
+                "session, so we cannot tell you which items will classify."
             ),
             fix_where=FIX_IN_FABRIC,
             fix_steps=(
-                "Open the Fabric link below and confirm "
-                "**RO_Item_Master.csv** is in the folder.",
-                "If it is missing, upload the latest copy there.",
+                "This is usually a Fabric sign-in that has expired — check "
+                "the status at the top of the **Documentation** page.",
+                "If you are signed in, open the link below and confirm "
+                "**RO_Item_Master.csv** is still in the folder.",
                 "Re-upload your file here to run the check again.",
             ),
             fabric_path=item_master_path,
         )]
 
-    master = item_master_df.copy()
-    master.columns = [str(c).strip() for c in master.columns]
-    has_key = "Item #" in master.columns
-    master_keys = _norm_item_key(master["Item #"]) if has_key else pd.Series(dtype=object)
+    dims = item_dims.set_index("__item_key")
+    # Only the fields that place an item on a portfolio row.  Brand and supply
+    # format are filled by the cascade in ways that are not a classification
+    # failure, so they are not treated as gaps here.
+    fields = [c for c in _DIM_PORTFOLIO_FIELDS if c in dims.columns]
 
-    # key -> the classifier fields that are blank on that master row
     blanks_by_key: dict = {}
-    if has_key:
-        classifiers = [c for c in ITEM_MASTER_CLASSIFIERS if c in master.columns]
-        absent = [c for c in ITEM_MASTER_CLASSIFIERS if c not in master.columns]
-        for pos, key in enumerate(master_keys):
-            if pd.isna(key):
-                continue
-            blank = [
-                c for c in classifiers
-                if not str(master[c].iloc[pos]).strip()
-                or str(master[c].iloc[pos]).strip().lower() in ("nan", "none")
-            ]
-            blanks_by_key[key] = blank + absent
+    for key, row in dims[fields].iterrows():
+        blank = [
+            _DIM_FIELD_LABELS[c] for c in fields
+            if not str(row[c]).strip()
+            or str(row[c]).strip().lower() in ("nan", "none")
+        ]
+        # Last row wins, matching the cascade's own duplicate handling.
+        blanks_by_key[str(key)] = blank
     known = set(blanks_by_key)
 
     desc = (df["Item Desc"].astype(str) if "Item Desc" in df.columns
             else pd.Series([""] * len(df), index=df.index))
-    file_keys = _norm_item_key(df["Item #"])
+    file_keys = df["Item #"].map(canonical_cell)
 
     # raw item -> [description, row count, why, what to fill in]
     problems: dict = {}
     for idx, key in file_keys.items():
-        if pd.isna(key):
+        if not key:
             continue
         raw = str(df.at[idx, "Item #"]).strip()
         if key not in known:
-            why = "Not in RO_Item_Master.csv"
-            todo = "Add a row: Item #, Item Desc, " + ", ".join(
-                ITEM_MASTER_CLASSIFIERS)
+            why = "Not in qry_pdh.csv or RO_Item_Master.csv"
+            todo = ("Add a row to RO_Item_Master.csv: Item #, Item Desc, "
+                    + ", ".join(_DIM_FIELD_LABELS.values()))
         else:
             blank = blanks_by_key[key]
             if not blank:
                 continue                       # properly classified
-            why = f"In RO_Item_Master.csv, but {', '.join(blank)} is blank"
+            why = f"Known, but {', '.join(blank)} is blank in both files"
             todo = "Fill in " + ", ".join(blank)
         entry = problems.setdefault(raw, [str(desc.at[idx]).strip(), 0, why, todo])
         entry[1] += 1
@@ -644,8 +660,8 @@ def _check_item_master_linkage(
     n_absent = sum(1 for r in rows if r[3].startswith("Not in"))
     n_blank = len(rows) - n_absent
     detail = " · ".join(filter(None, [
-        f"{n_absent} not in the file" if n_absent else "",
-        f"{n_blank} present but unclassified" if n_blank else "",
+        f"{n_absent} not in either file" if n_absent else "",
+        f"{n_blank} known but unclassified" if n_blank else "",
     ]))
 
     return [Finding(
@@ -686,7 +702,7 @@ def _check_item_master_linkage(
 def check_distribution_tracker(
     file_bytes: bytes,
     *,
-    item_master_df: Optional[pd.DataFrame] = None,
+    item_dims: Optional[pd.DataFrame] = None,
     item_master_path: str = "RO Tracking/RO_Item_Master.csv",
     config=None,
 ) -> PreflightResult:
@@ -696,10 +712,12 @@ def check_distribution_tracker(
     ----------
     file_bytes
         The raw uploaded bytes.
-    item_master_df
-        Already-fetched ``RO_Item_Master.csv`` frame, used for the linkage
-        check. Pass ``None`` when Fabric is unreachable — the check then
-        reports that it could not run rather than silently passing.
+    item_dims
+        The cascaded per-item dim frame from
+        :func:`data_sources.demand_plan_comparison.build_item_dim_frame_cascade`
+        (``qry_pdh.csv`` first, ``RO_Item_Master.csv`` filling its gaps).
+        Pass ``None`` when Fabric is unreachable — the check then reports that
+        it could not run rather than silently passing.
     item_master_path
         Lakehouse path of RO_Item_Master, echoed into the finding so the UI can
         build a deep link.
@@ -792,7 +810,7 @@ def check_distribution_tracker(
     result.findings.extend(_check_probability(scoped))
     result.findings.extend(_check_ship_dates(scoped))
     result.findings.extend(
-        _check_item_master_linkage(scoped, item_master_df, item_master_path)
+        _check_item_classification(scoped, item_dims, item_master_path)
     )
     result.findings.extend(_check_money(scoped))
     return result
@@ -812,7 +830,7 @@ __all__ = [
     "VOLUME_COLUMN",
     "MONEY_COLUMNS",
     "MAX_CELLS_SHOWN",
-    "ITEM_MASTER_CLASSIFIERS",
+    "_DIM_FIELD_LABELS",
     "Finding",
     "PreflightResult",
     "check_distribution_tracker",

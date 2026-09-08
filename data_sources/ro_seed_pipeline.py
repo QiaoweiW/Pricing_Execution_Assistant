@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.offsets import MonthEnd
 
+from .ro_dates import canonical_date_series
 from .ro_risk import risk_mask
 from .ro_rules_config import REFLECTED_IN_APS_COLUMN, RoRulesConfig
 from .fabric_lakehouse_io import (
@@ -211,16 +212,14 @@ def _parse_probability(series: pd.Series, log: Optional["_Log"] = None) -> pd.Se
 # ── Date canonicalisation (shared by both stages) ────────────────────────────
 
 def _canon_date(series: pd.Series) -> pd.Series:
-    """Parse mixed date representations (mm/dd/yyyy, ISO, Excel serial) → datetime."""
-    s = series.astype(str).str.strip()
-    s = s.replace(["nan", "NaN", "NaT", "None", "NULL", ""], pd.NA)
-    is_serial = s.str.fullmatch(r"\d+(\.0+)?", na=False)  # pure numeric ⇒ Excel serial
-    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
-    if is_serial.any():
-        out.loc[is_serial] = pd.to_datetime(
-            pd.to_numeric(s[is_serial]), origin="1899-12-30", unit="D")
-    out.loc[~is_serial] = pd.to_datetime(s[~is_serial], errors="coerce")
-    return out
+    """Parse mixed date representations (mm/dd/yyyy, ISO, Excel serial) → datetime.
+
+    Delegates to :func:`data_sources.ro_dates.canonical_date_series` so the
+    upload validator applies the identical rule.  It previously used a bare
+    ``pd.to_datetime`` and called every Excel serial unreadable, blocking runs
+    over rows this function reads without complaint.
+    """
+    return canonical_date_series(series)
 
 
 def _canon_date_str(series: pd.Series) -> pd.Series:

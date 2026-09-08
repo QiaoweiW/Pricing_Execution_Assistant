@@ -188,7 +188,7 @@ def test_unlinked_item_leaves_run_disabled_until_acknowledged(caps):
     _run_step1(caps, _Upload((_HEADER + _ROW).encode()), _master(999999))
     # The stubbed checkbox returns False → not acknowledged → still disabled.
     assert _run_button(caps)[1] is True
-    assert any("run anyway" in cb for cb in caps["checkbox"])
+    assert any("go ahead anyway" in cb for cb in caps["checkbox"])
     assert any("need your attention" in w for w in caps["warning"])
 
 
@@ -205,7 +205,10 @@ def test_step1_points_at_the_reference_file_and_offers_it_as_a_template(caps):
     assert any("template" in d.lower() for d in caps["download"])
     rendered = " ".join(caps["markdown"] + caps["captions"])
     # Named, linked, and framed as the thing to compare against.
-    assert "Distribution_Tracker_20260831_164436.csv" in rendered
+    # Assert against the constant, not a literal: the reference file gets
+    # rotated, and a hard-coded name turns that into a test failure.
+    assert page._RO_INPUT_EXAMPLE_NAME in rendered
+    assert page._RO_INPUT_EXAMPLE_URL in rendered
     assert "Append_New_History%2FArchive" in rendered
     assert "should look like the table below" in rendered
 
@@ -417,3 +420,139 @@ def test_rule_changes_point_at_the_step_1_upload():
     src = open(page.__file__, encoding="utf-8").read()
     assert "rebuild_ro_seed_from_published_history" not in src
     assert "take effect the next time you upload in Step 1" in src or            "effect the next time" in src
+
+
+# ── Step 1 · replacing RO_Item_Master in place ───────────────────────────────
+
+def test_step1_offers_an_item_master_upload(caps, monkeypatch):
+    """Both halves of the item fix — get the file, put it back — live together."""
+    calls = []
+    monkeypatch.setattr(page, "_render_ro_item_master_uploader",
+                        lambda: calls.append(1))
+    _run_step1(caps, None)
+    assert calls, "Step 1 must offer a way to upload a corrected item master"
+
+
+def test_the_item_master_uploader_is_inert_when_signed_out(caps, monkeypatch):
+    """No Fabric session → no read, no write, and no scary banner."""
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: False)
+    page._render_ro_item_master_uploader()
+    assert not any("Replace" in b[0] for b in caps["buttons"])
+    assert caps["error"] == []
+
+
+def test_the_item_master_guidance_warns_about_replacing_the_whole_list(caps,
+                                                                      monkeypatch):
+    monkeypatch.setattr(page.fabric_signin_widget, "is_fabric_signed_in",
+                        lambda: True)
+    page.st.file_uploader = lambda *a, **k: None
+    page._render_ro_item_master_uploader()
+    guidance = " ".join(caps["info"] + caps["markdown"])
+    assert "replaces the whole list" in guidance
+    assert "CSV UTF-8" in guidance
+    # The three column names a planner must not rename.
+    for col in ("Item #", "Portfolio Major", "Portfolio Minor"):
+        assert col in guidance, col
+    assert "archive" in guidance.lower()
+
+
+# ── Demand Summary · the four-step flow ──────────────────────────────────────
+
+def test_demand_summary_is_four_numbered_steps_in_order():
+    src = open(page.__file__, encoding="utf-8").read()
+    steps = [
+        "**Step 1 · Upload a new Base Plan**",
+        "**Step 2 · Download the plan files**",
+        "**Step 3 · Compare this plan with the last one**",
+        "**Step 4 · Withdraw a Base Plan upload**",
+    ]
+    positions = []
+    for step in steps:
+        assert step in src, step
+        positions.append(src.index(step))
+    assert positions == sorted(positions), "the steps must render in order"
+
+
+def test_the_destructive_withdraw_comes_after_the_uploader():
+    """It used to render FIRST — before the uploader it undoes."""
+    src = open(page.__file__, encoding="utf-8").read()
+    assert (src.index("_render_base_plan_uploader()")
+            < src.index("_render_withdraw_cycle_tool()"))
+
+
+def test_the_refresh_from_fabric_button_is_gone():
+    src = open(page.__file__, encoding="utf-8").read()
+    assert "demand_summary_refresh_from_fabric" not in src
+
+
+def test_reconciliation_runs_automatically_not_behind_a_button():
+    src = open(page.__file__, encoding="utf-8").read()
+    assert "_render_demand_reconciliation_autocheck()" in src
+    assert "▶️ Run reconciliation" not in src
+    assert "demand_reconcile_run" not in src
+    # It must still be re-runnable after a fix.
+    assert "demand_reconcile_recheck" in src
+
+
+def test_a_clean_reconciliation_reads_as_safe_to_proceed(caps, monkeypatch):
+    class _Bridge:
+        published_lbs = 92_200_000.0
+        drift_lbs = 0.0
+        ties = True
+        dropped_detail = pd.DataFrame()
+
+    monkeypatch.setattr(page, "_build_reconciliation", lambda: {"bridge": _Bridge()})
+    # The verdict is what this test is about; the waterfall it tucks into
+    # "Show me the working" has its own coverage.
+    monkeypatch.setattr(page, "_render_reconciliation_result", lambda p: None)
+    page.st.session_state.clear()
+    page._render_demand_reconciliation_autocheck()
+    assert any("the numbers add up" in s for s in caps["success"])
+    assert caps["warning"] == []
+
+
+def test_a_broken_reconciliation_tells_the_planner_to_act(caps, monkeypatch):
+    class _Bridge:
+        published_lbs = 92_200_000.0
+        drift_lbs = -2_000_000.0
+        ties = False
+        dropped_detail = pd.DataFrame()
+
+    shown = []
+    monkeypatch.setattr(page, "_build_reconciliation", lambda: {"bridge": _Bridge()})
+    monkeypatch.setattr(page, "_render_reconciliation_result", lambda p: shown.append(p))
+    page.st.session_state.clear()
+    page._render_demand_reconciliation_autocheck()
+    assert any("needs a look" in w for w in caps["warning"])
+    assert len(shown) == 1
+
+
+def test_the_bridge_runs_once_per_session(caps, monkeypatch):
+    """It rebuilds the whole plan and reads six files — never on a plain rerun."""
+    calls = []
+
+    class _Bridge:
+        published_lbs = 1.0
+        drift_lbs = 0.0
+        ties = True
+        dropped_detail = pd.DataFrame()
+
+    monkeypatch.setattr(page, "_build_reconciliation",
+                        lambda: (calls.append(1), {"bridge": _Bridge()})[1])
+    monkeypatch.setattr(page, "_render_reconciliation_result", lambda p: None)
+    page.st.session_state.clear()
+    page._render_demand_reconciliation_autocheck()
+    page._render_demand_reconciliation_autocheck()
+    assert len(calls) == 1
+
+
+def test_an_input_error_is_surfaced_not_swallowed(caps, monkeypatch):
+    monkeypatch.setattr(page, "_build_reconciliation",
+                        lambda: {"error": "Could not read the inputs."})
+    shown = []
+    monkeypatch.setattr(page, "_render_reconciliation_result", lambda p: shown.append(p))
+    page.st.session_state.clear()
+    page._render_demand_reconciliation_autocheck()
+    assert len(shown) == 1
+    assert caps["success"] == []

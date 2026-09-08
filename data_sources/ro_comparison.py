@@ -1610,6 +1610,66 @@ def fetch_ro_item_master_raw_bytes(*, force_refresh: bool = False) -> bytes:
     return _cached_item_master_raw_bytes("default")
 
 
+#: Columns ``RO_Item_Master.csv`` carries.  ``Item #`` is the join key and the
+#: two Portfolio fields place an item on a report row; the rest ride along.
+RO_ITEM_MASTER_COLUMNS: tuple = (
+    "Item #", "Item Desc", "Brand Category",
+    "Portfolio Major", "Portfolio Minor", "Supply Format",
+)
+
+#: Timestamped copies of every RO_Item_Master version, written before an
+#: overwrite so a bad upload is always recoverable.
+_RO_ITEM_MASTER_ARCHIVE_DIR: str = "RO Tracking/Archive"
+
+
+def save_ro_item_master(payload: bytes) -> tuple:
+    """Overwrite ``RO_Item_Master.csv`` in Fabric; return ``(path, archived)``.
+
+    Archive-then-overwrite, in that order: the current file is copied to
+    ``Files/RO Tracking/Archive/RO_Item_Master_<timestamp>.csv`` *before*
+    anything is replaced, so a mistaken upload is always recoverable by
+    re-uploading the archived copy.  A missing current file (first ever
+    upload) is not an error — there is simply nothing to archive.
+
+    Both Item Master caches are cleared on success so the very next read —
+    the dim cascade the upload check consults, and the portfolio enrichment
+    the comparison runs on — sees the new file rather than the 15-minute-old
+    one it would otherwise serve.
+
+    Raises :class:`RoComparisonError` on any write failure, with the archive
+    path named when one was already taken.
+    """
+    archived = ""
+    try:
+        current = _cached_item_master_raw_bytes("default")
+    except Exception:  # noqa: BLE001 — absent or unreadable: nothing to archive
+        current = b""
+    if current:
+        try:
+            archived = archive_bytes(
+                _SECRETS_SECTION, _RO_ITEM_MASTER_ARCHIVE_DIR,
+                "RO_Item_Master.csv", current,
+            )
+        except LakehouseIOError as exc:
+            raise RoComparisonError(
+                "Could not archive the current RO_Item_Master.csv, so nothing "
+                f"was overwritten: {exc}"
+            ) from exc
+
+    try:
+        write_bytes(_SECRETS_SECTION, _RO_ITEM_MASTER_BLOB_PATH, payload, etag=None)
+    except LakehouseIOError as exc:
+        raise RoComparisonError(
+            f"Could not write RO_Item_Master.csv: {exc}"
+            + (f"\n\nYour previous file is safe at `Files/{archived}`."
+               if archived else "")
+        ) from exc
+
+    _cached_item_master_df.clear()
+    _cached_item_master_raw_bytes.clear()
+    return _RO_ITEM_MASTER_BLOB_PATH, archived
+
+
 def upload_customer_input(filename: str, payload: bytes) -> str:
     """Save *payload* under ``Files/RO Tracking/Append_New_History/<filename>``.
 

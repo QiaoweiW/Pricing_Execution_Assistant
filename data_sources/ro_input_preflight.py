@@ -1,5 +1,11 @@
 """
-Pre-flight validation for an uploaded ``Distribution_Tracker.csv``.
+Pre-flight validation for the R&O uploads.
+
+Two entry points share one findings vocabulary:
+:func:`check_distribution_tracker` for the monthly tracker and
+:func:`check_ro_item_master` for the item-classification file, both returning
+a :class:`PreflightResult` — so the page renders either through the same
+panel, with the same block / acknowledge semantics and fix-list downloads.
 
 Why this module exists
 ----------------------
@@ -816,6 +822,213 @@ def check_distribution_tracker(
     return result
 
 
+# ── RO_Item_Master.csv ───────────────────────────────────────────────────────
+
+#: Without these the file classifies nothing: ``Item #`` is the join key and
+#: the two Portfolio fields are what place an item on a report row.
+ITEM_MASTER_REQUIRED: tuple = ("Item #", "Portfolio Major", "Portfolio Minor")
+
+#: Carried along and useful, but no total depends on them.
+ITEM_MASTER_OPTIONAL: tuple = ("Item Desc", "Brand Category", "Supply Format")
+
+
+def check_ro_item_master(
+    file_bytes: bytes,
+    *,
+    current_master_df: Optional[pd.DataFrame] = None,
+) -> PreflightResult:
+    """Validate a replacement ``RO_Item_Master.csv`` before it overwrites Fabric.
+
+    This upload is more dangerous than the tracker: it overwrites a shared
+    reference file every downstream classification reads, and a mistake stays
+    invisible until the next report comes out with items under no portfolio
+    row.  So the checks lean on the two things that actually break it — a
+    missing key column, and losing items the current file already classifies.
+
+    Parameters
+    ----------
+    current_master_df
+        The file being replaced.  Supplied so the check can warn when the new
+        version drops items the old one covered — the classic symptom of
+        editing a filtered view and uploading that instead of the full list.
+    """
+    result = PreflightResult()
+
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes), **_READ_KW)
+    except Exception as exc:  # noqa: BLE001
+        result.findings.append(Finding(
+            code="CANNOT_READ",
+            severity=SEVERITY_BLOCK,
+            title="This file could not be opened as a CSV",
+            means="Nothing was uploaded — the file itself has to read first.",
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=(
+                "In Excel choose **File → Save As** and pick "
+                "**CSV UTF-8 (Comma delimited) (*.csv)**.",
+                "Upload the saved CSV — not an .xlsx renamed to .csv.",
+            ),
+        ))
+        result.findings.append(Finding(
+            code="CANNOT_READ_DETAIL", severity=SEVERITY_INFO,
+            title="Technical detail (for IT, if you need to ask)",
+            means=f"{type(exc).__name__}: {exc}",
+        ))
+        return result
+
+    df.columns = [str(c).strip() for c in df.columns]
+    result.parsed = df
+    result.row_count = len(df)
+    result.rows_in_scope = len(df)
+
+    if df.empty:
+        result.findings.append(Finding(
+            code="NO_ROWS",
+            severity=SEVERITY_BLOCK,
+            title="The file has headers but no items",
+            means=(
+                "Uploading it would leave every item unclassified — every "
+                "portfolio row in the report would go blank."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=("Check you saved the sheet with its rows, then upload again.",),
+        ))
+        return result
+
+    missing = [c for c in ITEM_MASTER_REQUIRED if c not in df.columns]
+    if missing:
+        result.findings.append(Finding(
+            code="MISSING_COLUMNS",
+            severity=SEVERITY_BLOCK,
+            title=f"{len(missing)} column(s) the file cannot work without",
+            means=(
+                "**Item #** is how items are matched, and the two **Portfolio** "
+                "columns are what put an item on a row in the report. Without "
+                "them this file classifies nothing."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=(
+                "Open your file in Excel and look at the header row (row 1).",
+                "Add each column below, spelled exactly as shown — capitals "
+                "and spaces included.",
+                "Easier: download the current file with the button above and "
+                "edit that copy. Then the headers are already right.",
+                "Save as CSV (UTF-8) and upload again.",
+            ),
+            cells=pd.DataFrame({"Missing column": missing}),
+        ))
+        return result                          # later checks need these columns
+
+    optional_missing = [c for c in ITEM_MASTER_OPTIONAL if c not in df.columns]
+    if optional_missing:
+        result.findings.append(Finding(
+            code="MISSING_OPTIONAL_COLUMNS",
+            severity=SEVERITY_ACK,
+            title=f"{len(optional_missing)} extra column(s) are missing",
+            means=(
+                "Items will still classify correctly — these fields just come "
+                "through blank wherever they are shown."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=("Add them if you want those fields filled, or tick the "
+                       "box below to upload without them.",),
+            cells=pd.DataFrame({"Missing column": optional_missing}),
+        ))
+
+    keys = df["Item #"].map(canonical_cell)
+
+    blank_key = [_excel_row(i) for i, key in keys.items() if not key]
+    if blank_key:
+        result.findings.append(Finding(
+            code="BLANK_ITEM_NUMBER",
+            severity=SEVERITY_ACK,
+            title=f"{len(blank_key)} row(s) have no item number",
+            means="Those rows classify nothing and will simply be ignored.",
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=("Fill in the item number, or delete the empty rows.",),
+            cells=pd.DataFrame({"Excel row": blank_key}),
+        ))
+
+    dupes = keys[keys.ne("")].duplicated(keep=False)
+    if bool(dupes.any()):
+        dup_items = sorted(set(keys[keys.ne("")][dupes]))
+        result.findings.append(Finding(
+            code="DUPLICATE_ITEMS",
+            severity=SEVERITY_ACK,
+            title=f"{len(dup_items)} item(s) appear more than once",
+            means=(
+                "Only the **last** row for each item is used. If the copies "
+                "disagree, the one furthest down the file quietly wins."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=(
+                "Find each item below in your file (Ctrl+F).",
+                "Keep the correct row and delete the others.",
+                "Save as CSV (UTF-8) and upload again.",
+            ),
+            cells=pd.DataFrame({"Item #": dup_items}),
+        ))
+
+    unclassified = []
+    for idx in df.index:
+        if not keys[idx]:
+            continue
+        blank = [
+            c for c in ("Portfolio Major", "Portfolio Minor")
+            if not str(df.at[idx, c]).strip()
+        ]
+        if blank:
+            unclassified.append(
+                (_excel_row(idx), str(df.at[idx, "Item #"]).strip(), ", ".join(blank))
+            )
+    if unclassified:
+        result.findings.append(Finding(
+            code="UNCLASSIFIED_ROWS",
+            severity=SEVERITY_ACK,
+            title=f"{len(unclassified)} item(s) have a blank Portfolio field",
+            means=(
+                "Those items will count in Total B2C but appear under no "
+                "portfolio row, so the portfolio lines will not add up to the "
+                "total."
+            ),
+            fix_where=FIX_IN_EXCEL,
+            fix_steps=("Fill in the blank Portfolio cells listed below, or "
+                       "upload now and fix them later.",),
+            cells=pd.DataFrame(
+                unclassified, columns=["Excel row", "Item #", "Blank field(s)"],
+            ),
+        ))
+
+    if (current_master_df is not None and not current_master_df.empty
+            and "Item #" in current_master_df.columns):
+        had = set(current_master_df["Item #"].map(canonical_cell)) - {""}
+        lost = sorted(had - (set(keys) - {""}))
+        if lost:
+            result.findings.append(Finding(
+                code="ITEMS_DROPPED",
+                severity=SEVERITY_ACK,
+                title=f"{len(lost)} item(s) in the current file are missing from yours",
+                means=(
+                    "This upload **replaces** the whole file, so those items "
+                    "would stop being classified. Fine if you meant to retire "
+                    "them — but it is also exactly what happens when a "
+                    "filtered view is uploaded instead of the full list."
+                ),
+                fix_where=FIX_IN_EXCEL,
+                fix_steps=(
+                    "If you edited a filtered view, go back and upload the "
+                    "**whole** list instead.",
+                    "Safest habit: download the current file, edit that copy, "
+                    "upload it back — then nothing can go missing by accident.",
+                    "If you really are retiring these items, tick the box "
+                    "below and upload.",
+                ),
+                cells=pd.DataFrame({"Item # no longer present": lost}),
+            ))
+
+    return result
+
+
 __all__ = [
     "SEVERITY_BLOCK",
     "SEVERITY_ACK",
@@ -834,4 +1047,7 @@ __all__ = [
     "Finding",
     "PreflightResult",
     "check_distribution_tracker",
+    "check_ro_item_master",
+    "ITEM_MASTER_REQUIRED",
+    "ITEM_MASTER_OPTIONAL",
 ]

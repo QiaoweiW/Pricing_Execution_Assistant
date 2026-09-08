@@ -238,6 +238,7 @@ from data_sources.ro_comparison import (
     ro_item_master_blob_path,
     save_pipeline_review_snapshot,
     save_ro_comparison_output,
+    save_ro_item_master,
     fetch_ro_comparison_output_df,
 )
 from data_sources.ro_summary_report import (
@@ -1461,13 +1462,13 @@ def _render_ro_comparison() -> None:
 # The reference input the planner can copy the shape from.  A real archived
 # upload rather than a synthetic file, so what they see is what the app has
 # actually accepted.  Deep-linked (not read) so opening Step 1 costs no I/O.
-_RO_INPUT_EXAMPLE_NAME: str = "Distribution_Tracker_20260831_164436.csv"
+_RO_INPUT_EXAMPLE_NAME: str = "Distribution_Tracker_20260730_213739.csv"
 _RO_INPUT_EXAMPLE_URL: str = (
     "https://app.fabric.microsoft.com/groups/"
     "bb11c51d-03c8-4f1b-938c-e20657a8f31d/lakehouses/"
     "a01f513d-eee7-41eb-8c15-670bc40e7fc8?experience=fabric-developer"
     "&selectedPath=Files%2FRO%20Tracking%2FAppend_New_History%2FArchive%2F"
-    "Distribution_Tracker_20260831_164436.csv"
+    "Distribution_Tracker_20260730_213739.csv"
 )
 _RO_INPUT_ARCHIVE_URL: str = (
     _FABRIC_LAKEHOUSE_BASE
@@ -1735,8 +1736,10 @@ def _render_ro_input_contract() -> None:
 
     # RO_Item_Master sits right here, under the four checks: point 4 above is
     # the only one the planner fixes in Fabric rather than in her spreadsheet,
-    # so the file she needs is one click from the sentence that names it.
+    # so both halves of that fix — get the file, put it back — are one click
+    # from the sentence that names it.
     _render_ro_item_master_download_button(key_suffix="_step1")
+    _render_ro_item_master_uploader()
 
     st.download_button(
         "⬇️ Download the example as a blank template (CSV)",
@@ -1749,6 +1752,120 @@ def _render_ro_input_contract() -> None:
             "under these headers, delete the three example rows, and upload."
         ),
     )
+
+
+_SS_IM_PREFLIGHT: str = "_ro_item_master_preflight"
+_SS_IM_PREFLIGHT_NAME: str = "_ro_item_master_preflight_file"
+_SS_IM_ACK: str = "ro_item_master_ack"
+_SS_IM_SAVED: str = "_ro_item_master_saved_msg"
+
+
+def _render_ro_item_master_uploader() -> None:
+    """Upload a replacement ``RO_Item_Master.csv`` straight into Fabric.
+
+    The alternative — download, edit, then go to Fabric and delete-then-upload
+    by hand — is four steps in two applications, and the delete half is the
+    one that goes wrong.  Doing it here also means the file can be **checked
+    before** it lands: this overwrites a shared reference every downstream
+    classification reads, and a mistake stays invisible until the next report
+    shows items under no portfolio row.
+
+    Same gate shape as the tracker upload (blocking findings disable the
+    button, acknowledgeable ones need a tick), so a planner who has used Step 1
+    already knows how to read it.
+    """
+    with st.expander("📤 Upload a new RO_Item_Master.csv (replaces the current one)",
+                     expanded=False):
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.caption("_Sign in via **Documentation** to upload._")
+            return
+
+        st.markdown(
+            "**What this does:** replaces the item list in Fabric with yours. "
+            "Your current file is copied to an archive first, so nothing is "
+            "ever lost."
+        )
+        st.info(
+            "**Get it right in three steps:**\n\n"
+            "1. Click **⬇️ Download RO_Item_Master.csv** above — always start "
+            "from the real file, never a fresh spreadsheet.\n"
+            "2. Edit it in Excel. Add or correct rows. Keep **every** row you "
+            "still want classified — this replaces the whole list, so a row "
+            "you delete stops being classified.\n"
+            "3. Save as **CSV UTF-8 (Comma delimited)** and drop it below.\n\n"
+            "**Do not rename the columns.** `Item #`, `Portfolio Major` and "
+            "`Portfolio Minor` must keep their exact names — they are how "
+            "items get matched and placed on a report row. "
+            "`Item Desc`, `Brand Category` and `Supply Format` are along for "
+            "the ride and can be blank."
+        )
+
+        uploaded = st.file_uploader(
+            "Upload RO_Item_Master.csv",
+            type=["csv"],
+            key="ro_item_master_upload",
+        )
+
+        saved = st.session_state.pop(_SS_IM_SAVED, None)
+        if saved:
+            st.success(saved)
+
+        if uploaded is None:
+            st.session_state.pop(_SS_IM_PREFLIGHT, None)
+            st.session_state.pop(_SS_IM_PREFLIGHT_NAME, None)
+            return
+
+        cache_key = (uploaded.name, uploaded.size)
+        if st.session_state.get(_SS_IM_PREFLIGHT_NAME) != cache_key:
+            try:
+                current = fetch_ro_item_master_df()
+            except RoComparisonError:
+                current = None                 # first upload, or unreadable
+            with st.spinner("Checking your file…"):
+                st.session_state[_SS_IM_PREFLIGHT] = rpf.check_ro_item_master(
+                    uploaded.getvalue(), current_master_df=current,
+                )
+            st.session_state[_SS_IM_PREFLIGHT_NAME] = cache_key
+            st.session_state.pop(_SS_IM_ACK, None)
+
+        result = st.session_state.get(_SS_IM_PREFLIGHT)
+        may_save = _render_preflight_panel(result, ack_key=_SS_IM_ACK)
+
+        if st.button(
+            "⬆️ Replace RO_Item_Master.csv in Fabric",
+            key="ro_item_master_save",
+            type="primary",
+            disabled=not may_save,
+            help=("Archives the current file, then overwrites it with yours."
+                  if may_save else
+                  "Fix the problems above (or tick the box) to enable this."),
+        ):
+            try:
+                with st.spinner("Archiving the current file and uploading yours…"):
+                    blob_path, archived = save_ro_item_master(uploaded.getvalue())
+            except RoComparisonError as exc:
+                st.error(f"❌ Upload failed — nothing was replaced.\n\n{exc}")
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Unexpected error saving RO_Item_Master.csv")
+                st.error(
+                    "❌ Upload failed unexpectedly — nothing was replaced.\n\n"
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                rows = result.row_count if result is not None else 0
+                st.session_state[_SS_IM_SAVED] = (
+                    f"✅ Done — `Files/{blob_path}` now holds your "
+                    f"{rows:,} item(s)."
+                    + (f"  Your previous file is saved at `Files/{archived}`."
+                       if archived else "")
+                    + "  Upload your Distribution Tracker again to re-run the "
+                      "item check."
+                )
+                # The next check must read the file we just wrote, not the
+                # cached pre-upload one.
+                st.session_state.pop(_SS_RO_PREFLIGHT, None)
+                st.session_state.pop(_SS_RO_PREFLIGHT_NAME, None)
+                st.rerun(scope="app")
 
 
 def _render_ro_seed_method() -> None:
@@ -1800,7 +1917,7 @@ def _render_preflight_finding(finding) -> None:
             )
 
 
-def _render_preflight_panel(result) -> bool:
+def _render_preflight_panel(result, *, ack_key: str = None) -> bool:
     """Render the pre-flight verdict; return True when the run may proceed.
 
     The gate exists because the pipeline downstream is forgiving by design —
@@ -1873,8 +1990,8 @@ def _render_preflight_panel(result) -> bool:
         return False
 
     return st.checkbox(
-        "I understand — run anyway and classify these items later",
-        key=_SS_RO_ACK,
+        "I understand — go ahead anyway",
+        key=ack_key or _SS_RO_ACK,
     )
 
 
@@ -4758,41 +4875,82 @@ _RECON_FY_END: date = date(2027, 3, 1)
 _M_LBS: float = 1_000_000.0
 
 
-def _render_demand_reconciliation() -> None:
-    """Render the input → output bridge for the demand-plan files.
+#: Guards the automatic bridge to one run per session.  It rebuilds the plan
+#: over the full upload and reads six Fabric files, so it must never fire on
+#: an ordinary rerun — only on first arrival, or when the planner asks.
+_SS_DEMAND_BRIDGE_CHECKED: str = "_demand_bridge_autochecked"
 
-    Answers the question the raw previews above cannot: the upload and RO_Seed
-    carry more pounds than ``qry_mgmt_plan_full`` does, so *where did the rest
-    go, and is any of it a mistake?*
 
-    Everything is behind an explicit button.  The bridge re-runs the pipeline's
-    stage 2 over the full upload (~360k rows) and reads six Fabric files, which
-    is far too heavy to do on every page render — and it is a diagnostic a
-    planner reaches for deliberately, not something they need on load.
+def _reconciliation_is_clean(payload: dict) -> bool:
+    """True when the plan ties AND nothing was dropped that needs a decision."""
+    if not payload or payload.get("error"):
+        return False
+    bridge = payload.get("bridge")
+    if bridge is None:
+        return False
+    if bridge.drift_lbs is not None and not bridge.ties:
+        return False
+    detail = bridge.dropped_detail
+    if detail is None or detail.empty:
+        return True
+    return not bool((detail[RECON_COL_ACTION].str.len() > 0).any())
+
+
+def _render_demand_reconciliation_autocheck() -> None:
+    """Check the published plan against its inputs, automatically.
+
+    This used to sit behind a **Run reconciliation** button, which meant the
+    one question a planner most needs answered before reading the files —
+    *can I trust these numbers?* — was only answered by people who already
+    suspected they could not.  It now runs on arrival.
+
+    Cost is why it is guarded to once per session: the bridge rebuilds the
+    plan over the whole upload and reads six Fabric files.  A **Check again**
+    button re-runs it, which matters after a fix — otherwise the planner
+    corrects something and has no way to confirm it worked.
+
+    A clean result is one line.  A problem gets the full bridge: the
+    waterfall, the SKUs that were dropped, why, and what to do about each.
     """
-    with st.expander("🔎 Reconciliation — where the pounds went", expanded=False):
-        st.caption(
-            "Bridges **`ibp_base_plan_current.csv` + `RO_Seed.csv`** to the "
-            "published **`qry_mgmt_plan_full.csv`** / "
-            "**`qry_total_item_level_demand.csv`**, and the plan's R&O leg to "
-            "the **RO Summary's FY27 probabilized lbs**.  Rebuilds the plan "
-            "from the current inputs using the pipeline's own filters, so the "
-            "drop reasons shown are the real ones — then lists every SKU that "
-            "was dropped, why, and how to fix it."
-        )
-        if st.button(
-            "▶️ Run reconciliation",
-            key="demand_reconcile_run",
-            type="primary",
-            help="Re-reads the demand-plan inputs from Fabric and rebuilds the "
-                 "plan in memory (nothing is written).  Takes a few seconds.",
-        ):
-            with st.spinner("Reading inputs and rebuilding the demand plan…"):
-                st.session_state[_SS_DEMAND_BRIDGE_RESULT] = _build_reconciliation()
+    payload = st.session_state.get(_SS_DEMAND_BRIDGE_RESULT)
+    if not st.session_state.get(_SS_DEMAND_BRIDGE_CHECKED):
+        with st.spinner("Checking the published plan against its inputs…"):
+            payload = _build_reconciliation()
+        st.session_state[_SS_DEMAND_BRIDGE_RESULT] = payload
+        st.session_state[_SS_DEMAND_BRIDGE_CHECKED] = True
 
-        payload = st.session_state.get(_SS_DEMAND_BRIDGE_RESULT)
-        if payload is not None:
+    recheck = st.button(
+        "🔄 Check again",
+        key="demand_reconcile_recheck",
+        help="Re-reads the inputs and rebuilds the plan. Use it after fixing "
+             "something to confirm the fix worked. Nothing is written.",
+    )
+    if recheck:
+        with st.spinner("Reading inputs and rebuilding the demand plan…"):
+            payload = _build_reconciliation()
+        st.session_state[_SS_DEMAND_BRIDGE_RESULT] = payload
+
+    if payload is None:
+        return
+
+    if _reconciliation_is_clean(payload):
+        bridge = payload["bridge"]
+        st.success(
+            f"✅ **Checked — the numbers add up.** The published plan "
+            f"({bridge.published_lbs / _M_LBS:,.1f} M lbs) matches what its "
+            f"inputs produce, and nothing was dropped that needs your "
+            f"attention. The files below are safe to use."
+        )
+        with st.expander("Show me the working", expanded=False):
             _render_reconciliation_result(payload)
+        return
+
+    st.warning(
+        "⚠️ **This needs a look before you use these files.** The check below "
+        "shows where the pounds went — the lines marked with an action are "
+        "the ones to deal with; the rest are working as designed."
+    )
+    _render_reconciliation_result(payload)
 
 
 def _build_reconciliation() -> dict:
@@ -5082,79 +5240,76 @@ def _render_demand_summary() -> None:
         ):
             return
 
-        # Withdraw sits FIRST — it is the undo for the uploader directly below,
-        # so the recover-then-re-upload flow reads top-to-bottom.
-        _render_withdraw_cycle_tool()
-
-        # Upload a new Base Plan → run the in-app Demand Plan pipeline.
-        # The history tracker is appended (with the upload's authored Cycle)
-        # by that pipeline, so this Refresh button only re-reads.
-        _render_base_plan_uploader()
-
-        # Consolidated "Refresh from Fabric" button.  One click re-reads the
-        # ENTIRE section from the lakehouse — the demand summary CSVs and the
-        # Demand Plan Comparison summary below them.
-        #
-        # Why a full ``st.cache_data.clear()`` and not just
-        # ``clear_demand_summary_cache()``: the comparison pulls several
-        # *other* Fabric sources (IBP Shipments/Orders, the PDH / customer /
-        # ship-to dims, the RO Summary delta, the FY27 budget workbook)
-        # behind their own caches, and its build outputs are keyed on a cheap
-        # ``(rows, cols)`` shape signature — so a content change that leaves
-        # the shape intact would otherwise serve a stale build even after the
-        # raw reads refresh.  Flushing every ``@st.cache_data`` slot (the same
-        # primitive the Market Barometer "Refresh from Fabric" uses) is the
-        # only way to guarantee both sub-sections move together on one click.
-        if st.button(
-            "🔄 Refresh from Fabric",
-            key="demand_summary_refresh_from_fabric",
-            help=(
-                "Re-read this whole section from Microsoft Fabric — the Demand "
-                "Summary CSVs and the Demand Plan Comparison summary — "
-                "bypassing every data cache."
-            ),
+        # ── STEP 1 · Upload a new Base Plan ──────────────────────────────
+        # The section's entrance, so it comes first and opens itself. Same
+        # shape as RO Comparison Step 1: the one action that matters, at the
+        # top, with everything else folded below it.
+        with st.expander(
+            "**Step 1 · Upload a new Base Plan** — start here",
+            expanded=True,
         ):
-            st.cache_data.clear()
-            st.rerun(scope="app")
+            st.caption(
+                "Drop in the IBP base-plan export. The app rebuilds the "
+                "management plan and the item-level demand file from it, then "
+                "Steps 2 and 3 below read what it produced."
+            )
+            _render_base_plan_uploader()
 
-        # Load both files.  We catch errors PER FILE so a failure on
-        # one source doesn't hide the other (common case: one of the
-        # upstream queries is still running and its CSV is missing,
-        # while the other is already published).
-        # ── Reconciliation bridge (inputs → the two files below) ────
-        #
-        # Above the previews on purpose: it answers "can I trust these
-        # numbers?", which a planner needs before reading them, not after.
-        _render_demand_reconciliation()
+        # ── STEP 2 · Download the plan files (+ the automatic check) ─────
+        with st.expander(
+            "**Step 2 · Download the plan files** — and check they add up",
+            expanded=False,
+        ):
+            st.caption(
+                "The two published files, and a check that the numbers in them "
+                "match the inputs they were built from. The check runs on its "
+                "own — you only hear from it if something needs doing."
+            )
+            _render_demand_reconciliation_autocheck()
 
-        st.markdown("---")
-        st.markdown("")  # vertical breathing room before the first table.
-        _render_demand_summary_file(
-            title="Management Plan (Full)",
-            icon="📋",
-            fetch_fn=fetch_mgmt_plan_full,
-            blob_path_fn=mgmt_plan_full_blob_path,
-            download_basename="qry_mgmt_plan_full",
-            download_button_key="demand_summary_dl_mgmt_plan_full",
-        )
+            st.markdown("---")
+            _render_demand_summary_file(
+                title="Management Plan (Full)",
+                icon="📋",
+                fetch_fn=fetch_mgmt_plan_full,
+                blob_path_fn=mgmt_plan_full_blob_path,
+                download_basename="qry_mgmt_plan_full",
+                download_button_key="demand_summary_dl_mgmt_plan_full",
+            )
+            st.markdown("---")
+            _render_demand_summary_file(
+                title="Total Item-Level Demand",
+                icon="📦",
+                fetch_fn=fetch_total_item_level_demand,
+                blob_path_fn=total_item_level_demand_blob_path,
+                download_basename="qry_total_item_level_demand",
+                download_button_key="demand_summary_dl_total_item_level_demand",
+            )
 
-        st.markdown("---")
-        _render_demand_summary_file(
-            title="Total Item-Level Demand",
-            icon="📦",
-            fetch_fn=fetch_total_item_level_demand,
-            blob_path_fn=total_item_level_demand_blob_path,
-            download_basename="qry_total_item_level_demand",
-            download_button_key="demand_summary_dl_total_item_level_demand",
-        )
+        # ── STEP 3 · Demand Plan Comparison ──────────────────────────────
+        with st.expander(
+            "**Step 3 · Compare this plan with the last one** — what changed",
+            expanded=False,
+        ):
+            st.caption(
+                "Cycle-over-cycle and year-over-year movement, with the "
+                "drivers behind each line."
+            )
+            _render_demand_plan_comparison_section()
 
-        # ── Demand Plan Comparison Summary (cycle-over-cycle) ───────
-        #
-        # Pulls plan numbers from the plan-history tracker, actuals from
-        # IBP Shipments, and dimensions/brand from PDH — see
-        # ``demand_plan_comparison``.
-        st.markdown("---")
-        _render_demand_plan_comparison_section()
+        # ── STEP 4 · Withdraw ────────────────────────────────────────────
+        # The undo, quarantined at the bottom out of the happy path — it was
+        # previously the FIRST thing in the section, so a first-time planner
+        # reading top-to-bottom met the destructive tool before the uploader.
+        with st.expander(
+            "**Step 4 · Withdraw a Base Plan upload** — undo and start over",
+            expanded=False,
+        ):
+            st.caption(
+                "Uploaded the wrong file, or the wrong cycle? Withdraw it "
+                "here, then go back to Step 1 and upload the right one."
+            )
+            _render_withdraw_cycle_tool()
 
 
 # Session key holding the last upload-build result so download / preview

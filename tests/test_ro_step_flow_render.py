@@ -32,6 +32,11 @@ class _Ctx:
 _ST = MagicMock()
 _ST.session_state = {}
 _ST.fragment = lambda f: f
+# Pass-through caching decorators.  They are applied at IMPORT time, so a
+# MagicMock here would replace the decorated function itself — the page's
+# cached helpers would return a Mock instead of their value.
+_ST.cache_data = lambda *a, **k: (lambda fn: fn)
+_ST.cache_resource = lambda *a, **k: (lambda fn: fn)
 _ST.columns = lambda spec, **k: [
     _Ctx() for _ in (spec if isinstance(spec, (list, tuple)) else range(spec))
 ]
@@ -556,3 +561,61 @@ def test_an_input_error_is_surfaced_not_swallowed(caps, monkeypatch):
     page._render_demand_reconciliation_autocheck()
     assert len(shown) == 1
     assert caps["success"] == []
+
+
+# ── The reference example is the real file, not an invented one ──────────────
+
+def test_the_example_is_the_real_archived_tracker():
+    """Copied verbatim from the lakehouse: header + first three rows.
+
+    An invented example is worse than none — a planner matches her export
+    against it column-for-column, so a made-up shape sends her to "fix" a file
+    that was already correct.
+    """
+    df, raw = page._ro_input_example()
+    assert df is not None, "the example CSV must ship with the repo"
+    assert len(df) == 3, "three rows, as the guidance says"
+    # The real tracker's own spellings — NOT the pipeline's internal names.
+    for col in ("Sales Manager", "Customer", "Last Updated", "Add / Delete",
+                "Taxonomy", "Item Desc", "Item #", "Pipeline Status",
+                "Reflected in APS", "Anticipated Annual Lbs. Vol",
+                "Annual PC $", "Total Anticipated Slotting Costs", "Month"):
+        assert col in df.columns, col
+    assert raw, "the template download needs the bytes"
+
+
+def test_the_example_carries_every_column_the_checks_need():
+    """Whatever the validator can block on must be visible in the example."""
+    from data_sources import ro_input_preflight as pf
+
+    df, _ = page._ro_input_example()
+    renamed = df.rename(columns=pf.HEADER_ALIASES)
+    for col in pf.CRITICAL_COLUMNS:
+        assert col in renamed.columns, col
+    assert pf.MONTH_COLUMN in renamed.columns
+
+
+def test_the_template_is_byte_identical_to_the_example():
+    """One file serves both, so the table and the download cannot drift."""
+    df, raw = page._ro_input_example()
+    import io as _io
+    import pandas as _pd
+    assert _pd.read_csv(_io.BytesIO(raw), dtype=str,
+                        keep_default_na=False).equals(df)
+
+
+def test_the_template_passes_its_own_validator():
+    """A template that the gate would reject is a trap."""
+    from data_sources import ro_input_preflight as pf
+
+    _df, raw = page._ro_input_example()
+    assert pf.check_distribution_tracker(raw).ok_to_run
+
+
+def test_a_missing_example_file_does_not_break_step_1(caps, monkeypatch):
+    """The guidance stands on its own; the table is a bonus."""
+    monkeypatch.setattr(page, "_ro_input_example", lambda: (None, b""))
+    _run_step1(caps, None)
+    rendered = " ".join(caps["markdown"] + caps["captions"])
+    assert page._RO_INPUT_EXAMPLE_URL in rendered
+    assert not any("template" in d.lower() for d in caps["download"])

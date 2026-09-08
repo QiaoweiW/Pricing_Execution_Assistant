@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import io
 import logging
+from functools import lru_cache
+from pathlib import Path
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Callable, Optional
@@ -1475,20 +1477,48 @@ _RO_INPUT_ARCHIVE_URL: str = (
     + "&selectedPath=Files%2FRO%20Tracking%2FAppend_New_History%2FArchive"
 )
 
-# Three rows in the exact column order the app expects.  Doubles as the
-# downloadable template, so a planner whose own export has drifted can start
-# from a file the app is guaranteed to recognise.
-_RO_INPUT_EXAMPLE_CSV: str = (
-    "Month,Format,Customer,Taxonomy,Brand,Item #,Item Desc,Probability,"
-    "First Ship Date,Reflected in APS,Pipeline Status,"
-    "Anticipated Annual Lbs. Vol,Annual PC $,Total Anticipated Slotting Costs\n"
-    "2026-06-01,HTST,Walmart,Retail,Private Label,340021,"
-    "50 HTST Generic Item Jug,0.25,2027-01-01,No,Presented,23027714.3,0,0\n"
-    "2026-06-01,ESL,Costco,Club,Branded,342060,"
-    "DG OF Choc 2pc 59oz Disp UP,0.5,2027-01-01,No,Presented,2737394.4,0,15000\n"
-    "2026-06-01,Butter,Medosweet,Foodservice,Private Label,310678,"
-    "DG Btr Elg 30-1lb,0.25,2027-02-01,No,Bid Submitted,4394000,0,0\n"
+# The header plus first three rows of the reference upload above, copied
+# verbatim from the lakehouse — all 42 columns, in the file's own order, with
+# its own spellings (``Anticipated Annual Lbs. Vol``, not ``Lbs./yr``).
+#
+# Kept as a CSV in the repo rather than a string literal in this module: at 42
+# columns a literal is unreadable and impossible to diff, and holding the real
+# bytes means the same file serves both the on-screen example and the
+# downloadable template without a round-trip through pandas.
+_RO_INPUT_EXAMPLE_FILE: Path = (
+    Path(__file__).parent.parent
+    / "example_files" / "RO Comparison" / "Distribution_Tracker_EXAMPLE.csv"
 )
+
+
+@lru_cache(maxsize=1)
+def _ro_input_example_bytes() -> bytes:
+    """The reference CSV's bytes, read once per process (``b""`` if absent).
+
+    ``functools.lru_cache`` rather than ``st.cache_data``: this is a 1.6 KB
+    file that ships with the code, so it needs no cache invalidation, no
+    spinner and no Streamlit at all — and a plain memo cannot be defeated by
+    a test stubbing the decorator away.
+    """
+    try:
+        return _RO_INPUT_EXAMPLE_FILE.read_bytes()
+    except OSError as exc:
+        logger.warning("Distribution Tracker example unavailable: %s", exc)
+        return b""
+
+
+def _ro_input_example() -> tuple:
+    """Return ``(frame, bytes)`` for the reference upload, or ``(None, b"")``.
+
+    Parsed fresh per call — three rows, so the cost is nil, and the caller
+    cannot poison a shared frame by mutating it.  A missing file is not worth
+    breaking Step 1 over: the guidance below the table stands on its own, so
+    the caller simply skips the table.
+    """
+    raw = _ro_input_example_bytes()
+    if not raw:
+        return None, b""
+    return pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False), raw
 
 # What ▶️ Run RO_Seed does, written so it can be rebuilt in a spreadsheet.
 # Folded into Step 1 rather than living as its own module-level section: the
@@ -1701,18 +1731,29 @@ def _render_ro_input_contract() -> None:
     ``RO_Comparison_Output.csv`` wrong — everything else the pre-flight will
     tell them about, on their actual file, with the row number.
     """
+    example_df, example_bytes = _ro_input_example()
+
     st.markdown("**1 · Your upload file should look like the table below:**")
-    st.dataframe(
-        pd.read_csv(io.StringIO(_RO_INPUT_EXAMPLE_CSV), dtype=str),
-        use_container_width=True, hide_index=True,
-    )
-    st.caption(
-        f"The first three rows of **{_RO_INPUT_EXAMPLE_NAME}**, the last "
-        f"Distribution Tracker the app accepted — same columns, same formats, "
-        f"your rows underneath. "
-        f"[Open the file in Fabric]({_RO_INPUT_EXAMPLE_URL}) · "
-        f"[browse every past upload]({_RO_INPUT_ARCHIVE_URL})"
-    )
+    if example_df is not None:
+        # All 42 columns, scrolled sideways rather than trimmed: the point is
+        # to let a planner match her export column-for-column, and a curated
+        # subset would hide exactly the column she is missing.
+        st.dataframe(example_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"The first three rows of **{_RO_INPUT_EXAMPLE_NAME}**, the last "
+            f"Distribution Tracker the app accepted — {len(example_df.columns)} "
+            f"columns, scroll sideways to see them all. Same columns, same "
+            f"formats, your rows underneath. "
+            f"[Open the full file in Fabric]({_RO_INPUT_EXAMPLE_URL}) · "
+            f"[browse every past upload]({_RO_INPUT_ARCHIVE_URL})"
+        )
+    else:
+        st.caption(
+            f"[Open **{_RO_INPUT_EXAMPLE_NAME}** in Fabric]"
+            f"({_RO_INPUT_EXAMPLE_URL}) — the last Distribution Tracker the app "
+            f"accepted. Match its columns and formats. · "
+            f"[browse every past upload]({_RO_INPUT_ARCHIVE_URL})"
+        )
 
     st.info(
         "**You do not need to audit every column — or every row.** The check "
@@ -1741,17 +1782,19 @@ def _render_ro_input_contract() -> None:
     _render_ro_item_master_download_button(key_suffix="_step1")
     _render_ro_item_master_uploader()
 
-    st.download_button(
-        "⬇️ Download the example as a blank template (CSV)",
-        data=_RO_INPUT_EXAMPLE_CSV.encode("utf-8"),
-        file_name="Distribution_Tracker_TEMPLATE.csv",
-        mime="text/csv",
-        key="ro_input_template_dl",
-        help=(
-            "Use this when your own export is not recognised: paste your rows "
-            "under these headers, delete the three example rows, and upload."
-        ),
-    )
+    if example_bytes:
+        st.download_button(
+            "⬇️ Download this example as a template (CSV)",
+            data=example_bytes,
+            file_name="Distribution_Tracker_TEMPLATE.csv",
+            mime="text/csv",
+            key="ro_input_template_dl",
+            help=(
+                "Use this when your own export is not recognised: paste your "
+                "rows under these headers, delete the three example rows, add "
+                "your Month, and upload."
+            ),
+        )
 
 
 _SS_IM_PREFLIGHT: str = "_ro_item_master_preflight"

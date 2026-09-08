@@ -26,6 +26,10 @@ venv/
 !Pricing Quote Agent/current_pricing_data.duckdb
 !current_pricing_data.duckdb
 !pricing_data.parquet
+# Reference extracts the APP ITSELF renders — three rows each, shipped with the
+# code so the guidance works on a fresh deploy.  Without this exception the
+# blanket *.csv rule silently drops them and the examples vanish in production.
+!example_files/**/*.csv
 
 # Output files
 Output/

@@ -22,11 +22,27 @@ import pytest
 
 
 class _Ctx:
+    """Stands in for a column / container.
+
+    Carries the handful of element methods the page calls *on* a column
+    (rather than on ``st``), so a real exception inside the block still
+    propagates instead of being swallowed by a MagicMock.
+    """
+
     def __enter__(self):
         return self
 
     def __exit__(self, *a):
         return False
+
+    def metric(self, *a, **k):
+        return None
+
+    def markdown(self, *a, **k):
+        return None
+
+    def caption(self, *a, **k):
+        return None
 
 
 _ST = MagicMock()
@@ -698,36 +714,170 @@ def test_the_source_fix_is_still_reachable_after_declining(caps):
     assert "come in on their own next time" in labels
 
 
-# ── Root-cause analysis is rendered before the item list ─────────────────────
+# ── Step 2 reads as three numbered tasks ─────────────────────────────────────
 
-def test_the_rca_leads_with_the_cause(caps, monkeypatch):
-    from datetime import date as _date
+
+def _bridge(published=None, rebuilt=None, ties=True, drops=None):
+    """A DemandPlanBridge stand-in — only the fields the renderer reads."""
+    class _B:
+        drift_lbs = None if published is None else (published - rebuilt)
+        published_lbs = published
+        output_lbs = rebuilt
+        dropped_detail = pd.DataFrame() if drops is None else drops
+    _B.ties = ties
+    return _B()
+
+
+def _ro(delta=0.0, detail=None):
+    class _R:
+        ro_summary_lbs = 1_000_000.0
+        plan_lbs = 1_000_000.0 - delta
+        delta_lbs = delta
+    _R.detail = pd.DataFrame() if detail is None else detail
+    return _R()
+
+
+def _payload(**over):
+    base = {"bridge": _bridge(2_576_480_000.0, 2_576_080_000.0, ties=False),
+            "ro_bridge": _ro(), "ro_available": True}
+    base.update(over)
+    return base
+
+
+def test_step_2_renders_exactly_three_numbered_tasks(caps, monkeypatch):
+    monkeypatch.setattr(page, "_render_dropped_sku_decision", lambda a: None)
+    monkeypatch.setattr(page, "_render_ro_item_detail", lambda r: None)
+    page.st.session_state.clear()
+    page._render_reconciliation_result(_payload())
+    headings = [m for m in caps["markdown"] if m.startswith("##### ")]
+    assert len(headings) == 3, headings
+    assert headings[0].startswith("##### 1 · SKUs the plan left out")
+    assert headings[1].startswith("##### 2 · The full drop list")
+    assert headings[2].startswith("##### 3 · Are these files current?")
+
+
+def test_the_decision_comes_first(caps, monkeypatch):
+    """The planner's call leads; everything else is downstream of it."""
+    order = []
+    monkeypatch.setattr(page, "_render_dropped_sku_decision",
+                        lambda a: order.append("decision"))
+    monkeypatch.setattr(page, "_render_drop_list", lambda d: order.append("drops"))
+    monkeypatch.setattr(page, "_render_plan_freshness",
+                        lambda *a, **k: order.append("freshness"))
+    page.st.session_state.clear()
+    page._render_reconciliation_result(_payload())
+    assert order == ["decision", "drops", "freshness"]
+
+
+def test_the_waterfall_and_dropped_by_design_are_gone():
+    src = open(page.__file__, encoding="utf-8").read()
+    assert "Input — Base Plan + R&O" not in src
+    assert "Dropped by design" not in src
+    assert "= Demand plan" not in src
+
+
+def test_the_headline_names_which_tasks_need_the_planner(caps, monkeypatch):
+    monkeypatch.setattr(page, "_render_dropped_sku_decision", lambda a: None)
+    monkeypatch.setattr(page, "_render_ro_item_detail", lambda r: None)
+    page.st.session_state.clear()
+    page._render_reconciliation_result(
+        _payload(bridge=_bridge(100.0, 90.0, ties=False, drops=_actionable("1")))
+    )
+    warn = " ".join(caps["warning"])
+    assert "2 of the 3 checks below need you" in warn
+    assert "a decision" in warn and "out of date" in warn
+
+
+def test_all_clear_says_nothing_needs_doing(caps, monkeypatch):
+    monkeypatch.setattr(page, "_render_dropped_sku_decision", lambda a: None)
+    monkeypatch.setattr(page, "_render_ro_item_detail", lambda r: None)
+    page.st.session_state.clear()
+    page._render_reconciliation_result(
+        _payload(bridge=_bridge(100.0, 100.0, ties=True))
+    )
+    assert any("Nothing needs doing" in s for s in caps["success"])
+
+
+# ── Task 2 · the drop list is a download, not a wall of rows ─────────────────
+
+def test_the_drop_list_is_offered_as_a_download_only(caps):
+    from data_sources.demand_plan_reconcile import COL_ITEM, COL_GATE, COL_ACTION
+    detail = pd.DataFrame({COL_ITEM: ["1", "2"], COL_GATE: ["Not B2C"] * 2,
+                           COL_ACTION: ["", ""]})
+    page._render_drop_list(detail)
+    assert any("Full SKU-level drop list" in d for d in caps["download"])
+    # No table: the by-design drops are the bulk and are not actionable.
+    assert any("audit" in c for c in caps["captions"])
+
+
+def test_no_drops_means_no_list(caps):
+    page._render_drop_list(pd.DataFrame())
+    assert caps["download"] == []
+
+
+# ── Task 3 · the regenerate instruction ──────────────────────────────────────
+
+def test_a_stale_plan_says_regenerate_and_names_the_one_action(caps):
+    page._render_plan_freshness(
+        _bridge(2_576_480_000.0, 2_576_080_000.0, ties=False), _ro(), False)
+    assert any("out of date" in e for e in caps["error"])
+    said = " ".join(caps["markdown"])
+    assert "Step 1 · Upload a new Base Plan" in said
+    assert "RO_Seed.csv" in said
+    # Both outputs are named, so nobody regenerates one and forgets the other.
+    assert "qry_mgmt_plan_full.csv" in said
+    assert "qry_total_item_level_demand.csv" in said
+    # And the wrong fix is ruled out explicitly.
+    assert "not** edit the `qry` files by hand" in said
+
+
+def test_a_current_plan_says_so_without_instructions(caps):
+    page._render_plan_freshness(_bridge(100.0, 100.0, ties=True), _ro(), False)
+    assert any("Up to date" in s for s in caps["success"])
+    assert not any("Step 1" in m for m in caps["markdown"])
+
+
+def test_nothing_published_yet_is_not_an_error(caps):
+    page._render_plan_freshness(_bridge(None, 100.0, ties=True), _ro(), False)
+    assert caps["error"] == []
+    assert any("Nothing is published yet" in i for i in caps["info"])
+
+
+def test_the_ro_section_shows_the_item_detail_directly(caps, monkeypatch):
+    """No fold, no cause table — the item list is what the section is for."""
     from data_sources.demand_plan_reconcile import (
         COL_DELTA, COL_ITEM, COL_PLAN_LBS, COL_RO_SUMMARY_LBS, COL_STATUS,
-        RoFiscalBridge,
     )
+    shown = []
+    monkeypatch.setattr(page, "_render_ro_item_detail", lambda r: shown.append(r))
+    detail = pd.DataFrame([{
+        COL_ITEM: "370089", COL_RO_SUMMARY_LBS: 249_736.0, COL_PLAN_LBS: 301_007.0,
+        COL_DELTA: -51_271.0, COL_STATUS: "Both, but the plan carries more",
+    }])
+    page._render_plan_freshness(_bridge(100.0, 100.0, ties=True),
+                                _ro(-51_271.0, detail), True, pd.DataFrame())
+    assert len(shown) == 1, "the item-by-item detail must render, unfolded"
+    assert not any("Item-by-item detail" in lbl for lbl, _ in caps["expanders"])
 
+
+def test_the_ro_gap_is_explained_in_one_line(caps, monkeypatch):
+    """The root-cause headline survives as a caption, not a second table."""
+    from data_sources.demand_plan_reconcile import (
+        COL_DELTA, COL_ITEM, COL_PLAN_LBS, COL_RO_SUMMARY_LBS, COL_STATUS,
+    )
+    monkeypatch.setattr(page, "_render_ro_item_detail", lambda r: None)
     detail = pd.DataFrame([{
         COL_ITEM: "830109", COL_RO_SUMMARY_LBS: 792_000.0, COL_PLAN_LBS: 0.0,
         COL_DELTA: 792_000.0, COL_STATUS: "In RO Summary, absent from the plan",
     }])
-    bridge = RoFiscalBridge(fiscal_start=_date(2026, 4, 1),
-                            fiscal_end=_date(2027, 3, 31),
-                            ro_summary_lbs=792_000.0, plan_lbs=0.0, detail=detail)
-    page._render_ro_delta_rca(bridge, pd.DataFrame())
-    rendered = " ".join(caps["markdown"] + caps["warning"] + caps["captions"])
-    assert "root-cause analysis" in rendered
-    assert "gap is" in rendered
-    assert "nothing is unaccounted for" in rendered
+    page._render_plan_freshness(_bridge(100.0, 100.0, ties=True),
+                                _ro(792_000.0, detail), True, pd.DataFrame())
+    caption = " ".join(caps["captions"])
+    assert "gap is" in caption
+    assert "older RO_Seed" in caption
 
 
-def test_the_rca_renders_nothing_when_the_bridge_ties(caps):
-    from datetime import date as _date
-    from data_sources.demand_plan_reconcile import RoFiscalBridge
-
-    bridge = RoFiscalBridge(fiscal_start=_date(2026, 4, 1),
-                            fiscal_end=_date(2027, 3, 31),
-                            ro_summary_lbs=0.0, plan_lbs=0.0,
-                            detail=pd.DataFrame())
-    page._render_ro_delta_rca(bridge, pd.DataFrame())
-    assert caps["markdown"] == [] and caps["warning"] == []
+def test_a_missing_ro_summary_is_a_caption_not_a_scare(caps):
+    page._render_plan_freshness(_bridge(100.0, 100.0, ties=True), _ro(), False)
+    assert caps["warning"] == []
+    assert any("RO_Comparison_Output.csv" in c for c in caps["captions"])

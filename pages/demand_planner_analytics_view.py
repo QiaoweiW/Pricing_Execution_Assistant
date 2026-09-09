@@ -5198,53 +5198,31 @@ def _lakehouse_file_url(path: str) -> str:
             + "&selectedPath=" + quote(f"Files/{path}", safe=""))
 
 
-def _render_ro_delta_rca(ro_bridge, dropped_detail: pd.DataFrame) -> None:
-    """Explain the RO Summary ↔ plan gap: what is causing it, worst first.
-
-    The per-item table below answers "which items differ".  This answers the
-    question a planner actually has when looking at a multi-million-pound gap:
-    *what is causing it, and which cause do I chase first?*  Lines the plan
-    never received are joined back to the drop ledger, so the row names the
-    gate that removed them instead of sending the planner off to correlate two
-    tables by hand.
-    """
-    analysis = analyse_ro_delta(ro_bridge, dropped_detail)
-    if analysis.causes.empty:
-        return
-
-    st.markdown("**Why they differ** _(root-cause analysis)_")
-    if analysis.is_material:
-        st.warning(f"🔍 {analysis.headline}")
-    else:
-        st.info(f"🔍 {analysis.headline}  The gap is small enough to ignore.")
-
-    st.dataframe(
-        analysis.causes[["Cause", "Root cause", "Items", "M lbs", "Share of gap"]]
-        .style.format({"Items": "{:,.0f}", "M lbs": "{:+,.3f}",
-                       "Share of gap": "{:.0%}"}),
-        use_container_width=True, hide_index=True,
-    )
-    st.caption(
-        f"Causes sum to **{analysis.explained_lbs / _M_LBS:+,.2f} M lbs**, "
-        f"which is the whole gap — nothing is unaccounted for. Work down the "
-        f"list: the top row is the one worth fixing first."
-    )
-    with st.expander("What to do about each", expanded=False):
-        for _i, row in analysis.causes.iterrows():
-            st.markdown(f"**{row['Cause']}** — {row['M lbs']:+,.3f} M lbs")
-            if row["Root cause"]:
-                st.markdown(f"_{row['Root cause']}_")
-            st.markdown(row["What to do"])
+def _plan_is_stale(bridge) -> bool:
+    """True when the published files no longer match the inputs they came from."""
+    return bridge.drift_lbs is not None and not bridge.ties
 
 
 def _render_reconciliation_result(payload: dict) -> None:
-    """Render the bridge: the waterfall, what needs fixing, and the RO tie-out.
+    """Render the check as three tasks, in the order a planner acts on them.
 
-    Deliberately asymmetric.  Drops that are working as designed (zero-pound
-    padding, months past the horizon, genuine B2B items) collapse to a single
-    line each — a planner does not need a 300-row table to be told the plan
-    correctly excluded bulk butter.  Only the actionable half gets a table, and
-    the per-SKU list lives in the CSV rather than being duplicated on screen.
+    This used to be one column of findings — a drift banner, a waterfall, a
+    drop table, a set of expected-drop bullets, then an RO tie-out — and the
+    planner had to read all of it to work out which parts wanted them. Almost
+    none of it did.
+
+    There are only ever three things here, so they are numbered and each one
+    carries its own status:
+
+      1. SKUs the build could not place — a decision only the planner can make.
+      2. The full drop list — reference, never an action.
+      3. Whether the published files are still current — and if not, the one
+         thing that fixes it.
+
+    The waterfall and the dropped-by-design breakdown are gone: they explained
+    the arithmetic of a plan that was working correctly, which is not what
+    anyone opens this panel to find out. Both still live in the drop-list CSV
+    for anyone auditing it.
     """
     if payload.get("error"):
         st.warning(payload["error"])
@@ -5254,78 +5232,135 @@ def _render_reconciliation_result(payload: dict) -> None:
     detail = bridge.dropped_detail
     actionable = (detail.loc[detail[RECON_COL_ACTION].str.len() > 0]
                   if not detail.empty else detail)
-    expected = (detail.loc[detail[RECON_COL_ACTION].str.len() == 0]
-                if not detail.empty else detail)
+    ro = payload["ro_bridge"]
+    ro_available = bool(payload.get("ro_available"))
 
-    # ── Headline: does the published file tie to its inputs? ────────────
-    drift = bridge.drift_lbs
-    if drift is None:
-        st.info("ℹ️ Nothing published to compare against — the figures below "
-                "are what the next upload will produce.")
-    elif bridge.ties:
-        st.success(f"✅ The published plan ties to its inputs "
-                   f"({bridge.published_lbs / _M_LBS:,.1f} M lbs).")
-    else:
-        st.error(
-            f"❌ Published **{bridge.published_lbs / _M_LBS:,.1f} M** vs rebuilt "
-            f"**{bridge.output_lbs / _M_LBS:,.1f} M** ({drift / _M_LBS:+,.2f} M). "
-            "The published file was built from **different inputs** than the "
-            "ones on the lakehouse now — usually `RO_Seed.csv` regenerated, or "
-            "the RO rules changed, after the plan was built. Re-upload the Base "
-            "Plan so both come from one source."
-        )
+    undecided = (not actionable.empty
+                 and st.session_state.get(_SS_DROP_DECISION) is None)
+    stale = _plan_is_stale(bridge)
 
-    # ── The waterfall ───────────────────────────────────────────────────
-    rows = [{"Step": "Input — Base Plan + R&O", "Rows": bridge.input_rows,
-             "M lbs": bridge.input_lbs / _M_LBS}]
-    rows += [{"Step": f"− {s.label}", "Rows": -s.rows, "M lbs": -s.lbs / _M_LBS}
-             for s in bridge.steps if s.rows]
-    rows.append({"Step": "= Demand plan", "Rows": bridge.output_rows,
-                 "M lbs": bridge.output_lbs / _M_LBS})
-    st.dataframe(
-        pd.DataFrame(rows).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.1f}"}),
-        use_container_width=True, hide_index=True,
-    )
-    st.caption(
-        f"Forward window ends **{payload['window_end']:%b %Y}** "
-        f"(meeting month {payload['meeting_month']:%b %Y} + "
-        f"{_DEFAULT_FORWARD_WINDOW_MONTHS} months) — plan months on or after "
-        "that are cut. The R&O leg is expanded 36 months from the RO calendar "
-        "anchor and then cut at the same point, so its tail drops too."
-    )
+    _render_check_headline(undecided, stale)
 
-    # ── The SKUs left out: a decision, not an error ─────────────────────
+    st.markdown("---")
+    st.markdown("##### 1 · SKUs the plan left out — your call"
+                + ("  🔴" if undecided else "  ✅"))
     _render_dropped_sku_decision(actionable)
 
-    # ── Expected drops: one line each, no table ─────────────────────────
-    if not expected.empty:
-        summary = (
-            expected.groupby(RECON_COL_GATE)
-            .agg(skus=(RECON_COL_ITEM, "nunique"), lbs=(RECON_COL_LBS, "sum"))
-            .sort_values("lbs", key=abs, ascending=False)
-        )
-        st.markdown("**Dropped by design** _(no action needed)_")
-        st.markdown("\n".join(
-            f"- {issue} — **{int(r.skus):,} SKU(s)**, {r.lbs / _M_LBS:,.1f} M lbs"
-            for issue, r in summary.iterrows()
-        ))
+    st.markdown("---")
+    st.markdown("##### 2 · The full drop list — reference")
+    _render_drop_list(detail)
 
-    if not detail.empty:
-        st.download_button(
-            "⬇️ Full SKU-level drop list (CSV)",
-            data=detail.drop(columns=[RECON_COL_LINK]).to_csv(index=False).encode("utf-8"),
-            file_name=f"demand_plan_dropped_skus_{date.today():%Y%m%d}.csv",
-            mime="text/csv", key="demand_reconcile_dl_drops",
+    st.markdown("---")
+    st.markdown("##### 3 · Are these files current?"
+                + ("  🔴" if stale else "  ✅"))
+    _render_plan_freshness(bridge, ro, ro_available, detail)
+
+
+def _render_check_headline(undecided: bool, stale: bool) -> None:
+    """One line naming which of the three tasks actually want the planner."""
+    todo = []
+    if undecided:
+        todo.append("**1** (a decision)")
+    if stale:
+        todo.append("**3** (the files are out of date)")
+    if not todo:
+        st.success(
+            "✅ **Nothing needs doing.** All three checks below are clear — "
+            "the files are current, and every row the build dropped was "
+            "dropped by design."
+        )
+        return
+    st.warning(
+        f"⚠️ **{len(todo)} of the 3 checks below need you** — "
+        + " and ".join(todo)
+        + ".  The rest is reference."
+    )
+
+
+def _render_drop_list(detail: pd.DataFrame) -> None:
+    """The complete drop ledger, as one download.
+
+    Every row the build removed and why — the by-design ones (zero-pound
+    padding, months past the horizon, B2B items) as well as the ones needing a
+    decision. Deliberately not rendered on screen: the by-design drops are the
+    overwhelming majority, and reading them tells a planner nothing they can
+    act on. Anyone auditing the arithmetic wants it in Excel anyway.
+    """
+    if detail is None or detail.empty:
+        st.caption("_The build dropped nothing — there is no list to review._")
+        return
+    st.caption(
+        f"Every row the build removed and why — "
+        f"**{detail[RECON_COL_ITEM].nunique():,} SKU(s)** across "
+        f"{len(detail):,} line(s), including the ones dropped on purpose. "
+        f"Open it in Excel if you want to audit what the plan excluded."
+    )
+    st.download_button(
+        "⬇️ Full SKU-level drop list (CSV)",
+        data=detail.drop(columns=[RECON_COL_LINK], errors="ignore")
+                   .to_csv(index=False).encode("utf-8"),
+        file_name=f"demand_plan_dropped_skus_{date.today():%Y%m%d}.csv",
+        mime="text/csv", key="demand_reconcile_dl_drops",
+    )
+
+
+def _render_plan_freshness(
+    bridge, ro, ro_available: bool, dropped_detail: pd.DataFrame = None,
+) -> None:
+    """Are the published files built from today's inputs — and if not, what to do.
+
+    This catches a real, silent problem: ``RO_Seed.csv`` is rebuilt whenever a
+    Distribution Tracker is uploaded or the RO rules change, and the two
+    ``qry`` files do NOT follow on their own. They keep serving the older R&O
+    numbers until someone re-runs the plan, and nothing else in the app says
+    so.
+
+    The instruction is deliberately singular. There is exactly one action —
+    re-upload the Base Plan in Step 1 — and editing the qry files by hand is
+    never the right response here, so nothing else is offered.
+    """
+    if not _plan_is_stale(bridge):
+        if bridge.drift_lbs is None:
+            st.info(
+                "ℹ️ Nothing is published yet to compare against — the figures "
+                "here are what your next upload will produce."
+            )
+        else:
+            st.success(
+                f"✅ **Up to date.** The published files "
+                f"({bridge.published_lbs / _M_LBS:,.1f} M lbs) match what "
+                f"today's inputs produce. Nothing to regenerate."
+            )
+    else:
+        st.error(
+            f"🔴 **These files are out of date — regenerate them.** Published "
+            f"**{bridge.published_lbs / _M_LBS:,.1f} M lbs** vs "
+            f"**{bridge.output_lbs / _M_LBS:,.1f} M lbs** from today's inputs "
+            f"({bridge.drift_lbs / _M_LBS:+,.2f} M)."
+        )
+        st.markdown(
+            "**Why this happens:** `RO_Seed.csv` gets rebuilt every time a "
+            "Distribution Tracker is uploaded or the RO rules change. The two "
+            "`qry` files do **not** rebuild themselves, so they are still "
+            "serving the older R&O numbers.\n\n"
+            "**What to do — one thing:**\n"
+            "1. Go up to **Step 1 · Upload a new Base Plan**.\n"
+            "2. Upload the Base Plan again — the same file is fine.\n"
+            "3. That reruns the plan against the current `RO_Seed.csv` and "
+            "rewrites **both** `qry_mgmt_plan_full.csv` and "
+            "`qry_total_item_level_demand.csv`.\n"
+            "4. Come back here and press **🔄 Check again** — this turns "
+            "green.\n\n"
+            "Do **not** edit the `qry` files by hand for this. Regenerating is "
+            "the fix, and a hand edit would be overwritten by the next run."
         )
 
-    # ── R&O vs the RO Summary ───────────────────────────────────────────
-    ro = payload["ro_bridge"]
-    st.markdown("**R&O vs the RO Summary (FY27 probabilized)**")
-    if not payload.get("ro_available"):
-        st.warning(
-            "⚠️ `RO_Comparison_Output.csv` is missing or empty — no RO Summary "
-            "side to reconcile against. Publish the RO Comparison above, then "
-            "re-run."
+    st.markdown("**R&O vs the RO Summary (FY27 probabilized)** — item by item")
+    if not ro_available:
+        st.caption(
+            "_`RO_Comparison_Output.csv` is missing or empty, so there is no "
+            "RO Summary side to compare against. Publish the RO Comparison in "
+            "the section above, then press Check again._"
         )
         return
     c1, c2, c3 = st.columns(3)
@@ -5335,14 +5370,13 @@ def _render_reconciliation_result(payload: dict) -> None:
     if ro.detail.empty:
         st.success("✅ Every item ties within rounding.")
         return
-
-    # The cause, before the item list — a planner reading a multi-million-pound
-    # delta needs "what is driving this" answered before "which 200 items".
-    _render_ro_delta_rca(ro, detail)
-
-    with st.expander(f"Item-by-item detail ({len(ro.detail):,} items)",
-                     expanded=False):
-        _render_ro_item_detail(ro)
+    analysis = analyse_ro_delta(ro, dropped_detail)
+    st.caption(
+        f"{analysis.headline}  Regenerating the plan closes most of it: the "
+        f"gap is usually nothing more than the published plan still carrying "
+        f"an older RO_Seed."
+    )
+    _render_ro_item_detail(ro)
 
 
 def _render_ro_item_detail(ro) -> None:

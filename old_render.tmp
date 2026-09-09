@@ -1,0 +1,108 @@
+def _render_reconciliation_result(payload: dict) -> None:
+    """Render the bridge: the waterfall, what needs fixing, and the RO tie-out.
+
+    Deliberately asymmetric.  Drops that are working as designed (zero-pound
+    padding, months past the horizon, genuine B2B items) collapse to a single
+    line each — a planner does not need a 300-row table to be told the plan
+    correctly excluded bulk butter.  Only the actionable half gets a table, and
+    the per-SKU list lives in the CSV rather than being duplicated on screen.
+    """
+    if payload.get("error"):
+        st.warning(payload["error"])
+        return
+
+    bridge = payload["bridge"]
+    detail = bridge.dropped_detail
+    actionable = (detail.loc[detail[RECON_COL_ACTION].str.len() > 0]
+                  if not detail.empty else detail)
+    expected = (detail.loc[detail[RECON_COL_ACTION].str.len() == 0]
+                if not detail.empty else detail)
+
+    # ── Headline: does the published file tie to its inputs? ────────────
+    drift = bridge.drift_lbs
+    if drift is None:
+        st.info("ℹ️ Nothing published to compare against — the figures below "
+                "are what the next upload will produce.")
+    elif bridge.ties:
+        st.success(f"✅ The published plan ties to its inputs "
+                   f"({bridge.published_lbs / _M_LBS:,.1f} M lbs).")
+    else:
+        st.error(
+            f"❌ Published **{bridge.published_lbs / _M_LBS:,.1f} M** vs rebuilt "
+            f"**{bridge.output_lbs / _M_LBS:,.1f} M** ({drift / _M_LBS:+,.2f} M). "
+            "The published file was built from **different inputs** than the "
+            "ones on the lakehouse now — usually `RO_Seed.csv` regenerated, or "
+            "the RO rules changed, after the plan was built. Re-upload the Base "
+            "Plan so both come from one source."
+        )
+
+    # ── The waterfall ───────────────────────────────────────────────────
+    rows = [{"Step": "Input — Base Plan + R&O", "Rows": bridge.input_rows,
+             "M lbs": bridge.input_lbs / _M_LBS}]
+    rows += [{"Step": f"− {s.label}", "Rows": -s.rows, "M lbs": -s.lbs / _M_LBS}
+             for s in bridge.steps if s.rows]
+    rows.append({"Step": "= Demand plan", "Rows": bridge.output_rows,
+                 "M lbs": bridge.output_lbs / _M_LBS})
+    st.dataframe(
+        pd.DataFrame(rows).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.1f}"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        f"Forward window ends **{payload['window_end']:%b %Y}** "
+        f"(meeting month {payload['meeting_month']:%b %Y} + "
+        f"{_DEFAULT_FORWARD_WINDOW_MONTHS} months) — plan months on or after "
+        "that are cut. The R&O leg is expanded 36 months from the RO calendar "
+        "anchor and then cut at the same point, so its tail drops too."
+    )
+
+    # ── The SKUs left out: a decision, not an error ─────────────────────
+    _render_dropped_sku_decision(actionable)
+
+    # ── Expected drops: one line each, no table ─────────────────────────
+    if not expected.empty:
+        summary = (
+            expected.groupby(RECON_COL_GATE)
+            .agg(skus=(RECON_COL_ITEM, "nunique"), lbs=(RECON_COL_LBS, "sum"))
+            .sort_values("lbs", key=abs, ascending=False)
+        )
+        st.markdown("**Dropped by design** _(no action needed)_")
+        st.markdown("\n".join(
+            f"- {issue} — **{int(r.skus):,} SKU(s)**, {r.lbs / _M_LBS:,.1f} M lbs"
+            for issue, r in summary.iterrows()
+        ))
+
+    if not detail.empty:
+        st.download_button(
+            "⬇️ Full SKU-level drop list (CSV)",
+            data=detail.drop(columns=[RECON_COL_LINK]).to_csv(index=False).encode("utf-8"),
+            file_name=f"demand_plan_dropped_skus_{date.today():%Y%m%d}.csv",
+            mime="text/csv", key="demand_reconcile_dl_drops",
+        )
+
+    # ── R&O vs the RO Summary ───────────────────────────────────────────
+    ro = payload["ro_bridge"]
+    st.markdown("**R&O vs the RO Summary (FY27 probabilized)**")
+    if not payload.get("ro_available"):
+        st.warning(
+            "⚠️ `RO_Comparison_Output.csv` is missing or empty — no RO Summary "
+            "side to reconcile against. Publish the RO Comparison above, then "
+            "re-run."
+        )
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("RO Summary", f"{ro.ro_summary_lbs / _M_LBS:,.2f} M")
+    c2.metric("Plan R&O", f"{ro.plan_lbs / _M_LBS:,.2f} M")
+    c3.metric("Delta", f"{ro.delta_lbs / _M_LBS:+,.2f} M")
+    if ro.detail.empty:
+        st.success("✅ Every item ties within rounding.")
+        return
+
+    # The cause, before the item list — a planner reading a multi-million-pound
+    # delta needs "what is driving this" answered before "which 200 items".
+    _render_ro_delta_rca(ro, detail)
+
+    with st.expander(f"Item-by-item detail ({len(ro.detail):,} items)",
+                     expanded=False):
+        _render_ro_item_detail(ro)
+
+

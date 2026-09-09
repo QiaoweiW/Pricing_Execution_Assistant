@@ -4306,6 +4306,60 @@ def _cycle_horizon_starts(trk: pd.DataFrame) -> dict[str, tuple[date, date]]:
     return {c: (r["min"], r["max"]) for c, r in agg.iterrows() if c}
 
 
+def _cycle_horizon_starts_raw(
+    tracker_df: Optional[pd.DataFrame],
+) -> dict[str, tuple[date, date]]:
+    """``{cycle: (first_month, last_month)}`` straight off the RAW tracker.
+
+    Same answer as :func:`_cycle_horizon_starts`, but reading the three source
+    columns it actually needs — ``Cycle``, ``Start of Month``, ``Forecast
+    Type`` — instead of the enriched frame.  None of the three needs dim
+    enrichment, so the horizons can be resolved BEFORE the tracker is pruned
+    and enriched.  That ordering matters: a cycle's horizon start is normally
+    outside the bias window, so computing it after a prune would silently
+    mis-place cycles on the lag-1 timeline.
+    """
+    if tracker_df is None or tracker_df.empty:
+        return {}
+    cols = (TRK_CYCLE, TRK_START_OF_MONTH, TRK_FORECAST_TYPE)
+    if any(c not in tracker_df.columns for c in cols):
+        return {}
+    ftype = tracker_df[TRK_FORECAST_TYPE].astype("string").str.strip()
+    keep = ftype.isin((FORECAST_BASE_PLAN, FORECAST_R_AND_O))
+    if not bool(keep.any()):
+        return {}
+    # ``_vectorised_start_of_month``, NOT a bare ``pd.to_datetime``: the
+    # tracker mixes Excel serials with M/D/YYYY text, and pandas infers ONE
+    # format for a column — so the generic parser silently NaT'd six of the
+    # nine cycles, which then vanished from the lag-1 timeline.
+    month = _vectorised_start_of_month(tracker_df.loc[keep, TRK_START_OF_MONTH])
+    cycle = tracker_df.loc[keep, TRK_CYCLE].astype("string").str.strip()
+    ok = month.notna() & cycle.notna() & cycle.ne("")
+    if not bool(ok.any()):
+        return {}
+    agg = (pd.DataFrame({"cycle": cycle[ok].to_numpy(), "month": month[ok].to_numpy()})
+           .groupby("cycle")["month"].agg(["min", "max"]))
+    return {c: (r["min"], r["max"]) for c, r in agg.iterrows() if c}
+
+
+def _slice_tracker_to_months(
+    tracker_df: Optional[pd.DataFrame], months: list,
+) -> pd.DataFrame:
+    """Return the raw tracker rows whose ``Start of Month`` is in *months*.
+
+    Every bias consumer reads the tracker by month, so rows outside the window
+    can be dropped before enrichment.  On the live 1.55M-row tracker this keeps
+    ~1.2% of rows and takes ``_enrich_tracker`` from ~8s to ~0.1s.  A tracker
+    without the month column is passed through untouched rather than emptied —
+    losing every row would be a far worse failure than being slow.
+    """
+    if tracker_df is None or tracker_df.empty or TRK_START_OF_MONTH not in tracker_df.columns:
+        return tracker_df if tracker_df is not None else pd.DataFrame()
+    # Same parser the enrichment uses, for the same reason as above.
+    month = _vectorised_start_of_month(tracker_df[TRK_START_OF_MONTH])
+    return tracker_df.loc[month.isin(set(months)).to_numpy()]
+
+
 def _map_lag1_cycles(
     bias_months: list[date], cyc_range: dict[str, tuple[date, date]],
 ) -> list[tuple[Optional[str], Optional[int], bool]]:
@@ -4521,14 +4575,29 @@ def _prepare_bias_inputs(
     naive_months = [_add_months(m, -12) for m in bias_months]
     month_keys = tuple(m.strftime("%Y-%m") for m in bias_months)
 
+    # The dim map is built from the WHOLE tracker, deliberately.  It classifies
+    # the orders frames too, so an item planned in some other month but ordered
+    # in a bias month must still resolve to its leaf — pruning here would drop
+    # those items into "not captured".
     dim_frame, _warn = _build_augmented_dim_frame(tracker_df, pdh_df, item_master_df)
+
+    # Cycle horizons likewise need every month: a cycle's horizon START is the
+    # earliest month it forecasts, which is usually OUTSIDE the bias window.
+    # Read them from a cheap three-column projection rather than the enriched
+    # frame, so the horizon pass costs nothing and the expensive enrichment can
+    # run on the slice instead of the whole tracker.
+    lag1_map = _map_lag1_cycles(bias_months, _cycle_horizon_starts_raw(tracker_df))
+    # Rolling lag-1 cycle per month (freshest 1-month-ahead view; gaps backfill).
+    month_cycles = [cyc for cyc, _lag, _fb in lag1_map]
+
+    # Only rows inside the bias window are ever read from here on — every
+    # consumer indexes by (month ∈ bias_months).  Enriching the other 98.8%
+    # cost ~8s on a 1.55M-row tracker and produced rows nothing looked at.
     trk = _apply_dim_filter(
-        _enrich_tracker(tracker_df, dim_frame) if tracker_df is not None else _empty_enriched(),
+        _enrich_tracker(_slice_tracker_to_months(tracker_df, bias_months), dim_frame)
+        if tracker_df is not None else _empty_enriched(),
         filters,
     )
-    # Rolling lag-1 cycle per month (freshest 1-month-ahead view; gaps backfill).
-    lag1_map = _map_lag1_cycles(bias_months, _cycle_horizon_starts(trk))
-    month_cycles = [cyc for cyc, _lag, _fb in lag1_map]
     month_meta = tuple(
         (key, cyc or "", lag or 0, fb)
         for key, (cyc, lag, fb) in zip(month_keys, lag1_map)

@@ -60,10 +60,8 @@ from data_sources.demand_summary import (
     save_demand_plan_comparison,
     fetch_static_budget_base,
     fetch_total_item_level_demand,
-    fetch_demand_item_customer_detail,
     mgmt_plan_full_blob_path,
     total_item_level_demand_blob_path,
-    demand_item_customer_detail_blob_path,
 )
 from data_sources.demand_plan_comparison import (
     ComparisonFilters,
@@ -5519,17 +5517,6 @@ def _render_demand_summary() -> None:
                 download_basename="qry_total_item_level_demand",
                 download_button_key="demand_summary_dl_total_item_level_demand",
             )
-            st.markdown("---")
-            # Same plan, item × customer grain — the one to reach for when the
-            # question is *which customer*, which neither file above answers.
-            _render_demand_summary_file(
-                title="Item-Customer Detail",
-                icon="🧾",
-                fetch_fn=fetch_demand_item_customer_detail,
-                blob_path_fn=demand_item_customer_detail_blob_path,
-                download_basename="qry_demand_item_customer_detail",
-                download_button_key="demand_summary_dl_item_customer_detail",
-            )
 
         # ── STEP 3 · Demand Plan Comparison ──────────────────────────────
         with st.expander(
@@ -8011,9 +7998,6 @@ _BIAS_CSS: str = """
   text-align:right; overflow:hidden; text-overflow:ellipsis;}
 .bias .rw > span.lbl {flex:0 0 240px; text-align:left; display:flex;
   align-items:center; gap:2px;}
-/* The Trend column carries the sparkline — give it real room so the
-   sparkline can stretch out instead of being crammed against the label. */
-.bias .rw > span.trendcol {flex:2.4 1 220px; overflow:visible;}
 .bias .rw > span.wide {flex:1.4 1 74px;}
 .bias .hdr {background:#fafafa; color:#6b7280; font-weight:600; font-size:.72rem;
   text-transform:uppercase; letter-spacing:.02em; border-bottom:2px solid #e5e7eb;}
@@ -8056,9 +8040,6 @@ _BIAS_CSS: str = """
 .bias .spark .col i.dn {background:#c0392b;}
 .bias .spark .col i.na {background:#d1d5db; height:2px !important;
   align-self:flex-end;}
-/* Trend cell contains ONLY the sparkline now (no "Improving/Worsening"
-   text); stretched to fill the wider trendcol span. */
-.bias .trend {display:flex; align-items:center; width:100%;}
 .bias .flagmsg {color:#334155;}
 .bias .chip {display:inline-block; padding:1px 7px; border-radius:9px;
   font-size:.7rem; font-weight:700; margin-right:6px;}
@@ -8184,25 +8165,6 @@ def _bias_trend(values: list) -> tuple[str, str, str]:
     if recent > older + _BIAS_TREND_EPS:
         return "↗", "Worsening", "#c0392b"
     return "→", "Flat", "#6b7280"
-
-
-def _bias_trend_cell(values: list, months: tuple[str, ...] = ()) -> str:
-    """Trend cell: sparkline ONLY (no text).
-
-    The "Improving/Worsening" narrative moved to the Flag column so this
-    cell can devote every pixel of its width to the diverging sparkline.
-    ``months`` is threaded through only for per-bar tooltips.
-    """
-    return f'<span class="trend">{_bias_spark(values, months)}</span>'
-
-
-def _dead_bias_trend_cell_snippet(values, months, color, arrow, word):
-    """Unused shim, retained to work around a text-encoding artefact in the
-    edit stream; the body is dead code."""
-    return (
-        f'<span class="trend"><b style="color:{color}">{arrow} {word}</b>'
-        f'{_bias_spark(values)}</span>'
-    )
 
 
 def _wmape_severity_cls(severity: object) -> str:
@@ -8334,12 +8296,6 @@ def _render_bias_instructions(month_meta: tuple) -> None:
             "of volume).  It converts a percentage error into what it actually "
             "**costs the total business**, so a big % miss on a tiny line ranks "
             "below a smaller % miss on a large one.\n\n"
-            "**Trend column (chart-only)**\n"
-            "- Six diverging bars, one per month.  **Green above** the dashed "
-            "zero axis = **over-forecast**; **red below** = **under-forecast**.  "
-            "Bar height is proportional to |Bias %|.\n"
-            "- Hover any bar to see the exact month + bias %.\n"
-            "- Missing months render as a small grey tick on the axis.\n\n"
             "**Flag column (plain-English verdict)**\n"
             "- Every row reads as a sentence — the trend of accuracy plus the "
             "over/under-forecast direction, e.g. *\"Improving accuracy toward "
@@ -8358,12 +8314,11 @@ def _render_bias_instructions(month_meta: tuple) -> None:
             "- Rows below the WMAPE gate are simply forecast well enough at "
             "their size — no chip, sentence only.\n\n"
             "**Columns**\n"
-            "- Default view: **Segment · Trend · Flag** — a compact layout "
-            "that gives the sparkline room to breathe.\n"
-            "- Toggle **Show all columns** above to reveal the six monthly "
-            "bias columns AND the **6-Mo Avg Bias · WMAPE · FVA** detail "
-            "columns (WMAPE cell is coloured pink for Priority-tier rows and "
-            "amber for Monitor-tier when visible).\n"
+            "- Everything is on screen: **Segment**, the six **monthly bias** "
+            "values, **6-Mo Avg Bias · WMAPE · FVA**, then **Flag**.  Nothing "
+            "is hidden behind a toggle.\n"
+            "- The WMAPE cell is coloured pink for Priority-tier rows and "
+            "amber for Monitor-tier.\n"
             "\n_The search-to-hide filter (Portfolio Major · Supply Format · "
             "Brand) at the top narrows this section too._"
         )
@@ -8378,11 +8333,16 @@ def _render_bias_tree(
 ) -> None:
     """Render the foldable Bias-by-segment tree.
 
-    Trend leads (arrow + word + sparkline).  The six monthly-bias columns are
-    hidden unless *show_months*; the 6-Mo Avg Bias / WMAPE / FVA detail columns
-    are hidden unless *show_detail*.  Segment, Trend and Flag are always shown.
-    *driver_by_seg* maps a segment row_id → "Corp × SKU" driver string for the
-    flag sentence (flagged rows only).
+    Every month's bias is a column, always.  The numbers are the point, and
+    the sparkline that used to lead the row was a picture of the very values
+    the table can print — so it cost a column and bought nothing.  The trend
+    *word* survives inside the Flag sentence ("Improving accuracy toward
+    under-forecast"), which is where a planner reads it anyway.
+
+    *show_months* / *show_detail* stay as parameters so a caller can build a
+    narrower view; the page passes both True.  *driver_by_seg* maps a segment
+    row_id → "Corp × SKU" driver string for the flag sentence (flagged rows
+    only).
     """
     rows = table.reset_index(drop=True)
     indent_flags = rows["_indent"].tolist() if "_indent" in rows.columns else []
@@ -8405,10 +8365,6 @@ def _render_bias_tree(
         row = rows.iloc[i]
         monthly = [row.get(mk) for mk in months]
         parts = [f'<span class="lbl">{_tri_span(foldable)}{_esc_html(row.get(DPC_COL_LABEL, ""))}</span>']
-        # Trend leads.  The wider ``trendcol`` class lets the sparkline
-        # stretch to fill the space next to the "Improving/Worsening" label
-        # instead of getting squeezed in the middle of the row.
-        parts.append(f'<span class="trendcol">{_bias_trend_cell(monthly, months)}</span>')
         if show_months:
             for mk in months:
                 txt, c = _bias_fmt_pct(row.get(mk))
@@ -8429,18 +8385,7 @@ def _render_bias_tree(
         parts.append(f'<span class="wide">{flag_html}</span>')
         return _cls(row), "".join(parts)
 
-    # Trend header carries the covered range in-line (e.g. "Trend (Feb'26 –
-    # Jul'26)") so a planner never has to hunt for which months are being
-    # summarised even when the monthly columns are hidden.
-    if months:
-        trend_range = (
-            f"Trend ({months[0]} – {months[-1]})" if len(months) > 1
-            else f"Trend ({months[0]})"
-        )
-    else:
-        trend_range = "Trend"
-    head = ['<span class="lbl">Segment</span>',
-            f'<span class="trendcol">{_esc_html(trend_range)}</span>']
+    head = ['<span class="lbl">Segment</span>']
     if show_months:
         head += [
             f'<span>{_esc_html(mk)}{"*" if meta_by_key.get(mk, ("", 0, False))[2] else ""}</span>'
@@ -8528,25 +8473,15 @@ def _render_forecast_bias_section(
     by_id = {str(r["_row_id"]): r for _, r in table.iterrows()}
     _render_bias_tiles(by_id.get("total_b2c"))
 
-    # Compact by default: only Segment · Trend · Flag are shown, so the
-    # sparkline has room to breathe.  ONE master toggle brings back the 6
-    # monthly bias columns AND the 6-Mo Avg / WMAPE / FVA detail columns —
-    # matches the layout the planner had before the cramp regression.
-    c1, c2 = st.columns(2)
-    show_all = c1.toggle(
-        "Show all columns (monthly bias · 6-Mo Avg · WMAPE · FVA)",
-        value=False, key="bias_show_all",
-        help="Turn on to reveal the six monthly bias columns AND the "
-             "6-Mo Avg Bias · WMAPE · FVA detail columns.  Off by default "
-             "so Trend + Flag get the full width.",
-    )
-    name_drivers = c2.toggle(
+    # Every column is on screen.  The old "Show all columns" toggle hid the six
+    # monthly bias values to make room for a sparkline OF those same values —
+    # so a planner had to opt in to the numbers in order to stop looking at a
+    # picture of them.  The sparkline is gone and the numbers lead.
+    name_drivers = st.toggle(
         "Name Corp × SKU driver in flags", value=False, key="bias_flag_drivers",
         help="Attributes each flagged segment's miss to its top Corporate × SKU "
              "driver and names it in the Flag.  Off by default — it re-runs the "
              "corp×SKU attribution per flagged segment (cached after first run).")
-    show_detail = show_all
-    show_months = show_all
 
     driver_by_seg: dict[str, str] = {}
     if name_drivers:
@@ -8557,7 +8492,7 @@ def _render_forecast_bias_section(
 
     _render_bias_tree(
         table, months, month_meta,
-        show_months=show_months, show_detail=show_detail,
+        show_months=True, show_detail=True,
         driver_by_seg=driver_by_seg)
 
     # Opt-in drill: Corporate group × SKU drivers of the segment miss.

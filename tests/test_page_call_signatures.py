@@ -160,24 +160,23 @@ def test_the_order_yoy_helper_runs_end_to_end(monkeypatch):
 
 # ── Step 2 offers all three plan files ───────────────────────────────────────
 
-def test_step_2_offers_three_downloadable_plan_files():
-    """Management Plan, Total Item-Level Demand, and Item-Customer Detail.
+def test_step_2_offers_the_two_plan_downloads():
+    """Management Plan and Total Item-Level Demand, one red button each.
 
-    Pinned by widget key: each ``_render_demand_summary_file`` call is one red
-    primary download button, and dropping one is otherwise a silent loss.
+    Pinned by widget key: each ``_render_demand_summary_file`` call is one
+    download button, and losing one is otherwise silent.
     """
     src = _PAGE_PATH.read_text(encoding="utf-8")
     for key in ("demand_summary_dl_mgmt_plan_full",
-                "demand_summary_dl_total_item_level_demand",
-                "demand_summary_dl_item_customer_detail"):
+                "demand_summary_dl_total_item_level_demand"):
         assert src.count(f'download_button_key="{key}"') == 1, key
-
-
-def test_the_item_customer_detail_is_wired_to_its_own_source():
-    from data_sources.demand_summary import demand_item_customer_detail_blob_path
-
-    assert (demand_item_customer_detail_blob_path()
-            == "RO Tracking/Demand Plan/qry_demand_item_customer_detail.csv")
+    # The item-customer detail was tried and dropped, and its connector went
+    # with it — a surviving call would be a NameError at import.  Prose
+    # mentions of the file are fine: the pipeline really does write it, it is
+    # just not offered here.
+    for symbol in ("fetch_demand_item_customer_detail(",
+                   "demand_item_customer_detail_blob_path"):
+        assert symbol not in src, symbol
 
 
 def test_every_cached_demand_summary_blob_is_registered_for_the_cache_bound():

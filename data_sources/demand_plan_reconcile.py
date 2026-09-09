@@ -551,9 +551,162 @@ def _ro_summary_by_item(ro_comparison_output: Optional[pd.DataFrame]) -> pd.Data
     )
 
 
+# ── Root-cause analysis of the RO Summary ↔ plan gap ─────────────────────────
+
+#: Columns of the frame :func:`analyse_ro_delta` returns.
+RO_CAUSE_COLUMNS: tuple = (
+    "Cause", "Root cause", "Items", "M lbs", "Share of gap", "What to do",
+)
+
+
+@dataclass(frozen=True)
+class RoDeltaAnalysis:
+    """Why the RO Summary and the plan's R&O leg disagree.
+
+    ``causes`` is ranked by absolute contribution, so the first row is the one
+    worth fixing.  ``headline`` states the largest cause in one sentence.
+    ``explained_lbs`` is the signed sum of the causes — it reconciles to the
+    bridge's own delta, which is the property that makes the table trustworthy
+    rather than merely suggestive.
+    """
+    delta_lbs: float
+    causes: pd.DataFrame
+    headline: str
+    explained_lbs: float
+
+    @property
+    def is_material(self) -> bool:
+        """True when the gap is worth a planner's time (> 0.05 M lbs)."""
+        return abs(self.delta_lbs) > 50_000.0
+
+
+def _root_cause_for_missing(
+    items: set, dropped_detail: Optional[pd.DataFrame],
+) -> tuple:
+    """Return ``(root cause text, evidence frame)`` for RO lines absent from the plan.
+
+    The status alone ("In RO Summary, absent from the plan") says *that* the
+    line is missing, not *why*.  The drop ledger knows why — it recorded the
+    gate that removed each SKU — so joining the two turns a symptom into a
+    cause: "these two were dropped because they are not in PDH".
+    """
+    # No ledger at all is different from a ledger that does not mention the
+    # item.  The first means we cannot say why; the second is itself the
+    # answer — the build never dropped it, so it never arrived to be dropped.
+    if dropped_detail is None or not items:
+        return "", pd.DataFrame()
+    hit = (dropped_detail.loc[dropped_detail[COL_ITEM].astype(str).isin(items)]
+           if not dropped_detail.empty else dropped_detail)
+    if hit.empty:
+        return (
+            "Not in the drop ledger either — the line is absent from the "
+            "rebuilt plan's inputs, so it was never seeded. Check RO_Seed.csv "
+            "carries it for the current snapshot month."
+        ), pd.DataFrame()
+    by_gate = (
+        hit.groupby(COL_GATE)
+        .agg(items=(COL_ITEM, "nunique"), lbs=(COL_LBS, "sum"))
+        .sort_values("lbs", key=abs, ascending=False)
+    )
+    lead = by_gate.index[0]
+    return (
+        f"Dropped by the plan build — most of it as “{lead}”"
+        + (f" (+{len(by_gate) - 1} other reason(s))" if len(by_gate) > 1 else "")
+        + "."
+    ), by_gate.reset_index()
+
+
+def analyse_ro_delta(
+    ro_bridge: RoFiscalBridge,
+    dropped_detail: Optional[pd.DataFrame] = None,
+) -> RoDeltaAnalysis:
+    """Attribute the RO Summary ↔ plan R&O gap to ranked, actionable causes.
+
+    The per-item table answers "which items differ".  A planner looking at a
+    2 M lbs gap needs the next question answered: *what is causing it, and
+    which cause is worth chasing first?*  This groups the item detail by the
+    four bridge statuses, ranks them by how much of the gap each explains, and
+    — for lines the plan never received — joins the drop ledger so the row
+    names the **gate** that removed them rather than telling the planner to go
+    and look it up.
+
+    Pure: takes the two frames the caller already has, returns a frame.
+    """
+    detail = ro_bridge.detail
+    delta = float(ro_bridge.delta_lbs)
+
+    if detail is None or detail.empty:
+        return RoDeltaAnalysis(
+            delta_lbs=delta,
+            causes=pd.DataFrame(columns=list(RO_CAUSE_COLUMNS)),
+            headline="Every item ties within rounding — nothing to explain.",
+            explained_lbs=0.0,
+        )
+
+    total_abs = float(detail[COL_DELTA].abs().sum()) or 1.0
+    rows = []
+    for status, grp in detail.groupby(COL_STATUS):
+        lbs = float(grp[COL_DELTA].sum())
+        root, _evidence = ("", pd.DataFrame())
+        if status == _STATUS_MISSING_FROM_PLAN:
+            root, _evidence = _root_cause_for_missing(
+                set(grp[COL_ITEM].astype(str)), dropped_detail,
+            )
+        rows.append({
+            "Cause": status,
+            "Root cause": root or _ROOT_CAUSE_DEFAULTS.get(status, ""),
+            "Items": int(grp[COL_ITEM].nunique()),
+            "M lbs": lbs / 1_000_000.0,
+            "Share of gap": float(grp[COL_DELTA].abs().sum()) / total_abs,
+            "What to do": _RO_FIXES.get(status, ""),
+        })
+
+    causes = (pd.DataFrame(rows, columns=list(RO_CAUSE_COLUMNS))
+              .sort_values("M lbs", key=abs, ascending=False)
+              .reset_index(drop=True))
+
+    top = causes.iloc[0]
+    headline = (
+        f"{top['Share of gap']:.0%} of the {abs(delta) / 1_000_000.0:,.2f} M lbs "
+        f"gap is **{top['Cause'].lower()}** — {int(top['Items']):,} item(s), "
+        f"{top['M lbs']:+,.2f} M lbs."
+    )
+    return RoDeltaAnalysis(
+        delta_lbs=delta,
+        causes=causes,
+        headline=headline,
+        explained_lbs=float(detail[COL_DELTA].sum()),
+    )
+
+
+#: Root-cause text for the statuses whose cause is structural rather than
+#: something to look up in the drop ledger.
+_ROOT_CAUSE_DEFAULTS: dict = {
+    # Only reached when no drop ledger was supplied — with one, the cause is
+    # resolved to the actual gate by :func:`_root_cause_for_missing`.
+    _STATUS_MISSING_FROM_PLAN: (
+        "The RO line never reached the plan. Run the reconciliation with the "
+        "drop ledger to see which gate removed it."
+    ),
+    _STATUS_MISSING_FROM_RO: (
+        "The two sides came from different snapshots — the plan carries R&O "
+        "the published RO Summary does not."
+    ),
+    _STATUS_SHORTFALL: (
+        "Partial coverage: the forward window cut months off the tail of "
+        "these lines."
+    ),
+    _STATUS_EXCESS: (
+        "The plan expands more months than the Summary's annual pro-ration "
+        "covers — expected for lines starting before the fiscal year."
+    ),
+}
+
+
 __all__ = [
     "BridgeStep", "DemandPlanBridge", "build_demand_plan_bridge",
     "RoFiscalBridge", "build_ro_fiscal_bridge",
+    "RoDeltaAnalysis", "analyse_ro_delta", "RO_CAUSE_COLUMNS",
     "DROP_DETAIL_COLUMNS", "RO_BRIDGE_COLUMNS",
     "LINK_PDH", "LINK_RO_ITEM_MASTER", "LINK_BASE_PLAN_UPLOAD",
 ]

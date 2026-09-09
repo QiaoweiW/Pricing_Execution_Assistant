@@ -36,6 +36,7 @@ import io
 import logging
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import quote
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Callable, Optional
@@ -308,6 +309,7 @@ from data_sources.demand_plan_reconcile import (
     COL_RO_SUMMARY_LBS as RECON_COL_RO_SUMMARY_LBS,
     COL_ROWS as RECON_COL_ROWS,
     COL_STATUS as RECON_COL_STATUS,
+    analyse_ro_delta,
     LINK_PDH as RECON_LINK_PDH,
     LINK_RO_ITEM_MASTER as RECON_LINK_RO_ITEM_MASTER,
     build_demand_plan_bridge,
@@ -2185,7 +2187,7 @@ def _render_ro_step4_rerun() -> None:
     a first-time planner reading top-to-bottom walked straight into it.
     """
     with st.expander(
-        "**Step 4 · Re-upload, or change how RO is read** — when something needs fixing",
+        "**Step 4 · Re-upload, change how RO is read, download** — when something needs fixing",
         expanded=False,
     ):
         st.markdown("#### 4a · Replace a month you have already uploaded")
@@ -5069,6 +5071,172 @@ def _fix_link(target: str) -> Optional[tuple[str, str]]:
     }.get(target)
 
 
+#: The planner's call on the SKUs the plan left out. Session-scoped: it steers
+#: the guidance below, and is not written anywhere.
+_SS_DROP_DECISION: str = "demand_drop_decision"
+
+_DROP_APPROVE: str = "Approve — leave them out of the plan"
+_DROP_REJECT: str = "Do not approve — they belong in the plan"
+
+#: Both published files carry the plan, so a SKU added back by hand has to go
+#: into both or they stop agreeing with each other.
+_MGMT_FILES: tuple = (
+    ("qry_mgmt_plan_full.csv", "RO Tracking/Demand Plan/qry_mgmt_plan_full.csv"),
+    ("qry_total_item_level_demand.csv",
+     "RO Tracking/Demand Plan/qry_total_item_level_demand.csv"),
+)
+
+
+def _render_dropped_sku_decision(actionable: pd.DataFrame) -> None:
+    """Ask what should happen to the SKUs the plan left out.
+
+    These were previously rendered as errors to be fixed.  They are not
+    errors — they are a judgement the planner owns: a SKU the build could not
+    classify is either genuinely out of the plan, or it belongs in and the
+    build was wrong about it.  Only the planner knows which.
+
+    So the panel asks, and each answer leads somewhere concrete: approve and
+    the published files already reflect it; decline and it lists the rows to
+    add and the two files to add them to — both, because the plan lives in
+    each and a SKU added to one alone makes them disagree.
+    """
+    st.markdown("**SKUs the plan left out — your call**")
+    if actionable.empty:
+        st.success(
+            "✅ Nothing to decide — every row the build dropped was dropped "
+            "by design."
+        )
+        return
+
+    show = actionable[[RECON_COL_ITEM, RECON_COL_DESC, RECON_COL_FORECAST,
+                       RECON_COL_GATE, RECON_COL_ROWS, RECON_COL_LBS]].copy()
+    show[RECON_COL_LBS] = show[RECON_COL_LBS] / _M_LBS
+    show = show.rename(columns={RECON_COL_LBS: "M lbs"})
+    st.dataframe(
+        show.head(50).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.3f}"}),
+        use_container_width=True, hide_index=True,
+    )
+
+    n_items = int(actionable[RECON_COL_ITEM].nunique())
+    total_m = actionable[RECON_COL_LBS].abs().sum() / _M_LBS
+    st.caption(
+        f"**{n_items:,} SKU(s)**, {total_m:,.3f} M lbs"
+        + (" — showing the 50 largest." if len(show) > 50 else ".")
+        + "  The **Issue** column says why the build could not place each one."
+    )
+
+    st.markdown(
+        f"These {n_items:,} SKU(s) are **not** in the published plan. That is "
+        f"either right or wrong, and only you can say which:"
+    )
+    decision = st.radio(
+        "What should happen to them?",
+        options=[_DROP_APPROVE, _DROP_REJECT],
+        index=None,
+        key=_SS_DROP_DECISION,
+        label_visibility="collapsed",
+    )
+
+    if decision is None:
+        st.info(
+            "**Pick one to see what to do next.** Nothing is wrong with the "
+            "files as they stand — this is a judgement, not an error."
+        )
+        return
+
+    if decision == _DROP_APPROVE:
+        st.success(
+            f"✅ **Approved — nothing more to do.** The published files "
+            f"already exclude these {n_items:,} SKU(s), so the plan is "
+            f"finished. They will reappear here next cycle if the same "
+            f"issue does, which is your reminder to fix the source if you "
+            f"would rather they came in on their own."
+        )
+        return
+
+    st.warning(
+        "⚠️ **Then you need to add them back by hand — to BOTH files.** The "
+        "build cannot place them, so re-running will not bring them in. "
+        "Adding them to only one file makes the two disagree, which shows up "
+        "later as a reconciliation gap."
+    )
+    st.markdown(
+        "1. Download the rows below — that is exactly what is missing.\n"
+        "2. Open each file in Fabric, add those rows, and save it back under "
+        "the **same name**.\n"
+        "3. Come back and press **🔄 Check again** at the top of this step; "
+        "the gap should close."
+    )
+    for label, path in _MGMT_FILES:
+        st.markdown(f"- [{label}]({_lakehouse_file_url(path)})")
+
+    st.download_button(
+        f"⬇️ Download the {n_items:,} SKU(s) to add back (CSV)",
+        data=actionable.drop(columns=[RECON_COL_LINK], errors="ignore")
+                       .to_csv(index=False).encode("utf-8"),
+        file_name=f"demand_plan_skus_to_add_back_{date.today():%Y%m%d}.csv",
+        mime="text/csv",
+        key="demand_reconcile_dl_addback",
+    )
+
+    # The source fix, still offered — adding rows by hand works this cycle,
+    # but fixing the classification stops it recurring every cycle.
+    with st.expander("Or fix the source so they come in on their own next time",
+                     expanded=False):
+        for issue in actionable[RECON_COL_GATE].unique():
+            grp = actionable.loc[actionable[RECON_COL_GATE] == issue]
+            st.markdown(f"**{issue}** — {grp[RECON_COL_ITEM].nunique():,} SKU(s)")
+            st.markdown(grp[RECON_COL_ACTION].iloc[0])
+            link = _fix_link(grp[RECON_COL_LINK].iloc[0])
+            if link:
+                st.link_button(link[0], link[1])
+
+
+def _lakehouse_file_url(path: str) -> str:
+    """Deep-link to one file in the pricing lakehouse."""
+    return (_FABRIC_LAKEHOUSE_BASE
+            + "&selectedPath=" + quote(f"Files/{path}", safe=""))
+
+
+def _render_ro_delta_rca(ro_bridge, dropped_detail: pd.DataFrame) -> None:
+    """Explain the RO Summary ↔ plan gap: what is causing it, worst first.
+
+    The per-item table below answers "which items differ".  This answers the
+    question a planner actually has when looking at a multi-million-pound gap:
+    *what is causing it, and which cause do I chase first?*  Lines the plan
+    never received are joined back to the drop ledger, so the row names the
+    gate that removed them instead of sending the planner off to correlate two
+    tables by hand.
+    """
+    analysis = analyse_ro_delta(ro_bridge, dropped_detail)
+    if analysis.causes.empty:
+        return
+
+    st.markdown("**Why they differ** _(root-cause analysis)_")
+    if analysis.is_material:
+        st.warning(f"🔍 {analysis.headline}")
+    else:
+        st.info(f"🔍 {analysis.headline}  The gap is small enough to ignore.")
+
+    st.dataframe(
+        analysis.causes[["Cause", "Root cause", "Items", "M lbs", "Share of gap"]]
+        .style.format({"Items": "{:,.0f}", "M lbs": "{:+,.3f}",
+                       "Share of gap": "{:.0%}"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        f"Causes sum to **{analysis.explained_lbs / _M_LBS:+,.2f} M lbs**, "
+        f"which is the whole gap — nothing is unaccounted for. Work down the "
+        f"list: the top row is the one worth fixing first."
+    )
+    with st.expander("What to do about each", expanded=False):
+        for _i, row in analysis.causes.iterrows():
+            st.markdown(f"**{row['Cause']}** — {row['M lbs']:+,.3f} M lbs")
+            if row["Root cause"]:
+                st.markdown(f"_{row['Root cause']}_")
+            st.markdown(row["What to do"])
+
+
 def _render_reconciliation_result(payload: dict) -> None:
     """Render the bridge: the waterfall, what needs fixing, and the RO tie-out.
 
@@ -5126,33 +5294,8 @@ def _render_reconciliation_result(payload: dict) -> None:
         "anchor and then cut at the same point, so its tail drops too."
     )
 
-    # ── What needs fixing ───────────────────────────────────────────────
-    st.markdown("**Needs your attention**")
-    if actionable.empty:
-        st.success("✅ Nothing to fix — every dropped row was dropped by design.")
-    else:
-        show = actionable[[RECON_COL_ITEM, RECON_COL_DESC, RECON_COL_FORECAST,
-                           RECON_COL_GATE, RECON_COL_ROWS, RECON_COL_LBS]].copy()
-        show[RECON_COL_LBS] = show[RECON_COL_LBS] / _M_LBS
-        show = show.rename(columns={RECON_COL_LBS: "M lbs"})
-        st.dataframe(
-            show.head(50).style.format({"Rows": "{:,.0f}", "M lbs": "{:,.3f}"}),
-            use_container_width=True, hide_index=True,
-        )
-        n_items = actionable[RECON_COL_ITEM].nunique()
-        st.caption(
-            f"**{n_items:,} SKU(s)**, "
-            f"{actionable[RECON_COL_LBS].abs().sum() / _M_LBS:,.1f} M lbs"
-            + (f" — showing the 50 largest." if len(show) > 50 else ".")
-        )
-        # One action + one link per distinct issue, not repeated per row.
-        for issue in actionable[RECON_COL_GATE].unique():
-            grp = actionable.loc[actionable[RECON_COL_GATE] == issue]
-            st.markdown(f"**{issue}** — {grp[RECON_COL_ITEM].nunique():,} SKU(s)")
-            st.markdown(grp[RECON_COL_ACTION].iloc[0])
-            link = _fix_link(grp[RECON_COL_LINK].iloc[0])
-            if link:
-                st.link_button(link[0], link[1])
+    # ── The SKUs left out: a decision, not an error ─────────────────────
+    _render_dropped_sku_decision(actionable)
 
     # ── Expected drops: one line each, no table ─────────────────────────
     if not expected.empty:
@@ -5192,6 +5335,18 @@ def _render_reconciliation_result(payload: dict) -> None:
     if ro.detail.empty:
         st.success("✅ Every item ties within rounding.")
         return
+
+    # The cause, before the item list — a planner reading a multi-million-pound
+    # delta needs "what is driving this" answered before "which 200 items".
+    _render_ro_delta_rca(ro, detail)
+
+    with st.expander(f"Item-by-item detail ({len(ro.detail):,} items)",
+                     expanded=False):
+        _render_ro_item_detail(ro)
+
+
+def _render_ro_item_detail(ro) -> None:
+    """The per-item RO Summary vs plan table, with its per-status fix text."""
     ro_show = ro.detail[[RECON_COL_ITEM, RECON_COL_RO_SUMMARY_LBS,
                          RECON_COL_PLAN_LBS, RECON_COL_DELTA,
                          RECON_COL_STATUS]].copy()

@@ -619,3 +619,115 @@ def test_a_missing_example_file_does_not_break_step_1(caps, monkeypatch):
     rendered = " ".join(caps["markdown"] + caps["captions"])
     assert page._RO_INPUT_EXAMPLE_URL in rendered
     assert not any("template" in d.lower() for d in caps["download"])
+
+
+# ── Dropped SKUs are a decision, not an error ────────────────────────────────
+
+def _actionable(*items) -> pd.DataFrame:
+    from data_sources.demand_plan_reconcile import (
+        COL_ACTION, COL_DESC, COL_FORECAST, COL_GATE, COL_ITEM, COL_LBS,
+        COL_LINK, COL_ROWS,
+    )
+    return pd.DataFrame([{
+        COL_ITEM: i, COL_DESC: f"desc {i}", COL_FORECAST: "Base Plan",
+        COL_GATE: "Unclassified — not in PDH", COL_ROWS: 2,
+        COL_LBS: 792_000.0, COL_ACTION: "Classify it in RO_Item_Master.csv.",
+        COL_LINK: "",
+    } for i in items])
+
+
+def _radio(caps, answer):
+    """Stub st.radio to return *answer*, recording the options offered."""
+    def _r(label="", options=(), **k):
+        caps["radio"] = list(options)
+        return answer
+    page.st.radio = _r
+
+
+def test_nothing_dropped_reads_as_nothing_to_decide(caps):
+    page._render_dropped_sku_decision(pd.DataFrame())
+    assert any("Nothing to decide" in s for s in caps["success"])
+
+
+def test_the_planner_is_asked_to_decide_not_told_to_fix(caps):
+    _radio(caps, None)
+    page._render_dropped_sku_decision(_actionable("830109", "830108"))
+    heading = " ".join(caps["markdown"])
+    assert "your call" in heading
+    assert caps["radio"] == [page._DROP_APPROVE, page._DROP_REJECT]
+    # Undecided is not an error state.
+    assert any("not an error" in i for i in caps["info"])
+    assert caps["error"] == []
+
+
+def test_approving_closes_it_out_with_nothing_further_to_do(caps):
+    _radio(caps, page._DROP_APPROVE)
+    page._render_dropped_sku_decision(_actionable("830109"))
+    assert any("nothing more to do" in s.lower() for s in caps["success"])
+    assert caps["warning"] == []
+
+
+def test_declining_names_both_files_and_offers_the_rows(caps):
+    _radio(caps, page._DROP_REJECT)
+    page._render_dropped_sku_decision(_actionable("830109", "830108"))
+    assert any("BOTH files" in w for w in caps["warning"])
+    rendered = " ".join(caps["markdown"])
+    assert "qry_mgmt_plan_full.csv" in rendered
+    assert "qry_total_item_level_demand.csv" in rendered
+    assert any("add back" in d.lower() for d in caps["download"])
+
+
+def test_declining_warns_that_one_file_alone_desynchronises_them(caps):
+    _radio(caps, page._DROP_REJECT)
+    page._render_dropped_sku_decision(_actionable("830109"))
+    assert any("only one file" in w for w in caps["warning"])
+
+
+def test_both_management_files_are_linked_into_fabric():
+    for _label, path in page._MGMT_FILES:
+        url = page._lakehouse_file_url(path)
+        assert url.startswith("https://app.fabric.microsoft.com/")
+        assert "%20" in url and " " not in url.split("selectedPath=")[-1]
+
+
+def test_the_source_fix_is_still_reachable_after_declining(caps):
+    """Adding rows by hand fixes this cycle; the source fix stops it recurring."""
+    _radio(caps, page._DROP_REJECT)
+    page._render_dropped_sku_decision(_actionable("830109"))
+    labels = " ".join(lbl for lbl, _ in caps["expanders"])
+    assert "come in on their own next time" in labels
+
+
+# ── Root-cause analysis is rendered before the item list ─────────────────────
+
+def test_the_rca_leads_with_the_cause(caps, monkeypatch):
+    from datetime import date as _date
+    from data_sources.demand_plan_reconcile import (
+        COL_DELTA, COL_ITEM, COL_PLAN_LBS, COL_RO_SUMMARY_LBS, COL_STATUS,
+        RoFiscalBridge,
+    )
+
+    detail = pd.DataFrame([{
+        COL_ITEM: "830109", COL_RO_SUMMARY_LBS: 792_000.0, COL_PLAN_LBS: 0.0,
+        COL_DELTA: 792_000.0, COL_STATUS: "In RO Summary, absent from the plan",
+    }])
+    bridge = RoFiscalBridge(fiscal_start=_date(2026, 4, 1),
+                            fiscal_end=_date(2027, 3, 31),
+                            ro_summary_lbs=792_000.0, plan_lbs=0.0, detail=detail)
+    page._render_ro_delta_rca(bridge, pd.DataFrame())
+    rendered = " ".join(caps["markdown"] + caps["warning"] + caps["captions"])
+    assert "root-cause analysis" in rendered
+    assert "gap is" in rendered
+    assert "nothing is unaccounted for" in rendered
+
+
+def test_the_rca_renders_nothing_when_the_bridge_ties(caps):
+    from datetime import date as _date
+    from data_sources.demand_plan_reconcile import RoFiscalBridge
+
+    bridge = RoFiscalBridge(fiscal_start=_date(2026, 4, 1),
+                            fiscal_end=_date(2027, 3, 31),
+                            ro_summary_lbs=0.0, plan_lbs=0.0,
+                            detail=pd.DataFrame())
+    page._render_ro_delta_rca(bridge, pd.DataFrame())
+    assert caps["markdown"] == [] and caps["warning"] == []

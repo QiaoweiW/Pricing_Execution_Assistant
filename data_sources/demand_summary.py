@@ -82,6 +82,13 @@ _MGMT_PLAN_FULL_BLOB_PATH: str = (
 _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH: str = (
     "RO Tracking/Demand Plan/qry_total_item_level_demand.csv"
 )
+# Item × Customer × Month detail — the same plan as qry_mgmt_plan_full, but
+# carrying Customer Name, which is what makes it the file planners reach for
+# when they need to see WHO the demand sits with.  Written by the same
+# demand-plan run as the other two, so it is always the same cycle.
+_DEMAND_ITEM_CUSTOMER_DETAIL_BLOB_PATH: str = (
+    "RO Tracking/Demand Plan/qry_demand_item_customer_detail.csv"
+)
 # Primary source for the per-item Supply Format lookup used by the
 # Demand Pivot Summary.  Joined on Item.  When a row is missing here,
 # we fall back to RO_Item_Master.csv (read via the existing
@@ -252,6 +259,7 @@ _READ_CSV_KWARGS_BY_BLOB: dict[str, dict] = {
 _CACHED_BLOB_PATHS: tuple[str, ...] = (
     _MGMT_PLAN_FULL_BLOB_PATH,
     _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH,
+    _DEMAND_ITEM_CUSTOMER_DETAIL_BLOB_PATH,
     _PDH_BLOB_PATH,
     _MGMT_PLAN_HISTORY_TRACKER_BLOB_PATH,
     _DEMAND_PLAN_COMPARISON_BLOB_PATH,
@@ -443,6 +451,25 @@ def fetch_total_item_level_demand(
     return _coerce_demand_dates_for_display(snapshot)
 
 
+def fetch_demand_item_customer_detail(
+    *, force_refresh: bool = False,
+) -> DemandSummarySnapshot:
+    """Return the latest ``qry_demand_item_customer_detail.csv`` as a snapshot.
+
+    The item × customer × month grain of the same plan the other two files
+    carry — the one to reach for when the question is *which customer*.
+
+    No date coercion, unlike :func:`fetch_total_item_level_demand`: this file
+    already stores ``Start of Month`` as ISO dates rather than Excel serials,
+    so there is nothing to repair for the preview.
+
+    See :func:`fetch_mgmt_plan_full` for the ``force_refresh`` contract.
+    """
+    if force_refresh:
+        _cached_fetch.clear()
+    return _fetch_snapshot(_DEMAND_ITEM_CUSTOMER_DETAIL_BLOB_PATH)
+
+
 def fetch_pdh(*, force_refresh: bool = False) -> DemandSummarySnapshot:
     """Return the latest ``qry_pdh.csv`` as a snapshot.
 
@@ -615,6 +642,11 @@ def mgmt_plan_full_blob_path() -> str:
 def total_item_level_demand_blob_path() -> str:
     """Return the POSIX path of the total-item-level-demand CSV under ``Files/``."""
     return _TOTAL_ITEM_LEVEL_DEMAND_BLOB_PATH
+
+
+def demand_item_customer_detail_blob_path() -> str:
+    """Return the POSIX path of the item-customer-detail CSV under ``Files/``."""
+    return _DEMAND_ITEM_CUSTOMER_DETAIL_BLOB_PATH
 
 
 def mgmt_plan_history_tracker_blob_path() -> str:
@@ -2232,6 +2264,7 @@ __all__ = [
     "DemandSummarySnapshot",
     "fetch_mgmt_plan_full",
     "fetch_total_item_level_demand",
+    "fetch_demand_item_customer_detail",
     "fetch_pdh",
     "fetch_ibp_base_plan_current",
     "fetch_static_budget_base",
@@ -2240,6 +2273,7 @@ __all__ = [
     "fetch_raw_bytes",
     "mgmt_plan_full_blob_path",
     "total_item_level_demand_blob_path",
+    "demand_item_customer_detail_blob_path",
     "clear_demand_summary_cache",
     # Pivot surface.
     "COL_START_OF_MONTH", "COL_ITEM", "COL_PORTFOLIO_MAJOR",

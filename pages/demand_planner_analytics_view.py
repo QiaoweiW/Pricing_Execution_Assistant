@@ -60,8 +60,10 @@ from data_sources.demand_summary import (
     save_demand_plan_comparison,
     fetch_static_budget_base,
     fetch_total_item_level_demand,
+    fetch_demand_item_customer_detail,
     mgmt_plan_full_blob_path,
     total_item_level_demand_blob_path,
+    demand_item_customer_detail_blob_path,
 )
 from data_sources.demand_plan_comparison import (
     ComparisonFilters,
@@ -5516,6 +5518,17 @@ def _render_demand_summary() -> None:
                 blob_path_fn=total_item_level_demand_blob_path,
                 download_basename="qry_total_item_level_demand",
                 download_button_key="demand_summary_dl_total_item_level_demand",
+            )
+            st.markdown("---")
+            # Same plan, item × customer grain — the one to reach for when the
+            # question is *which customer*, which neither file above answers.
+            _render_demand_summary_file(
+                title="Item-Customer Detail",
+                icon="🧾",
+                fetch_fn=fetch_demand_item_customer_detail,
+                blob_path_fn=demand_item_customer_detail_blob_path,
+                download_basename="qry_demand_item_customer_detail",
+                download_button_key="demand_summary_dl_item_customer_detail",
             )
 
         # ── STEP 3 · Demand Plan Comparison ──────────────────────────────

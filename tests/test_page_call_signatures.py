@@ -156,3 +156,45 @@ def test_the_order_yoy_helper_runs_end_to_end(monkeypatch):
 
     assert isinstance(yoy, dict) and yoy, "one entry per comparison row"
     assert set(labels) == {"L12M", "L6M", "L3M"}
+
+
+# ── Step 2 offers all three plan files ───────────────────────────────────────
+
+def test_step_2_offers_three_downloadable_plan_files():
+    """Management Plan, Total Item-Level Demand, and Item-Customer Detail.
+
+    Pinned by widget key: each ``_render_demand_summary_file`` call is one red
+    primary download button, and dropping one is otherwise a silent loss.
+    """
+    src = _PAGE_PATH.read_text(encoding="utf-8")
+    for key in ("demand_summary_dl_mgmt_plan_full",
+                "demand_summary_dl_total_item_level_demand",
+                "demand_summary_dl_item_customer_detail"):
+        assert src.count(f'download_button_key="{key}"') == 1, key
+
+
+def test_the_item_customer_detail_is_wired_to_its_own_source():
+    from data_sources.demand_summary import demand_item_customer_detail_blob_path
+
+    assert (demand_item_customer_detail_blob_path()
+            == "RO Tracking/Demand Plan/qry_demand_item_customer_detail.csv")
+
+
+def test_every_cached_demand_summary_blob_is_registered_for_the_cache_bound():
+    """``_CACHED_BLOB_PATHS`` sizes the cache; a blob missing from it evicts early.
+
+    The module says so itself — the list exists "so the cache bound is derived
+    from reality instead of a magic number that silently goes stale the day a
+    ninth source is added". Adding a fetcher without registering its blob is
+    exactly that failure, and it shows up only as mysterious cache misses.
+    """
+    import data_sources.demand_summary as ds
+
+    registered = set(ds._CACHED_BLOB_PATHS)
+    for name in dir(ds):
+        if name.endswith("_BLOB_PATH") and name.startswith("_"):
+            path = getattr(ds, name)
+            if isinstance(path, str) and path.endswith(".csv"):
+                assert path in registered, (
+                    f"{name} is fetched but missing from _CACHED_BLOB_PATHS"
+                )

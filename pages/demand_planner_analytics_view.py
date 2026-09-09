@@ -6280,7 +6280,7 @@ def _cached_comparison_order_yoy(
     except (LakehouseIOError, ValueError):
         enriched = None
     enriched = _bh_apply_combo_exclude(enriched, combo_exclude)
-    res = build_business_health(enriched, None, prior_month)
+    res = build_business_health(enriched, prior_month)
     yoy = {
         str(r[DPC_COL_ROW_ID]): {
             "L12M": r[BH_YOY_LABELS["L12M"]],

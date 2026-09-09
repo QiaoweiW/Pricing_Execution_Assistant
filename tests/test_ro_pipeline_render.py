@@ -27,6 +27,12 @@ class _Ctx:
 _ST = MagicMock()
 _ST.session_state = {}
 _ST.fragment = lambda f: f
+# Pass-through caching decorators: they are applied at IMPORT time, so a
+# MagicMock replaces the decorated function itself and every cached helper
+# returns a Mock.  Kept identical across the render-test modules so it does
+# not matter which of them imports the page first.
+_ST.cache_data = lambda *a, **k: (lambda fn: fn)
+_ST.cache_resource = lambda *a, **k: (lambda fn: fn)
 _ST.columns = lambda spec, **k: [
     _Ctx() for _ in (spec if isinstance(spec, (list, tuple)) else range(spec))
 ]

@@ -1236,9 +1236,11 @@ _SERIAL_DAY_MAX = (
 def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
     """Vectorised first-of-month coercion (Excel serials + strings).
 
-    Tries integer-serial parsing first (the source CSV's native shape)
-    then falls back to pandas' generic string parser for any non-numeric
-    survivors.  Anything that still cannot be parsed becomes ``NaT``.
+    Tries integer-serial parsing first (the source CSV's native shape) then
+    falls back to the string parser for any non-numeric survivors — with a
+    per-element retry so a column carrying MORE THAN ONE text date format
+    does not lose whichever style pandas failed to infer.  Anything that
+    still cannot be parsed becomes ``NaT``.
     The output dtype is ``object`` carrying :class:`datetime.date`
     values, matching :func:`_coerce_start_of_month` so downstream code
     that compares against ``date`` objects keeps working unchanged.
@@ -1278,7 +1280,20 @@ def _vectorised_start_of_month(series: pd.Series) -> pd.Series:
     #    through the same overflow-prone ns-unit cast).
     needs_str = serials_ts.isna() & as_num.isna()
     if needs_str.any():
-        str_ts = pd.to_datetime(s[needs_str], errors="coerce")
+        raw = s[needs_str].astype("string")
+        str_ts = pd.to_datetime(raw, errors="coerce")
+        # pandas infers ONE format for the whole column, so a column mixing
+        # "3/1/2026" with "2026-04-01" — which happens whenever some rows were
+        # written by the pipeline (M/D/YYYY) and others came from an ISO
+        # export — parses the style it locked onto and silently NaTs the rest.
+        # Those rows then vanish from every downstream sum with no error.
+        # Retry ONLY the leftovers per-element, so the common single-format
+        # column keeps the vectorised fast path.  Same fix, same reasoning as
+        # :func:`data_sources.ro_dates.canonical_date_series`.
+        retry = str_ts.isna() & raw.notna() & raw.str.strip().ne("")
+        if retry.any():
+            str_ts.loc[retry] = pd.to_datetime(
+                raw[retry], errors="coerce", format="mixed")
         serials_ts.loc[needs_str] = str_ts
     # Snap to first-of-month, return as a Series of ``date`` (object).
     out = serials_ts.dt.to_period("M").dt.to_timestamp()

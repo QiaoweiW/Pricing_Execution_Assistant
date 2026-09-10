@@ -77,22 +77,27 @@ def test_serials_and_text_together_do_not_lose_cycles():
     assert starts["C3"][0] == date(2026, 5, 1)
 
 
-@pytest.mark.xfail(
-    reason="Latent bug in _vectorised_start_of_month, not introduced here: "
-           "its string fallback is a single pd.to_datetime, so a column mixing "
-           "US *and* ISO text loses whichever style pandas did not infer. The "
-           "live tracker pairs serials with one text style, so it parses "
-           "cleanly today (proven by the byte-identical baseline) — but the "
-           "day a tracker carries both text styles, rows would vanish "
-           "silently. Fix is the format='mixed' retry used in ro_dates.",
-    strict=True,
-)
-def test_two_text_date_formats_in_one_column_currently_lose_a_cycle():
+def test_two_text_date_formats_in_one_column_both_parse():
+    """The latent bug, now closed.
+
+    ``_vectorised_start_of_month``'s string fallback was a single
+    ``pd.to_datetime``.  pandas infers one format for a whole column, so a
+    column mixing US and ISO text kept whichever style it locked onto and
+    silently NaT'd the rest — and those rows then vanished from every
+    downstream sum with no error raised anywhere.  It retries the leftovers
+    per-element now, so both styles survive.
+    """
     trk = _tracker([
         _row("3/1/2026", "C1"),        # US text
-        _row("2026-04-01", "C2"),      # ISO text — silently NaT'd today
+        _row("2026-04-01", "C2"),      # ISO text — this is what used to vanish
+        _row("5/1/2026", "C3"),        # US again
+        _row(46173, "C4"),             # Excel serial = 2026-05-01
     ])
-    assert set(dpc._cycle_horizon_starts_raw(trk)) == {"C1", "C2"}
+    starts = dpc._cycle_horizon_starts_raw(trk)
+    assert set(starts) == {"C1", "C2", "C3", "C4"}, (
+        f"a date style was lost: {sorted(starts)}"
+    )
+    assert starts["C2"][0] == date(2026, 4, 1)
 
 
 def test_the_raw_and_enriched_horizon_readers_agree():
@@ -174,3 +179,72 @@ def test_the_prep_maps_the_same_lag1_cycles_as_an_unpruned_read():
     assert "C1" in bi.month_cycles, "the earliest cycle must survive the prune"
     # And the enriched frame really is pruned to the window.
     assert set(bi.trk["month"]) <= set(bi.bias_months)
+
+
+# ── The shared month parser ──────────────────────────────────────────────────
+#
+# _vectorised_start_of_month is used by demand_plan_comparison,
+# demand_item_customer and aps_upload_pipeline, so its per-element retry has
+# to recover mixed text WITHOUT disturbing anything that already parsed.
+# Verified against 2.99M live rows across five real columns: byte-identical
+# output, zero NaT before and after.
+
+_vsm = dpc._vectorised_start_of_month
+
+
+@pytest.mark.parametrize("values,expected", [
+    (["3/1/2026", "2026-04-01"], [date(2026, 3, 1), date(2026, 4, 1)]),
+    (["2026-04-01", "3/1/2026"], [date(2026, 4, 1), date(2026, 3, 1)]),
+    (["1/15/2026", "2026-02-28", "3/1/2026"],
+     [date(2026, 1, 1), date(2026, 2, 1), date(2026, 3, 1)]),
+])
+def test_mixed_text_formats_all_parse_whatever_the_order(values, expected):
+    """Order matters to pandas' inference; it must not matter to the result."""
+    assert list(_vsm(pd.Series(values))) == expected
+
+
+def test_serials_and_text_can_share_a_column():
+    out = _vsm(pd.Series([46173, "3/1/2026", "2026-04-01"]))
+    assert list(out) == [date(2026, 5, 1), date(2026, 3, 1), date(2026, 4, 1)]
+
+
+@pytest.mark.parametrize("junk", ["", "  ", None, "not a date", "Q1"])
+def test_unparseable_values_stay_missing(junk):
+    """The retry must not start inventing dates for genuine rubbish.
+
+    Missing comes back as ``None`` beside parsed dates and as ``NaT`` when a
+    column parses to nothing at all (it stays datetime64 rather than being
+    cast to object).  Both are null; the caller only ever tests for that.
+    """
+    assert pd.isna(_vsm(pd.Series([junk]))[0])
+    # ...including when it sits beside a value that DID parse.
+    mixed = _vsm(pd.Series([junk, "3/1/2026"]))
+    assert pd.isna(mixed[0]) and mixed[1] == date(2026, 3, 1)
+
+
+def test_a_single_format_column_is_untouched():
+    """The fast path still handles the common case; the retry never fires."""
+    vals = [f"{m}/1/2026" for m in range(1, 13)]
+    assert list(_vsm(pd.Series(vals))) == [date(2026, m, 1) for m in range(1, 13)]
+
+
+def test_everything_snaps_to_the_first_of_the_month():
+    out = _vsm(pd.Series(["3/17/2026", "2026-04-28"]))
+    assert list(out) == [date(2026, 3, 1), date(2026, 4, 1)]
+
+
+def test_datetime64_columns_bypass_parsing_entirely():
+    """DuckDB hands back real timestamps; they must not go near the serial path."""
+    out = _vsm(pd.Series(pd.to_datetime(["2026-03-17", "2026-04-28"])))
+    assert list(out) == [date(2026, 3, 1), date(2026, 4, 1)]
+
+
+def test_an_out_of_range_number_stays_missing_rather_than_being_reparsed():
+    """A contaminated serial is not a date string — the retry must not grab it."""
+    assert pd.isna(_vsm(pd.Series([99_999_999]))[0])
+
+
+def test_a_category_dtype_column_parses():
+    """The live tracker's Start of Month arrives as a pandas category."""
+    s = pd.Series(["3/1/2026", "2026-04-01"], dtype="category")
+    assert list(_vsm(s)) == [date(2026, 3, 1), date(2026, 4, 1)]

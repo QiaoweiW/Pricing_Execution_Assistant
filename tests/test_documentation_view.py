@@ -172,30 +172,96 @@ def test_the_corp_group_formula_states_the_automatic_rule():
     assert "fuzzy" in f.notes.lower(), "the fuzzy carve-out must be explained"
 
 
-# ── Lakehouse index ─────────────────────────────────────────────────────────
+# ── The file index ─────────────────────────────────────────────────────────
 
-def test_lakehouse_links_are_escaped_deep_links():
-    for p in doc._LAKEHOUSE_PATHS:
-        url = doc._lakehouse_url(p.path)
+def test_every_file_is_attached_to_a_real_page():
+    """The index is keyed by app page — a typo would orphan a whole group."""
+    pages = set(_sidebar_order())
+    for f in doc._DATA_FILES:
+        assert f.view in pages, f"{f.name}: unknown page {f.view!r}"
+
+
+def test_the_index_covers_every_page_that_has_files():
+    """Not just Demand Planner Analytics — the old version only had that one."""
+    covered = {f.view for f in doc._DATA_FILES}
+    assert covered >= {
+        "Demand Planner Analytics", "Market Barometer", "New Price Quote",
+        "Shipment Monitor & HTST Requote", "Bid Assistant",
+        "Oracle Pricing Data Download", "Pricing Execution Automation",
+    }
+
+
+def test_every_row_is_complete_and_uses_a_known_owner():
+    known = {label for label, _meaning in doc._OWNERS}
+    for f in doc._DATA_FILES:
+        assert f.name.strip() and f.purpose.strip(), f.name
+        assert f.owner in known, f"{f.name}: unknown owner {f.owner!r}"
+        assert f.purpose.rstrip().endswith("."), f"{f.name}: purpose not a sentence"
+
+
+def test_folder_links_are_escaped_deep_links():
+    for f in doc._DATA_FILES:
+        if not f.folder:
+            continue                     # a lakehouse table, not a file
+        url = doc._lakehouse_url(f.folder)
         assert url.startswith("https://app.fabric.microsoft.com/")
-        if p.path:
-            assert "selectedPath=Files%2F" in url, p.label
-            assert " " not in url, f"unescaped space in {p.label}"
+        assert "selectedPath=Files%2F" in url, f.name
+        assert " " not in url, f"unescaped space in {f.name}"
 
 
-def test_documented_files_live_under_documented_folders():
-    folders = {p.path for p in doc._LAKEHOUSE_PATHS if p.path}
-    for f in doc._LAKEHOUSE_FILES:
-        assert any(f.path.startswith(folder) for folder in folders), f.path
+def test_a_table_row_carries_no_folder_link():
+    """Delta tables have no folder to open; the row must say so, not link."""
+    tables = [f for f in doc._DATA_FILES if not f.folder]
+    assert tables, "expected some lakehouse-table rows"
+    for f in tables:
+        assert "table" in f.name.lower(), f"{f.name}: no folder but not a table"
 
 
-def test_documented_files_are_real_blob_paths():
-    """Each file in the index must actually be referenced by a data source."""
-    sources = "\n".join(
-        p.read_text(encoding="utf-8")
-        for p in (_ROOT / "data_sources").glob("*.py"))
-    for f in doc._LAKEHOUSE_FILES:
-        assert f.path in sources, f"documented but never read/written: {f.path}"
+def test_documented_paths_are_referenced_by_the_code():
+    """Each folder or file named here must appear somewhere in data_sources.
+
+    Guards against documenting a path that was renamed or never existed —
+    the failure mode where a planner replaces a file nothing reads.
+    """
+    # Excludes documentation_view itself — it declares these very strings, so
+    # including it would make every assertion below trivially true.
+    sources = chr(10).join(
+        path.read_text(encoding="utf-8")
+        for pkg in ("data_sources", "pricebook", "pages", "utils")
+        for path in (_ROOT / pkg).glob("*.py")
+        if path.name != "documentation_view.py")
+    # Folders the app only ever links to — they have no reader of their own.
+    link_only = {"Finance", "Monthly_Pricing_Execution", "VBCS"}
+    for f in doc._DATA_FILES:
+        if not f.folder or f.folder in link_only:
+            continue
+        assert f.folder in sources, f"{f.name}: folder {f.folder!r} unused"
+
+
+def test_grouping_keeps_each_page_navigable():
+    """A page with many files must be broken into groups, not one long list."""
+    for view in doc._DATA_VIEW_ORDER:
+        groups = doc._files_for(view)
+        count = sum(len(rows) for _g, rows in groups)
+        if count > 10:
+            assert len(groups) > 1, f"{view}: {count} rows in one flat group"
+        # A group is never emitted empty.
+        assert all(rows for _g, rows in groups), view
+
+
+def test_the_file_table_is_one_markdown_block():
+    """Row-per-st.markdown renders a stack of one-row tables, not a table."""
+    rows = doc._files_for("Bid Assistant")[0][1]
+    table = doc._file_table(rows)
+    assert table.count("\n") == len(rows) + 1      # header + separator + rows
+    assert table.startswith("| File |")
+
+
+def test_the_replace_instructions_tell_people_to_back_up_and_keep_the_name():
+    joined = " ".join(doc._REPLACE_STEPS).lower()
+    assert "download" in joined, "no back-up-first step"
+    assert "name" in joined and "header" in joined, "no keep-the-schema step"
+    assert "app" in doc._REPLACE_WARNING.lower()
 
 
 # ── The Word export ─────────────────────────────────────────────────────────
@@ -239,8 +305,8 @@ def test_the_word_export_keeps_the_links_clickable():
     # separator arrives as "&amp;" — unescape before comparing to the source.
     targets = [html.unescape(t) for t in
                re.findall(r'Target="([^"]+)"[^>]*TargetMode="External"', rels)]
-    assert sum("lakehouses" in t for t in targets) >= len(
-        [p for p in doc._LAKEHOUSE_PATHS]) - 1
+    linked = {f.folder for f in doc._DATA_FILES if f.folder}
+    assert sum("lakehouses" in t for t in targets) >= len(linked)
     assert any(doc._VELOCITY_REPORT_URL == t for t in targets)
     assert any(doc._FINANCE_PNL_REPORT_URL == t for t in targets)
 

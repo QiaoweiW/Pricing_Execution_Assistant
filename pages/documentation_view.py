@@ -3,23 +3,24 @@ Documentation page view — the app's landing page and its single sign-in point.
 
 Three jobs, in this order:
 
-1. **Microsoft Fabric sign-in.**  This is the ONLY place in the app that
-   renders the device-code sign-in flow.  Every other view detects the
-   session and points here, so the panel stays at the top of this page and
-   this page stays first in the sidebar.
+1. **The Microsoft Fabric connection.**  ``streamlit_app`` warms the OneLake
+   token once per session, so the connection is normally already up by the
+   time anyone reads this.  The panel here is the status light plus the ONLY
+   device-code sign-in flow in the app — the fallback for when that warm-up
+   failed — which is why it stays at the top of this page.
 2. **The manual.**  How to drive each view (click by click), the exact
    arithmetic behind every number the app publishes (so anyone can rebuild
-   it in Excel), and a clickable index of the lakehouse folders and files
-   each view reads from.
+   it in Excel), and — keyed by the page that uses them — every file the
+   app touches, what each is for, and how to replace it.
 3. **A Word copy of all of it.**  One button hands the whole manual over as
    a ``.docx`` so it can be sent to someone who has no access to the app.
 
 Why the content is data, not prose
 ----------------------------------
 The page bodies below are built from module-level tuples
-(:data:`_PAGE_GUIDES`, :data:`_FORMULAS`, :data:`_LAKEHOUSE_PATHS`,
-:data:`_LAKEHOUSE_FILES`) rather than one long ``st.markdown`` blob.  Adding a
-page, a formula or a folder is a one-entry edit, the render functions never
+(:data:`_PAGE_GUIDES`, :data:`_FORMULAS`, :data:`_DATA_FILES`) rather
+than one long ``st.markdown`` blob.  Adding a page, a formula or a file is a
+one-entry edit, the render functions never
 change, and nothing can drift out of alignment between the sections.  It also
 keeps every Fabric URL in exactly one place — see :data:`_LAKEHOUSE_BASE`.
 
@@ -100,20 +101,22 @@ class _PageGuide(NamedTuple):
 _PAGE_GUIDES: tuple = (
     _PageGuide(
         name="Documentation",
-        one_liner="This page. Sign in to Microsoft Fabric, then read how "
-                  "everything else works.",
+        one_liner="This page. The manual for everything else, plus the "
+                  "Microsoft Fabric connection light.",
         steps=(
-            "Look at the box at the top. If it says you are connected, you "
-            "are done — do not click anything.",
-            "If it asks you to sign in, click the sign-in button, then follow "
-            "the link it shows and type the code it gives you.",
-            "Come back to this tab. The box turns green on its own.",
-            "Now click any page in the left sidebar. You will not be asked to "
-            "sign in again.",
+            "Read the box at the top only if something is broken — Fabric "
+            "connects on its own when the app starts.",
+            "Use **Download this manual (Word)** to send this page to "
+            "someone who does not have the app.",
+            "Open the guide for the page you are about to use, then click "
+            "that page in the left sidebar.",
+            "**Where the data lives** at the bottom lists every file the app "
+            "reads, what it is for, and how to replace it.",
         ),
         needs_fabric=False,
-        gotcha="You only sign in once per session. If a page says it has no "
-               "data, come back here and check the box is still green.",
+        gotcha="If a page says it has no data, come back here and check the "
+               "connection box. If it is red, sign in there — that is the "
+               "one time you need it.",
     ),
     _PageGuide(
         name="Demand Planner Analytics",
@@ -279,8 +282,8 @@ def _render_page_guides() -> None:
         with st.expander(f"**{g.name}** — {g.one_liner}", expanded=False):
             if g.needs_fabric:
                 st.caption(
-                    "🔐 Needs Microsoft Fabric — sign in at the top of this "
-                    "page first."
+                    "🔗 Reads Microsoft Fabric — connected automatically; "
+                    "nothing to do unless the box at the top says otherwise."
                 )
             st.markdown(
                 "\n".join(f"{i}. {s}" for i, s in enumerate(g.steps, 1))
@@ -606,147 +609,413 @@ def _render_formulas() -> None:
 
 
 # ── Section 4: where the data lives ──────────────────────────────────────────
+#
+# Organised the way a person actually arrives at the question — "this page
+# showed me a wrong number, which file is behind it?" — so the index is keyed
+# by **app page**, then by the section inside it, and every row answers: what
+# is this file for, who is allowed to change it, and where is it in Fabric.
+#
+# The previous shape (one table of folders, a second table of files) made the
+# reader join the two in their head and only covered Demand Planner Analytics.
 
 
-class _LakehousePath(NamedTuple):
-    """One clickable lakehouse destination."""
-    label: str    # human name
-    path: str     # path under Files/ ("" = lakehouse root)
-    used_by: str  # which view reads or writes it
+class _DataFile(NamedTuple):
+    """One file (or folder, or lakehouse table) the app depends on."""
+    view: str        # the sidebar page that reads it
+    group: str       # the section inside that page ("" = page-wide)
+    name: str        # what to look for in Fabric
+    folder: str      # path under Files/ for the deep-link ("" = a table)
+    purpose: str     # how the app uses it
+    owner: str       # one of _OWNERS — who is allowed to change it
 
 
-_LAKEHOUSE_PATHS: tuple = (
-    _LakehousePath("Pricing lakehouse (root)", "",
-                   "Everything below lives here"),
-    _LakehousePath("Activity_Model", "Activity_Model",
-                   "New Price Quote · Shipment Monitor — fee brackets, "
-                   "delivery-charge table, pallet & UOM files"),
-    _LakehousePath("Activity_Model / Shipment Report",
-                   "Activity_Model/Shipment Report",
-                   "Shipment Monitor — the order & shipment lines operators "
-                   "refresh monthly"),
-    _LakehousePath("Finance", "Finance",
-                   "Demand Planner Analytics — SKU-level net sales & gross "
-                   "profit actuals"),
-    _LakehousePath("RO Tracking", "RO Tracking",
-                   "Demand Planner Analytics → RO Comparison — the seed, the "
-                   "item master and the trackers (see the file table below)"),
-    _LakehousePath("RO Tracking / RO_Reporting", "RO Tracking/RO_Reporting",
-                   "Demand Planner Analytics → RO Comparison — the two "
-                   "published outputs"),
-    _LakehousePath("RO Tracking / Demand Plan", "RO Tracking/Demand Plan",
-                   "Demand Planner Analytics → Demand Summary (IBP) — "
-                   "management plan, PDH classification, comparison summaries"),
-    _LakehousePath("RO Tracking / APS", "RO Tracking/APS",
-                   "Demand Planner Analytics → Demand Summary (APS) — the "
-                   "cycle history and the latest built cycle"),
-    _LakehousePath("Milk_cost_tracker", "Milk_cost_tracker",
-                   "Market Barometer — milk usage & base-cost trackers"),
-    _LakehousePath("Monthly_Pricing_Execution", "Monthly_Pricing_Execution",
-                   "Market Barometer — mover downloads, COLA program "
-                   "tracker, refreshable VBCS"),
-    _LakehousePath("Program_Bid_Management / New_Bids",
-                   "Program_Bid_Management/New_Bids",
-                   "Bid Assistant — bid scenario files"),
-    _LakehousePath("BOM", "BOM",
-                   "Bid Assistant — bills of material behind the cost "
-                   "formulas"),
-    _LakehousePath("VBCS", "VBCS",
-                   "Oracle Pricing Data Download — the fixed VBCS files to "
-                   "compare against"),
-    _LakehousePath("VBCS / Extract_Snapshot", "VBCS/Extract_Snapshot",
-                   "Oracle Pricing Data Download — the automatic audit trail "
-                   "of every CSV downloaded"),
+# Four owner labels, and only four, so the column can be scanned rather than
+# read.  The distinction that matters: "in the app" files are versioned and
+# archived for you, so replacing them by hand in Fabric skips that safety net.
+_OWNER_APP_UPLOAD: str = "You — in the app"
+_OWNER_FABRIC: str = "You — in Fabric"
+_OWNER_GENERATED: str = "The app"
+_OWNER_AUTO: str = "Refreshes itself"
+
+_OWNERS: tuple = (
+    (_OWNER_APP_UPLOAD,
+     "Upload it through the page that owns it — usually a Step 1. The app "
+     "validates it, archives the previous copy and rebuilds whatever depends "
+     "on it. Do not replace these by hand in Fabric; you would skip all of "
+     "that."),
+    (_OWNER_FABRIC,
+     "Replace it directly in Fabric, using the five steps above. These are "
+     "reference tables the app reads but has no uploader for."),
+    (_OWNER_GENERATED,
+     "Output. The app writes it and will overwrite it on the next run, so "
+     "editing it by hand achieves nothing — change the input instead."),
+    (_OWNER_AUTO,
+     "A lakehouse table or dataflow that refreshes on its own. Nothing to "
+     "upload, and nothing you can break from here."),
+)
+
+_REPLACE_STEPS: tuple = (
+    "Find the file in the list below and click its **folder** link. That "
+    "opens the exact folder in Fabric — you do not have to go hunting.",
+    "**Download the file that is there now** before you do anything else. "
+    "That copy is your undo.",
+    "Keep the **file name and the column headers exactly the same**. The app "
+    "finds files by name and reads columns by header, so a renamed file "
+    "looks missing and a renamed column looks empty.",
+    "Upload the new file into that same folder and choose **Replace** when "
+    "Fabric asks.",
+    "Back in the app, reload the page. Reads are cached for up to an hour, "
+    "so if a section has a refresh button, press it.",
+)
+
+_REPLACE_WARNING: str = (
+    "Only files marked \"You — in Fabric\" should be replaced this way. "
+    "Anything marked \"You — in the app\" has an uploader on its own page: "
+    "use it, because it also validates the file, archives the old one and "
+    "rebuilds everything downstream."
 )
 
 
-class _LakehouseFile(NamedTuple):
-    """One individual file, and what happens if you change it."""
-    path: str        # full path under Files/
-    written_by: str  # what puts it there
-    if_changed: str  # what moves in the app when this file changes
+# One row per file.  Grouped by the page a person is looking at when they need
+# it; a file shared by two pages is listed under the page that can REPLACE it,
+# and the other page's group says so rather than repeating nine rows.
+_DATA_FILES: tuple = (
+    # ── Demand Planner Analytics ─────────────────────────────────────────
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "Distribution_Tracker.csv", "RO Tracking/Append_New_History",
+        "The tracker you upload in Step 1 — the input behind every RO number.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "RO_Item_Master.csv", "RO Tracking",
+        "Maps each item code to its portfolio and format. This is the file to "
+        "fix when Step 1 reports an item it cannot classify.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "RO_Seed.csv", "RO Tracking",
+        "The opportunity and risk lines that cleared the Step 1 gates.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "RO_Comparison_Output.csv", "RO Tracking/RO_Reporting",
+        "The row-level comparison behind Step 2 and the Step 3 drivers.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "RO_Summary_Report.csv", "RO Tracking/RO_Reporting",
+        "The rolled-up report you download from Step 2.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "RO_History_Tracker.csv", "RO Tracking",
+        "Every seed ever built, so cycles can be compared with each other.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "Distribution_Tracker_History.csv", "RO Tracking",
+        "Every tracker you have uploaded, kept as an audit trail.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "RO Comparison",
+        "Static_Budget_Base_Lbs.csv · Static_Budget_RO_Lbs.csv · "
+        "Static_Budget_Base&RO_by_Month.csv", "RO Tracking",
+        "The budget baselines the RO bridge measures against.",
+        _OWNER_FABRIC),
 
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (IBP)",
+        "ibp_base_plan_current.csv", "RO Tracking/Demand Plan/Append New Plan",
+        "The base plan you upload in Step 1. Everything else here is built "
+        "from it.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (IBP)",
+        "qry_mgmt_plan_full.csv", "RO Tracking/Demand Plan",
+        "The management plan, rebuilt from your upload. Downloaded in Step 2.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (IBP)",
+        "qry_total_item_level_demand.csv", "RO Tracking/Demand Plan",
+        "Item-level demand, rebuilt from your upload. Downloaded in Step 2.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (IBP)",
+        "qry_mgmt_plan_history_tracker.csv", "RO Tracking/Demand Plan",
+        "Every IBP cycle ever uploaded — the prior-cycle baseline for BOTH "
+        "comparison modules, so it matters beyond this section.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (IBP)",
+        "qry_demand_plan_comparison_summary.csv", "RO Tracking/Demand Plan",
+        "The published cycle-over-cycle summary.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (IBP)",
+        "FY27_Budget_Demand_Plan_Summary.xlsx", "RO Tracking/Demand Plan",
+        "The FY27 budget workbook the comparison matches against, row by row.",
+        _OWNER_FABRIC),
 
-# The files a planner actually touches or asks about, for the two folders that
-# drive Demand Planner Analytics.  Deliberately not exhaustive: an index of
-# every blob would go stale in a week and help nobody.
-_LAKEHOUSE_FILES: tuple = (
-    _LakehouseFile(
-        "RO Tracking/Append_New_History/Distribution_Tracker.csv",
-        "You, in RO Comparison Step 1",
-        "The input to everything else in RO. Re-uploading rebuilds the seed, "
-        "the comparison and the summary."),
-    _LakehouseFile(
-        "RO Tracking/RO_Item_Master.csv",
-        "You, in RO Comparison Step 1 or 4",
-        "Maps item codes to portfolio and format. Fix it when Step 1 reports "
-        "an item it cannot classify."),
-    _LakehouseFile(
-        "RO Tracking/RO_Seed.csv",
-        "The app, from your tracker upload",
-        "The filtered opportunity + risk lines. Rebuilt on every upload — "
-        "never edit it by hand."),
-    _LakehouseFile(
-        "RO Tracking/RO_Reporting/RO_Comparison_Output.csv",
-        "The app",
-        "The row-level comparison behind Step 2 and the Step 3 drivers."),
-    _LakehouseFile(
-        "RO Tracking/RO_Reporting/RO_Summary_Report.csv",
-        "The app",
-        "The rolled-up report you download from Step 2."),
-    _LakehouseFile(
-        "RO Tracking/Demand Plan/qry_pdh.csv",
-        "The IBP pipeline",
-        "The PDH classification driving every category roll-up. A wrong "
-        "portfolio here moves numbers on every Demand Planner page."),
-    _LakehouseFile(
-        "RO Tracking/Demand Plan/qry_mgmt_plan_history_tracker.csv",
-        "Demand Summary (IBP) Step 1",
-        "Every IBP cycle ever uploaded — the prior-cycle baseline for both "
-        "comparison modules."),
-    _LakehouseFile(
-        "RO Tracking/APS/qry_mgmt_plan_full_aps_history.csv",
-        "Demand Summary (APS) Step 1",
-        "Every APS cycle ever uploaded. This is what the Step 2 table and "
-        "the Step 3 cycle picker read."),
-    _LakehouseFile(
-        "RO Tracking/APS/qry_mgmt_plan_full_aps.csv",
-        "Demand Summary (APS) Step 1",
-        "Just the most recently built cycle, both legs — the file offered for "
-        "download in Step 2."),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (APS / Oracle)",
+        "qry_mgmt_plan_full_aps_history.csv", "RO Tracking/APS",
+        "Every APS cycle ever uploaded. The Step 2 table and the Step 3 cycle "
+        "picker both read this one file.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (APS / Oracle)",
+        "qry_mgmt_plan_full_aps.csv", "RO Tracking/APS",
+        "Just the most recently built cycle, both legs — the Step 2 download.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Demand Planner Analytics", "Demand Summary (APS / Oracle)",
+        "Append_New_File (folder)", "RO Tracking/APS/Append_New_File",
+        "Your raw APS exports and RO_Seed files, filed exactly as uploaded.",
+        _OWNER_GENERATED),
+
+    _DataFile(
+        "Demand Planner Analytics", "Shared across the page",
+        "qry_pdh.csv", "RO Tracking/Demand Plan",
+        "The PDH product classification driving every category roll-up. A "
+        "wrong portfolio here moves numbers on every section of this page.",
+        _OWNER_AUTO),
+    _DataFile(
+        "Demand Planner Analytics", "Shared across the page",
+        "IBP Orders · IBP Shipments (lakehouse tables)", "",
+        "Customer orders and shipments — the actuals every accuracy number is "
+        "measured against.",
+        _OWNER_AUTO),
+    _DataFile(
+        "Demand Planner Analytics", "Shared across the page",
+        "Finance (folder)", "Finance",
+        "SKU-level net sales and gross profit actuals, linked from IBP "
+        "Cadence and Supporting files.",
+        _OWNER_AUTO),
+    _DataFile(
+        "Demand Planner Analytics", "Shared across the page",
+        "IRI_Weekly_Units_*.csv", "RO Tracking/IRI",
+        "Weekly IRI units behind Velocity Analysis and the plan-lift maths. "
+        "The newest dated file wins.",
+        _OWNER_FABRIC),
+
+    # ── Market Barometer ─────────────────────────────────────────────────
+    _DataFile(
+        "Market Barometer", "",
+        "Milk_Mover_Tracker.csv", "Milk_cost_tracker",
+        "The milk rates per Category × Class that drive the Milk Mover.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "Market Barometer", "",
+        "base_milk_cost_monthly_tracker.csv", "Milk_cost_tracker",
+        "The monthly base-milk-cost series behind the mover comparison.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "Market Barometer", "",
+        "Milk_Usage_Stable.csv", "Milk_cost_tracker",
+        "Per-item skim, butterfat, protein and other-solids usage — the "
+        "multipliers in the milk-cost formula.",
+        _OWNER_FABRIC),
+    _DataFile(
+        "Market Barometer", "",
+        "Product_Milk Base Cost.csv", "Activity_Model",
+        "Per-product milk base cost used by the mover arithmetic.",
+        _OWNER_FABRIC),
+    _DataFile(
+        "Market Barometer", "",
+        "COLA_Program_Tracker.csv", "Monthly_Pricing_Execution",
+        "The COLA program rows you add and edit in Annual COLA Movers.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "Market Barometer", "",
+        "VBCS_refrehable (folder)", "Monthly_Pricing_Execution/VBCS_refrehable",
+        "The refreshable VBCS outputs the monthly cycle produces.",
+        _OWNER_GENERATED),
+    _DataFile(
+        "Market Barometer", "",
+        "Mover downloads", "Monthly_Pricing_Execution",
+        "The four mover files published at the end of a monthly run.",
+        _OWNER_GENERATED),
+
+    # ── New Price Quote ──────────────────────────────────────────────────
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Sell-to_Volume Bracket_Fee.csv", "Activity_Model",
+        "Sell-to volume fee brackets.", _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Custom Label_Volume Bracket_Fee.csv", "Activity_Model",
+        "Custom-label volume fee brackets.", _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Delivery_Miles Tier_Drop Size Tier_Fee.csv", "Activity_Model",
+        "The delivery-charge grid: mileage tier × drop-size tier.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Pallet_Fee.csv", "Activity_Model",
+        "The mixed-pallet fee.", _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Plant_Class_Plant Fees.csv", "Activity_Model",
+        "Per-plant class fees.", _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Product_Class_Plant.csv", "Activity_Model",
+        "Which class and plant each product belongs to.", _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Product_Processing_Pkg_Ing.csv", "Activity_Model",
+        "Processing, packaging and ingredient cost per product.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "Product_UOM.csv", "Activity_Model",
+        "Each-to-pound conversions. Also read by Demand Planner Analytics.",
+        _OWNER_APP_UPLOAD),
+    _DataFile(
+        "New Price Quote", "Rate files (replace them from this page)",
+        "activity_model_monthly_state.json", "Activity_Model",
+        "Bookkeeping for the monthly refresh — which files were last "
+        "replaced, and when.", _OWNER_GENERATED),
+
+    # ── Pricing Execution Automation ─────────────────────────────────────
+    _DataFile(
+        "Pricing Execution Automation", "",
+        "tasks.json", "Pricing_Execution_Task_Manager",
+        "The task list the page shows. Created and updated by the page "
+        "itself as you start and edit tasks.", _OWNER_GENERATED),
+
+    # ── Shipment Monitor & HTST Requote ──────────────────────────────────
+    _DataFile(
+        "Shipment Monitor & HTST Requote", "",
+        "Shipment Report (folder)", "Activity_Model/Shipment Report",
+        "Dated order and shipment snapshots; the newest one wins. This is the "
+        "file operators refresh monthly.", _OWNER_FABRIC),
+    _DataFile(
+        "Shipment Monitor & HTST Requote", "",
+        "htst_shipment (lakehouse table)", "",
+        "The HTST shipment dataflow output behind the activity metrics.",
+        _OWNER_AUTO),
+    _DataFile(
+        "Shipment Monitor & HTST Requote", "",
+        "Shipments (lakehouse table)", "",
+        "Row-level shipments behind the velocity and drop-size metrics.",
+        _OWNER_AUTO),
+    _DataFile(
+        "Shipment Monitor & HTST Requote", "",
+        "The Activity_Model fee files", "Activity_Model",
+        "The fee brackets, delivery grid, pallet and UOM files listed under "
+        "**New Price Quote** — this page reads them, that page replaces them.",
+        _OWNER_APP_UPLOAD),
+
+    # ── Bid Assistant ────────────────────────────────────────────────────
+    _DataFile(
+        "Bid Assistant", "",
+        "New_Bids (folder)", "Program_Bid_Management/New_Bids",
+        "The bid scenario files you choose from at the top of the page.",
+        _OWNER_FABRIC),
+    _DataFile(
+        "Bid Assistant", "",
+        "BOM_History_Tracker_tagged.csv", "BOM",
+        "The bills of material behind every ingredient, packaging and "
+        "conversion cost.", _OWNER_AUTO),
+    _DataFile(
+        "Bid Assistant", "",
+        "BOM_Append (folder)", "BOM/BOM_Append",
+        "Drop a new BOM extract here to extend the tracker.", _OWNER_FABRIC),
+    _DataFile(
+        "Bid Assistant", "",
+        "Budget_Update.csv", "BOM/Budget",
+        "The budget line the RFP P&L is compared against.", _OWNER_FABRIC),
+
+    # ── Oracle Pricing Data Download ─────────────────────────────────────
+    _DataFile(
+        "Oracle Pricing Data Download", "",
+        "VBCS fixed files", "VBCS",
+        "The fixed VBCS files the Compare tool diffs your Oracle read "
+        "against.", _OWNER_FABRIC),
+    _DataFile(
+        "Oracle Pricing Data Download", "",
+        "Extract_Snapshot (folder)", "VBCS/Extract_Snapshot",
+        "A timestamped copy of every CSV you download — the audit trail, "
+        "written automatically.", _OWNER_GENERATED),
 )
+
+#: Page order for the index — the sidebar order, minus pages with no files.
+_DATA_VIEW_ORDER: tuple = tuple(
+    dict.fromkeys(f.view for f in _DATA_FILES)
+)
+
+
+def _files_for(view: str) -> tuple:
+    """Every row for one page, grouped, in declaration order.
+
+    Returns ``((group_label, rows), ...)`` — declaration order is the
+    authoring order, so related files stay together without a sort key.
+    """
+    groups: list = []
+    for f in _DATA_FILES:
+        if f.view != view:
+            continue
+        if not groups or groups[-1][0] != f.group:
+            groups.append((f.group, []))
+        groups[-1][1].append(f)
+    return tuple(groups)
+
+
+def _file_table(rows) -> str:
+    """One markdown table for a group of files.
+
+    Built as a single string on purpose: consecutive ``st.markdown`` calls are
+    separate blocks, so emitting a row at a time renders a stack of one-row
+    tables instead of one table.
+    """
+    body = "\n".join(
+        f"| `{f.name}` | {f.purpose} | {f.owner} | "
+        + (f"[{f.folder}]({_lakehouse_url(f.folder)})" if f.folder
+           else "_lakehouse table_")
+        + " |"
+        for f in rows
+    )
+    return (
+        "| File | What it's for | Who updates it | Where it lives |\n"
+        "|---|---|---|---|\n" + body
+    )
 
 
 def _render_data_sources() -> None:
-    """Clickable index of every Fabric destination the app touches."""
-    st.markdown("### 🗄️ Where the data lives (all links open in Fabric)")
+    """The file index, keyed by the page a person is looking at."""
+    st.markdown("### 🗄️ Where the data lives")
     st.caption(
-        "Every folder the app reads or writes, in the B2C pricing lakehouse. "
-        "Click any row to land on that exact folder — useful when you want to "
-        "check a source file yourself, or trace a number back to its input."
-    )
-    rows = "\n".join(
-        f"| [{p.label}]({_lakehouse_url(p.path)}) | {p.used_by} |"
-        for p in _LAKEHOUSE_PATHS
-    )
-    st.markdown(
-        "| Lakehouse folder | Read / written by |\n"
-        "|---|---|\n" + rows
+        "Every file the app reads or writes, grouped by the page that uses "
+        "it. Each row says what the file is for, who is allowed to change it, "
+        "and links straight to its folder in Fabric."
     )
 
-    st.markdown("#### The individual files behind Demand Planner Analytics")
-    st.caption(
-        "Who writes each file, and what moves in the app if it changes. "
-        "Anything marked *the app* is generated — edit the input instead."
-    )
-    file_rows = "\n".join(
-        f"| `{f.path.rsplit('/', 1)[-1]}` | {f.written_by} | {f.if_changed} |"
-        for f in _LAKEHOUSE_FILES
-    )
-    st.markdown(
-        "| File | Written by | What changes if it changes |\n"
-        "|---|---|---|\n" + file_rows
-    )
+    with st.expander("**How to replace a file in Fabric** — read this first",
+                     expanded=False):
+        st.markdown(
+            "\n".join(f"{i}. {s}" for i, s in enumerate(_REPLACE_STEPS, 1))
+        )
+        st.warning(_REPLACE_WARNING)
+        st.markdown(
+            f"[Open the pricing lakehouse in Fabric]({_lakehouse_url()}) — "
+            "the root of everything listed below."
+        )
+        st.markdown("**What \"Who updates it\" means**")
+        st.markdown(
+            "\n".join(f"- **{label}** — {meaning}" for label, meaning in _OWNERS)
+        )
+
+    for view in _DATA_VIEW_ORDER:
+        groups = _files_for(view)
+        count = sum(len(rows) for _g, rows in groups)
+        with st.expander(f"**{view}** — {count} entries", expanded=False):
+            for group, rows in groups:
+                if group:
+                    st.markdown(f"**{group}**")
+                st.markdown(_file_table(rows))
 
     st.markdown("#### Embedded reports")
     st.markdown(
@@ -768,13 +1037,24 @@ _DOC_TITLE: str = "Darigold Pricing Intelligence — User Manual"
 _DOC_FILENAME: str = "Darigold_Pricing_Intelligence_Manual.docx"
 
 _START_HERE: tuple = (
-    "**Sign in to Microsoft Fabric.** Once per session, on the Documentation "
-    "page. Every other page then just works.",
     "**Pick a page on the left.** The sidebar is ordered the way the work "
     "flows: Documentation first, the daily tools in the middle, the two "
     "specialist tools at the bottom.",
     "**Open the page's own instructions.** Every page has an Instructions "
     "block or a \"how this is computed\" box at the top.",
+    "**Start at Step 1.** In the upload modules the later steps read what "
+    "Step 1 produced, so work top to bottom.",
+)
+
+#: Shown under the connection panel.  Fabric now connects on its own when the
+#: app starts (``streamlit_app`` warms the OneLake token once per session), so
+#: signing in is the exception rather than step one.  The panel above is a
+#: status light with a fallback button; telling people to "sign in first" only
+#: sent them hunting for a button they almost never need.
+_CONNECTION_NOTE: str = (
+    "Microsoft Fabric connects automatically when the app starts — there is "
+    "normally nothing to do here. The box above is a status light: sign in "
+    "only if it tells you the connection failed."
 )
 
 _UTF8_TIP: str = (
@@ -804,11 +1084,7 @@ def _build_manual_docx() -> bytes:
 
     b.heading("Start here", 1)
     b.numbered([s.replace("**", "") for s in _START_HERE])
-    b.para(
-        "If a page says it has no data, check you are still signed in to "
-        "Microsoft Fabric — that is the cause nine times out of ten.",
-        italic=True, grey=True,
-    )
+    b.para(_CONNECTION_NOTE, italic=True, grey=True)
 
     b.heading("What each page does, and how to drive it", 1)
     b.para("One entry per page in the sidebar, in the same order.", grey=True)
@@ -816,7 +1092,8 @@ def _build_manual_docx() -> bytes:
         b.heading(g.name, 2)
         b.para(g.one_liner, italic=True)
         if g.needs_fabric:
-            b.para("Needs Microsoft Fabric — sign in first.", grey=True)
+            b.para("Reads Microsoft Fabric (connected automatically).",
+                   grey=True)
         b.numbered([s.replace("**", "").replace("`", "") for s in g.steps])
         if g.gotcha:
             b.callout("Watch out:", g.gotcha)
@@ -853,26 +1130,28 @@ def _build_manual_docx() -> bytes:
     b.page_break()
     b.heading("Where the data lives", 1)
     b.para(
-        "Every folder the app reads or writes in the B2C pricing lakehouse. "
-        "The folder names are clickable and open in Fabric.", grey=True,
-    )
-    b.table(
-        ["Lakehouse folder", "Read / written by"],
-        [[p.label, p.used_by] for p in _LAKEHOUSE_PATHS],
-        links=[_lakehouse_url(p.path) for p in _LAKEHOUSE_PATHS],
+        "Every file the app reads or writes, grouped by the page that uses "
+        "it. The folder in the last column is a link into Fabric.", grey=True,
     )
 
-    b.heading("The individual files behind Demand Planner Analytics", 2)
-    b.para(
-        "Who writes each file, and what moves in the app if it changes. "
-        "Anything marked \"the app\" is generated — edit the input instead.",
-        grey=True,
-    )
-    b.table(
-        ["File", "Written by", "What changes if it changes"],
-        [[f.path, f.written_by, f.if_changed] for f in _LAKEHOUSE_FILES],
-        links=[_lakehouse_url(f.path.rsplit("/", 1)[0]) for f in _LAKEHOUSE_FILES],
-    )
+    b.heading("How to replace a file in Fabric", 2)
+    b.numbered([s.replace("**", "") for s in _REPLACE_STEPS])
+    b.callout("Careful:", _REPLACE_WARNING.replace('"', ""))
+    b.para("What \u201cWho updates it\u201d means", bold=True)
+    b.bullets([f"{label} — {meaning}" for label, meaning in _OWNERS])
+
+    for view in _DATA_VIEW_ORDER:
+        b.heading(view, 2)
+        for group, rows in _files_for(view):
+            if group:
+                b.para(group, bold=True)
+            b.table(
+                ["File", "What it's for", "Who updates it", "Where it lives"],
+                [[f.name, f.purpose, f.owner, f.folder or "lakehouse table"]
+                 for f in rows],
+                links=[_lakehouse_url(f.folder) if f.folder else None
+                       for f in rows],
+            )
 
     b.heading("Embedded reports", 2)
     b.link_bullets((
@@ -953,8 +1232,8 @@ def render() -> None:
         unsafe_allow_html=True,
     )
     st.caption(
-        "Sign in below, then use the sidebar. This page explains every other "
-        "page, every formula behind the numbers, and where all the data lives."
+        "The manual for the whole app: what every page does, every formula "
+        "behind the numbers, and where all the data lives."
     )
 
     # ── Microsoft Fabric Sign-in (prominent, top of page) ────────────────────
@@ -968,10 +1247,7 @@ def render() -> None:
 
     st.markdown("### 🚦 Start here")
     st.markdown("\n".join(f"{i}. {s}" for i, s in enumerate(_START_HERE, 1)))
-    st.caption(
-        "*If a page says it has no data, come back here and check you are "
-        "still signed in — that is the cause nine times out of ten.*"
-    )
+    st.caption(f"*{_CONNECTION_NOTE}*")
 
     st.markdown("---")
     _render_docx_download()

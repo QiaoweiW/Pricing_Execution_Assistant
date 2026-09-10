@@ -20,6 +20,11 @@ prophet>=1.1.0
 statsmodels>=0.14.0
 patsy>=0.5.0
 openpyxl>=3.0.0
+
+# Word export of the Documentation page ("Download this manual (.docx)"), so
+# the manual can be shared with people who do not have app access.  Pure
+# Python, no system deps; openpyxl covers .xlsx but cannot write .docx.
+python-docx>=1.1.0
 pywin32>=306; sys_platform == "win32"
 
 # Microsoft Fabric / OneLake — Delta-table reader (HTST Shipment dataflow

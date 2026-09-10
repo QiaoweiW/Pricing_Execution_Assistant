@@ -27,8 +27,12 @@ _TABLE_KEY = "priceadjs"
 
 
 def render():
+    # Title tracks the sidebar label in streamlit_app.VIEW_NAME_MAPPING —
+    # the page was renamed there and the heading was left behind, so a user
+    # clicking "Oracle Pricing Data Download" landed on "Pricebook Editor".
     st.markdown(
-        '<h1 class="main-header">Pricebook Editor</h1>', unsafe_allow_html=True)
+        '<h1 class="main-header">Oracle Pricing Data Download</h1>',
+        unsafe_allow_html=True)
     st.caption("Read & write via ORDS REST — server-side validations and "
                "triggers run exactly as in the Excel add-in.")
 

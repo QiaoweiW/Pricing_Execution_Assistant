@@ -881,3 +881,107 @@ def test_a_missing_ro_summary_is_a_caption_not_a_scare(caps):
     page._render_plan_freshness(_bridge(100.0, 100.0, ties=True), _ro(), False)
     assert caps["warning"] == []
     assert any("RO_Comparison_Output.csv" in c for c in caps["captions"])
+
+
+# ── Forecast bias drivers: two drills, capped charts, no toggle ──────────────
+
+def _drivers(n=3, vol=1.0) -> pd.DataFrame:
+    from data_sources.demand_plan_comparison import (
+        BIAS_COL_AVG, BIAS_COL_FLAG_SEV, BIAS_COL_IMPACT, BIAS_COL_VOLUME,
+        BIAS_COL_WMAPE,
+    )
+    return pd.DataFrame([{
+        "corp_group": f"Corp{i}", "item_key": f"3400{i:02d}",
+        "item_desc": f"Item {i}", "brand": "Branded",
+        "soft": False, "unattributed": False,
+        "_driver_id": f"Corp{i}#{i}", "_abs_error": float(n - i),
+        BIAS_COL_VOLUME: vol + i, BIAS_COL_WMAPE: 0.2, BIAS_COL_AVG: -0.1,
+        BIAS_COL_IMPACT: 0.02, BIAS_COL_FLAG_SEV: "",
+        "_fcst": (1.0,), "_act": (1.0,), "2026-08": -0.1,
+    } for i in range(n)])
+
+
+def test_both_driver_drills_are_offered_and_named(caps, monkeypatch):
+    """One says 6-Month, the other says Latest Month — no guessing which."""
+    for fn in ("_render_bias_drivers_latest_month", "_render_bias_corp_sku_drivers"):
+        assert hasattr(page, fn), fn
+    src = open(page.__file__, encoding="utf-8").read()
+    assert "Forecast Bias Corporate × SKU Drivers — 6-Month" in src
+    assert "Forecast Bias Corporate × SKU Drivers — Latest Month" in src
+
+
+def test_the_flag_naming_toggle_is_gone():
+    src = open(page.__file__, encoding="utf-8").read()
+    assert "bias_flag_drivers" not in src
+    assert "_bias_driver_by_segment" not in src
+    assert "Name Corp × SKU driver in flags" not in src
+
+
+def test_the_latest_month_drill_asks_for_one_month():
+    """n_months=1 is what makes it cheap — half the rows of the 6-month drill."""
+    src = open(page.__file__, encoding="utf-8").read()
+    i = src.index("def _cached_latest_month_drivers(")
+    assert "n_months=1" in src[i:i + 2000]
+
+
+def test_the_latest_month_list_shows_only_customer_sku_volume(caps):
+    frames = []
+    page.st.dataframe = lambda df, **k: frames.append(
+        df.data if hasattr(df, "data") else df)
+    page._render_latest_month_driver_list(_drivers(3), "total_b2c", "Aug 2026")
+    assert frames, "the list must render"
+    assert list(frames[0].columns) == ["Customer", "SKU", "Volume (M lbs)"]
+
+
+def test_the_latest_month_list_is_ranked_biggest_miss_first(caps):
+    frames = []
+    page.st.dataframe = lambda df, **k: frames.append(
+        df.data if hasattr(df, "data") else df)
+    page._render_latest_month_driver_list(_drivers(3), "seg", "Aug 2026")
+    # _abs_error descends 3,2,1 across Corp0..Corp2.
+    assert list(frames[0]["Customer"]) == ["Corp0", "Corp1", "Corp2"]
+
+
+def test_the_latest_month_list_draws_no_charts(caps):
+    drawn = []
+    page.st.plotly_chart = lambda *a, **k: drawn.append(1)
+    page.st.dataframe = lambda *a, **k: None
+    page._render_latest_month_driver_list(_drivers(5), "seg", "Aug 2026")
+    assert drawn == [], "the latest-month list is a list, not a chart wall"
+
+
+def test_the_latest_month_list_always_offers_every_row_as_csv(caps):
+    page.st.dataframe = lambda *a, **k: None
+    page._render_latest_month_driver_list(_drivers(60), "seg", "Aug 2026")
+    assert any("Download all 60 rows" in d for d in caps["download"])
+
+
+# ── The chart cap — the crash fix ────────────────────────────────────────────
+
+def test_charts_are_capped_at_ten(caps, monkeypatch):
+    """1,713 Plotly figures is what took the tab down; ten is the opening set."""
+    drawn = []
+    monkeypatch.setattr(page, "_render_corp_sku_driver_chart",
+                        lambda row, months, key: drawn.append(key))
+    page._render_capped_driver_charts(_drivers(50), ("2026-08",), "total_b2c")
+    assert len(drawn) == page._DRIVER_CHART_PAGE == 10
+    assert any("of **50**" in c for c in caps["captions"])
+    assert any("more chart" in b[0] for b in caps["buttons"])
+
+
+def test_no_cap_message_when_everything_already_fits(caps, monkeypatch):
+    drawn = []
+    monkeypatch.setattr(page, "_render_corp_sku_driver_chart",
+                        lambda row, months, key: drawn.append(key))
+    page._render_capped_driver_charts(_drivers(4), ("2026-08",), "seg")
+    assert len(drawn) == 4
+    assert not any("more chart" in b[0] for b in caps["buttons"])
+
+
+def test_show_more_raises_the_cap(caps, monkeypatch):
+    drawn = []
+    monkeypatch.setattr(page, "_render_corp_sku_driver_chart",
+                        lambda row, months, key: drawn.append(key))
+    page.st.session_state["bias_drv_chart_n_seg"] = 20
+    page._render_capped_driver_charts(_drivers(50), ("2026-08",), "seg")
+    assert len(drawn) == 20

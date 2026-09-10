@@ -8187,10 +8187,13 @@ def _bias_flag_html(
     rows only (WMAPE ≥ 10% AND segment |error| ≥ 1% of Total-B2C volume) —
     a single "High impact" chip whose tooltip carries the rationale (kept
     off the chip face so the visible table stays scannable).  Monitor-tier
-    rows show only the sentence (still coloured amber in the WMAPE cell
-    when that column is visible).  ``driver`` names the top Corporate × SKU
-    contributor when the "Name Corp × SKU driver in flags" toggle is on and
-    attribution was available.
+    rows show only the sentence (still coloured amber in the WMAPE cell).
+
+    ``driver`` appends "— driven by X" when a caller supplies a top
+    Corporate × SKU contributor.  The page passes ``None``: the toggle that
+    used to fill it re-ran the whole corp×SKU attribution once per flagged
+    segment, and the two driver drills below answer the same question
+    without putting a multi-minute build behind a checkbox.
     """
     parts: list[str] = []
     if severity == BIAS_FLAG_PRIORITY:
@@ -8329,7 +8332,6 @@ def _render_bias_tree(
     *,
     show_months: bool = False,
     show_detail: bool = False,
-    driver_by_seg: Optional[dict[str, str]] = None,
 ) -> None:
     """Render the foldable Bias-by-segment tree.
 
@@ -8340,13 +8342,10 @@ def _render_bias_tree(
     under-forecast"), which is where a planner reads it anyway.
 
     *show_months* / *show_detail* stay as parameters so a caller can build a
-    narrower view; the page passes both True.  *driver_by_seg* maps a segment
-    row_id → "Corp × SKU" driver string for the flag sentence (flagged rows
-    only).
+    narrower view; the page passes both True.
     """
     rows = table.reset_index(drop=True)
     indent_flags = rows["_indent"].tolist() if "_indent" in rows.columns else []
-    driver_by_seg = driver_by_seg or {}
     # month_key -> (cycle, lag, is_fallback)
     meta_by_key = {k: (cyc, lag, fb) for k, cyc, lag, fb in month_meta}
 
@@ -8381,7 +8380,7 @@ def _render_bias_tree(
         _arrow, trend_word, _color = _bias_trend(monthly)
         flag_html = _bias_flag_html(
             row.get(BIAS_COL_FLAG_SEV), trend_word, row.get(BIAS_COL_FLAG_DIR),
-            driver_by_seg.get(str(row.get("_row_id", ""))))
+            None)
         parts.append(f'<span class="wide">{flag_html}</span>')
         return _cls(row), "".join(parts)
 
@@ -8477,85 +8476,191 @@ def _render_forecast_bias_section(
     # monthly bias values to make room for a sparkline OF those same values —
     # so a planner had to opt in to the numbers in order to stop looking at a
     # picture of them.  The sparkline is gone and the numbers lead.
-    name_drivers = st.toggle(
-        "Name Corp × SKU driver in flags", value=False, key="bias_flag_drivers",
-        help="Attributes each flagged segment's miss to its top Corporate × SKU "
-             "driver and names it in the Flag.  Off by default — it re-runs the "
-             "corp×SKU attribution per flagged segment (cached after first run).")
+    _render_bias_tree(table, months, month_meta,
+                      show_months=True, show_detail=True)
 
-    driver_by_seg: dict[str, str] = {}
-    if name_drivers:
-        with st.spinner("Attributing flagged segments to Corporate × SKU…"):
-            driver_by_seg = _bias_driver_by_segment(
-                table, tracker_df, pdh_df, item_master_df, filters,
-                ibp_actuals_df, ibp_naive_df)
-
-    _render_bias_tree(
-        table, months, month_meta,
-        show_months=True, show_detail=True,
-        driver_by_seg=driver_by_seg)
-
-    # Opt-in drill: Corporate group × SKU drivers of the segment miss.
+    # Two driver drills, both opt-in.  Latest month leads: "what went wrong
+    # last month" is the question people arrive with, and it is the cheaper
+    # of the two to build.
+    _render_bias_drivers_latest_month(
+        tracker_df, pdh_df, item_master_df, filters,
+        ibp_actuals_df, ibp_naive_df, table)
     _render_bias_corp_sku_drivers(
         tracker_df, pdh_df, item_master_df, filters,
         ibp_actuals_df, ibp_naive_df, table)
 
 
-def _bias_driver_by_segment(
-    table: pd.DataFrame,
+#: Session flag for the latest-month drill, kept separate from the 6-month
+#: one so opening a cheap list never triggers the expensive build.
+_BIAS_LATEST_LOADED_KEY: str = "bias_latest_month_drivers_loaded"
+_BIAS_LATEST_SEG_KEY: str = "bias_latest_month_segment"
+
+
+def _render_bias_drivers_latest_month(
     tracker_df: pd.DataFrame,
     pdh_df: Optional[pd.DataFrame],
     item_master_df: Optional[pd.DataFrame],
     filters: ComparisonFilters,
     ibp_actuals_df: Optional[pd.DataFrame],
     ibp_naive_df: Optional[pd.DataFrame],
-) -> dict[str, str]:
-    """Top Corporate × SKU driver string per FLAGGED segment, for the flag.
+    bias_table: pd.DataFrame,
+) -> None:
+    """Who and what drove **last month's** miss — customer, SKU, volume.
 
-    Bounded + best-effort: only flagged rows (Priority / Monitor) are attributed,
-    it reuses the same cached corp×SKU builder the drill-in uses (so repeats are
-    free), and a segment is named only when its forecast attribution clears
-    :data:`_BIAS_DRIVERS_MIN_FCST_ATTR` (else the corp split isn't trustworthy).
-    Returns ``{}`` when the corporate-group dims can't be loaded.
+    Deliberately not a smaller copy of the 6-month drill.  That one exists to
+    investigate a trend, so it carries WMAPE, FVA, avg bias, filters and a
+    chart per cell.  This one answers a different question — *what went wrong
+    last month* — and the answer is a list you read top to bottom, so it is
+    three columns and nothing else: **Customer** (corporate group), **SKU**,
+    and the **volume** behind it.  No charts, no filters, no detail columns.
+
+    Cheap by construction.  It asks the builder for ``n_months=1``, and since
+    ``_prepare_bias_inputs`` now prunes the tracker to the window, one month
+    reads ~9,300 rows where six read ~18,600 — half the work of the drill
+    below, on top of the 4.5x the prune already bought.
     """
-    if BIAS_COL_FLAG_SEV not in table.columns:
-        return {}
-    flagged = [
-        str(r["_row_id"]) for _, r in table.iterrows()
-        if str(r.get(BIAS_COL_FLAG_SEV, "")).strip()
-    ]
-    if not flagged:
-        return {}
-    sts, pts, names, _warn = _load_corp_group_dims()
-    if sts is None or pts is None or names is None:
-        return {}
-    base_sig = (
-        _signature_for(tracker_df), _signature_for(ibp_actuals_df),
-        _signature_for(ibp_naive_df), _signature_for(pdh_df),
-        _signature_for(item_master_df), _signature_for(sts),
-        _signature_for(pts), _signature_for(names),
-        filters.prior_month.isoformat(), tuple(sorted(filters.combo_exclude)),
-    )
-    out: dict[str, str] = {}
-    for seg in flagged:
-        try:
-            (drivers, _months, _lbl, _vol, _attr, fcst_attr, avail
-             ) = _cached_corp_sku_drivers(
-                base_sig + (seg,), filters, seg, tracker_df, ibp_actuals_df,
-                ibp_naive_df, pdh_df, item_master_df, sts, pts, names)
-        except Exception:                       # noqa: BLE001 — never fatal
-            continue
+    with st.expander("🔎 Forecast Bias Corporate × SKU Drivers — Latest Month",
+                     expanded=False):
+        month_label = filters.prior_month.strftime("%b %Y")
+        st.caption(
+            f"The **Corporate group × SKU** cells behind **{month_label}**'s "
+            f"base-plan miss — the single month the table above calls Prior "
+            f"Month.  Ranked biggest miss first.  Customer, SKU and volume "
+            f"only; open the **6-Month** drill below for the trend, the "
+            f"accuracy detail and the monthly charts."
+        )
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.caption("_Sign in via **Documentation** to load the drivers._")
+            return
+        if not st.session_state.get(_BIAS_LATEST_LOADED_KEY):
+            if st.button("📥 Load latest-month drivers",
+                         key="bias_latest_load_btn", type="primary"):
+                st.session_state[_BIAS_LATEST_LOADED_KEY] = True
+                st.rerun(scope="app")
+            return
+
+        sts, pts, names, dim_warn = _load_corp_group_dims()
+        if sts is None or pts is None or names is None:
+            st.warning(
+                f"⚠️ Could not load the corporate-group dimensions ({dim_warn}), "
+                "so the customer column cannot be resolved."
+            )
+            return
+
+        seg_ids = [str(r["_row_id"]) for _, r in bias_table.iterrows()]
+        labels = {
+            str(r["_row_id"]): str(r.get(DPC_COL_LABEL, r["_row_id"]))
+            .replace(" ", "").replace("• ", "").strip()
+            for _, r in bias_table.iterrows()
+        }
+        st.session_state.setdefault(
+            _BIAS_LATEST_SEG_KEY, _bias_default_segment(bias_table))
+        seg = st.selectbox(
+            "Segment", options=seg_ids, key=_BIAS_LATEST_SEG_KEY,
+            format_func=lambda s: labels.get(s, s),
+            help="Pick a node from the accuracy table above; its "
+                 "Corporate × SKU cells for the latest month are listed below.",
+        )
+
+        sig = (
+            _signature_for(tracker_df), _signature_for(ibp_actuals_df),
+            _signature_for(ibp_naive_df), _signature_for(pdh_df),
+            _signature_for(item_master_df), _signature_for(sts),
+            _signature_for(pts), _signature_for(names),
+            filters.prior_month.isoformat(),
+            tuple(sorted(filters.combo_exclude)), seg, "latest",
+        )
+        with st.spinner(f"Building {month_label} drivers…"):
+            drivers, avail, fcst_attr = _cached_latest_month_drivers(
+                sig, filters, seg, tracker_df, ibp_actuals_df, ibp_naive_df,
+                pdh_df, item_master_df, sts, pts, names)
+
         if not avail or drivers is None or drivers.empty:
-            continue
+            st.info(f"No drivers for this segment in {month_label}.")
+            return
         if pd.isna(fcst_attr) or fcst_attr < _BIAS_DRIVERS_MIN_FCST_ATTR:
-            continue
-        top = drivers.iloc[0]
-        corp = _corp_driver_label(top)
-        sku = str(top.get("item_desc") or top.get("item_key") or "").strip()
-        label = " × ".join(x for x in (corp, sku) if x)
-        if label:
-            out[seg] = label
-    return out
+            st.warning(
+                f"⚠️ **Corporate attribution low — only "
+                f"{0.0 if pd.isna(fcst_attr) else fcst_attr:.0%} of this "
+                f"segment's base-plan forecast mapped to a corporate group.**  "
+                f"The customer column would be misleading, so it is withheld.  "
+                f"See *How corporate group is derived* in the 6-Month drill for "
+                f"the chain to fix."
+            )
+            return
+
+        _render_latest_month_driver_list(drivers, seg, month_label)
+
+
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_latest_month_drivers(
+    sig_key: tuple,
+    filters: ComparisonFilters,
+    segment_row_id: str,
+    _tracker_df: pd.DataFrame,
+    _actuals_df: Optional[pd.DataFrame],
+    _naive_df: Optional[pd.DataFrame],
+    _pdh_df: Optional[pd.DataFrame],
+    _item_master_df: Optional[pd.DataFrame],
+    _shiptosites_df: Optional[pd.DataFrame],
+    _plantosites_df: Optional[pd.DataFrame],
+    _customernames_df: Optional[pd.DataFrame],
+) -> tuple:
+    """One-month driver build (native tuple out — dodges the pickle hazard)."""
+    res = build_forecast_bias_corp_sku_drivers(
+        _tracker_df, _actuals_df, _naive_df, _pdh_df, filters,
+        segment_row_id=segment_row_id,
+        shiptosites_df=_shiptosites_df, plantosites_df=_plantosites_df,
+        customernames_df=_customernames_df, item_master_df=_item_master_df,
+        n_months=1, top_n=0)
+    return res.drivers, res.available, res.forecast_attributed_share
+
+
+#: Rows listed before the "show more" button.  A list is meant to be read, and
+#: nobody reads 1,700 rows — but unlike the chart cap this one is only about
+#: legibility: the CSV below always carries every row.
+_LATEST_ROWS_PAGE: int = 25
+
+
+def _render_latest_month_driver_list(
+    drivers: pd.DataFrame, seg: str, month_label: str,
+) -> None:
+    """Customer · SKU · volume, biggest miss first.  No charts, no filters."""
+    view = drivers.copy()
+    view["Customer"] = [_corp_driver_label(r) for _, r in view.iterrows()]
+    view["SKU"] = [
+        f"{r.get('item_key', '')} · {r.get('item_desc', '')}".strip(" ·")
+        for _, r in view.iterrows()
+    ]
+    view["Volume (M lbs)"] = pd.to_numeric(
+        view.get(BIAS_COL_VOLUME), errors="coerce")
+    # Already impact-ranked by the builder; sort explicitly so the contract is
+    # visible here rather than inherited silently.
+    view = view.sort_values("_abs_error", ascending=False, kind="stable")
+    out = view[["Customer", "SKU", "Volume (M lbs)"]].reset_index(drop=True)
+
+    key = f"bias_latest_rows_{seg}"
+    limit = int(st.session_state.get(key, _LATEST_ROWS_PAGE))
+    st.dataframe(
+        out.head(limit).style.format({"Volume (M lbs)": "{:,.3f}"}),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        f"{min(limit, len(out)):,} of **{len(out):,}** cell(s) for "
+        f"{month_label}, biggest miss first.  Volume is the segment's ordered "
+        f"pounds behind each cell."
+    )
+    if len(out) > limit:
+        if st.button(f"Show {min(_LATEST_ROWS_PAGE, len(out) - limit)} more",
+                     key=f"bias_latest_more_{seg}"):
+            st.session_state[key] = limit + _LATEST_ROWS_PAGE
+            st.rerun(scope="app")
+    st.download_button(
+        f"⬇️ Download all {len(out):,} rows (CSV)",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name=f"bias_drivers_latest_month_{seg}_"
+                  f"{pd.Timestamp.utcnow().strftime('%Y%m%d')}.csv",
+        mime="text/csv", key=f"bias_latest_dl_{seg}", use_container_width=True)
 
 
 # ── Corporate group × SKU drivers (opt-in drill under the bias tree) ─────────
@@ -8651,14 +8756,16 @@ def _render_bias_corp_sku_drivers(
     The builder returns the segment's FULL cell list (``top_n=0``); filtering
     and chart fan-out happen in :func:`_render_corp_sku_driver_list`.
     """
-    with st.expander("🔎 Forecast Bias Corporate × SKU Drivers", expanded=False):
+    with st.expander("🔎 Forecast Bias Corporate × SKU Drivers — 6-Month",
+                     expanded=False):
         st.caption(
             "Drill into the **Corporate group × SKU** cells driving a segment's "
-            "lag-1 base-plan miss — ranked by **pounds of error (impact)**, the "
-            "cells actually moving the number.  Filter by brand / corporate "
-            "group / SKU / impact; every listed cell gets its own monthly "
-            "chart, so **narrow the filters before widening the list**.  Loads "
-            "on demand so it never slows the report above."
+            "lag-1 base-plan miss **over the same six months as the table "
+            "above** — ranked by **pounds of error (impact)**, the cells "
+            "actually moving the number.  Filter by brand / corporate group / "
+            "SKU / impact.  For last month on its own, use the **Latest "
+            "Month** drill above.  Loads on demand so it never slows the "
+            "report above."
         )
         with st.expander("ℹ️ How corporate group is derived", expanded=False):
             st.markdown(
@@ -8903,8 +9010,49 @@ def _render_corp_sku_driver_list(
                   f"{pd.Timestamp.utcnow().strftime('%Y%m%d')}.csv",
         mime="text/csv", key=f"bias_drv_dl_{seg}", use_container_width=True)
 
-    for i, (_, row) in enumerate(shown.iterrows()):
+    _render_capped_driver_charts(shown, months, seg)
+
+
+#: Charts drawn before the planner has to ask for more.  Each is a full Plotly
+#: figure and Total B2C can list 1,700+ cells, so rendering them all is what
+#: took the browser down.  Ten is enough to read the shape of the miss, and
+#: the table above still lists every row.
+_DRIVER_CHART_PAGE: int = 10
+
+
+def _render_capped_driver_charts(
+    shown: pd.DataFrame, months: tuple, seg: str,
+) -> None:
+    """Draw the top-N charts by impact, with a button to reveal more.
+
+    The filters used to be the only throttle, so the widest setting asked the
+    browser for one Plotly figure per listed cell — 1,713 of them for Total
+    B2C.  That is what crashed the tab.  Capping hides no data: the table
+    above is complete either way, and the rows arrive impact-ranked, so the
+    first ten are the ten worth looking at.
+    """
+    key = f"bias_drv_chart_n_{seg}"
+    limit = int(st.session_state.get(key, _DRIVER_CHART_PAGE))
+    total = len(shown)
+
+    if total > limit:
+        st.caption(
+            f"Showing the **{limit}** highest-impact charts of **{total:,}**.  "
+            f"Every cell is in the table above — narrow the filters to bring a "
+            f"specific one into view rather than loading hundreds of charts."
+        )
+    for i, (_, row) in enumerate(shown.head(limit).iterrows()):
         _render_corp_sku_driver_chart(row, months, key=f"bias_drv_chart_{seg}_{i}")
+
+    if total > limit:
+        if st.button(
+            f"Show {min(_DRIVER_CHART_PAGE, total - limit)} more chart(s)",
+            key=f"bias_drv_more_{seg}",
+            help="Each chart is a full interactive figure; adding hundreds at "
+                 "once is what makes the tab stop responding.",
+        ):
+            st.session_state[key] = limit + _DRIVER_CHART_PAGE
+            st.rerun(scope="app")
 
 
 def _render_corp_sku_driver_chart(row: pd.Series, months: tuple, *, key: str) -> None:

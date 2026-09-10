@@ -438,9 +438,16 @@ def _cached_source_columns(_cache_token: str) -> list[str]:
     return list(header.columns)
 
 
-def fetch_source_columns() -> list[str]:
+def fetch_source_columns(*, force_refresh: bool = False) -> list[str]:
     """Raw ``dbo.Shipments`` column names for the UI diagnostic; ``[]`` on any
-    read failure (a diagnostic must never break the section)."""
+    read failure (a diagnostic must never break the section).
+
+    Takes ``force_refresh`` like its sibling :func:`fetch_shipments_df`: the
+    cache key is a constant token, so an explicit clear is the only way to
+    re-read after the table's schema changes.
+    """
+    if force_refresh:
+        _cached_source_columns.clear()
     try:
         return _cached_source_columns("default")
     except ShipmentsVelocityError:

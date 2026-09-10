@@ -113,10 +113,7 @@ from data_sources.demand_plan_comparison import (
     build_comparison_not_captured,
     build_demand_plan_comparison,
     build_enriched_sources,
-    build_item_dim_frame,
     build_item_dim_frame_cascade,
-    build_corp_group_lookups,
-    _vectorised_item_key,
     ComparisonNotCaptured,
     DIAG_COL_LBS,
     DIAG_COL_MLBS,
@@ -198,14 +195,12 @@ from data_sources.aps_upload_pipeline import (
     FORECAST_APS_BASE_PLAN as APS_FCST_BASE_PLAN,
     FORECAST_R_AND_O as APS_FCST_R_AND_O,
     aps_history_path,
-    build_corp_review,
     delete_history_slice,
     fetch_aps_history_df,
     generate_base_plan_from_upload,
     generate_ro_from_seed,
     list_aps_history_cycles,
-    parse_corp_override_csv,
-    patch_history_corp,
+    summarise_history,
 )
 from data_sources.ro_comparison import (
     ANNUAL_OPP_CHANGE,
@@ -629,6 +624,15 @@ def _section_load_gate(
 # the planner is looking at and loading it eagerly is correct.
 _SS_VELOCITY_LOADED: str = "velocity_analysis_loaded"
 _SS_APS_LOADED: str = "demand_summary_aps_loaded"
+
+# TTL for the derived (build) outputs.  60 minutes — matches the bumped
+# raw-CSV TTL so the build cache never out-lives its inputs.  The "🔄
+# Refresh from Fabric" button clears the raw cache (and the page reruns,
+# so the build cache misses cleanly on the next render).  Defined up here
+# because @st.cache_data(ttl=...) is evaluated at IMPORT time, and the first
+# decorator that reads it is now the APS section's, far above the Demand Plan
+# Comparison block where this used to live.
+_CACHE_TTL_SECONDS_OUTPUTS: int = 60 * 60
 _SS_BUSINESS_HEALTH_LOADED: str = "business_health_loaded"
 _SS_DEMAND_SUMMARY_LOADED: str = "demand_summary_loaded"
 
@@ -5550,8 +5554,6 @@ _APS_UPLOAD_RESULT_KEY: str = "aps_upload_result"
 # Bumped after a successful build so the file_uploader widget resets (a re-run
 # doesn't re-ingest the same file).
 _APS_UPLOAD_NONCE_KEY: str = "aps_upload_nonce"
-# Bumped after a successful corp-group patch so the patch uploader resets.
-_APS_PATCH_NONCE_KEY: str = "aps_patch_nonce"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -5566,171 +5568,68 @@ def _cached_persisted_aps_plan() -> Optional[pd.DataFrame]:
     return df
 
 
-def _render_aps_corp_review(history: Optional[pd.DataFrame]) -> None:
-    """R&O Corporate Group review + patch — read/written straight on the history file.
+def _flush_aps_caches() -> None:
+    """Invalidate every cache that reads the APS history, in one place.
 
-    The APS base-plan leg is attributed deterministically (plan-to bridge +
-    native code), so only the R&O leg's **fuzzy / Unmapped** customers warrant a
-    look.  Works off the already-loaded ``qry_mgmt_plan_full_aps_history.csv``
-    (*history*, read once by the caller): **download** the list, correct the
-    **Corporate Group** cells, **upload** it back, and **Apply patch** rewrites
-    *only* those still-reviewable R&O rows on the history file (exact matches and
-    prior patches are left untouched, so earlier fixes never need redoing).
+    There are three, and they used to be cleared ad-hoc at each write site —
+    which is how the comparison's cycle picker came to be missed entirely and
+    kept serving a pre-upload cycle list for a whole hour after an upload.
+    Every APS write (build, delete) calls this instead, so a cache added here
+    later cannot be forgotten at one write site and remembered at another.
     """
-    if not fabric_signin_widget.is_fabric_signed_in():
-        return
-    with st.expander("🧾 R&O Corporate Group review + patch", expanded=False):
-        st.caption(
-            "R&O **Customers** whose Corporate Group is still **Fuzzy** or "
-            "**Unmapped** on the APS history tracker (Unmapped first).  To fix: "
-            "**download** the list, correct the **Corporate Group** cells, "
-            "**upload** it back, and click **Apply patch** — that rewrites *only* "
-            "those still-reviewable R&O rows directly on the history file "
-            "(exact matches and earlier patches are left alone)."
-        )
-        if history is None or history.empty:
-            st.info(
-                "ℹ️ No APS history yet — build a cycle in **Demand Summary (APS / Oracle)** "
-                "above; the review lights up once the history file exists."
-            )
-            return
-        review = build_corp_review(history)
-        n_review = len(review)
-        if n_review:
-            st.warning(
-                f"⚠️ **{n_review}** R&O customer(s) need a Corporate Group review."
-            )
-        if review.empty:
-            st.success("✅ Every R&O customer already has a resolved Corporate Group.")
-        else:
-            st.dataframe(review, use_container_width=True, hide_index=True)
-        st.download_button(
-            label="⬇️ Download review list (CSV)",
-            data=review.to_csv(index=False).encode("utf-8"),
-            file_name="aps_ro_corp_group_match_log.csv",
-            mime="text/csv",
-            key="aps_corp_review_download",
-            disabled=review.empty,
-        )
-
-        st.markdown("**Apply a fixed review list**")
-        patch_nonce = st.session_state.get(_APS_PATCH_NONCE_KEY, 0)
-        patch = st.file_uploader(
-            "Upload fixed review list (CSV)", type=["csv"],
-            key=f"aps_patch_upload_{patch_nonce}",
-            help="The downloaded list with corrected Corporate Group values "
-                 "(Customer + Corporate Group columns).",
-        )
-        if st.button(
-            "✅ Apply patch to history", key="aps_patch_apply",
-            disabled=patch is None,
-        ) and patch is not None:
-            try:
-                overrides = parse_corp_override_csv(patch.getvalue())
-                if not overrides:
-                    st.warning(
-                        "No usable Customer → Corporate Group rows found "
-                        "(blank / (Unmapped) values are skipped)."
-                    )
-                    return
-                with st.spinner("Patching the APS history tracker…"):
-                    patched, total = patch_history_corp(overrides)
-                _cached_persisted_aps_plan.clear()
-                _cached_aps_history.clear()   # comparison picks up the patched history
-                st.session_state[_APS_PATCH_NONCE_KEY] = patch_nonce + 1
-                if patched:
-                    st.success(
-                        f"✅ Patched **{patched:,}** R&O row(s) across "
-                        f"**{len(overrides)}** customer(s); history now "
-                        f"**{total:,}** rows."
-                    )
-                else:
-                    st.info(
-                        "No reviewable rows matched — those customers may already "
-                        "be resolved (exact / previously patched)."
-                    )
-                st.rerun(scope="app")
-            except (ApsUploadError, LakehouseIOError, ValueError) as exc:
-                st.error(f"❌ Could not apply the patch.\n\n{exc}")
+    _cached_persisted_aps_plan.clear()
+    _cached_aps_history.clear()
+    _cached_aps_history_summary.clear()
+    _cached_aps_comparison_options.clear()
 
 
-# Fragment-isolated: a widget interaction anywhere inside this section reruns
-# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
-# the whole script per interaction by default, so without this a filter click
-# here re-executes every other section's Fabric reads and rebuilds.  Writes that
-# must refresh the WHOLE page (cache flush + reload after an upload / withdraw)
-# call ``st.rerun(scope="app")``, which escapes the fragment.
-#
-# Safe because this section owns its state: its widgets are namespaced to it and
-# no other section reads them.  (The RO rules panel writes a config that only
-# RO-section consumers read — verified before fragmenting.)
-@st.fragment
-def _render_demand_summary_aps() -> None:
-    """Render the Demand Summary (APS / Oracle) section — the upload-driven APS plan.
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False, max_entries=2)
+def _cached_csv_bytes(sig: tuple, _frame: pd.DataFrame) -> bytes:
+    """Serialise a frame to download-ready CSV bytes, once per distinct frame.
 
-    One foldable section containing, top → bottom: ① **upload & manage** (build
-    the Base Plan leg from an APS bulk export **or** the R&O leg from an R&O
-    seed, and a delete tool for a Cycle / FY / Forecast Type slice), ② the
-    **R&O Corporate Group review + patch** sub-section, and ③ the **APS Demand
-    Plan Comparison Summary** sub-section — the last two are native (nested)
-    expanders available whenever the history file exists.  B2C-only.
+    ``st.download_button`` wants the bytes up front, so the naive call
+    (``frame.to_csv().encode()`` inline) re-serialised on EVERY rerun of the
+    fragment — measured at 47.4 MB and 1.17s for the live 382,738-row APS plan,
+    per interaction.  Keyed on *sig* (``_frame`` is the unhashable payload) and
+    bounded to 2 entries so the cache itself can't grow without limit.
     """
-    with st.expander("📈 Demand Summary (APS / Oracle)", expanded=False):
-        st.caption(
-            "**APS / Oracle demand plan.**  Upload an **APS bulk export** (builds the "
-            "**Base Plan** leg) **or** an **R&O seed** (builds the **R&O** leg), "
-            "pick the **Cycle** + **Fiscal Year**, and the rows are shaped to the "
-            "history schema (Portfolio / Supply by **item code** via PDH → "
-            "RO_Item_Master; Corporate Group via the `plan_to_code → "
-            "dp_dimplantosites → dp_dimcustomernames` bridge, native code as "
-            f"fallback) and upserted into **`{aps_history_path()}`** — replacing "
-            "only that (Cycle, FY, Forecast Type) leg.  Use the delete tool to "
-            "clear a slice.  Review / patch corporate groups and build the "
-            "comparison in the sub-sections below."
-        )
-
-        # Auth gate — match every other Fabric-backed section here.
-        if not fabric_signin_widget.is_fabric_signed_in():
-            st.warning(
-                "🔒 **Microsoft Fabric is not connected.**  Sign in via "
-                "**Documentation** in the sidebar, then return here."
-            )
-            return
-
-        # Gated: this section reads the ≈1M-row APS history tracker plus the
-        # plan-to-site / customer-name dimensions, all of which loaded on every
-        # render while the expander was closed.
-        if not _section_load_gate(
-            _SS_APS_LOADED,
-            button_label="▶️ Load APS / Oracle demand plan",
-            blurb="Reads the APS history tracker and the customer / ship-to "
-                  "dimensions from OneLake — loaded on request so the rest of "
-                  "the page stays fast.",
-            help_text="Loads the APS history for this session.  Upload, "
-                      "review and comparison behave normally once loaded.",
-        ):
-            return
-
-        _render_aps_upload_manage()
-
-        # ② + ③ share ONE history read (the ≈1M-row tracker is the section's
-        # heaviest source).  Reading it here — before either sub-section — means
-        # neither blocks the other on its own read, so both render together and
-        # are independent.  The read is cached (see _cached_aps_history), so the
-        # upload/manage step above and a warm rerun don't pay for it again.
-        try:
-            aps_history = _cached_aps_history()
-        except (LakehouseIOError, ValueError) as exc:
-            aps_history = None
-            st.warning(f"Could not read the APS history tracker: {exc}")
-
-        # ② + ③ — native (nested) foldable sub-sections, always available.
-        _render_aps_corp_review(aps_history)
-        _render_aps_comparison_section(aps_history)
+    return _frame.to_csv(index=False).encode("utf-8")
 
 
-def _render_aps_upload_manage() -> None:
-    """① Upload & build one leg (Base Plan or R&O) + delete a history slice."""
+def _render_aps_download_preview(frame: pd.DataFrame, *, key_prefix: str) -> None:
+    """Download button (fixed filename) + a first-100-rows preview expander."""
+    st.download_button(
+        label=f"⬇️ Download `{APS_OUTPUT_NAME}`",
+        data=_cached_csv_bytes(_signature_for(frame), frame),
+        file_name=APS_OUTPUT_NAME,
+        mime="text/csv",
+        key=f"{key_prefix}_download",
+        type="primary",
+        use_container_width=True,
+        help="Exactly the file saved in Fabric.",
+    )
+    with st.expander("👁️ Preview (first 100 rows)", expanded=False):
+        st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
+
+
+# ── Step 1 · Upload this cycle's plan ────────────────────────────────────────
+def _render_aps_step1_upload() -> None:
+    """Pick Cycle + Fiscal Year, choose a leg, upload, build.
+
+    One upload builds one leg.  The two legs are independent by design, so a
+    planner can rebuild a bad R&O seed without disturbing the base plan they
+    already loaded.
+    """
+    st.caption(
+        "A cycle is made of **two files**, uploaded one at a time:\n\n"
+        "1. the **APS bulk export** from Oracle — the baseline plan, the big one;\n"
+        "2. the **RO_Seed** — the risks and opportunities on top of it.\n\n"
+        "Pick the cycle and fiscal year, say which of the two you are uploading, "
+        "then press build.  Each upload replaces **only its own half**, so "
+        "loading the RO_Seed never disturbs the base plan you already loaded, "
+        "and re-uploading a file simply overwrites the previous attempt."
+    )
+
     pick = st.columns(2)
     with pick[0]:
         cycle = st.selectbox(
@@ -5743,7 +5642,7 @@ def _render_aps_upload_manage() -> None:
             help="The fiscal year this upload represents.",
         )
     kind = st.radio(
-        "What are you uploading?",
+        "Which file is this?",
         options=("APS bulk export → Base Plan leg", "R&O seed → R&O leg"),
         horizontal=True, key="aps_upload_kind",
         help="An APS export replaces only the Base Plan rows for this Cycle + FY; "
@@ -5790,104 +5689,226 @@ def _render_aps_upload_manage() -> None:
             st.session_state.pop(_APS_UPLOAD_RESULT_KEY, None)
             st.error(f"❌ Could not build the APS plan.\n\n{exc}")
         if res_new is not None:
-            _cached_persisted_aps_plan.clear()
-            _cached_aps_history.clear()   # so the comparison + review see the change
+            # One call, every APS cache — including the comparison's cycle
+            # picker, so the cycle just built is selectable immediately.
+            _flush_aps_caches()
             st.session_state[_APS_UPLOAD_RESULT_KEY] = res_new
 
-    # Build outcome (or persisted / empty state), then the delete tool.
     res = st.session_state.get(_APS_UPLOAD_RESULT_KEY)
-    if res is not None:
-        cov = "—" if pd.isna(res.corp_coverage) else f"{res.corp_coverage:.0%}"
-        leg = (f"{res.aps_rows:,} Base Plan" if res.aps_rows
-               else f"{res.ro_rows:,} R&O")
-        st.success(
-            f"✅ Built **{len(res.rows):,}** rows ({leg}) for **{res.cycle} / "
-            f"FY{res.fy}** — corporate-group coverage **{cov}**.  History tracker "
-            f"now **{res.history_rows:,}** rows."
-        )
-        _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
-    else:
-        try:
-            persisted = _cached_persisted_aps_plan()
-        except (LakehouseIOError, ValueError) as exc:
-            persisted = None
-            st.warning(f"Could not read the saved APS file: {exc}")
-        if persisted is not None and not persisted.empty:
-            st.success(
-                f"✅ Loaded the last-built **{APS_OUTPUT_NAME}** from Fabric "
-                f"({len(persisted):,} rows)."
-            )
-            _render_aps_download_preview(persisted, key_prefix="aps_upload_saved")
-        else:
-            st.caption(
-                "_Pick a **Cycle** + **Fiscal Year**, choose what you're uploading, "
-                "then click **Build & append to history**._"
-            )
-
-    _render_aps_delete_tool()
-
-
-def _render_aps_delete_tool() -> None:
-    """Delete a (Cycle, FY, Forecast Type) slice from the APS history tracker."""
-    with st.container(border=True):
-        st.markdown("**🗑️ Delete rows from the APS history tracker**")
+    if res is None:
         st.caption(
-            "Remove a slice by **Cycle + Fiscal Year + Forecast Type** — e.g. "
-            "clear a bad R&O leg before re-uploading its seed.  Permanent."
+            "_Nothing built yet this session.  Pick a **Cycle** + **Fiscal Year**, "
+            "choose which file you're uploading, then click **Build & append to "
+            "history**._"
         )
-        dc = st.columns(3)
-        with dc[0]:
-            del_cycle = st.selectbox("Cycle", APS_CYCLES, key="aps_del_cycle")
-        with dc[1]:
-            del_fy = st.selectbox("Fiscal Year", APS_FISCAL_YEARS, key="aps_del_fy")
-        with dc[2]:
-            del_type = st.selectbox(
-                "Forecast Type", ("All", APS_FCST_BASE_PLAN, APS_FCST_R_AND_O),
-                key="aps_del_type")
-        confirm = st.checkbox(
-            f"Yes, permanently delete **{del_type}** rows for "
-            f"**{del_cycle} / FY{del_fy}**", key="aps_del_confirm")
-        if st.button(
-            "🗑️ Delete matching rows", key="aps_del_btn", disabled=not confirm,
-        ) and confirm:
-            types = None if del_type == "All" else (del_type,)
-            try:
-                with st.spinner("Deleting from the APS history tracker…"):
-                    deleted, total = delete_history_slice(
-                        str(del_cycle), int(del_fy), types)
-                # Clear caches so the review + comparison sub-sections re-read the
-                # post-delete history later in THIS run (no rerun needed, so the
-                # confirmation banner stays visible).
-                _cached_persisted_aps_plan.clear()
-                _cached_aps_history.clear()
-                if deleted:
-                    st.success(
-                        f"🗑️ Deleted **{deleted:,}** row(s); history tracker now "
-                        f"**{total:,}** rows."
-                    )
-                else:
-                    st.info(
-                        "No rows matched that Cycle / Fiscal Year / Forecast Type."
-                    )
-            except (LakehouseIOError, ValueError) as exc:
-                st.error(f"❌ Could not delete the slice.\n\n{exc}")
+        return
 
-
-def _render_aps_download_preview(frame: pd.DataFrame, *, key_prefix: str) -> None:
-    """Download button (fixed filename) + a first-100-rows preview expander."""
-    st.download_button(
-        label=f"⬇️ Download `{APS_OUTPUT_NAME}`",
-        data=frame.to_csv(index=False).encode("utf-8"),
-        file_name=APS_OUTPUT_NAME,
-        mime="text/csv",
-        key=f"{key_prefix}_download",
-        type="primary",
-        use_container_width=True,
-        help="Exactly the file saved in Fabric (reflects any applied "
-             "Corporate Group patch).",
+    cov = "—" if pd.isna(res.corp_coverage) else f"{res.corp_coverage:.0%}"
+    leg = f"{res.aps_rows:,} Base Plan" if res.aps_rows else f"{res.ro_rows:,} R&O"
+    st.success(
+        f"✅ Built **{len(res.rows):,}** rows ({leg}) for **{res.cycle} / "
+        f"FY{res.fy}** — corporate-group coverage **{cov}**.  History tracker "
+        f"now **{res.history_rows:,}** rows.  "
+        f"**{res.cycle}** is ready to pick in Step 3."
     )
-    with st.expander("👁️ Preview (first 100 rows)", expanded=False):
-        st.dataframe(frame.head(100), use_container_width=True, hide_index=True)
+    if getattr(res, "corp_defaulted", 0):
+        st.caption(
+            f"ℹ️ {res.corp_defaulted:,} R&O row(s) had no corporate group on file, "
+            f"so each one now uses its own customer name.  Nothing for you to do — "
+            f"this used to be a manual download-and-fix step."
+        )
+    _render_aps_download_preview(res.rows, key_prefix="aps_upload_live")
+
+
+# ── Step 2 · Check what landed ───────────────────────────────────────────────
+@st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
+def _cached_aps_history_summary(sig: tuple, _hist: pd.DataFrame) -> pd.DataFrame:
+    """Cached :func:`summarise_history` — a group-by over the ≈1.4M-row history.
+
+    Keyed on the frame's shape signature (``_hist`` is the unhashable payload,
+    excluded from the key by its leading underscore).
+    """
+    return summarise_history(_hist)
+
+
+def _render_aps_step2_check(aps_history: Optional[pd.DataFrame]) -> None:
+    """Show what the history file now holds, and offer the saved plan file."""
+    st.caption(
+        "Every cycle currently stored, newest at the top.  After an upload, "
+        "find your cycle here and check the row counts look right — a cycle "
+        "needs **both** legs before Step 3 can compare it properly."
+    )
+    if aps_history is None or aps_history.empty:
+        st.info(
+            "ℹ️ Nothing stored yet.  Upload a file in **Step 1** and it will "
+            "appear here."
+        )
+        return
+
+    summary = _cached_aps_history_summary(_signature_for(aps_history), aps_history)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+    incomplete = [
+        f"**{row['Cycle']}** is missing its "
+        + ("R&O seed" if row["R&O rows"] == 0 else "APS bulk export")
+        for _, row in summary.iterrows()
+        if not (row["Base Plan rows"] and row["R&O rows"])
+    ]
+    if incomplete:
+        st.caption(
+            "⚠️ " + ", ".join(incomplete)
+            + ".  Upload the missing file in Step 1 when you have it."
+        )
+
+    st.markdown("---")
+    st.markdown("**The saved plan file**")
+    st.caption(
+        f"`{APS_OUTPUT_NAME}` holds the most recently built cycle — both legs "
+        "together.  This is the same file the app saved to Fabric."
+    )
+    try:
+        persisted = _cached_persisted_aps_plan()
+    except (LakehouseIOError, ValueError) as exc:
+        st.warning(f"Could not read the saved APS file: {exc}")
+        return
+    if persisted is None or persisted.empty:
+        st.caption("_No saved file yet — build a cycle in Step 1._")
+        return
+    st.caption(f"{len(persisted):,} rows.")
+    _render_aps_download_preview(persisted, key_prefix="aps_upload_saved")
+
+
+# ── Step 4 · Delete a cycle ──────────────────────────────────────────────────
+def _render_aps_step4_delete() -> None:
+    """Delete a (Cycle, FY, Forecast Type) slice from the APS history tracker."""
+    st.caption(
+        "Uploaded the wrong file, or the wrong cycle?  Remove it here, then go "
+        "back to **Step 1** and upload the right one.  You can drop just one "
+        "leg — say a bad R&O seed — and leave the base plan alone.  This "
+        "cannot be undone."
+    )
+    dc = st.columns(3)
+    with dc[0]:
+        del_cycle = st.selectbox("Cycle", APS_CYCLES, key="aps_del_cycle")
+    with dc[1]:
+        del_fy = st.selectbox("Fiscal Year", APS_FISCAL_YEARS, key="aps_del_fy")
+    with dc[2]:
+        del_type = st.selectbox(
+            "Which leg?", ("All", APS_FCST_BASE_PLAN, APS_FCST_R_AND_O),
+            key="aps_del_type")
+    confirm = st.checkbox(
+        f"Yes, permanently delete **{del_type}** rows for "
+        f"**{del_cycle} / FY{del_fy}**", key="aps_del_confirm")
+    if st.button(
+        "🗑️ Delete matching rows", key="aps_del_btn", disabled=not confirm,
+    ) and confirm:
+        types = None if del_type == "All" else (del_type,)
+        try:
+            with st.spinner("Deleting from the APS history tracker…"):
+                deleted, total = delete_history_slice(
+                    str(del_cycle), int(del_fy), types)
+            # Same one-call flush as the build: Steps 2 and 3 must not keep
+            # offering a cycle that no longer exists.  No st.rerun() — clearing
+            # in place lets the confirmation banner survive to be read.
+            _flush_aps_caches()
+            if deleted:
+                st.success(
+                    f"🗑️ Deleted **{deleted:,}** row(s); history tracker now "
+                    f"**{total:,}** rows."
+                )
+            else:
+                st.info(
+                    "No rows matched that Cycle / Fiscal Year / Forecast Type."
+                )
+        except (LakehouseIOError, ValueError) as exc:
+            st.error(f"❌ Could not delete the slice.\n\n{exc}")
+
+
+# Fragment-isolated: a widget interaction anywhere inside this section reruns
+# ONLY this function, not the other ~11k lines of the page.  Streamlit reruns
+# the whole script per interaction by default, so without this a filter click
+# here re-executes every other section's Fabric reads and rebuilds.  Writes that
+# must refresh the WHOLE page call ``st.rerun(scope="app")``, which escapes the
+# fragment.
+#
+# Safe because this section owns its state: its widgets are namespaced to it and
+# no other section reads them.
+@st.fragment
+def _render_demand_summary_aps() -> None:
+    """Render the Demand Summary (APS / Oracle) section as four numbered steps.
+
+    Laid out to mirror **Demand Summary (IBP)** so a planner who has used one
+    already knows this one: upload first, check what landed, compare, and the
+    destructive tool quarantined at the bottom.
+
+        Step 1 · Upload this cycle's plan     — the entrance, opens itself
+        Step 2 · Check what landed            — what the history now holds
+        Step 3 · Compare with the last cycle  — the analysis
+        Step 4 · Delete a cycle               — the undo, out of the happy path
+
+    Steps 2 and 3 share ONE read of the ≈1.4M-row history tracker (the
+    section's heaviest source), taken here so neither blocks on the other.
+    """
+    with st.expander("📈 Demand Summary (APS / Oracle)", expanded=False):
+        st.caption(
+            "**The demand plan as Oracle/APS sees it.**  Upload each cycle's two "
+            "files, and this section keeps a running history of every cycle so "
+            "you can compare one against the last.  Everything is stored in "
+            f"**`{aps_history_path()}`**.  B2C only."
+        )
+
+        # Auth gate — match every other Fabric-backed section here.
+        if not fabric_signin_widget.is_fabric_signed_in():
+            st.warning(
+                "🔒 **Microsoft Fabric is not connected.**  Sign in via "
+                "**Documentation** in the sidebar, then return here."
+            )
+            return
+
+        # Gated: this section reads the ≈1.4M-row APS history tracker plus the
+        # plan-to-site / customer-name dimensions, all of which loaded on every
+        # render while the expander was closed.
+        if not _section_load_gate(
+            _SS_APS_LOADED,
+            button_label="▶️ Load APS / Oracle demand plan",
+            blurb="Reads the APS history tracker and the customer / ship-to "
+                  "dimensions from OneLake — loaded on request so the rest of "
+                  "the page stays fast.",
+            help_text="Loads the APS history for this session.  Upload, "
+                      "review and comparison behave normally once loaded.",
+        ):
+            return
+
+        # ── STEP 1 · Upload ──────────────────────────────────────────────
+        with st.expander(
+            "**Step 1 · Upload this cycle's plan** — start here", expanded=True,
+        ):
+            _render_aps_step1_upload()
+
+        # ONE history read for Steps 2 + 3.  Taken after Step 1 so a build in
+        # this same run (which flushes the cache) is already reflected below.
+        try:
+            aps_history = _cached_aps_history()
+        except (LakehouseIOError, ValueError) as exc:
+            aps_history = None
+            st.warning(f"Could not read the APS history tracker: {exc}")
+
+        # ── STEP 2 · Check what landed ───────────────────────────────────
+        with st.expander(
+            "**Step 2 · Check what landed** — and download the file",
+            expanded=False,
+        ):
+            _render_aps_step2_check(aps_history)
+
+        # ── STEP 3 · Compare ─────────────────────────────────────────────
+        _render_aps_comparison_section(aps_history)
+
+        # ── STEP 4 · Delete ──────────────────────────────────────────────
+        # The undo, quarantined at the bottom out of the happy path, exactly as
+        # Demand Summary (IBP) quarantines its withdraw tool.
+        with st.expander(
+            "**Step 4 · Delete a cycle** — undo and start over", expanded=False,
+        ):
+            _render_aps_step4_delete()
 
 
 def _render_demand_summary_file(
@@ -6126,11 +6147,6 @@ def _dpc_generate(tracker_df: pd.DataFrame) -> None:
     st.session_state[_DPC_ENABLED_KEY] = True
     st.rerun(scope="fragment")
 
-# TTL for the derived (build) outputs.  60 minutes — matches the bumped
-# raw-CSV TTL so the build cache never out-lives its inputs.  The "🔄
-# Refresh from Fabric" button clears the raw cache (and the page reruns,
-# so the build cache misses cleanly on the next render).
-_CACHE_TTL_SECONDS_OUTPUTS: int = 60 * 60
 
 
 def _fy27_budget_workbook_etag() -> str:
@@ -9336,7 +9352,7 @@ def _build_aps_merged_tracker(
 
 @st.cache_data(ttl=_CACHE_TTL_SECONDS_OUTPUTS, show_spinner=False)
 def _cached_aps_comparison_options(
-    _aps_sig: tuple, _ibp_sig: tuple, _pdh_sig: tuple,
+    aps_sig: tuple, ibp_sig: tuple, pdh_sig: tuple,
     _aps_hist: pd.DataFrame,
     _ibp_tracker: Optional[pd.DataFrame],
     _pdh: Optional[pd.DataFrame],
@@ -9347,6 +9363,15 @@ def _cached_aps_comparison_options(
     combos`` each scan the ≈1M-row tracker; without this they re-ran on every
     rerun (each filter tweak).  Keyed on the source shape signatures, so the
     scans recompute only when the underlying data actually changes.
+
+    The three ``*_sig`` parameters carry NO leading underscore, and that is
+    load-bearing: Streamlit excludes underscore-prefixed parameters from the
+    cache key.  They were all underscored once, which left this function with a
+    constant key — it served the first cycle list of the hour forever, so a
+    freshly uploaded cycle was missing from the picker until the TTL lapsed
+    (C6 did exactly this).  The DataFrames keep their underscores on purpose:
+    they are the payload, they are expensive to hash, and the signatures
+    already stand in for them.  ``test_cache_key_hygiene.py`` guards the shape.
     """
     aps_cycles = list_aps_history_cycles(_aps_hist)
     ibp_cycles = list_tracker_cycles(_ibp_tracker) if _ibp_tracker is not None else []
@@ -9410,7 +9435,15 @@ def _render_aps_comparison_section(aps_hist: Optional[pd.DataFrame]) -> None:
     IBP section (FY27 workbook by row-id); actuals reuse IBP Orders /
     Shipments.  All controls appear whenever the APS history file exists.
     """
-    with st.expander("🧭 APS / Oracle Demand Plan Comparison Summary", expanded=False):
+    with st.expander(
+        "**Step 3 · Compare this cycle with the last one** — what changed",
+        expanded=False,
+    ):
+        st.caption(
+            "Pick the cycle you just uploaded as **Current**, pick what to measure "
+            "it against as **Prior**, then press Generate.  If a cycle you have "
+            "uploaded is not in the list, check it appears in Step 2 first."
+        )
         st.caption(
             "Compares the **APS / Oracle plan** (current cycle, from the APS history "
             "tracker) against a chosen **prior cycle of the IBP tracker** "
@@ -10399,9 +10432,9 @@ def render() -> None:
     _render_ro_comparison()
     st.markdown("---")
 
-    # APS above IBP.  The APS section is self-contained: upload & manage, then
-    # the corp-group review + patch and the demand-summary comparison + variance
-    # drill-in are nested foldable sub-sections inside it.
+    # APS above IBP.  Both are self-contained and share one four-step shape —
+    # upload, check, compare, undo — so a planner who has used either already
+    # knows the other.
     _render_demand_summary_aps()
     st.markdown("---")
 

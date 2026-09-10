@@ -11,57 +11,18 @@ be called directly.  What these tests protect:
   "Regenerate from published" panel.  Auto-save covers all of it.
 * The **structure**: four numbered steps, Pipeline at a Glance collapsed.
 
-Context managers use a real class so an exception inside ``with expander:``
-propagates instead of being swallowed by a MagicMock ``__exit__``.
+The Streamlit stub is shared (``tests.streamlit_stub``) because the page can
+only be imported once per session — see that module for why per-file stubs
+made the suite order-dependent.
 """
-import sys
-from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
 
-class _Ctx:
-    """Stands in for a column / container.
+from tests.streamlit_stub import Ctx as _Ctx, bind, install  # noqa: E402
 
-    Carries the handful of element methods the page calls *on* a column
-    (rather than on ``st``), so a real exception inside the block still
-    propagates instead of being swallowed by a MagicMock.
-    """
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def metric(self, *a, **k):
-        return None
-
-    def markdown(self, *a, **k):
-        return None
-
-    def caption(self, *a, **k):
-        return None
-
-
-_ST = MagicMock()
-_ST.session_state = {}
-_ST.fragment = lambda f: f
-# Pass-through caching decorators.  They are applied at IMPORT time, so a
-# MagicMock here would replace the decorated function itself — the page's
-# cached helpers would return a Mock instead of their value.
-_ST.cache_data = lambda *a, **k: (lambda fn: fn)
-_ST.cache_resource = lambda *a, **k: (lambda fn: fn)
-_ST.columns = lambda spec, **k: [
-    _Ctx() for _ in (spec if isinstance(spec, (list, tuple)) else range(spec))
-]
-_ST.expander = lambda *a, **k: _Ctx()
-_ST.container = lambda *a, **k: _Ctx()
-_ST.popover = lambda *a, **k: _Ctx()
-sys.modules["streamlit"] = _ST
-sys.modules.setdefault("streamlit.components", MagicMock())
-sys.modules.setdefault("streamlit.components.v1", MagicMock())
+_ST = install()
 
 from data_sources import ro_input_preflight as rpf
 from data_sources.demand_plan_comparison import build_item_dim_frame_cascade  # noqa: E402
@@ -103,12 +64,7 @@ def caps(monkeypatch):
     c = {"buttons": [], "expanders": [], "markdown": [], "captions": [],
          "download": [], "checkbox": [], "error": [], "warning": [],
          "success": [], "info": []}
-    _ST = page.st
-    _ST.session_state = {}
-    _ST.fragment = lambda f: f
-    _ST.columns = lambda spec, **k: [
-        _Ctx() for _ in (spec if isinstance(spec, (list, tuple)) else range(spec))
-    ]
+    _ST = bind(page)
 
     def _expander(label="", **k):
         c["expanders"].append((label, k.get("expanded")))

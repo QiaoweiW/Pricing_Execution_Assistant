@@ -8,40 +8,13 @@ inside ``with col:`` / ``with expander:`` propagate (a MagicMock __exit__ would
 otherwise swallow them and defeat the point of the test).
 """
 
-import sys
-from unittest.mock import MagicMock
-
 import pandas as pd
 import pytest
 
 
-class _Ctx:
-    def __enter__(self):
-        return self
+from tests.streamlit_stub import bind, install  # noqa: E402
 
-    def __exit__(self, *a):
-        return False
-
-
-# ── Install a fake streamlit BEFORE importing the page ───────────────────────
-_ST = MagicMock()
-_ST.session_state = {}
-_ST.fragment = lambda f: f
-# Pass-through caching decorators: they are applied at IMPORT time, so a
-# MagicMock replaces the decorated function itself and every cached helper
-# returns a Mock.  Kept identical across the render-test modules so it does
-# not matter which of them imports the page first.
-_ST.cache_data = lambda *a, **k: (lambda fn: fn)
-_ST.cache_resource = lambda *a, **k: (lambda fn: fn)
-_ST.columns = lambda spec, **k: [
-    _Ctx() for _ in (spec if isinstance(spec, (list, tuple)) else range(spec))
-]
-_ST.expander = lambda *a, **k: _Ctx()
-_ST.container = lambda *a, **k: _Ctx()
-_ST.popover = lambda *a, **k: _Ctx()
-sys.modules["streamlit"] = _ST
-sys.modules.setdefault("streamlit.components", MagicMock())
-sys.modules.setdefault("streamlit.components.v1", MagicMock())
+_ST = install()
 
 from data_sources.ro_comparison import (  # noqa: E402
     ANNUAL_OPP_LE, CUR_FISCAL_PROB_LE, YEAR1_PROB_LE,
@@ -54,12 +27,8 @@ import pages.demand_planner_analytics_view as page  # noqa: E402
 def caps(monkeypatch):
     """Fresh streamlit stub behaviours per test; returns a capture dict."""
     c = {"plotly": [], "editor": []}
-    _ST.session_state = {}
-    _ST.fragment = lambda f: f
-    _ST.columns = lambda spec, **k: [
-        _Ctx() for _ in (spec if isinstance(spec, (list, tuple)) else range(spec))
-    ]
-    _ST.expander = lambda *a, **k: _Ctx()
+    global _ST
+    _ST = bind(page)        # configure what the page actually holds
     _ST.multiselect = lambda *a, **k: k.get("default", [])
     _ST.number_input = lambda *a, **k: k.get("value", 0)
     _ST.slider = lambda *a, **k: k.get("value", (0, 100))

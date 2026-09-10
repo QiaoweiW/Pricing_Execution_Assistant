@@ -31,6 +31,16 @@ their leg into ``qry_mgmt_plan_full_aps_history.csv`` via
 Type).  :func:`delete_history_slice` removes a (Cycle, FY[, Forecast Type])
 slice.
 
+Corporate groups resolve themselves
+-----------------------------------
+An R&O customer that no dimension could match used to land as ``(Unmapped)``
+and wait for a planner to curate it through a download / edit / re-upload
+"review + patch" tool.  That tool is retired: :func:`apply_customer_corp_default`
+now gives those rows the customer's own name — which is what the planner typed
+almost every time — on both the leg being built and the merged history file, so
+older rows heal themselves on the next upload.  Fuzzy matches are deliberately
+left alone; see that function for why overwriting them breaks roll-ups.
+
 Reuse (no duplication): the RO_Seed expansion + fuzzy corp match come from
 :mod:`data_sources.holistic_demand_plan_aps`; dims + date coercion + the
 plan-to bridge from :mod:`data_sources.demand_plan_comparison`; all Fabric I/O
@@ -57,12 +67,10 @@ from data_sources.holistic_demand_plan_aps import (
     CORP_GROUP_UNMAPPED,
     FORECAST_APS_BASE_PLAN,
     FORECAST_R_AND_O,
-    MATCH_COL_CORP,
     MATCH_COL_CUSTOMER,
     MATCH_COL_STATUS,
     _build_name_to_corp,
     _build_ro_leg,
-    _clean_overrides,
     _corp_by_customer,
     _filter_b2c,
 )
@@ -104,16 +112,19 @@ APS_HIST_COLUMNS: tuple[str, ...] = (
     COL_FORECAST, COL_PMAJ, COL_PMIN, COL_SFMT, COL_CORP, COL_CUSTOMER, COL_CORP_SRC,
     COL_CYCLE, COL_FY, COL_INCLUSION,
 )
-# How a row's Corporate Group was resolved.  The review + direct-on-file patch
-# target only the two "needs a look" sources; exact/native/bridge/override are
-# left alone (so prior patches are never redone).
+# How a row's Corporate Group was resolved.  Only ``unmapped`` means "nothing
+# resolved it" — see :func:`apply_customer_corp_default`, which fills those in
+# automatically so no one has to curate them by hand.
 CORP_SRC_BRIDGE: str   = "bridge"     # APS: plan_to_code → dp_dimplantosites → corp
 CORP_SRC_NATIVE: str   = "native"     # APS: fell back to the file's corporate_group_code
 CORP_SRC_EXACT: str    = "exact"      # R&O: exact customer-name match
-CORP_SRC_FUZZY: str    = "fuzzy"      # R&O: fuzzy customer-name match  ← reviewable
-CORP_SRC_UNMAPPED: str = "unmapped"   # neither leg resolved a real group ← reviewable
-CORP_SRC_OVERRIDE: str = "override"   # planner set it by hand (a patch)
-_CORP_SRC_REVIEWABLE: frozenset = frozenset({CORP_SRC_FUZZY, CORP_SRC_UNMAPPED})
+CORP_SRC_FUZZY: str    = "fuzzy"      # R&O: fuzzy customer-name match
+CORP_SRC_UNMAPPED: str = "unmapped"   # neither leg resolved a real group
+CORP_SRC_CUSTOMER: str = "customer"   # R&O: defaulted to the Customer name (automatic)
+# Historical only: rows written by the retired manual "review + patch" tool.
+# Nothing produces this any more, but it is still present in the history file
+# and must keep being treated as resolved.
+CORP_SRC_OVERRIDE: str = "override"
 # The per-run stamp columns (added last; stripped before a re-stamp).
 _STAMP_COLS: tuple[str, ...] = (COL_CYCLE, COL_FY, COL_INCLUSION)
 
@@ -154,6 +165,7 @@ class ApsUploadResult:
     history_rows: int           # total rows in the history file after upsert
     corp_coverage: float        # share of APS-leg pounds mapped to a real corp group
     match_log: pd.DataFrame     # R&O Customer → Corporate Group fuzzy log
+    corp_defaulted: int         # R&O rows given their Customer name as the group
     cycle: str
     fy: int
 
@@ -282,6 +294,54 @@ def _build_aps_leg(
     return grouped, coverage
 
 
+def apply_customer_corp_default(
+    df: Optional[pd.DataFrame],
+) -> tuple[pd.DataFrame, int]:
+    """Unresolved R&O rows inherit their Customer name as the Corporate Group.
+
+    Replaces the retired "review + patch" tool.  A planner used to download the
+    unresolved customers, type a Corporate Group into each one and upload the
+    sheet back; in practice the value they typed was the customer's own name
+    almost every time, so the app now just does that.
+
+    Scope is deliberately narrow — only rows where **nothing** resolved a group:
+
+    * **R&O rows only.**  Base-plan rows carry no Customer at all (verified: all
+      1,342,282 of them are blank), so there is nothing to inherit.
+    * **``unmapped`` only** — never ``fuzzy``.  A fuzzy row already matched a
+      real group out of the customer-names dimension, and that group is usually
+      the spelling the *base plan* uses ("SMART AND FINAL" where the R&O seed
+      says "Smart & Final").  Overwriting it with the customer name would split
+      one corporate group into two and quietly break the roll-up — measured on
+      the live file, it would have broken 2 groups to fix 1.
+    * **Non-blank Customer only.**  A blank one has nothing to paste, so it
+      stays ``(Unmapped)`` rather than becoming an empty group.
+
+    Idempotent: filled rows are stamped ``Corp Source = customer``, which is not
+    ``unmapped``, so a second pass matches nothing.  Returns
+    ``(frame, rows_filled)`` — the input frame unchanged when nothing matched
+    (no defensive copy of a million-row frame for a no-op).
+    """
+    if df is None or df.empty:
+        return (df if df is not None else pd.DataFrame(columns=list(APS_HIST_COLUMNS))), 0
+    for col in (COL_FORECAST, COL_CORP_SRC, COL_CUSTOMER, COL_CORP):
+        if col not in df.columns:
+            return df, 0
+    customer = df[COL_CUSTOMER].astype(str).str.strip()
+    target = (
+        (df[COL_FORECAST].astype(str).str.strip() == FORECAST_R_AND_O)
+        & (df[COL_CORP_SRC].astype(str).str.strip().str.lower() == CORP_SRC_UNMAPPED)
+        & customer.astype(bool)
+    )
+    n = int(target.sum())
+    if not n:
+        return df, 0
+    out = df.copy()
+    out.loc[target, COL_CORP] = customer[target]
+    out.loc[target, COL_CORP_SRC] = CORP_SRC_CUSTOMER
+    return out, n
+
+
 def _shape_ro_history(
     ro_detail: pd.DataFrame, cust_corp: dict[str, str], cust_src: dict[str, str],
     dim_maps: dict,
@@ -323,6 +383,9 @@ def _shape_ro_history(
     leg[COL_PMIN] = leg[COL_ITEM].map(dim_maps.get("pminor", {})).fillna("")
     dim_desc = leg[COL_ITEM].map(dim_maps.get("desc", {})).fillna("")
     leg[COL_ITEM_DESC] = dim_desc
+    # Fill unresolved groups here, at the source, so the rows the planner
+    # previews and downloads match what lands in the history file.
+    leg, _filled = apply_customer_corp_default(leg)
     return leg
 
 
@@ -387,6 +450,7 @@ def build_aps_history_rows(
     result = ApsUploadResult(
         rows=combined, aps_rows=len(aps_leg), ro_rows=len(ro_leg),
         history_rows=0, corp_coverage=coverage, match_log=match_log,
+        corp_defaulted=0,
         cycle=str(cycle), fy=int(fy))
     return combined, result
 
@@ -422,19 +486,32 @@ def replace_cycle_fy_forecast_slice(
 
 def upsert_aps_history_leg(
     new_rows: pd.DataFrame, cycle: str, fy: int, forecast_types,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, int]:
     """Replace the (Cycle, FY, Forecast Type) slice of the history file; return it merged.
 
     Read-modify-write via :func:`update_csv` (ETag-retry) — safe against a
-    concurrent save.  Returns the full merged history frame.
+    concurrent save.  Returns ``(merged_history, rows_corp_defaulted)``.
+
+    The merged frame passes through :func:`apply_customer_corp_default` before
+    it is written.  ``_shape_ro_history`` already cleans the leg being built, so
+    this second pass exists for rows *already* in the file from an earlier
+    upload — they are healed in place the next time anything is built, at no
+    extra I/O (we are reading and rewriting the file regardless).
     """
-    return update_csv(
-        _SECRETS_SECTION, _APS_HISTORY_BLOB,
-        lambda current: replace_cycle_fy_forecast_slice(
-            current, new_rows, cycle, fy, forecast_types),
+    filled = {"n": 0}
+
+    def _merge(current: Optional[pd.DataFrame]) -> pd.DataFrame:
+        merged = replace_cycle_fy_forecast_slice(
+            current, new_rows, cycle, fy, forecast_types)
+        merged, filled["n"] = apply_customer_corp_default(merged)
+        return merged
+
+    merged = update_csv(
+        _SECRETS_SECTION, _APS_HISTORY_BLOB, _merge,
         initial_default=pd.DataFrame(columns=list(APS_HIST_COLUMNS)),
         verify=False,   # large blob — skip the full-file header re-read
     )
+    return merged, filled["n"]
 
 
 def delete_history_slice(cycle: str, fy: int, forecast_types=None) -> tuple[int, int]:
@@ -467,119 +544,24 @@ def delete_history_slice(cycle: str, fy: int, forecast_types=None) -> tuple[int,
 
 def _persist_leg_and_upsert(
     rows: pd.DataFrame, cycle: str, fy: int, forecast_types,
-) -> int:
-    """Upsert one leg into the history + refresh the this-cycle snapshot; return total.
+) -> tuple[int, int]:
+    """Upsert one leg into the history + refresh the this-cycle snapshot.
 
     ``verify=False`` on the writes: these frames are large (hundreds of thousands
     of rows) and the post-write header re-read is pure overhead (the header
     contract is pinned).  The ``qry_mgmt_plan_full_aps.csv`` snapshot is rewritten
     to the *whole* (Cycle, FY) slice of the merged history (both legs), so it
     always reflects the current cycle regardless of which leg was just built.
+
+    Returns ``(total_history_rows, rows_corp_defaulted)``.
     """
-    merged = upsert_aps_history_leg(rows, cycle, fy, forecast_types)
+    merged, corp_defaulted = upsert_aps_history_leg(rows, cycle, fy, forecast_types)
     slice_df = merged[
         (merged[COL_CYCLE].astype(str).str.strip() == str(cycle))
         & (merged[COL_FY].astype(str).str.strip() == str(fy))
     ]
     write_csv(_SECRETS_SECTION, _APS_FULL_BLOB, slice_df, verify=False)
-    return len(merged)
-
-
-# ── R&O Corporate-Group override (planner-uploaded fixed match log) ──────────
-def parse_corp_override_csv(data: bytes) -> dict[str, str]:
-    """Parse a fixed match-log CSV → ``{Customer: Corporate Group}`` overrides.
-
-    Accepts the downloaded match-log shape (``Customer`` / ``Corporate Group``
-    columns, case-insensitive); rows with a blank / ``(Unmapped)`` Corporate
-    Group are skipped, so a half-filled sheet only patches the customers the
-    planner actually completed.
-    """
-    try:
-        raw = pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False)
-    except Exception as exc:  # noqa: BLE001
-        raise ApsUploadError(f"Could not read the override CSV: {exc}") from exc
-    cols = {c.strip().lower(): c for c in raw.columns}
-    cust_col = cols.get(MATCH_COL_CUSTOMER.lower())
-    corp_col = cols.get(MATCH_COL_CORP.lower())
-    if not cust_col or not corp_col:
-        raise ApsUploadError(
-            f"The override CSV must have '{MATCH_COL_CUSTOMER}' and "
-            f"'{MATCH_COL_CORP}' columns (found {list(raw.columns)})."
-        )
-    out: dict[str, str] = {}
-    for cust, corp in zip(raw[cust_col], raw[corp_col]):
-        k, v = str(cust).strip(), str(corp).strip()
-        if k and v and v != CORP_GROUP_UNMAPPED:
-            out[k] = v
-    return out
-
-
-def build_corp_review(history_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Return the R&O customers whose Corporate Group needs a look.
-
-    One row per distinct Customer whose ``Corp Source`` is *fuzzy* or *unmapped*,
-    in the downloadable match-log shape ``(Customer, Corporate Group, Match)``.
-    Read straight off the history file, so the review is available whenever the
-    file exists — no dependency on a fresh upload.  Unmapped first, then Fuzzy.
-    """
-    review_cols = [MATCH_COL_CUSTOMER, MATCH_COL_CORP, MATCH_COL_STATUS]
-    if (history_df is None or history_df.empty
-            or COL_CUSTOMER not in history_df.columns
-            or COL_CORP_SRC not in history_df.columns):
-        return pd.DataFrame(columns=review_cols)
-    ro = history_df[history_df[COL_FORECAST].astype(str).str.strip() == FORECAST_R_AND_O].copy()
-    ro["_cust"] = ro[COL_CUSTOMER].astype(str).str.strip()
-    ro["_src"] = ro[COL_CORP_SRC].astype(str).str.strip().str.lower()
-    review = ro[ro["_src"].isin(_CORP_SRC_REVIEWABLE) & ro["_cust"].astype(bool)]
-    if review.empty:
-        return pd.DataFrame(columns=review_cols)
-    out = review.drop_duplicates("_cust")[[COL_CUSTOMER, COL_CORP, "_src"]].copy()
-    out["_src"] = out["_src"].str.title()          # fuzzy → Fuzzy, unmapped → Unmapped
-    out.columns = review_cols
-    order = {CORP_SRC_UNMAPPED.title(): 0, CORP_SRC_FUZZY.title(): 1}
-    return (
-        out.assign(_o=out[MATCH_COL_STATUS].map(order).fillna(9))
-        .sort_values(["_o", MATCH_COL_CUSTOMER])
-        .drop(columns="_o")
-        .reset_index(drop=True)
-    )
-
-
-def patch_history_corp(overrides: Optional[dict[str, str]]) -> tuple[int, int]:
-    """Apply ``{Customer: Corporate Group}`` to the history file's reviewable R&O rows.
-
-    Updates ONLY R&O rows whose Customer is in *overrides* **and** whose Corp
-    Source is still reviewable (fuzzy / unmapped) — so exact matches and prior
-    overrides are never touched, and previous patches never need redoing.  The
-    patched rows are stamped ``Corp Source = override``.  Read-modify-write on
-    the history file (verify=False; large blob).  Returns
-    ``(rows_patched, total_history_rows)``.
-    """
-    clean = _clean_overrides(overrides)
-    if not clean:
-        return 0, 0
-    counter = {"n": 0}
-
-    def _mutate(current: Optional[pd.DataFrame]) -> pd.DataFrame:
-        if current is None or current.empty:
-            return pd.DataFrame(columns=list(APS_HIST_COLUMNS))
-        df = current.copy()
-        for col in (COL_CUSTOMER, COL_CORP_SRC, COL_CORP, COL_FORECAST):
-            if col not in df.columns:
-                df[col] = ""
-        cust = df[COL_CUSTOMER].astype(str).str.strip()
-        src = df[COL_CORP_SRC].astype(str).str.strip().str.lower()
-        is_ro = df[COL_FORECAST].astype(str).str.strip() == FORECAST_R_AND_O
-        target = is_ro & cust.isin(clean) & src.isin(_CORP_SRC_REVIEWABLE)
-        counter["n"] = int(target.sum())
-        df.loc[target, COL_CORP] = cust[target].map(clean)
-        df.loc[target, COL_CORP_SRC] = CORP_SRC_OVERRIDE
-        return df
-
-    merged = update_csv(
-        _SECRETS_SECTION, _APS_HISTORY_BLOB, _mutate,
-        initial_default=pd.DataFrame(columns=list(APS_HIST_COLUMNS)), verify=False)
-    return counter["n"], len(merged)
+    return len(merged), corp_defaulted
 
 
 def _archive_raw_upload(upload_bytes: bytes, filename: str) -> None:
@@ -652,8 +634,9 @@ def generate_base_plan_from_upload(
         raise ApsUploadError(
             "Transform produced no Base Plan rows — check the export's columns "
             "(month / item_code / consensus_forecast) and B2C mapping.")
-    history_rows = _persist_leg_and_upsert(rows, cycle, fy, (FORECAST_APS_BASE_PLAN,))
-    return replace(partial, history_rows=history_rows)
+    history_rows, corp_defaulted = _persist_leg_and_upsert(
+        rows, cycle, fy, (FORECAST_APS_BASE_PLAN,))
+    return replace(partial, history_rows=history_rows, corp_defaulted=corp_defaulted)
 
 
 def generate_ro_from_seed(
@@ -682,8 +665,9 @@ def generate_ro_from_seed(
         raise ApsUploadError(
             "Transform produced no R&O rows — check the R&O seed's columns and "
             "that it holds B2C rows for this horizon.")
-    history_rows = _persist_leg_and_upsert(rows, cycle, fy, (FORECAST_R_AND_O,))
-    return replace(partial, history_rows=history_rows)
+    history_rows, corp_defaulted = _persist_leg_and_upsert(
+        rows, cycle, fy, (FORECAST_R_AND_O,))
+    return replace(partial, history_rows=history_rows, corp_defaulted=corp_defaulted)
 
 
 def fetch_aps_history_df() -> Optional[pd.DataFrame]:
@@ -708,6 +692,54 @@ def list_aps_history_cycles(history_df: Optional[pd.DataFrame]) -> list[str]:
         if COL_MONTH in history_df.columns else None
     )
     return order_cycles_by_horizon(history_df[COL_CYCLE], months)
+
+
+#: Column order of :func:`summarise_history` — the page renders it as-is.
+HISTORY_SUMMARY_COLUMNS: tuple[str, ...] = (
+    "Cycle", "Base Plan rows", "R&O rows", "Total rows", "Plan covers",
+)
+
+
+def summarise_history(history_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """One row per stored cycle: rows in each leg, and the months it covers.
+
+    Answers the only question a planner has straight after an upload — *did my
+    cycle land, and is it complete?*  A cycle needs both legs (an APS bulk
+    export and an R&O seed) before the comparison can read it properly, and a
+    zero in either column says which file is still missing.
+
+    Newest cycle first, ordered by :func:`list_aps_history_cycles` (plan
+    horizon, not label) and reversed, so the cycle just uploaded is at the top.
+    Empty frame — with the right columns — when there is no history yet.
+    """
+    if history_df is None or history_df.empty or COL_CYCLE not in history_df.columns:
+        return pd.DataFrame(columns=list(HISTORY_SUMMARY_COLUMNS))
+    cycles = history_df[COL_CYCLE].astype(str).str.strip()
+    legs = (
+        history_df[COL_FORECAST].astype(str).str.strip()
+        if COL_FORECAST in history_df.columns
+        else pd.Series("", index=history_df.index)
+    )
+    months = (
+        pd.Series(_vectorised_start_of_month(history_df[COL_MONTH]),
+                  index=history_df.index)
+        if COL_MONTH in history_df.columns
+        else pd.Series(pd.NA, index=history_df.index)
+    )
+    rows = []
+    for cycle in list_aps_history_cycles(history_df):
+        in_cycle = cycles == cycle
+        span = months[in_cycle].dropna()
+        rows.append({
+            "Cycle": cycle,
+            "Base Plan rows": int((in_cycle & (legs == FORECAST_APS_BASE_PLAN)).sum()),
+            "R&O rows": int((in_cycle & (legs == FORECAST_R_AND_O)).sum()),
+            "Total rows": int(in_cycle.sum()),
+            "Plan covers": (
+                f"{min(span):%b %Y} → {max(span):%b %Y}" if len(span) else "—"),
+        })
+    out = pd.DataFrame(rows, columns=list(HISTORY_SUMMARY_COLUMNS))
+    return out.iloc[::-1].reset_index(drop=True)
 
 
 def list_aps_history_forecast_types(history_df: Optional[pd.DataFrame]) -> list[str]:

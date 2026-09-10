@@ -8,10 +8,9 @@ import datetime as dt
 
 from data_sources.aps_upload_pipeline import (
     APS_HIST_COLUMNS,
-    ApsUploadResult,
+    CORP_SRC_CUSTOMER,
     CORP_SRC_EXACT,
     CORP_SRC_FUZZY,
-    CORP_SRC_OVERRIDE,
     CORP_SRC_UNMAPPED,
     COL_CORP,
     COL_CORP_SRC,
@@ -30,13 +29,11 @@ from data_sources.aps_upload_pipeline import (
     _to_excel_serial,
     FORECAST_APS_BASE_PLAN,
     FORECAST_R_AND_O,
+    apply_customer_corp_default,
     build_aps_history_rows,
-    build_corp_review,
-    delete_history_slice,
     list_aps_history_forecast_types,
-    parse_corp_override_csv,
-    patch_history_corp,
     replace_cycle_fy_forecast_slice,
+    summarise_history,
     today_inclusion_serial,
 )
 
@@ -242,62 +239,128 @@ def test_shape_ro_history_keeps_customer_and_source():
     by_cust = dict(zip(leg[COL_CUSTOMER], zip(leg[COL_CORP], leg[COL_CORP_SRC])))
     assert by_cust["URM"] == ("DFS Gormet", CORP_SRC_FUZZY)
     assert by_cust["Kroger"] == ("Kroger", CORP_SRC_EXACT)
-    # Unmapped customer falls back to the (Unmapped) sentinel corp group.
-    assert by_cust["7-Eleven"][1] == CORP_SRC_UNMAPPED
+    # An unmapped customer no longer lands as "(Unmapped)" waiting for a human:
+    # it takes its own name as the group, stamped so we know how it got there.
+    assert by_cust["7-Eleven"] == ("7-Eleven", CORP_SRC_CUSTOMER)
     # R&O rows carry no party site / sales forecast, and dims backfill from dims.
     assert (leg[COL_PARTY] == "").all() and (leg[COL_SALES_LBS] == 0.0).all()
     assert (leg["Portfolio Major"] == "Butter").all()
 
 
-def test_parse_corp_override_csv():
-    csv = (
-        "Customer,Corporate Group,Match\n"
-        "URM,URM,Fuzzy\n"
-        "Costco,,Exact\n"            # blank -> skipped
-        "HEB,(Unmapped),Exact\n"     # Unmapped -> skipped
-        "Kroger,Kroger Co,Exact\n"
-    ).encode("utf-8")
-    assert parse_corp_override_csv(csv) == {"URM": "URM", "Kroger": "Kroger Co"}
+# ── Corporate groups resolve themselves (replaces the manual review+patch) ───
 
-
-def test_build_corp_review_lists_only_reviewable_unmapped_first():
-    review = build_corp_review(_history_with_ro())
-    # Kroger (exact) is NOT reviewable; URM (fuzzy) + 7-Eleven (unmapped) are.
-    assert list(review.columns) == ["Customer", "Corporate Group", "Match"]
-    assert list(review["Customer"]) == ["7-Eleven", "URM"]   # Unmapped first
-    assert list(review["Match"]) == ["Unmapped", "Fuzzy"]
-
-
-def test_build_corp_review_empty_without_columns():
-    # A legacy history frame missing Customer / Corp Source yields nothing to review.
-    bare = pd.DataFrame({COL_FORECAST: ["R&O"], COL_CORP: ["X"]})
-    assert build_corp_review(bare).empty
-    assert build_corp_review(None).empty
-
-
-def test_patch_history_corp_targets_reviewable_ro_only(monkeypatch):
-    """The mutator patches only reviewable R&O rows; exact / prior rows untouched."""
-    import data_sources.aps_upload_pipeline as aps
-
-    captured = {}
-
-    def fake_update_csv(section, blob, mutator, *, initial_default=None, verify=True):
-        out = mutator(_history_with_ro())
-        captured["out"] = out
-        return out
-
-    monkeypatch.setattr(aps, "update_csv", fake_update_csv)
-    patched, total = aps.patch_history_corp({"URM": "URM Inc", "7-Eleven": "7-Eleven",
-                                             "Kroger": "SHOULD NOT APPLY"})
-    out = captured["out"]
+def test_unmapped_ro_rows_take_the_customer_name():
+    out, n = apply_customer_corp_default(_history_with_ro())
     by_cust = dict(zip(out[COL_CUSTOMER], zip(out[COL_CORP], out[COL_CORP_SRC])))
-    assert by_cust["URM"] == ("URM Inc", CORP_SRC_OVERRIDE)         # fuzzy -> patched
-    assert by_cust["7-Eleven"] == ("7-Eleven", CORP_SRC_OVERRIDE)   # unmapped -> patched
-    assert by_cust["Kroger"] == ("Kroger", CORP_SRC_EXACT)          # exact -> untouched
-    assert patched == 2 and total == len(out)
+    # _shape_ro_history already filled 7-Eleven, so the frame arrives clean.
+    assert n == 0
+    assert by_cust["7-Eleven"] == ("7-Eleven", CORP_SRC_CUSTOMER)
 
 
-def test_patch_history_corp_noop_without_overrides():
-    # No clean overrides -> returns early without touching Fabric.
-    assert patch_history_corp({}) == (0, 0)
-    assert patch_history_corp(None) == (0, 0)
+def test_a_legacy_unmapped_row_is_healed_in_place():
+    """Rows written before this rule existed are fixed on the next write."""
+    legacy = pd.DataFrame({
+        COL_FORECAST: [FORECAST_R_AND_O],
+        COL_CORP: ["(Unmapped)"], COL_CUSTOMER: ["Walgreens"],
+        COL_CORP_SRC: [CORP_SRC_UNMAPPED],
+    })
+    out, n = apply_customer_corp_default(legacy)
+    assert n == 1
+    assert out.loc[0, COL_CORP] == "Walgreens"
+    assert out.loc[0, COL_CORP_SRC] == CORP_SRC_CUSTOMER
+
+
+def test_fuzzy_matches_are_left_alone():
+    """A fuzzy row already holds the spelling the BASE PLAN uses.
+
+    Overwriting "SMART AND FINAL" with the seed's "Smart & Final" would split
+    one corporate group into two and break the roll-up — measured on the live
+    file, doing so would have broken 2 groups to fix 1.  So fuzzy is untouched.
+    """
+    fuzzy = pd.DataFrame({
+        COL_FORECAST: [FORECAST_R_AND_O],
+        COL_CORP: ["SMART AND FINAL"], COL_CUSTOMER: ["Smart & Final"],
+        COL_CORP_SRC: [CORP_SRC_FUZZY],
+    })
+    out, n = apply_customer_corp_default(fuzzy)
+    assert n == 0 and out.loc[0, COL_CORP] == "SMART AND FINAL"
+
+
+def test_base_plan_rows_are_never_touched():
+    """Base-plan rows carry no Customer at all — there is nothing to inherit."""
+    base = pd.DataFrame({
+        COL_FORECAST: [FORECAST_APS_BASE_PLAN],
+        COL_CORP: ["(Unmapped)"], COL_CUSTOMER: [""],
+        COL_CORP_SRC: [CORP_SRC_UNMAPPED],
+    })
+    out, n = apply_customer_corp_default(base)
+    assert n == 0 and out.loc[0, COL_CORP] == "(Unmapped)"
+
+
+def test_a_blank_customer_has_nothing_to_paste():
+    """Better an honest (Unmapped) than an empty-string corporate group."""
+    blank = pd.DataFrame({
+        COL_FORECAST: [FORECAST_R_AND_O],
+        COL_CORP: ["(Unmapped)"], COL_CUSTOMER: ["   "],
+        COL_CORP_SRC: [CORP_SRC_UNMAPPED],
+    })
+    out, n = apply_customer_corp_default(blank)
+    assert n == 0 and out.loc[0, COL_CORP] == "(Unmapped)"
+
+
+def test_the_fill_is_idempotent():
+    """Runs on every upload, so a second pass must be a no-op."""
+    legacy = pd.DataFrame({
+        COL_FORECAST: [FORECAST_R_AND_O], COL_CORP: ["(Unmapped)"],
+        COL_CUSTOMER: ["Raley's"], COL_CORP_SRC: [CORP_SRC_UNMAPPED],
+    })
+    once, n1 = apply_customer_corp_default(legacy)
+    twice, n2 = apply_customer_corp_default(once)
+    assert (n1, n2) == (1, 0)
+    pd.testing.assert_frame_equal(once, twice)
+
+
+@pytest.mark.parametrize("frame", [None, pd.DataFrame(),
+                                   pd.DataFrame({"Item": ["1"]})])
+def test_the_fill_survives_junk_input(frame):
+    out, n = apply_customer_corp_default(frame)
+    assert n == 0 and out is not None
+
+
+def test_the_fill_does_not_copy_when_nothing_matches():
+    """A no-op must not clone a million-row frame."""
+    clean = pd.DataFrame({
+        COL_FORECAST: [FORECAST_R_AND_O], COL_CORP: ["Kroger"],
+        COL_CUSTOMER: ["Kroger"], COL_CORP_SRC: [CORP_SRC_EXACT],
+    })
+    out, n = apply_customer_corp_default(clean)
+    assert n == 0 and out is clean
+
+
+# ── Step 2's "what landed" summary ──────────────────────────────────────────
+
+def test_history_summary_counts_each_leg_and_the_span():
+    summary = summarise_history(_history_with_ro())
+    assert list(summary.columns) == [
+        "Cycle", "Base Plan rows", "R&O rows", "Total rows", "Plan covers"]
+    row = summary.iloc[0]
+    assert row["Cycle"] == "C5"
+    assert row["Base Plan rows"] == 1
+    assert row["R&O rows"] == 3
+    assert row["Total rows"] == 4
+    assert row["Plan covers"] == "Jul 2026 → Jul 2026"
+
+
+def test_history_summary_puts_the_newest_cycle_first():
+    """The planner has just uploaded the newest cycle; show it at the top."""
+    old = _finalize([_shape_ro_leg()], "C4", 2027, 46220)
+    new = _finalize([_shape_ro_leg()], "C5", 2027, 46220)
+    new[COL_MONTH] = 46234                       # a later horizon than C4's
+    summary = summarise_history(pd.concat([old, new], ignore_index=True))
+    assert list(summary["Cycle"]) == ["C5", "C4"]
+
+
+def test_history_summary_is_empty_without_history():
+    for empty in (None, pd.DataFrame()):
+        out = summarise_history(empty)
+        assert out.empty and "Cycle" in out.columns
